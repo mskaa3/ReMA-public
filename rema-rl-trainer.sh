@@ -8,8 +8,10 @@
 #SBATCH --gpus-per-node=hopper:2    # (ilość kart graficznych na węźle)
 #SBATCH --verbose                   # wyświetlanie informacji o zadaniu
 
-cp -r ./data/MATH $TMPDIR/MATH
 cp -r ./data/overall_math $TMPDIR/overall_math
+cp -r ./data/MATH $TMPDIR/MATH
+
+cp ../verl.sif $TMPDIR
 
 source ./env.sh
 export HF_HOME=$TMPDIR/hf_home
