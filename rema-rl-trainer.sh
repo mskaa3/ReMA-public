@@ -18,7 +18,7 @@ cp ../verl.sif $TMPDIR
 source ./env.sh
 export HF_HOME=$TMPDIR/hf_home
 
-COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install flash-attn==2.7.4.post1 --no-build-isolation;python3 -m pip install -r requirements.txt;cd src/verl && pip install -e .;python3 -m verl.trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml;python3 -m pip install 'ray==2.10.0'"
+COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install flash-attn==2.7.4.post1 --no-build-isolation;python3 -m pip install -r requirements.txt;python3 -m pip install 'ray==2.10.0';cd src/verl && pip install -e .;python3 -m verl.trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml"
 
 srun apptainer exec --nv \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
