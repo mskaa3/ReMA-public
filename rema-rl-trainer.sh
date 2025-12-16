@@ -11,7 +11,7 @@
 cp -r ./data/overall_math $TMPDIR/overall_math
 cp -r ./data/MATH $TMPDIR/MATH
 
-# rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema.sif $TMPDIR/
+rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema.sif $TMPDIR/
 # rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v2.sif $TMPDIR/
 
 cp ../verl.sif $TMPDIR
