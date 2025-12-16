@@ -12,7 +12,7 @@ cp -r ./data/overall_math $TMPDIR/overall_math
 cp -r ./data/MATH $TMPDIR/MATH
 
 # rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema.sif $TMPDIR/
-rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v2.sif $TMPDIR/
+# rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v2.sif $TMPDIR/
 
 cp ../verl.sif $TMPDIR
 
@@ -24,7 +24,7 @@ COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install flash-attn==2.7.4.pos
 srun apptainer exec --nv \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
-    $TMPDIR/verl-rema-v2.sif \
+    $TMPDIR/verl-rema.sif \
     bash -c "$COMMAND"
 
 if [[ -n $TMPDIR ]]; then
