@@ -191,7 +191,7 @@ algorithm:
   lam: 1.0
   adv_estimator: grpo
   norm_adv_by_std_in_grpo: True  # DrGRPO
-  use_kl_in_reward: True
+  # use_kl_in_reward: True
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
     type: fixed
