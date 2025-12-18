@@ -195,6 +195,7 @@ reward_model:
 algorithm:
   gamma: 1.0
   lam: 1.0
+  gamma_turn_level: 1.0
   adv_estimator: grpo
   norm_adv_by_std_in_grpo: True  # DrGRPO
   use_kl_in_reward: False
