@@ -91,7 +91,7 @@ actor_rollout_ref:
     response_length: ${data.max_response_length}
     # for vllm rollout
     dtype: bfloat16 # should align with FSDP
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.8
     ignore_eos: False
     enforce_eager: False
     free_cache_engine: False
@@ -226,7 +226,7 @@ trainer:
   test_freq: 10
   critic_warmup: 0
   default_hdfs_dir: null
-  remove_previous_ckpt_in_save: False
+  remove_previous_ckpt_in_save: True
   del_local_ckpt_after_load: False
   default_local_dir: /root/tmpdir/${trainer.project_name}/${trainer.experiment_name}
   device: cuda
