@@ -27,6 +27,7 @@ actor_rollout_ref:
     use_remove_padding: True
   actor:
     strategy: fsdp  # This is for backward-compatibility
+    clip_mode: turn
     ppo_mini_batch_size: 12  # per GPU
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: 8
@@ -166,6 +167,7 @@ critic:
     load_contents: ${critic.checkpoint.save_contents}
 
 reward_model:
+  strategy: fsdp
   enable: False
   sandbox_fusion:
     url: null
@@ -175,9 +177,9 @@ reward_model:
   reward_manager: rema
   mask_unfinished_reward: True
 
-custom_reward_function:
-  path: verifier.py
-  name: verify
+# custom_reward_function:
+#   path: verifier.py
+#   name: verify
 
 # curriculum_learning:
 #   enable: True
@@ -191,7 +193,7 @@ algorithm:
   lam: 1.0
   adv_estimator: grpo
   norm_adv_by_std_in_grpo: True  # DrGRPO
-  # use_kl_in_reward: True
+  use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
     type: fixed
