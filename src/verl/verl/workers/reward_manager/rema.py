@@ -184,8 +184,8 @@ class ReMARewardManager:
                     last_round_msg = data_item.non_tensor_batch['history'][i_role]
                     assert last_round_msg['role'] == role, role
 
-                    format_r = compute_format_r(data_source, role, last_round_msg['content'])
-                    score += format_r
+                    # format_r = compute_format_r(data_source, role, last_round_msg['content'])
+                    # score += format_r
                 reward_tensor_map[f'{role}_turn_level_reward'][i_bsz, num_turns - 1] = score
 
             if data_source not in already_print_data_sources:
