@@ -20,7 +20,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: meta-llama/Llama-3.1-8B-Instruct
+    path: meta-llama/Meta-Llama-3-8B-Instruct
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True
