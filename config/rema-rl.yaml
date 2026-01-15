@@ -20,7 +20,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: Qwen/Qwen2.5-7B-Instruct
+    path: meta-llama/Llama-3.1-8B-Instruct
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True
