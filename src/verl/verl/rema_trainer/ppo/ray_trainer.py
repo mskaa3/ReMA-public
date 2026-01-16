@@ -616,7 +616,7 @@ class RayReMATrainer(object):
 
         # Create tuples of (input, output, score) and sort by input text
         samples = list(zip(inputs, outputs, scores, groundtruths, histories))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+        # samples.sort(key=lambda x: x[0])  # Sort by input text
 
         # Use fixed random seed for deterministic shuffling
         rng = np.random.RandomState(42)
