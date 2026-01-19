@@ -10,7 +10,7 @@
 
 cp -r ./data/overall_math $TMPDIR/overall_math
 cp -r ./data/MATH $TMPDIR/MATH
-cp -r ./src/verl /verl
+cp -r ./src/verl /root/ReMA-public/src/verl
 
 rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v3.sif $TMPDIR/
 
