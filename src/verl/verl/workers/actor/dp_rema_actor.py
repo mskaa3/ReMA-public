@@ -265,8 +265,11 @@ class DataParallelReMAPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+        agent_roles = data.meta_info.get('agent_roles', None)
 
         select_keys = ['labels', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'step_ids']
+        if 'agent_role_ids' in data.batch.keys():
+            select_keys.append('agent_role_ids')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
@@ -314,6 +317,7 @@ class DataParallelReMAPPOActor(BasePPOActor):
                     # response_mask = attention_mask[:, -response_length:]
                     labels = data['labels']
                     label_mask = labels != -100
+                    agent_role_ids = data['agent_role_ids'] if 'agent_role_ids' in data else None
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
                     step_id = data['step_ids']
@@ -343,6 +347,13 @@ class DataParallelReMAPPOActor(BasePPOActor):
                     )
                     # compute entropy loss from entropy
                     entropy_loss = verl_F.masked_mean(entropy, label_mask)
+                    role_entropy_metrics = {}
+                    if agent_roles is not None and agent_role_ids is not None:
+                        for role_idx, role_name in enumerate(agent_roles):
+                            role_mask = label_mask & (agent_role_ids == role_idx)
+                            if role_mask.any():
+                                role_entropy = verl_F.masked_mean(entropy, role_mask)
+                                role_entropy_metrics[f'actor/entropy_loss/{role_name}'] = role_entropy.detach().item()
 
                     # compute policy loss
                     policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -375,6 +386,7 @@ class DataParallelReMAPPOActor(BasePPOActor):
                         'actor/log_ratio_clipfrac': log_ratio_clipfrac.detach().item(),
                         'actor/ppo_kl': ppo_kl.detach().item(),
                     }
+                    data.update(role_entropy_metrics)
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()

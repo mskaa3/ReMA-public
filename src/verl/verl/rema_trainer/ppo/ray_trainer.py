@@ -312,6 +312,7 @@ def merge_roles_data(data: DataProto) -> DataProto:
     agent_roles = data.meta_info['agent_roles']
     
     new_tensor_batch = {}
+    num_roles = len(agent_roles)
     for key in data.batch.keys():
         role_name = ''
         for role in agent_roles:
@@ -321,7 +322,7 @@ def merge_roles_data(data: DataProto) -> DataProto:
         if role_name in agent_roles:
             v_name = key.replace(f'{role_name}_', '')
             if v_name not in new_tensor_batch:
-                new_tensor_batch[v_name] = [None, None]
+                new_tensor_batch[v_name] = [None] * num_roles
             new_tensor_batch[v_name][agent_roles.index(role_name)] = data.batch[key]
         else:
             new_tensor_batch[key] = data.batch[key].repeat(len(agent_roles), *[1 for _ in range(data.batch[key].ndim - 1)])
@@ -330,6 +331,12 @@ def merge_roles_data(data: DataProto) -> DataProto:
     for key in new_tensor_batch.keys():
         if isinstance(new_tensor_batch[key], list):
             new_tensor_batch[key] = torch.cat(new_tensor_batch[key], dim=0)
+
+    # Track role id per token so downstream actor metrics can be split by role.
+    if 'labels' in new_tensor_batch:
+        batch_size_per_role = len(data.non_tensor_batch['uid'])
+        role_ids = torch.arange(num_roles, dtype=torch.long).repeat_interleave(batch_size_per_role)
+        new_tensor_batch['agent_role_ids'] = role_ids.unsqueeze(1).expand(-1, new_tensor_batch['labels'].shape[1]).contiguous()
     
     new_non_tensor_batch = {}
     uid_list = data.non_tensor_batch['uid'].tolist()

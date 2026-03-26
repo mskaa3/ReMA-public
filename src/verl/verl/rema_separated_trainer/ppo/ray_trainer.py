@@ -331,6 +331,11 @@ def split_batch_for_agents(data: DataProto) -> Dict[str, DataProto]:
         new_tensor_batches[role]['num_turns'] = torch.tensor(
             data.non_tensor_batch['num_turns'].tolist()
         )
+        if 'labels' in new_tensor_batches[role]:
+            role_idx = agent_roles.index(role)
+            new_tensor_batches[role]['agent_role_ids'] = torch.full_like(
+                new_tensor_batches[role]['labels'], fill_value=role_idx, dtype=torch.long
+            )
     
     # build non_tensor_batch
     new_non_tensor_batches = {role: {} for role in agent_roles}
