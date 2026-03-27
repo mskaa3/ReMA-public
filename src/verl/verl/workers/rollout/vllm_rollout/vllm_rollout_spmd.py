@@ -24,6 +24,7 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
+import json
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from contextlib import contextmanager
@@ -829,42 +830,50 @@ class vLLMRollout(BaseRollout):
     ):
         """Build chat list for a specific role"""
 
+        def _to_text(content):
+            if isinstance(content, str):
+                return content
+            if isinstance(content, (dict, list)):
+                return json.dumps(content, ensure_ascii=False)
+            return str(content)
+
         chat_lst = [[{
             "role": "system",
-            "content": system_prompts[role]
+            "content": _to_text(system_prompts[role])
         }] for _ in range(len(history_list))]
 
         for i, (hist, question) in enumerate(zip(history_list, questions)):
+            question_text = _to_text(question)
             if role == agent_roles[0]: # meta-thinking
-                chat_lst[i].append({"role": "user", "content": question})
+                chat_lst[i].append({"role": "user", "content": question_text})
                 for j in range(len(hist)):
                     if j % 2 == 0:
                         chat_lst[i].append({
                             "role": "assistant",
-                            "content": hist[j]["content"]
+                            "content": _to_text(hist[j]["content"])
                         })
                     else:
                         chat_lst[i].append({
                             "role": "user",
-                            "content": hist[j]["content"]
+                            "content": _to_text(hist[j]["content"])
                         })
             else: # reasoning
                 chat_lst[i].append({
                     "role":
                     "user",
                     "content":
-                    f'Question:\n{question}\n\nInstruction:\n{hist[0]["content"]}',
+                    f'Question:\n{question_text}\n\nInstruction:\n{_to_text(hist[0]["content"])}',
                 })
                 for j in range(1, len(hist)):
                     if (j + 1) % 2 == 0:
                         chat_lst[i].append({
                             "role": "assistant",
-                            "content": hist[j]["content"]
+                            "content": _to_text(hist[j]["content"])
                         })
                     else:
                         chat_lst[i].append({
                             "role": "user",
-                            "content": hist[j]["content"]
+                            "content": _to_text(hist[j]["content"])
                         })
 
         return chat_lst

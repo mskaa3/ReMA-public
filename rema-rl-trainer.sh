@@ -17,12 +17,13 @@ rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rem
 source ./env.sh
 export HF_HOME=$TMPDIR/hf_home
 
-COMMAND="unset ROCR_VISIBLE_DEVICES;export PYTHONPATH=/verl:\$PYTHONPATH;python3 -m verl.rema_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml"
+COMMAND="unset ROCR_VISIBLE_DEVICES;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml"
 
 srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
     --mount type=bind,src=$TMPDIR/verl,dst=/verl \
+    --mount type=bind,src=$TMPDIR/verl,dst=/root/ReMA-public/src/verl \
     $TMPDIR/verl-rema-v3.sif \
     bash -c "$COMMAND"
 
