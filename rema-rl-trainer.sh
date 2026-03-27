@@ -19,7 +19,7 @@ export HF_HOME=$TMPDIR/hf_home
 
 COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m verl.rema_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml"
 
-srun apptainer exec --nv \
+srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
     $TMPDIR/verl-rema-v3.sif \
