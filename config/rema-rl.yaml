@@ -3,7 +3,7 @@ data:
   chat_template: null  # override in code
   train_files: /root/tmpdir/MATH/train_lv3to5_8k.parquet
   val_files: /root/tmpdir/overall_math/test.parquet
-  prompt_key: prompt
+  prompt_key: question
   reward_fn_key: data_source
   max_prompt_length: 4096
   max_response_length: 512
