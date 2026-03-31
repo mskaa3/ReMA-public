@@ -17,7 +17,7 @@ rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rem
 source ./env.sh
 export HF_HOME=$TMPDIR/hf_home
 
-COMMAND="unset ROCR_VISIBLE_DEVICES;pip install antlr4-python3-runtime==4.11.1;pip install --upgrade math-verify[antlr4_13_2];export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml"
+COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install --force-reinstall antlr4-python3-runtime==4.9.3;python3 -m pip install --force-reinstall math-verify;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml"
 
 srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
