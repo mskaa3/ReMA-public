@@ -5,7 +5,7 @@
 #SBATCH --time=24:00:00             # maksymalny czas wykonania zadania
 #SBATCH --mem=200gb                 # ilość pamięci RAM
 #SBATCH -p lem-gpu-short            # partycja
-#SBATCH --gpus-per-node=hopper:2    # (ilość kart graficznych na węźle)
+#SBATCH --gpus-per-node=hopper:4    # (ilość kart graficznych na węźle)
 #SBATCH --verbose                   # wyświetlanie informacji o zadaniu
 
 cp -r ./data/overall_math $TMPDIR/overall_math
