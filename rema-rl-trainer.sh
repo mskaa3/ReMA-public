@@ -2,7 +2,7 @@
 #SBATCH --job-name=verl-trainer     # nazwa
 #SBATCH --nodes=1                   # ilość węzłów
 #SBATCH --cpus-per-gpu=4            # ilość cpu na zadanie
-#SBATCH --time=24:00:00             # maksymalny czas wykonania zadania
+#SBATCH --time=48:00:00             # maksymalny czas wykonania zadania
 #SBATCH --mem=200gb                 # ilość pamięci RAM
 #SBATCH -p lem-gpu-short            # partycja
 #SBATCH --gpus-per-node=hopper:4    # (ilość kart graficznych na węźle)
