@@ -317,6 +317,11 @@ class DataParallelReMAPPOActor(BasePPOActor):
                     # response_mask = attention_mask[:, -response_length:]
                     labels = data['labels']
                     label_mask = labels != -100
+                    # Some trajectories (e.g. truncated before reasoning emits tokens) can
+                    # produce micro-batches with no valid label tokens at all.
+                    # Skip such micro-batches to avoid invalid turn-level mask construction.
+                    if not label_mask.any():
+                        continue
                     agent_role_ids = data['agent_role_ids'] if 'agent_role_ids' in data else None
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
