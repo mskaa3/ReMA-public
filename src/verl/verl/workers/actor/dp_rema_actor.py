@@ -329,6 +329,7 @@ class DataParallelReMAPPOActor(BasePPOActor):
 
                     clip_ratio = self.config.clip_ratio
                     entropy_coeff = self.config.entropy_coeff
+                    entropy_coeff_by_role = self.config.get('entropy_coeff_by_role', None)
                     clip_ratio_c = self.config.clip_ratio_c
                     log_ratio_clip_c = self.config.log_ratio_clip_c
                     agg_mode = self.config.agg_mode
@@ -353,15 +354,28 @@ class DataParallelReMAPPOActor(BasePPOActor):
                     # compute entropy loss from entropy
                     entropy_loss = verl_F.masked_mean(entropy, label_mask)
                     role_entropy_metrics = {}
+                    role_entropy_losses = {}
                     if agent_roles is not None and agent_role_ids is not None:
                         for role_idx, role_name in enumerate(agent_roles):
                             role_mask = label_mask & (agent_role_ids == role_idx)
                             if role_mask.any():
                                 role_entropy = verl_F.masked_mean(entropy, role_mask)
+                                role_entropy_losses[role_name] = role_entropy
                                 role_entropy_metrics[f'actor/entropy_loss/{role_name}'] = role_entropy.detach().item()
 
                     # compute policy loss
-                    policy_loss = pg_loss - entropy_loss * entropy_coeff
+                    if entropy_coeff_by_role and len(role_entropy_losses) > 0:
+                        entropy_regularizer = torch.zeros_like(entropy_loss)
+                        for role_name, role_entropy in role_entropy_losses.items():
+                            role_coeff = float(entropy_coeff_by_role.get(role_name, entropy_coeff))
+                            entropy_regularizer = entropy_regularizer + role_entropy * role_coeff
+                            role_entropy_metrics[f'actor/entropy_coeff/{role_name}'] = role_coeff
+                        role_entropy_metrics['actor/entropy_regularizer'] = entropy_regularizer.detach().item()
+                    else:
+                        entropy_regularizer = entropy_loss * entropy_coeff
+                        role_entropy_metrics['actor/entropy_regularizer'] = entropy_regularizer.detach().item()
+
+                    policy_loss = pg_loss - entropy_regularizer
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
