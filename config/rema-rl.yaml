@@ -113,7 +113,7 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     disable_log_stats: True
     add_checking: False
-    max_num_turns: 30
+    max_num_turns: 1
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     do_sample: True
     n: 16
@@ -128,8 +128,6 @@ actor_rollout_ref:
       n: 1
       do_sample: True
     calculate_log_probs: False
-    multi_turn:
-      enable: False
 
 critic:
   rollout_n: ${actor_rollout_ref.rollout.n}
