@@ -166,11 +166,13 @@ class MultiAgentRollout:
                             "content": hist[j]["content"]
                         })
             else: # reasoning
+                # Ablation: reasoning receives only the meta_thinking plan/instruction,
+                # without the original question.
                 chat_lst[i].append({
                     "role":
                     "user",
                     "content":
-                    f'Question:\n{question}\n\nInstruction:\n{hist[0]["content"]}',
+                    f'Plan:\n{hist[0]["content"]}',
                 })
                 for j in range(1, len(hist)):
                     if (j + 1) % 2 == 0:
