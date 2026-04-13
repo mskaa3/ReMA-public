@@ -652,7 +652,7 @@ class RayReMASeparatedTrainer(object):
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
         if max_num_turns > 1:
-            from prompt.math.multi_turn_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
+            from prompt.math.multi_turn_subtask_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
             from prompt import FINISH_FLAG
             rollout_meta_info = {
                 'agent_roles': ['meta_thinking', 'reasoning'],
@@ -1128,7 +1128,7 @@ class RayReMASeparatedTrainer(object):
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
         if max_num_turns > 1:
-            from prompt.math.multi_turn_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
+            from prompt.math.multi_turn_subtask_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
             from prompt import FINISH_FLAG
             rollout_meta_info = {
                 'agent_roles': self.config.algorithm.switch_agent.agent_roles,
@@ -1184,9 +1184,9 @@ class RayReMASeparatedTrainer(object):
                 else:
                     # because verl originally calls this 'chat'
                     gen_batch = new_batch.select(
-                        batch_keys=['batch_idx'], 
+                        batch_keys=['batch_idx'],
                         non_tensor_batch_keys=['question'], 
-                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts'], 
+                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts'],
                         deepcopy=True
                     )
 
