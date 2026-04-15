@@ -652,7 +652,7 @@ class RayReMASeparatedTrainer(object):
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
         if max_num_turns > 1:
-            from prompt.math.multi_turn_subtask_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
+            from prompt.math.multi_turn_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
             from prompt import FINISH_FLAG
             rollout_meta_info = {
                 'agent_roles': ['meta_thinking', 'reasoning'],
@@ -1128,7 +1128,7 @@ class RayReMASeparatedTrainer(object):
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
         if max_num_turns > 1:
-            from prompt.math.multi_turn_subtask_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
+            from prompt.math.multi_turn_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
             from prompt import FINISH_FLAG
             rollout_meta_info = {
                 'agent_roles': self.config.algorithm.switch_agent.agent_roles,
