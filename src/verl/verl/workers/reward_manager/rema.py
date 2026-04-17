@@ -23,6 +23,9 @@ from pebble import ProcessPool
 from concurrent.futures import TimeoutError
 from math_verify.errors import TimeoutException
 
+META_BOXED_PENALTY = 0.25
+
+
 def compute_score_fn(compute_score, params):
     data_source, response, ground_truth, extra_info = params
     return compute_score(data_source, response, ground_truth, extra_info)
@@ -170,6 +173,15 @@ class ReMARewardManager:
             score = scores[i_bsz]
             
             num_turns = data_item.non_tensor_batch['num_turns']
+            full_history = data_item.non_tensor_batch.get('history', [])
+            valid_history = full_history[:num_turns * len(agent_roles)]
+            meta_has_boxed = any(
+                isinstance(msg, dict)
+                and msg.get('role') == 'meta_thinking'
+                and isinstance(msg.get('content'), str)
+                and 'boxed' in msg.get('content').lower()
+                for msg in valid_history
+            )
             
             for i_role, role in enumerate(agent_roles):
                 turn_finished = data_item.batch[f'{role}_turn_finished'].item()
@@ -186,7 +198,12 @@ class ReMARewardManager:
 
                     format_r = compute_format_r(data_source, role, last_round_msg['content'])
                     score += format_r
-                reward_tensor_map[f'{role}_turn_level_reward'][i_bsz, num_turns - 1] = score
+
+                role_score = score
+                if role == 'meta_thinking' and meta_has_boxed:
+                    role_score -= META_BOXED_PENALTY
+
+                reward_tensor_map[f'{role}_turn_level_reward'][i_bsz, num_turns - 1] = role_score
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
