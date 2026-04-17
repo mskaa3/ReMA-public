@@ -121,6 +121,8 @@ class ReMARewardManager:
         reward_tensor_map = {
             f'{role}_turn_level_reward': torch.zeros(batch_size, max_num_turns, dtype=torch.float32) for role in agent_roles
         }
+        reward_tensor_map['meta_boxed_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['meta_boxed_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         
         already_print_data_sources = {}
 
@@ -182,6 +184,9 @@ class ReMARewardManager:
                 and 'boxed' in msg.get('content').lower()
                 for msg in valid_history
             )
+            if meta_has_boxed:
+                reward_tensor_map['meta_boxed_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['meta_boxed_penalty_value'][i_bsz] = META_BOXED_PENALTY
             
             for i_role, role in enumerate(agent_roles):
                 turn_finished = data_item.batch[f'{role}_turn_finished'].item()

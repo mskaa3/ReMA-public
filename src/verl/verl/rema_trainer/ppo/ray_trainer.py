@@ -1177,6 +1177,13 @@ class RayReMATrainer(object):
                         #     "reasoning_turn_level_reward": tensor([...], device='cuda:0'),
                         # }
                         reward_tensor_map = self.reward_fn(new_batch)
+                        meta_boxed_penalty_applied = reward_tensor_map.pop('meta_boxed_penalty_applied', None)
+                        meta_boxed_penalty_value = reward_tensor_map.pop('meta_boxed_penalty_value', None)
+                        if meta_boxed_penalty_applied is not None:
+                            metrics['reward/meta_boxed_penalty_applied_count'] = meta_boxed_penalty_applied.sum().item()
+                            metrics['reward/meta_boxed_penalty_applied_rate'] = meta_boxed_penalty_applied.float().mean().item()
+                        if meta_boxed_penalty_value is not None:
+                            metrics['reward/meta_boxed_penalty_avg_value'] = meta_boxed_penalty_value.float().mean().item()
                         new_batch.batch['acc'] = reward_tensor_map.pop('acc')
                         # batch.batch['token_level_scores'] = reward_tensor
                         for key_reward, reward_tensor in reward_tensor_map.items():
