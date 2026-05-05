@@ -196,13 +196,16 @@ class ReMARewardManager:
                     # `turn_finished` is 0 means finished normally.
                     score = score if turn_finished == 0 else 0.0
 
-                if turn_finished == 0 and data_item.meta_info['use_format_reward'] and max_num_turns == 1:
-                    # XXX(ziyu): only add format reward for normally finished 1-turn conversation
-                    last_round_msg = data_item.non_tensor_batch['history'][i_role]
-                    assert last_round_msg['role'] == role, role
-
-                    format_r = compute_format_r(data_source, role, last_round_msg['content'])
-                    score += format_r
+                # Legacy format reward path disabled for cleaner experiments.
+                # We now use explicit role-level penalties/bonuses (e.g. META_BOXED_PENALTY)
+                # instead of single-turn-only format shaping.
+                # if turn_finished == 0 and data_item.meta_info['use_format_reward'] and max_num_turns == 1:
+                #     # XXX(ziyu): only add format reward for normally finished 1-turn conversation
+                #     last_round_msg = data_item.non_tensor_batch['history'][i_role]
+                #     assert last_round_msg['role'] == role, role
+                #
+                #     format_r = compute_format_r(data_source, role, last_round_msg['content'])
+                #     score += format_r
 
                 role_score = score
                 if role == 'meta_thinking' and meta_has_boxed:
