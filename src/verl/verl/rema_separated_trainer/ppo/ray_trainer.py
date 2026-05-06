@@ -382,6 +382,7 @@ class RayReMASeparatedTrainer(object):
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+
         self._current_train_agent = None
         self._current_train_agent_idx = None
 
@@ -426,6 +427,71 @@ class RayReMASeparatedTrainer(object):
         self._validate_config()
         
         self._create_dataloader()
+
+    def _hierarchy_enabled(self) -> bool:
+        return bool(self.config.algorithm.get('hierarchy', {}).get('enable', False))
+
+    def _get_hierarchy_config(self) -> Dict:
+        hierarchy_config = self.config.algorithm.get('hierarchy', {})
+        return OmegaConf.to_container(hierarchy_config, resolve=True) if hierarchy_config else {}
+
+    def _get_rollout_agent_roles(self):
+        if self._hierarchy_enabled():
+            return self._get_hierarchy_config()['agent_roles']
+        return self.config.algorithm.get('switch_agent', {}).get('agent_roles', ['meta_thinking', 'reasoning'])
+
+    def _get_train_agent_roles(self):
+        if self._hierarchy_enabled():
+            hierarchy_config = self._get_hierarchy_config()
+            return hierarchy_config.get('train_agent_roles', hierarchy_config['agent_roles'])
+        return self.config.algorithm.get('switch_agent', {}).get('agent_roles', ['meta_thinking', 'reasoning'])
+
+    def _get_start_agent(self):
+        if self._hierarchy_enabled():
+            hierarchy_config = self._get_hierarchy_config()
+            return hierarchy_config.get('start_agent', self._get_train_agent_roles()[0])
+        return self.config.algorithm.get('switch_agent', {}).get('start_agent', self._get_train_agent_roles()[0])
+
+    def _get_score_role(self):
+        if self._hierarchy_enabled():
+            return self._get_hierarchy_config().get('finalizer_role', 'finalizer')
+        return 'reasoning'
+
+    def _build_rollout_meta_info(self, max_num_turns: int) -> Dict:
+        if self._hierarchy_enabled():
+            from prompt.math.hierarchical_mamrp import HIERARCHICAL_SYSTEM_PROMPTS
+            hierarchy_config = self._get_hierarchy_config()
+            return {
+                'agent_roles': hierarchy_config['agent_roles'],
+                'finish_flag': None,
+                'system_prompts': HIERARCHICAL_SYSTEM_PROMPTS,
+                'max_num_turns': max_num_turns,
+                'hierarchy': hierarchy_config,
+            }
+
+        if max_num_turns > 1:
+            from prompt.math.multi_turn_subtask_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
+            from prompt import FINISH_FLAG
+            return {
+                'agent_roles': self._get_rollout_agent_roles(),
+                'finish_flag': FINISH_FLAG,
+                'system_prompts': {
+                    'meta_thinking': MTA_SYSTEM_PRMOPT,
+                    'reasoning': RA_SYSTEM_PRMOPT,
+                },
+                'max_num_turns': max_num_turns,
+            }
+
+        from prompt.math.single_turn_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
+        return {
+            'agent_roles': self._get_rollout_agent_roles(),
+            'finish_flag': None,
+            'system_prompts': {
+                'meta_thinking': MTA_SYSTEM_PRMOPT,
+                'reasoning': RA_SYSTEM_PRMOPT,
+            },
+            'max_num_turns': max_num_turns,
+        }
 
     def _validate_config(self):
         config = self.config
@@ -651,29 +717,8 @@ class RayReMASeparatedTrainer(object):
         sample_scores = []
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
-        if max_num_turns > 1:
-            from prompt.math.multi_turn_subtask_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
-            from prompt import FINISH_FLAG
-            rollout_meta_info = {
-                'agent_roles': ['meta_thinking', 'reasoning'],
-                'finish_flag': FINISH_FLAG,
-                'system_prompts': {
-                    'meta_thinking': MTA_SYSTEM_PRMOPT,
-                    'reasoning': RA_SYSTEM_PRMOPT
-                },
-                'max_num_turns': max_num_turns
-            }
-        else:
-            from prompt.math.single_turn_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
-            rollout_meta_info = {
-                'agent_roles': ['meta_thinking', 'reasoning'],
-                'finish_flag': None,
-                'system_prompts': {
-                    'meta_thinking': MTA_SYSTEM_PRMOPT,
-                    'reasoning': RA_SYSTEM_PRMOPT
-                },
-                'max_num_turns': max_num_turns
-            }
+        rollout_meta_info = self._build_rollout_meta_info(max_num_turns)
+        score_role = self._get_score_role()
 
         for test_data in self.val_dataloader:
             # test_batch = DataProto.from_single_dict(test_data)
@@ -710,7 +755,7 @@ class RayReMASeparatedTrainer(object):
                 test_gen_batch = test_batch.select(
                         batch_keys=['batch_idx'], 
                         non_tensor_batch_keys=['question'], 
-                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts'], 
+                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'hierarchy'],
                         deepcopy=True
                     )
             
@@ -725,7 +770,8 @@ class RayReMASeparatedTrainer(object):
 
             # pad to be divisible by dp_size
 
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg['meta_thinking'].world_size)
+            pad_role = rollout_meta_info['agent_roles'][0]
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg[pad_role].world_size)
             test_output_gen_batch_padded = self.multi_turn_generate_sequences(test_gen_batch_padded)
 
             # unpad
@@ -743,21 +789,24 @@ class RayReMASeparatedTrainer(object):
             test_batch.meta_info['use_format_reward'] = self.config.reward_model.get('use_format_reward', False)
             # evaluate using reward_function
             reward_tensor = self.val_reward_fn(test_batch)
-            reward_tensor_lst.append(reward_tensor['reasoning_turn_level_reward'])
+            score_reward_key = f'{score_role}_turn_level_reward'
+            reward_tensor_lst.append(reward_tensor[score_reward_key])
             acc_tensor_lst.append(reward_tensor['acc'])
 
             # Store scores
-            scores = reward_tensor['reasoning_turn_level_reward'].sum(-1).cpu().tolist()
+            scores = reward_tensor[score_reward_key].sum(-1).cpu().tolist()
             sample_scores.extend(scores)
             num_turns = torch.tensor(test_output_gen_batch.non_tensor_batch['num_turns'].tolist(), dtype=torch.float32, device="cpu")
             num_turns_lst.append(num_turns)
-            turn_level_completion_tokens = test_output_gen_batch.batch['meta_thinking_num_gen_tokens'].cpu() + \
-                test_output_gen_batch.batch['reasoning_num_gen_tokens'].cpu()
+            turn_level_completion_tokens = None
+            for role in rollout_meta_info['agent_roles']:
+                role_tokens = test_output_gen_batch.batch[f'{role}_num_gen_tokens'].cpu()
+                turn_level_completion_tokens = role_tokens if turn_level_completion_tokens is None else turn_level_completion_tokens + role_tokens
             completion_tokens = turn_level_completion_tokens.sum(dim=-1)
             completion_tokens_lst.append(completion_tokens)
 
             # not use `data_source`, use `subset` instead
-            data_source_lst.append(test_batch.non_tensor_batch.get('subset', ['unknown'] * reward_tensor['reasoning_turn_level_reward'].shape[0]))
+            data_source_lst.append(test_batch.non_tensor_batch.get('subset', ['unknown'] * reward_tensor[score_reward_key].shape[0]))
             
             history_lst.append(test_output_gen_batch.non_tensor_batch['history'].tolist())
 
@@ -834,9 +883,12 @@ class RayReMASeparatedTrainer(object):
 
         # create actor and rollout
         if self.hybrid_engine:
+            switch_config = self.config.algorithm.get('switch_agent', {})
+            default_model_path = self.config.actor_rollout_ref.model.path
+            model_paths = switch_config.get('model_paths', [default_model_path, default_model_path])
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Agent0_ActorRollout)
             agent0_config = copy.deepcopy(self.config.actor_rollout_ref)
-            agent0_config.model.path = self.config.algorithm.switch_agent.model_paths[0]
+            agent0_config.model.path = model_paths[0]
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Agent0_ActorRollout],
                                                      config=agent0_config,
                                                      role='actor_rollout')
@@ -844,7 +896,7 @@ class RayReMASeparatedTrainer(object):
 
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Agent1_ActorRollout)
             agent1_config = copy.deepcopy(self.config.actor_rollout_ref)
-            agent1_config.model.path = self.config.algorithm.switch_agent.model_paths[1]
+            agent1_config.model.path = model_paths[1] if len(model_paths) > 1 else model_paths[0]
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Agent1_ActorRollout],
                                                      config=agent1_config,
                                                      role='actor_rollout')
@@ -905,10 +957,16 @@ class RayReMASeparatedTrainer(object):
             'meta_thinking': self.actor_rollout_wg0,
             'reasoning': self.actor_rollout_wg1,
         }
+        if self._hierarchy_enabled():
+            hierarchy_config = self._get_hierarchy_config()
+            decomposer_role = hierarchy_config.get('decomposer_role', 'decomposer')
+            self.actor_rollout_wg = {}
+            for role in hierarchy_config['agent_roles']:
+                self.actor_rollout_wg[role] = self.actor_rollout_wg0 if role == decomposer_role else self.actor_rollout_wg1
 
         self.multi_agent_rollout = MultiAgentRollout(
             self.config.actor_rollout_ref.rollout,
-            {'meta_thinking': self.tokenizer, 'reasoning': self.tokenizer},
+            {role: self.tokenizer for role in self.actor_rollout_wg.keys()},
             self.actor_rollout_wg,
         )
 
@@ -1053,22 +1111,25 @@ class RayReMASeparatedTrainer(object):
             epoch (int, optional): Current epoch number. Only needed for epoch-level switching.
         """
         # agent_roles = ['meta_thinking', 'reasoning']
-        switch_config = self.config.algorithm.switch_agent
-        agent_roles = switch_config.agent_roles
+        switch_config = self.config.algorithm.get('switch_agent', {})
+        agent_roles = self._get_train_agent_roles()
+        start_agent = self._get_start_agent()
+        switch_level = switch_config.get('level', 'step')
+        switch_freq = switch_config.get('freq', 1)
         
         # Calculate new agent index based on switch level
-        if switch_config.level == 'step':
-            self._current_train_agent_idx = self.global_steps // switch_config.freq \
-                + agent_roles.index(switch_config.start_agent)
-        elif switch_config.level == 'epoch':
+        if switch_level == 'step':
+            self._current_train_agent_idx = self.global_steps // switch_freq \
+                + agent_roles.index(start_agent)
+        elif switch_level == 'epoch':
             if epoch is None:
                 epoch_idx = self.global_steps // len(self.train_dataloader)
             else:
                 epoch_idx = epoch
-            self._current_train_agent_idx = epoch_idx // switch_config.freq \
-                + agent_roles.index(switch_config.start_agent)
+            self._current_train_agent_idx = epoch_idx // switch_freq \
+                + agent_roles.index(start_agent)
         else:
-            raise ValueError(f"Unknown switch_level: {switch_config.level}")
+            raise ValueError(f"Unknown switch_level: {switch_level}")
         
         # Apply modulo to keep index in valid range
         self._current_train_agent_idx %= len(agent_roles)
@@ -1127,30 +1188,7 @@ class RayReMASeparatedTrainer(object):
         print(f'Starting training with {self._current_train_agent}')
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
-        if max_num_turns > 1:
-            from prompt.math.multi_turn_subtask_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
-            from prompt import FINISH_FLAG
-            rollout_meta_info = {
-                'agent_roles': self.config.algorithm.switch_agent.agent_roles,
-                'finish_flag': FINISH_FLAG,
-                'system_prompts': {
-                    'meta_thinking': MTA_SYSTEM_PRMOPT,
-                    'reasoning': RA_SYSTEM_PRMOPT
-                },
-                'max_num_turns': max_num_turns
-            }
-        else:
-            from prompt.math.single_turn_mamrp import MTA_SYSTEM_PRMOPT, RA_SYSTEM_PRMOPT
-            from prompt import FINISH_FLAG
-            rollout_meta_info = {
-                'agent_roles': self.config.algorithm.switch_agent.agent_roles,
-                'finish_flag': None,
-                'system_prompts': {
-                    'meta_thinking': MTA_SYSTEM_PRMOPT,
-                    'reasoning': RA_SYSTEM_PRMOPT
-                },
-                'max_num_turns': max_num_turns
-            }
+        rollout_meta_info = self._build_rollout_meta_info(max_num_turns)
         
         batch = None
         num_prompt_in_batch = 0
@@ -1186,7 +1224,7 @@ class RayReMASeparatedTrainer(object):
                     gen_batch = new_batch.select(
                         batch_keys=['batch_idx'],
                         non_tensor_batch_keys=['question'], 
-                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts'],
+                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'hierarchy'],
                         deepcopy=True
                     )
 
@@ -1220,11 +1258,11 @@ class RayReMASeparatedTrainer(object):
 
                     
                     # compute global_valid tokens
-                    new_batch.meta_info['global_token_num'] = torch.sum(
-                        new_batch.batch['meta_thinking_attention_mask'] 
-                        + new_batch.batch['reasoning_attention_mask'], 
-                        dim=-1
-                    ).tolist()
+                    global_attention_mask = None
+                    for role in rollout_meta_info['agent_roles']:
+                        role_attention_mask = new_batch.batch[f'{role}_attention_mask']
+                        global_attention_mask = role_attention_mask if global_attention_mask is None else global_attention_mask + role_attention_mask
+                    new_batch.meta_info['global_token_num'] = torch.sum(global_attention_mask, dim=-1).tolist()
 
                     # # recompute old_log_probs
                     # with _timer('old_log_prob', timing_raw):
@@ -1479,8 +1517,9 @@ class RayReMASeparatedTrainer(object):
             unpad_history = [x for x in padded_history if x['role'] != 'padding']
             results_dict[uid]['history'].append(unpad_history)
             results_dict[uid]['response'].append(data_item.non_tensor_batch['response'])
+            score_role = self._get_score_role()
             results_dict[uid]['score'].append(
-                data_item.batch['reasoning_turn_level_reward'].sum().item()
+                data_item.batch[f'{score_role}_turn_level_reward'].sum().item()
             )
             results_dict[uid]['finish_reason'].append(
                 data_item.non_tensor_batch['finish_reason']

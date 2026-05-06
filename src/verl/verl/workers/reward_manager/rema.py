@@ -177,9 +177,10 @@ class ReMARewardManager:
             num_turns = data_item.non_tensor_batch['num_turns']
             full_history = data_item.non_tensor_batch.get('history', [])
             valid_history = full_history[:num_turns * len(agent_roles)]
+            meta_roles = {'meta_thinking', 'decomposer'}
             meta_has_boxed = any(
                 isinstance(msg, dict)
-                and msg.get('role') == 'meta_thinking'
+                and msg.get('role') in meta_roles
                 and isinstance(msg.get('content'), str)
                 and 'boxed' in msg.get('content').lower()
                 for msg in valid_history
@@ -208,7 +209,7 @@ class ReMARewardManager:
                 #     score += format_r
 
                 role_score = score
-                if role == 'meta_thinking' and meta_has_boxed:
+                if role in meta_roles and meta_has_boxed:
                     role_score -= META_BOXED_PENALTY
 
                 reward_tensor_map[f'{role}_turn_level_reward'][i_bsz, num_turns - 1] = role_score

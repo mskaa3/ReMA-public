@@ -8,6 +8,7 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.protocol import collate_fn as data_proto_collate_fn, pad_dataproto_to_divisor, unpad_dataproto
 import torch
 import unicodedata
+import re
 
 def normalize_text(text):
     return unicodedata.normalize('NFKC', text)
@@ -227,6 +228,38 @@ class MultiAgentRollout:
         }
         data = DataProto.from_dict(batch_dict)
         return data, chat_lst
+
+    def _prepare_chat_prompts(
+        self,
+        role: str,
+        chat_lst: List[List[Dict[str, str]]],
+        tokenizers: Dict[str, PreTrainedTokenizer],
+    ) -> DataProto:
+        inputs = self._apply_chat_template(chat_lst, tokenizers[role])
+        attention_mask = inputs["attention_mask"]
+        data = DataProto.from_dict({
+            "input_ids": inputs["input_ids"],
+            "attention_mask": attention_mask,
+            "position_ids": compute_position_id_with_mask(attention_mask),
+        })
+        return data
+
+    def _generate_from_chat_list(
+        self,
+        role: str,
+        chat_lst: List[List[Dict[str, str]]],
+        tokenizers: Dict[str, PreTrainedTokenizer],
+        meta_info: Dict,
+        response_length: int,
+    ):
+        prompt_proto = self._prepare_chat_prompts(role, chat_lst, tokenizers)
+        prompt_proto.meta_info.update(meta_info)
+        return self._generate_role_responses(
+            rollout=self.rollout_wg_dict[role],
+            prompt_proto=prompt_proto,
+            tokenizer=tokenizers[role],
+            response_length=response_length,
+        )
 
     def _filter_truncated_prompts_before_generation(
         self,
@@ -527,6 +560,202 @@ class MultiAgentRollout:
         latest_outputs = [h[-1]["content"] for h in history]
         return latest_outputs, conversation_history
 
+    @staticmethod
+    def _extract_subtasks(plan_text: str) -> List[Tuple[str, str]]:
+        subtasks = []
+        for line in plan_text.splitlines():
+            match = re.match(r"\s*-?\s*(S\d+)\s*[:.)-]\s*(.+?)\s*$", line, re.IGNORECASE)
+            if match:
+                subtasks.append((match.group(1).upper(), match.group(2).strip()))
+        if not subtasks and plan_text.strip():
+            subtasks.append(("S1", plan_text.strip()))
+        return subtasks
+
+    @staticmethod
+    def _parse_assignments(
+        selector_text: str,
+        subtasks: List[Tuple[str, str]],
+        worker_roles: List[str],
+        default_worker: str,
+    ) -> Dict[str, str]:
+        assignments = {}
+        lowered_workers = {worker.lower(): worker for worker in worker_roles}
+        for subtask_id, _ in subtasks:
+            selected_worker = None
+            for line in selector_text.splitlines():
+                if subtask_id.lower() not in line.lower():
+                    continue
+                for worker_lower, worker in lowered_workers.items():
+                    if worker_lower in line.lower():
+                        selected_worker = worker
+                        break
+                if selected_worker is not None:
+                    break
+            assignments[subtask_id] = selected_worker or default_worker
+        return assignments
+
+    @staticmethod
+    def _format_worker_specs(worker_specs: Dict[str, str], worker_roles: List[str]) -> str:
+        return "\n".join([
+            f"- {role}: {worker_specs.get(role, '')}"
+            for role in worker_roles
+        ])
+
+    @staticmethod
+    def _format_subtasks(subtasks: List[Tuple[str, str]]) -> str:
+        return "\n".join([f"- {subtask_id}: {description}" for subtask_id, description in subtasks])
+
+    def _run_hierarchical_conversation(
+        self,
+        prompts: DataProto,
+        tokenizers: Dict[str, PreTrainedTokenizer],
+        agent_roles: List[str],
+        system_prompts: Dict[str, str],
+        hierarchy_config: Dict,
+        history: List[List[Dict[str, str]]],
+        finish_flags: np.ndarray,
+        finish_reason: List[Optional[str]],
+        response_length: int,
+    ):
+        questions = prompts.non_tensor_batch["question"]
+        batch_size = len(questions)
+        decomposer_role = hierarchy_config.get("decomposer_role", "decomposer")
+        selector_role = hierarchy_config.get("selector_role", "selector")
+        finalizer_role = hierarchy_config.get("finalizer_role", "finalizer")
+        worker_roles = hierarchy_config.get("worker_roles", [])
+        default_worker = hierarchy_config.get("default_worker", worker_roles[-1] if worker_roles else selector_role)
+        worker_specs = hierarchy_config.get("worker_specs", {})
+        pass_question_to_workers = hierarchy_config.get("pass_question_to_workers", False)
+
+        conversation_history = {
+            role: [None for _ in range(batch_size)]
+            for role in agent_roles
+        }
+
+        def append_history(idx, role, content, num_gen_tokens, stop_reason):
+            history[idx].append({
+                "role": role,
+                "content": content,
+                "num_gen_tokens": num_gen_tokens,
+                "stop_reason": stop_reason,
+            })
+
+        # 1. Decompose the original problem.
+        decomposer_chats = [[
+            {"role": "system", "content": system_prompts[decomposer_role]},
+            {"role": "user", "content": question},
+        ] for question in questions]
+        decomposer_outputs, decomposer_tokens, decomposer_stops, _ = self._generate_from_chat_list(
+            decomposer_role, decomposer_chats, tokenizers, prompts.meta_info, response_length)
+        for idx, output in enumerate(decomposer_outputs):
+            conversation_history[decomposer_role][idx] = decomposer_chats[idx]
+            append_history(idx, decomposer_role, output, decomposer_tokens[idx], decomposer_stops[idx])
+
+        # 2. Select workers for each subtask.
+        worker_spec_text = self._format_worker_specs(worker_specs, worker_roles)
+        selector_chats = []
+        parsed_subtasks = []
+        for idx, question in enumerate(questions):
+            subtasks = self._extract_subtasks(decomposer_outputs[idx])
+            parsed_subtasks.append(subtasks)
+            selector_chats.append([
+                {"role": "system", "content": system_prompts[selector_role]},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\n"
+                        f"Plan:\n{decomposer_outputs[idx]}\n\n"
+                        f"Available workers:\n{worker_spec_text}"
+                    ),
+                },
+            ])
+        selector_outputs, selector_tokens, selector_stops, _ = self._generate_from_chat_list(
+            selector_role, selector_chats, tokenizers, prompts.meta_info, response_length)
+        parsed_assignments = []
+        for idx, output in enumerate(selector_outputs):
+            conversation_history[selector_role][idx] = selector_chats[idx]
+            append_history(idx, selector_role, output, selector_tokens[idx], selector_stops[idx])
+            parsed_assignments.append(
+                self._parse_assignments(output, parsed_subtasks[idx], worker_roles, default_worker)
+            )
+
+        # 3. Execute selected workers. Non-selected workers get dummy zero-token entries
+        # so tensor construction keeps one slot per logical role.
+        worker_results = [{role: "" for role in worker_roles} for _ in range(batch_size)]
+        for worker_role in worker_roles:
+            assigned_indices = [
+                idx for idx, assignments in enumerate(parsed_assignments)
+                if worker_role in assignments.values()
+            ]
+            worker_chats_by_idx = {}
+            if assigned_indices:
+                worker_chats = []
+                for idx in assigned_indices:
+                    assigned_subtasks = [
+                        (subtask_id, description)
+                        for subtask_id, description in parsed_subtasks[idx]
+                        if parsed_assignments[idx].get(subtask_id) == worker_role
+                    ]
+                    question_block = f"Question:\n{questions[idx]}\n\n" if pass_question_to_workers else ""
+                    chat = [
+                        {"role": "system", "content": system_prompts[worker_role]},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{question_block}"
+                                f"Your assigned subtasks:\n{self._format_subtasks(assigned_subtasks)}"
+                            ),
+                        },
+                    ]
+                    worker_chats.append(chat)
+                    worker_chats_by_idx[idx] = chat
+                outputs, tokens, stops, _ = self._generate_from_chat_list(
+                    worker_role, worker_chats, tokenizers, prompts.meta_info, response_length)
+                for local_idx, idx in enumerate(assigned_indices):
+                    output = outputs[local_idx]
+                    conversation_history[worker_role][idx] = worker_chats_by_idx[idx]
+                    worker_results[idx][worker_role] = output
+                    append_history(idx, worker_role, output, tokens[local_idx], stops[local_idx])
+
+            for idx in range(batch_size):
+                if conversation_history[worker_role][idx] is None:
+                    conversation_history[worker_role][idx] = [
+                        {"role": "system", "content": system_prompts[worker_role]},
+                        {"role": "user", "content": "No subtasks were assigned to this worker."},
+                    ]
+                    append_history(idx, worker_role, "", 0, "stop_when_truncated")
+
+        # 4. Finalize from all worker results.
+        finalizer_chats = []
+        for idx, question in enumerate(questions):
+            worker_result_text = "\n\n".join([
+                f"{worker_role}:\n{worker_results[idx].get(worker_role, '')}"
+                for worker_role in worker_roles
+            ])
+            finalizer_chats.append([
+                {"role": "system", "content": system_prompts[finalizer_role]},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\n"
+                        f"Plan:\n{decomposer_outputs[idx]}\n\n"
+                        f"Assignments:\n{selector_outputs[idx]}\n\n"
+                        f"Worker results:\n{worker_result_text}"
+                    ),
+                },
+            ])
+        finalizer_outputs, finalizer_tokens, finalizer_stops, _ = self._generate_from_chat_list(
+            finalizer_role, finalizer_chats, tokenizers, prompts.meta_info, response_length)
+        for idx, output in enumerate(finalizer_outputs):
+            conversation_history[finalizer_role][idx] = finalizer_chats[idx]
+            append_history(idx, finalizer_role, output, finalizer_tokens[idx], finalizer_stops[idx])
+            finish_flags[idx] = True
+            finish_reason[idx] = "stop_when_truncated" if (
+                self.config.stop_when_truncated and finalizer_stops[idx] == "length"
+            ) else None
+
+        return finalizer_outputs, conversation_history
+
     def _mark_unfinished_as_max_turns(self, finish_flags: np.ndarray,
                                       finish_reason: List[Optional[str]]):
         """Mark unfinished samples as reaching maximum turns"""
@@ -689,11 +918,13 @@ class MultiAgentRollout:
         ]
         non_tensor_batch["response"] = latest_outputs
 
-        padded_history = _pad_history(history, 2 * self.config.max_num_turns)
+        max_history_length = max(2 * self.config.max_num_turns,
+                                 len(agent_roles) * self.config.max_num_turns)
+        padded_history = _pad_history(history, max_history_length)
         padded_conversation_history = {
             role:
             _pad_history(conversation_history[role],
-                         2 * self.config.max_num_turns)
+                         max_history_length)
             for role in agent_roles
         }
 
@@ -825,27 +1056,41 @@ class MultiAgentRollout:
 
         # Multi-turn dialogue generation
         # this will change the history, finish_flags, finish_reason
-        latest_outputs, conversation_history = self._run_multi_turn_conversation(
-            prompts=prompts,
-            tokenizers=tokenizers,
-            max_num_turns=max_num_turns,
-            agent_roles=agent_roles,
-            system_prompts=system_prompts,
-            finish_flag=finish_flag,
-            history=history,
-            finish_flags=finish_flags,
-            finish_reason=finish_reason,
-            response_length=self.config.response_length,
-        )
+        hierarchy_config = prompts.meta_info.get("hierarchy", {})
+        if hierarchy_config.get("enable", False):
+            latest_outputs, conversation_history = self._run_hierarchical_conversation(
+                prompts=prompts,
+                tokenizers=tokenizers,
+                agent_roles=agent_roles,
+                system_prompts=system_prompts,
+                hierarchy_config=hierarchy_config,
+                history=history,
+                finish_flags=finish_flags,
+                finish_reason=finish_reason,
+                response_length=self.config.response_length,
+            )
+        else:
+            latest_outputs, conversation_history = self._run_multi_turn_conversation(
+                prompts=prompts,
+                tokenizers=tokenizers,
+                max_num_turns=max_num_turns,
+                agent_roles=agent_roles,
+                system_prompts=system_prompts,
+                finish_flag=finish_flag,
+                history=history,
+                finish_flags=finish_flags,
+                finish_reason=finish_reason,
+                response_length=self.config.response_length,
+            )
 
         # Mark completion reasons
         # this will change the finish_reason
-        if max_num_turns > 1:
+        if max_num_turns > 1 and not hierarchy_config.get("enable", False):
             self._mark_unfinished_as_max_turns(finish_flags, finish_reason)
 
         last_round_responses = [{
             m["role"]: m["content"]
-            for m in h[-2:]
+            for m in h[-len(agent_roles):]
         } for h in history]
 
         # extract information from history record
@@ -882,7 +1127,7 @@ class MultiAgentRollout:
             conversation_history=conversation_history,
         )
         
-        if self.config.add_checking:
+        if self.config.add_checking and not hierarchy_config.get("enable", False):
             try:
                 self._checking(
                     history=history,

@@ -44,6 +44,12 @@ actor_rollout_ref:
     entropy_coeff_by_role:
       meta_thinking: 0.001
       reasoning: 0.002
+      decomposer: 0.001
+      selector: 0.001
+      algebra_worker: 0.002
+      functional_analysis_worker: 0.002
+      general_math_worker: 0.002
+      finalizer: 0.002
     use_kl_loss: False # True for GRPO, False for DrGRPO
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
@@ -214,6 +220,21 @@ algorithm:
   filter_groups:
     enable: False
     max_num_gen_batches: 0
+  hierarchy:
+    enable: False
+    decomposer_role: decomposer
+    selector_role: selector
+    finalizer_role: finalizer
+    worker_roles: [algebra_worker, functional_analysis_worker, general_math_worker]
+    agent_roles: [decomposer, selector, algebra_worker, functional_analysis_worker, general_math_worker, finalizer]
+    train_agent_roles: [decomposer, selector, algebra_worker, functional_analysis_worker, general_math_worker, finalizer]
+    start_agent: decomposer
+    default_worker: general_math_worker
+    pass_question_to_workers: False
+    worker_specs:
+      algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
+      functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning
+      general_math_worker: fallback mathematical reasoning and synthesis support
 
 trainer:
   debug_mode: False

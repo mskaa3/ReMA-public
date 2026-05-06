@@ -1,0 +1,120 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2868
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww29700\viewh15980\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 I am working on a multi-agent RL project with hierarchical GRPO.\
+\
+Current setting:\
+I currently have two agents:\
+- a high-level agent that decomposes a task into subtasks,\
+- a low-level agent that executes those subtasks.\
+\
+Target system:\
+I want to extend this into a more complex hierarchical system with the following components:\
+\
+1. Decomposer\
+The Decomposer receives the original task and outputs a structured decomposition of the task into subtasks. The decomposition should be represented as a DAG, where nodes are subtasks and edges encode dependencies between subtasks. This functionality already works right?\
+\
+2. Selector\
+The Selector receives the plan (decomposition) to the subtasks plan (from decomposer), and, for each subtask, chooses the most appropriate Worker agent to execute it.\
+\
+3. Worker agents\
+Workers are a pool of specialized agents. Each Worker has its own role specification, prompt, and capabilities. For example, in mathematical problems, one Worker might specialize in algebra, while another might specialize in functional analysis.\
+\
+The system should execute the full plan using the selected Workers and produce a final answer for the original task.\
+\
+Training objective:\
+I want to train the Decomposer and Selector using hierarchical GRPO, bottom-up.\
+\
+For each original task:\
+- sample M decompositions from the Decomposer,\
+- for each decomposition, sample N Worker selections from the Selector,\
+- execute each selected DAG with the chosen Workers,\
+- obtain a final reward based on whether the final answer is correct.\
+\
+The ground truth is available only for the whole task, not for individual subtasks.\
+\
+Reward design:\
+The final reward should depend primarily on final-answer correctness.\
+\
+In addition, I want optional auxiliary/proxy rewards:\
+- Worker answer entropy as a proxy for confidence,\
+- compatibility between selected Worker and assigned subtask,\
+- heuristic compatibility based on previous Worker performance or declared Worker skills.\
+\
+Selector training:\
+For a fixed decomposition, compare the N different Worker selections. Use these rewards to compute advantages among selections and train the Selector to choose better Workers for a given decomposition.\
+\
+Decomposer training:\
+For each decomposition branch, aggregate the rewards obtained across the N Selector rollouts, for example by averaging them. Use these aggregated branch rewards to compute advantages among decompositions and train the Decomposer to produce better decompositions.\
+\
+The intended effect is:\
+- the Selector learns to assign the best Workers for a given decomposition,\
+- the Decomposer learns to produce decompositions that lead to high final performance under the Selector.\
+\
+Model configurations:\
+I want two modes:\
+1. Shared-policy mode:\
+   The Decomposer and Selector are implemented as a shared policy model, with role-specific prompting.\
+2. Separate-policy mode:\
+   The Decomposer and Selector are implemented as two separate policy models. They may use the same base model architecture or different models.\
+\
+Worker configuration:\
+For the MVP, Workers should not be optimized. They should be frozen LLM agents implemented as one base model with different role prompts.\
+\
+Later, I want to support optional Worker finetuning with LoRA adapters, one adapter per Worker role.\
+\
+Structured outputs:\
+The Decomposer and Selector outputs should be structured and machine-parseable.\
+\
+The Decomposer should output something like:\
+- task summary,\
+- list of subtask nodes,\
+- dependencies between nodes,\
+- expected output for each subtask.\
+\
+The Selector should output something like:\
+- subtask id,\
+- selected Worker id,\
+- rationale or confidence,\
+- optional compatibility score.\
+\
+MVP request:\
+Please implement an MVP of this system with:\
+- one Decomposer,\
+- one Selector,\
+- two Worker agents,\
+- structured Decomposer output,\
+- structured Selector output,\
+- DAG execution,\
+- final answer generation,\
+- enough logging to inspect decompositions, selections, Worker outputs, final rewards, and advantages.\
+\
+I already have related logic implemented in this project:\
+https://github.com/mskaa3/PettingLLMs/tree/vibe-coder\
+\
+Please inspect the existing project structure before coding and reuse the local patterns where possible.\
+\
+Training setups:\
+I ultimately want to support two training setups.\
+\
+Setup A: full hierarchical bottom-up GRPO\
+For each task:\
+- sample M decompositions,\
+- for each decomposition sample N selections,\
+- execute all branches,\
+- train Selector from within-decomposition selection advantages,\
+- train Decomposer from aggregated decomposition-level rewards.\
+\
+Setup B: alternating efficient training\
+Train one level at a time:\
+- freeze Decomposer, use a single decomposition, sample multiple Selector rollouts, and train only Selector,\
+- freeze Selector, sample multiple Decomposer rollouts, use a single Worker selection per decomposition, and train only Decomposer,\
+- alternate these phases.\
+\
+Before coding:\
+Please first restate your understanding of the desired system, identify any ambiguous parts, and ask clarifying questions if needed. Then propose a concrete MVP implementation plan.\
+}
