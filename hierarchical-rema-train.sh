@@ -12,5 +12,5 @@ set -euo pipefail
 
 export RUN_KIND=${RUN_KIND:-train}
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec bash "$SCRIPT_DIR/hierarchical-rema-trainer.sh"
+SOURCE_DIR=${SLURM_SUBMIT_DIR:-$(pwd)}
+exec bash "$SOURCE_DIR/hierarchical-rema-trainer.sh"
