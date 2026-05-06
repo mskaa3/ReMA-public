@@ -10,18 +10,21 @@
 
 set -euo pipefail
 
+SOURCE_DIR=${SLURM_SUBMIT_DIR:-$PWD}
+
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
 if [[ "$DEBUG_LAUNCHER" == "1" || "$DEBUG_LAUNCHER" == "true" || "$DEBUG_LAUNCHER" == "True" ]]; then
     set -x
 fi
 
-if [[ -f ./env.sh ]]; then
-    source ./env.sh
+if [[ -f "$SOURCE_DIR/env.sh" ]]; then
+    source "$SOURCE_DIR/env.sh"
 fi
 
 JOB_ID=${SLURM_JOB_ID:-manual}
 RUN_KIND=${RUN_KIND:-rollout}  # rollout | train
 RUN_ROOT=${RUN_ROOT:-$TMPDIR/hierarchical_rema_${RUN_KIND}_${JOB_ID}}
+TASK_SOURCE_ARG=${1:-}
 
 case "$RUN_KIND" in
     rollout)
@@ -70,8 +73,17 @@ WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-256}
 BEST_K=${BEST_K:-10}
 PRINT_MODE=${PRINT_MODE:-summary}
 
-TRAIN_INPUT=${TRAIN_INPUT:-}
-TRAIN_INPUT_STAGE=${TRAIN_INPUT_STAGE:-$RUN_ROOT/train_input}
+TASK_SOURCE=${TASK_SOURCE:-$TASK_SOURCE_ARG}
+TASK_SOURCE=${TASK_SOURCE:-$SOURCE_DIR/data/overall_math/all_test_data.jsonl}
+TASK_FORMAT=${TASK_FORMAT:-auto}
+PROMPT_KEY=${PROMPT_KEY:-question}
+ANSWER_KEY=${ANSWER_KEY:-answer}
+TASK_ID_KEY=${TASK_ID_KEY:-idx}
+MAX_TASKS=${MAX_TASKS:-0}
+TASKS_PER_EPOCH=${TASKS_PER_EPOCH:-0}
+SHUFFLE_TASKS=${SHUFFLE_TASKS:-false}
+TASK_SOURCE_STAGE=${TASK_SOURCE_STAGE:-$RUN_ROOT/task_source}
+TASK_SOURCE_RUNTIME=${TASK_SOURCE_RUNTIME:-$TASK_SOURCE}
 TRAIN_ROLE=${TRAIN_ROLE:-both}
 TRAIN_POLICY_ID=${TRAIN_POLICY_ID:-}
 TRAIN_VAL_RATIO=${TRAIN_VAL_RATIO:-0.05}
@@ -79,6 +91,7 @@ TRAIN_MIN_REWARD=${TRAIN_MIN_REWARD:-}
 TRAIN_MIN_ADVANTAGE=${TRAIN_MIN_ADVANTAGE:-}
 SAVE_REPLAY_COPY=${SAVE_REPLAY_COPY:-false}
 SEED=${SEED:-42}
+NUM_EPOCHS=${NUM_EPOCHS:-1}
 
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
@@ -102,10 +115,11 @@ TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-false}
 ENABLE_WANDB=${ENABLE_WANDB:-false}
 WANDB_PROJECT=${WANDB_PROJECT:-hierarchical-rema}
 WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-}
+DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}
 
 mkdir -p "$RUN_ROOT" "$LOCAL_OUTPUT_DIR" "$PERSIST_LOCAL_DIR"
 
-cp -r ./src/verl "$TMPDIR/verl"
+cp -r "$SOURCE_DIR/src/verl" "$TMPDIR/verl"
 rclone copy "$SIF_IMAGE_PATH" "$TMPDIR/"
 
 export HF_HOME=${HF_HOME:-$TMPDIR/hf_home}
@@ -136,6 +150,16 @@ if [[ "$ENABLE_WANDB" == "1" || "$ENABLE_WANDB" == "true" || "$ENABLE_WANDB" == 
     ENABLE_WANDB_FLAG="--enable-wandb"
 fi
 
+SHUFFLE_TASKS_FLAG=""
+if [[ "$SHUFFLE_TASKS" == "1" || "$SHUFFLE_TASKS" == "true" || "$SHUFFLE_TASKS" == "True" ]]; then
+    SHUFFLE_TASKS_FLAG="--shuffle-tasks"
+fi
+
+DISABLE_ROLLOUT_LOGGING_FLAG=""
+if [[ "$DISABLE_ROLLOUT_LOGGING" == "1" || "$DISABLE_ROLLOUT_LOGGING" == "true" || "$DISABLE_ROLLOUT_LOGGING" == "True" ]]; then
+    DISABLE_ROLLOUT_LOGGING_FLAG="--disable-rollout-logging"
+fi
+
 WANDB_EXPERIMENT_NAME_FLAG=""
 if [[ -n "$WANDB_EXPERIMENT_NAME" ]]; then
     WANDB_EXPERIMENT_NAME_FLAG="--experiment-name ${WANDB_EXPERIMENT_NAME}"
@@ -161,23 +185,40 @@ if [[ -n "$TRAIN_MIN_ADVANTAGE" ]]; then
     TRAIN_MIN_ADVANTAGE_FLAG="--min-advantage ${TRAIN_MIN_ADVANTAGE}"
 fi
 
-stage_train_input() {
-    if [[ -z "${TRAIN_INPUT:-}" ]]; then
-        echo "TRAIN_INPUT must be set when RUN_KIND=train. Point it to a local path or S3 path containing all_rollouts.jsonl." >&2
+stage_task_source() {
+    if [[ "$TASK_SOURCE" == "demo" ]]; then
+        TASK_SOURCE_RUNTIME="demo"
+        return
+    fi
+
+    if [[ "$TASK_SOURCE" != /* && "$TASK_SOURCE" != *:* && -e "$SOURCE_DIR/$TASK_SOURCE" ]]; then
+        TASK_SOURCE="$SOURCE_DIR/$TASK_SOURCE"
+    fi
+
+    mkdir -p "$TASK_SOURCE_STAGE"
+
+    if [[ "$TASK_SOURCE" == *:* ]]; then
+        rclone copy "$TASK_SOURCE" "$TASK_SOURCE_STAGE"
+    elif [[ -d "$TASK_SOURCE" ]]; then
+        cp -r "$TASK_SOURCE"/. "$TASK_SOURCE_STAGE"/
+    elif [[ -f "$TASK_SOURCE" ]]; then
+        cp "$TASK_SOURCE" "$TASK_SOURCE_STAGE"/
+    else
+        echo "TASK_SOURCE does not exist: $TASK_SOURCE" >&2
         exit 1
     fi
 
-    mkdir -p "$TRAIN_INPUT_STAGE"
-
-    if [[ "$TRAIN_INPUT" == *:* ]]; then
-        rclone copy "$TRAIN_INPUT" "$TRAIN_INPUT_STAGE"
-    elif [[ -d "$TRAIN_INPUT" ]]; then
-        cp -r "$TRAIN_INPUT"/. "$TRAIN_INPUT_STAGE"/
-    elif [[ -f "$TRAIN_INPUT" ]]; then
-        cp "$TRAIN_INPUT" "$TRAIN_INPUT_STAGE"/
+    if [[ -f "$TASK_SOURCE" ]]; then
+        TASK_SOURCE_RUNTIME="$TASK_SOURCE_STAGE/$(basename "$TASK_SOURCE")"
+    elif [[ "$TASK_SOURCE" == *:* ]]; then
+        remote_name=$(basename "$TASK_SOURCE")
+        if [[ "$remote_name" == *.* && -f "$TASK_SOURCE_STAGE/$remote_name" ]]; then
+            TASK_SOURCE_RUNTIME="$TASK_SOURCE_STAGE/$remote_name"
+        else
+            TASK_SOURCE_RUNTIME="$TASK_SOURCE_STAGE"
+        fi
     else
-        echo "TRAIN_INPUT does not exist: $TRAIN_INPUT" >&2
-        exit 1
+        TASK_SOURCE_RUNTIME="$TASK_SOURCE_STAGE"
     fi
 }
 
@@ -189,8 +230,17 @@ RUN_ROOT=$RUN_ROOT
 LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR
 PERSIST_LOCAL_DIR=$PERSIST_LOCAL_DIR
 S3_OUTPUT_PATH=$S3_OUTPUT_PATH
-TRAIN_INPUT=${TRAIN_INPUT:-}
-TRAIN_INPUT_STAGE=$TRAIN_INPUT_STAGE
+TASK_SOURCE=$TASK_SOURCE
+TASK_SOURCE_STAGE=$TASK_SOURCE_STAGE
+TASK_SOURCE_RUNTIME=$TASK_SOURCE_RUNTIME
+TASK_FORMAT=$TASK_FORMAT
+PROMPT_KEY=$PROMPT_KEY
+ANSWER_KEY=$ANSWER_KEY
+TASK_ID_KEY=$TASK_ID_KEY
+MAX_TASKS=$MAX_TASKS
+TASKS_PER_EPOCH=$TASKS_PER_EPOCH
+SHUFFLE_TASKS=$SHUFFLE_TASKS
+NUM_EPOCHS=$NUM_EPOCHS
 MODEL_PATH=$MODEL_PATH
 DECOMPOSER_MODEL_PATH=$DECOMPOSER_MODEL_PATH
 SELECTOR_MODEL_PATH=$SELECTOR_MODEL_PATH
@@ -202,6 +252,7 @@ PRINT_MODE=$PRINT_MODE
 ENABLE_WANDB=$ENABLE_WANDB
 WANDB_PROJECT=$WANDB_PROJECT
 WANDB_EXPERIMENT_NAME=$WANDB_EXPERIMENT_NAME
+DISABLE_ROLLOUT_LOGGING=$DISABLE_ROLLOUT_LOGGING
 EOF
 }
 
@@ -224,7 +275,7 @@ persist_outputs() {
 }
 
 if [[ "$RUN_KIND" == "train" ]]; then
-    stage_train_input
+    stage_task_source
 fi
 
 write_run_metadata
@@ -234,8 +285,11 @@ echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
 echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
 echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
 if [[ "$RUN_KIND" == "train" ]]; then
-    echo "[hierarchical-rema] TRAIN_INPUT_STAGE=$TRAIN_INPUT_STAGE"
-    find "$TRAIN_INPUT_STAGE" -maxdepth 3 -type f | sort || true
+    echo "[hierarchical-rema] TASK_SOURCE=$TASK_SOURCE"
+    echo "[hierarchical-rema] TASK_SOURCE_RUNTIME=$TASK_SOURCE_RUNTIME"
+    if [[ "$TASK_SOURCE_RUNTIME" != "demo" ]]; then
+        find "$TASK_SOURCE_STAGE" -maxdepth 3 -type f | sort || true
+    fi
 fi
 
 if [[ "$RUN_KIND" == "rollout" ]]; then
@@ -264,7 +318,8 @@ python3 -m hierarchical_rema.demo \
   --worker-max-new-tokens ${WORKER_MAX_NEW_TOKENS} \
   --output-dir ${LOCAL_OUTPUT_DIR} \
   --best-k ${BEST_K} \
-  --print-mode ${PRINT_MODE}"
+  --print-mode ${PRINT_MODE} \
+  ${DISABLE_ROLLOUT_LOGGING_FLAG}"
 else
     COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export HF_HOME=$TMPDIR/hf_home; \
@@ -272,7 +327,31 @@ export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
 python3 -m hierarchical_rema.train \
-  --input ${TRAIN_INPUT_STAGE} \
+  --task-source ${TASK_SOURCE_RUNTIME} \
+  --task-format ${TASK_FORMAT} \
+  --prompt-key ${PROMPT_KEY} \
+  --answer-key ${ANSWER_KEY} \
+  --task-id-key ${TASK_ID_KEY} \
+  --max-tasks ${MAX_TASKS} \
+  --tasks-per-epoch ${TASKS_PER_EPOCH} \
+  ${SHUFFLE_TASKS_FLAG} \
+  --backend ${BACKEND} \
+  --mode ${MODE} \
+  --phase ${PHASE} \
+  --num-epochs ${NUM_EPOCHS} \
+  ${PARAMETER_SHARING_FLAG} \
+  --worker-base-model-path ${WORKER_BASE_MODEL_PATH} \
+  --num-decompositions ${NUM_DECOMPOSITIONS} \
+  --num-selections ${NUM_SELECTIONS} \
+  --soft-max-hops ${SOFT_MAX_HOPS} \
+  --hard-max-hops ${HARD_MAX_HOPS} \
+  --soft-hop-penalty ${SOFT_HOP_PENALTY} \
+  --temperature ${TEMPERATURE} \
+  --top-p ${TOP_P} \
+  --controller-max-new-tokens ${CONTROLLER_MAX_NEW_TOKENS} \
+  --worker-max-new-tokens ${WORKER_MAX_NEW_TOKENS} \
+  ${DISABLE_ROLLOUT_LOGGING_FLAG} \
+  --best-k ${BEST_K} \
   --role ${TRAIN_ROLE} \
   ${TRAIN_POLICY_ID_FLAG} \
   ${TRAIN_MIN_REWARD_FLAG} \

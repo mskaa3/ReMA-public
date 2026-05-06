@@ -63,17 +63,44 @@ PYTHONPATH=src/verl/verl python -m hierarchical_rema.demo \
   --worker-base-model-path /path/to/worker-model
 ```
 
-The demo prints the full structured rollout tree plus the decomposer/selector training batches that would be consumed by a future GRPO integration, and it can write JSONL rollout logs under `outputs/hierarchical_rema`.
+The demo now defaults to a compact rollout summary in stdout and can write JSONL rollout logs under `outputs/hierarchical_rema`.
 
-Train controller policies from saved rollout logs with offline GRPO:
+Run integrated controller training:
 
 ```bash
 PYTHONPATH=src/verl/verl python -m hierarchical_rema.train \
-  --input outputs/hierarchical_rema/5158272 \
+  --task-source data/overall_math/all_test_data.jsonl \
+  --backend mock \
+  --mode joint \
+  --num-epochs 2 \
   --model-path /path/to/controller-model \
   --output-dir outputs/hierarchical_rema_train/run_002
 ```
 
-If you want saved train/val/all replay copies for debugging, add `--save-replay-copy`.
+This path does the full outer loop inside one job:
+
+1. load task examples
+2. sample decompositions and selections
+3. execute workers and compute rewards
+4. derive controller samples and advantages
+5. run GRPO-style controller updates
+6. save checkpoints, summaries, and optional replay copies
+
+Useful flags:
+
+- `--tasks-per-epoch`: limit how many tasks are rolled out in one outer epoch
+- `--epochs`: number of GRPO update epochs per outer epoch
+- `--save-replay-copy`: save train/val/all controller samples per policy for inspection
+- `--enable-wandb`: enable W&B logging
+- `--disable-rollout-logging`: skip JSONL rollout logging if you only want training artifacts
+
+If you still want the old replay-buffer workflow, it is available separately:
+
+```bash
+PYTHONPATH=src/verl/verl python -m hierarchical_rema.replay_train \
+  --input outputs/hierarchical_rema/5158272 \
+  --model-path /path/to/controller-model \
+  --output-dir outputs/hierarchical_rema_train/run_002
+```
 
 Training artifacts are written per policy id, so shared-controller runs will produce one policy folder and separate decomposer/selector runs will produce two. Worker-role LoRA optimization is not implemented yet; see `worker_training.py` for the placeholder.

@@ -7,6 +7,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Dict, Iterable, List, Optional, Sequence
 
+from .schema import TaskRollout
+
 
 @dataclass
 class ControllerReplaySample:
@@ -95,6 +97,48 @@ def load_controller_samples_from_rollouts(
                                 timestamp=timestamp,
                             )
                         )
+    if not samples:
+        raise ValueError("No controller replay samples matched the provided filters")
+    return samples
+
+
+def controller_samples_from_task_rollouts(
+    task_rollouts: Sequence[TaskRollout],
+    roles: Optional[Sequence[str]] = None,
+    min_reward: Optional[float] = None,
+    min_advantage: Optional[float] = None,
+    source_path: str = "",
+) -> List[ControllerReplaySample]:
+    allowed_roles = set(roles) if roles else None
+    samples: List[ControllerReplaySample] = []
+    for rollout in task_rollouts:
+        training_batch = rollout.training_batch
+        for batch_key in ("decomposer_samples", "selector_samples"):
+            for sample in getattr(training_batch, batch_key):
+                role = sample.role
+                reward = float(sample.reward)
+                advantage = float(sample.advantage)
+                if allowed_roles is not None and role not in allowed_roles:
+                    continue
+                if min_reward is not None and reward < min_reward:
+                    continue
+                if min_advantage is not None and advantage < min_advantage:
+                    continue
+                samples.append(
+                    ControllerReplaySample(
+                        role=role,
+                        policy_id=sample.policy_id,
+                        group_id=sample.group_id,
+                        prompt_text=sample.prompt_text,
+                        completion_text=sample.completion_text,
+                        reward=reward,
+                        advantage=advantage,
+                        metadata=dict(sample.metadata),
+                        task_id=rollout.task.task_id,
+                        source_path=source_path,
+                        timestamp=None,
+                    )
+                )
     if not samples:
         raise ValueError("No controller replay samples matched the provided filters")
     return samples

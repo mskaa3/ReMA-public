@@ -371,6 +371,9 @@ def run_offline_policy_training(
     train_samples: Sequence[ControllerReplaySample],
     val_samples: Sequence[ControllerReplaySample],
     config: OfflineTrainingConfig,
+    tracking=None,
+    tracking_prefix: str = "",
+    log_step_offset: int = 0,
 ) -> Dict:
     _ensure_repo_root_on_path()
     from torch.utils.data import DataLoader
@@ -427,7 +430,8 @@ def run_offline_policy_training(
 
     output_dir = Path(config.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    tracking = _init_tracking(config)
+    owns_tracking = tracking is None
+    tracking = tracking or _init_tracking(config)
     metrics_log_path = output_dir / "train_metrics.jsonl"
     eval_log_path = output_dir / "eval_metrics.jsonl"
     config_path = output_dir / "train_config.json"
@@ -454,7 +458,7 @@ def run_offline_policy_training(
                 "train/num_val_samples": len(val_samples),
                 "train/total_update_steps": total_update_steps,
             },
-            step=0,
+            step=log_step_offset,
         )
 
     global_step = 0
@@ -528,13 +532,13 @@ def run_offline_policy_training(
                     or global_step == total_update_steps
                 ):
                     concise_metrics = {
-                        "train/loss": metrics["loss"],
-                        "train/lr": metrics["lr"],
-                        "train/mean_reward": metrics["mean_reward"],
-                        "train/mean_advantage": metrics["mean_advantage"],
-                        "train/approx_kl": metrics["approx_kl"],
-                        "train/entropy": metrics["entropy"],
-                        "train/clipfrac": metrics["clipfrac"],
+                        f"{tracking_prefix}train/loss": metrics["loss"],
+                        f"{tracking_prefix}train/lr": metrics["lr"],
+                        f"{tracking_prefix}train/mean_reward": metrics["mean_reward"],
+                        f"{tracking_prefix}train/mean_advantage": metrics["mean_advantage"],
+                        f"{tracking_prefix}train/approx_kl": metrics["approx_kl"],
+                        f"{tracking_prefix}train/entropy": metrics["entropy"],
+                        f"{tracking_prefix}train/clipfrac": metrics["clipfrac"],
                     }
                     print(
                         f"[hierarchical-rema][grpo] step={global_step}/{total_update_steps} "
@@ -545,7 +549,7 @@ def run_offline_policy_training(
                         f"approx_kl={metrics['approx_kl']:.6f}"
                     )
                     if tracking is not None:
-                        tracking.log(concise_metrics, step=global_step)
+                        tracking.log(concise_metrics, step=log_step_offset + global_step)
 
                 if config.eval_every_steps > 0 and val_loader is not None and global_step % config.eval_every_steps == 0:
                     val_metrics = evaluate_controller_model(
@@ -563,7 +567,10 @@ def run_offline_policy_training(
                         f"val_loss={val_metrics['val_loss']:.6f}"
                     )
                     if tracking is not None:
-                        tracking.log({"val/val_loss": val_metrics["val_loss"]}, step=global_step)
+                        tracking.log(
+                            {f"{tracking_prefix}val/val_loss": val_metrics["val_loss"]},
+                            step=log_step_offset + global_step,
+                        )
 
                 if config.save_steps > 0 and global_step % config.save_steps == 0:
                     _save_model_checkpoint(model, tokenizer, output_dir / f"checkpoint-{global_step}")
@@ -591,14 +598,15 @@ def run_offline_policy_training(
     )
     if tracking is not None:
         final_metrics = {
-            "train/final_steps": global_step,
-            "train/num_train_samples": len(train_samples),
-            "train/num_val_samples": len(val_samples),
+            f"{tracking_prefix}train/final_steps": global_step,
+            f"{tracking_prefix}train/num_train_samples": len(train_samples),
+            f"{tracking_prefix}train/num_val_samples": len(val_samples),
         }
         if "val_loss" in summary:
-            final_metrics["val/final_loss"] = summary["val_loss"]
-        tracking.log(final_metrics, step=max(global_step, 1))
-        _finish_tracking(tracking)
+            final_metrics[f"{tracking_prefix}val/final_loss"] = summary["val_loss"]
+        tracking.log(final_metrics, step=log_step_offset + max(global_step, 1))
+        if owns_tracking:
+            _finish_tracking(tracking)
     return summary
 
 
