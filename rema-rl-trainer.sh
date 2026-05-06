@@ -18,7 +18,7 @@ source ./env.sh
 export HF_HOME=$TMPDIR/hf_home
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 
-COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install --force-reinstall math-verify;python3 -m pip install --force-reinstall --no-deps antlr4-python3-runtime==4.9.3;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_separated_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml +algorithm.switch_agent.enable=True +algorithm.switch_agent.level=step +algorithm.switch_agent.freq=1 +algorithm.switch_agent.agent_roles=[meta_thinking,reasoning] +algorithm.switch_agent.start_agent=meta_thinking +algorithm.switch_agent.model_paths=[${MODEL_PATH},${MODEL_PATH}]"
+COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install --force-reinstall math-verify;python3 -m pip install --force-reinstall --no-deps antlr4-python3-runtime==4.9.3;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_separated_trainer.main_ppo --config-path=/home/moska/ReMA-public/config --config-name=rema-rl.yaml +algorithm.switch_agent.enable=True +algorithm.switch_agent.level=step +algorithm.switch_agent.freq=1 +algorithm.switch_agent.agent_roles=[meta_thinking,reasoning] +algorithm.switch_agent.start_agent=meta_thinking +algorithm.switch_agent.model_paths=[${MODEL_PATH},${MODEL_PATH}]"
 
 srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \

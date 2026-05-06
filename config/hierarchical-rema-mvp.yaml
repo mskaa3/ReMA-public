@@ -1,0 +1,58 @@
+backend:
+  type: mock
+  hf:
+    temperature: 0.7
+    top_p: 0.95
+    do_sample: true
+    controller_max_new_tokens: 768
+    worker_max_new_tokens: 256
+    max_format_retries: 2
+    device_map: auto
+    torch_dtype: auto
+    trust_remote_code: true
+
+controller:
+  parameter_sharing: false
+  shared_model_path: null
+  decomposer_model_path: Qwen/Qwen2.5-1.5B-Instruct
+  selector_model_path: Qwen/Qwen2.5-1.5B-Instruct
+
+workers:
+  base_model_path: Qwen/Qwen2.5-1.5B-Instruct
+  enable_role_lora: false
+  pool:
+    - worker_id: algebra_worker
+      description: Exact symbolic manipulation specialist.
+      skills: [algebra, symbolic_manipulation]
+      lora_adapter_path: null
+      trainable: false
+    - worker_id: analysis_worker
+      description: Calculus and theorem-driven analysis specialist.
+      skills: [analysis, calculus]
+      lora_adapter_path: null
+      trainable: false
+
+rollout:
+  num_decompositions: 3
+  num_selections_per_decomposition: 2
+  max_nodes_per_decomposition: 4
+  soft_max_hops: 3
+  hard_max_hops: 5
+  soft_hop_penalty: 0.1
+  soft_hop_penalty_power: 1.0
+
+reward:
+  final_answer: 1.0
+  confidence: 0.2
+  compatibility: 0.2
+  entropy_cap: 2.0
+
+training:
+  mode: joint
+  alternating_phase: selector
+
+logging:
+  output_dir: outputs/hierarchical_rema
+  save_all_rollouts: true
+  save_best_rollouts: true
+  best_k: 10
