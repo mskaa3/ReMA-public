@@ -87,8 +87,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
     parser.add_argument("--output-dir", default="outputs/hierarchical_rema")
     parser.add_argument("--best-k", type=int, default=10)
+    parser.add_argument("--print-mode", choices=["summary", "full", "none"], default="summary")
     parser.add_argument("--disable-rollout-logging", action="store_true")
     return parser.parse_args()
+
+
+def _rollout_summary(rollout) -> dict:
+    best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
+    best_selection_reward = max(
+        selection.reward.total_reward
+        for decomposition in rollout.decompositions
+        for selection in decomposition.selections
+    )
+    return {
+        "task_id": rollout.task.task_id,
+        "num_decompositions": len(rollout.decompositions),
+        "num_total_selections": sum(len(decomposition.selections) for decomposition in rollout.decompositions),
+        "best_decomposition_id": best_decomposition.decomposition.decomposition_id,
+        "best_decomposition_reward": best_decomposition.decomposition_reward,
+        "mean_decomposition_reward": sum(
+            decomposition.decomposition_reward for decomposition in rollout.decompositions
+        ) / max(len(rollout.decompositions), 1),
+        "best_selection_reward": best_selection_reward,
+    }
 
 
 def main() -> None:
@@ -135,17 +156,31 @@ def main() -> None:
         ),
         rollout_logging_config=logging_config,
     )
-    results = [
+    rollouts = [
         trainer.run(
             task=task,
             worker_pool=worker_pool,
             policy_config=policy_config,
             rollout_config=rollout_config,
             schedule=schedule,
-        ).to_dict()
+        )
         for task in tasks
     ]
-    print(json.dumps(results, indent=2, sort_keys=True))
+    if args.print_mode == "none":
+        return
+
+    if args.print_mode == "full":
+        print(json.dumps([rollout.to_dict() for rollout in rollouts], indent=2, sort_keys=True))
+        return
+
+    summary = {
+        "backend": args.backend,
+        "mode": args.mode,
+        "phase": args.phase,
+        "num_tasks": len(rollouts),
+        "tasks": [_rollout_summary(rollout) for rollout in rollouts],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

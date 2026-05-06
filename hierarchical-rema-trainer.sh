@@ -9,7 +9,11 @@
 #SBATCH --verbose
 
 set -euo pipefail
-set -x
+
+DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
+if [[ "$DEBUG_LAUNCHER" == "1" || "$DEBUG_LAUNCHER" == "true" || "$DEBUG_LAUNCHER" == "True" ]]; then
+    set -x
+fi
 
 if [[ -f ./env.sh ]]; then
     source ./env.sh
@@ -64,6 +68,7 @@ TOP_P=${TOP_P:-0.95}
 CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-768}
 WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-256}
 BEST_K=${BEST_K:-10}
+PRINT_MODE=${PRINT_MODE:-summary}
 
 TRAIN_INPUT=${TRAIN_INPUT:-}
 TRAIN_INPUT_STAGE=${TRAIN_INPUT_STAGE:-$RUN_ROOT/train_input}
@@ -94,6 +99,9 @@ DEVICE=${DEVICE:-cuda}
 TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-false}
+ENABLE_WANDB=${ENABLE_WANDB:-false}
+WANDB_PROJECT=${WANDB_PROJECT:-hierarchical-rema}
+WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-}
 
 mkdir -p "$RUN_ROOT" "$LOCAL_OUTPUT_DIR" "$PERSIST_LOCAL_DIR"
 
@@ -121,6 +129,16 @@ fi
 TRUST_REMOTE_CODE_FLAG=""
 if [[ "$TRUST_REMOTE_CODE" == "1" || "$TRUST_REMOTE_CODE" == "true" || "$TRUST_REMOTE_CODE" == "True" ]]; then
     TRUST_REMOTE_CODE_FLAG="--trust-remote-code"
+fi
+
+ENABLE_WANDB_FLAG=""
+if [[ "$ENABLE_WANDB" == "1" || "$ENABLE_WANDB" == "true" || "$ENABLE_WANDB" == "True" ]]; then
+    ENABLE_WANDB_FLAG="--enable-wandb"
+fi
+
+WANDB_EXPERIMENT_NAME_FLAG=""
+if [[ -n "$WANDB_EXPERIMENT_NAME" ]]; then
+    WANDB_EXPERIMENT_NAME_FLAG="--experiment-name ${WANDB_EXPERIMENT_NAME}"
 fi
 
 TRAIN_MODEL_FLAGS="--model-path ${MODEL_PATH}"
@@ -180,6 +198,10 @@ BACKEND=$BACKEND
 TASK=$TASK
 MODE=$MODE
 PHASE=$PHASE
+PRINT_MODE=$PRINT_MODE
+ENABLE_WANDB=$ENABLE_WANDB
+WANDB_PROJECT=$WANDB_PROJECT
+WANDB_EXPERIMENT_NAME=$WANDB_EXPERIMENT_NAME
 EOF
 }
 
@@ -241,7 +263,8 @@ python3 -m hierarchical_rema.demo \
   --controller-max-new-tokens ${CONTROLLER_MAX_NEW_TOKENS} \
   --worker-max-new-tokens ${WORKER_MAX_NEW_TOKENS} \
   --output-dir ${LOCAL_OUTPUT_DIR} \
-  --best-k ${BEST_K}"
+  --best-k ${BEST_K} \
+  --print-mode ${PRINT_MODE}"
 else
     COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export HF_HOME=$TMPDIR/hf_home; \
@@ -257,8 +280,11 @@ python3 -m hierarchical_rema.train \
   ${SAVE_REPLAY_COPY_FLAG} \
   ${GRADIENT_CHECKPOINTING_FLAG} \
   ${TRUST_REMOTE_CODE_FLAG} \
+  ${ENABLE_WANDB_FLAG} \
+  ${WANDB_EXPERIMENT_NAME_FLAG} \
   ${TRAIN_MODEL_FLAGS} \
   --output-dir ${LOCAL_OUTPUT_DIR} \
+  --project-name ${WANDB_PROJECT} \
   --val-ratio ${TRAIN_VAL_RATIO} \
   --seed ${SEED} \
   --learning-rate ${LEARNING_RATE} \

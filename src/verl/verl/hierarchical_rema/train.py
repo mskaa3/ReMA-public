@@ -51,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--project-name", default="hierarchical-rema")
+    parser.add_argument("--experiment-name", default=None)
+    parser.add_argument("--enable-wandb", action="store_true")
     return parser.parse_args()
 
 
@@ -175,6 +178,14 @@ def main() -> None:
         replay_exports = _maybe_save_replay_copy(policy_dir, split, enabled=args.save_replay_copy)
 
         model_path = _model_path_for_policy(policy_id, split["train"] or split["all"], args)
+        experiment_name = args.experiment_name or output_dir.name
+        if len(policy_splits) > 1:
+            experiment_name = f"{experiment_name}-{policy_id}"
+        print(
+            f"[hierarchical-rema][train] policy={policy_id} "
+            f"train_samples={len(split['train'])} val_samples={len(split['val'])} "
+            f"model={model_path}"
+        )
         training_config = OfflineTrainingConfig(
             model_name_or_path=model_path,
             output_dir=str(policy_dir),
@@ -198,6 +209,9 @@ def main() -> None:
             torch_dtype=args.torch_dtype,
             trust_remote_code=args.trust_remote_code,
             gradient_checkpointing=args.gradient_checkpointing,
+            project_name=args.project_name,
+            experiment_name=experiment_name,
+            enable_wandb=args.enable_wandb,
         )
         summaries[policy_id] = run_offline_policy_training(
             train_samples=split["train"],
@@ -208,10 +222,15 @@ def main() -> None:
         summaries[policy_id]["model_path"] = model_path
         summaries[policy_id]["objective"] = "grpo"
         summaries[policy_id].update(replay_exports)
+        print(
+            f"[hierarchical-rema][train] completed policy={policy_id} "
+            f"steps={summaries[policy_id]['steps']} "
+            f"output_dir={summaries[policy_id]['output_dir']}"
+        )
 
     with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summaries, handle, indent=2, sort_keys=True)
-    print(json.dumps(summaries, indent=2, sort_keys=True))
+    print(f"[hierarchical-rema][train] wrote summary to {output_dir / 'training_summary.json'}")
 
 
 if __name__ == "__main__":

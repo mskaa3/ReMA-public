@@ -34,6 +34,9 @@ class OfflineTrainingConfig:
     torch_dtype: str = "bfloat16"
     trust_remote_code: bool = True
     gradient_checkpointing: bool = True
+    project_name: str = "hierarchical-rema"
+    experiment_name: str = "hierarchical-rema-train"
+    enable_wandb: bool = False
 
 def _ensure_repo_root_on_path() -> None:
     import sys
@@ -80,6 +83,33 @@ def _load_scheduler_factory():
         from transformers import get_cosine_schedule_with_warmup
 
         return get_cosine_schedule_with_warmup
+
+
+def _init_tracking(config: OfflineTrainingConfig):
+    _ensure_repo_root_on_path()
+    try:
+        from verl.utils.tracking import Tracking
+    except Exception:
+        return None
+
+    backends = ["console"]
+    if config.enable_wandb:
+        backends.append("wandb")
+    return Tracking(
+        project_name=config.project_name,
+        experiment_name=config.experiment_name,
+        default_backend=backends,
+        config=asdict(config),
+    )
+
+
+def _finish_tracking(tracking) -> None:
+    if tracking is None:
+        return
+    try:
+        tracking.__del__()
+    except Exception:
+        pass
 
 
 def _load_model_and_tokenizer(config: OfflineTrainingConfig):
@@ -397,6 +427,7 @@ def run_offline_policy_training(
 
     output_dir = Path(config.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    tracking = _init_tracking(config)
     metrics_log_path = output_dir / "train_metrics.jsonl"
     eval_log_path = output_dir / "eval_metrics.jsonl"
     config_path = output_dir / "train_config.json"
@@ -411,6 +442,20 @@ def run_offline_policy_training(
     }
     with (output_dir / "training_data_stats.json").open("w", encoding="utf-8") as handle:
         json.dump(training_data_stats, handle, indent=2, sort_keys=True)
+    print(
+        f"[hierarchical-rema][grpo] experiment={config.experiment_name} "
+        f"train_samples={len(train_samples)} val_samples={len(val_samples)} "
+        f"updates={total_update_steps}"
+    )
+    if tracking is not None:
+        tracking.log(
+            {
+                "train/num_train_samples": len(train_samples),
+                "train/num_val_samples": len(val_samples),
+                "train/total_update_steps": total_update_steps,
+            },
+            step=0,
+        )
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
@@ -418,6 +463,7 @@ def run_offline_policy_training(
 
     for epoch in range(config.epochs):
         model.train()
+        print(f"[hierarchical-rema][grpo] epoch {epoch + 1}/{config.epochs}")
         for batch_idx, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -476,6 +522,30 @@ def run_offline_policy_training(
                 }
                 with metrics_log_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(metrics, sort_keys=True) + "\n")
+                if (
+                    global_step == 1
+                    or global_step % max(config.logging_steps, 1) == 0
+                    or global_step == total_update_steps
+                ):
+                    concise_metrics = {
+                        "train/loss": metrics["loss"],
+                        "train/lr": metrics["lr"],
+                        "train/mean_reward": metrics["mean_reward"],
+                        "train/mean_advantage": metrics["mean_advantage"],
+                        "train/approx_kl": metrics["approx_kl"],
+                        "train/entropy": metrics["entropy"],
+                        "train/clipfrac": metrics["clipfrac"],
+                    }
+                    print(
+                        f"[hierarchical-rema][grpo] step={global_step}/{total_update_steps} "
+                        f"epoch={epoch + 1}/{config.epochs} "
+                        f"loss={metrics['loss']:.6f} "
+                        f"mean_reward={metrics['mean_reward']:.4f} "
+                        f"mean_advantage={metrics['mean_advantage']:.4f} "
+                        f"approx_kl={metrics['approx_kl']:.6f}"
+                    )
+                    if tracking is not None:
+                        tracking.log(concise_metrics, step=global_step)
 
                 if config.eval_every_steps > 0 and val_loader is not None and global_step % config.eval_every_steps == 0:
                     val_metrics = evaluate_controller_model(
@@ -488,9 +558,19 @@ def run_offline_policy_training(
                         _save_model_checkpoint(model, tokenizer, output_dir / "best")
                     with eval_log_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps({"step": global_step, **val_metrics}, sort_keys=True) + "\n")
+                    print(
+                        f"[hierarchical-rema][grpo] eval step={global_step} "
+                        f"val_loss={val_metrics['val_loss']:.6f}"
+                    )
+                    if tracking is not None:
+                        tracking.log({"val/val_loss": val_metrics["val_loss"]}, step=global_step)
 
                 if config.save_steps > 0 and global_step % config.save_steps == 0:
                     _save_model_checkpoint(model, tokenizer, output_dir / f"checkpoint-{global_step}")
+                    print(
+                        f"[hierarchical-rema][grpo] saved checkpoint step={global_step} "
+                        f"path={output_dir / f'checkpoint-{global_step}'}"
+                    )
 
     _save_model_checkpoint(model, tokenizer, output_dir / "final")
     summary = {
@@ -505,6 +585,20 @@ def run_offline_policy_training(
         summary.update(evaluate_controller_model(model=model, dataloader=val_loader, device=device))
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
+    print(
+        f"[hierarchical-rema][grpo] finished experiment={config.experiment_name} "
+        f"steps={global_step} output_dir={output_dir}"
+    )
+    if tracking is not None:
+        final_metrics = {
+            "train/final_steps": global_step,
+            "train/num_train_samples": len(train_samples),
+            "train/num_val_samples": len(val_samples),
+        }
+        if "val_loss" in summary:
+            final_metrics["val/final_loss"] = summary["val_loss"]
+        tracking.log(final_metrics, step=max(global_step, 1))
+        _finish_tracking(tracking)
     return summary
 
 
