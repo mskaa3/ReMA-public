@@ -9,6 +9,7 @@
 #SBATCH --verbose
 
 set -euo pipefail
+set -x
 
 if [[ -f ./env.sh ]]; then
     source ./env.sh
@@ -35,6 +36,8 @@ esac
 
 LOCAL_OUTPUT_DIR=${LOCAL_OUTPUT_DIR:-$RUN_ROOT/output}
 PERSIST_LOCAL_DIR=${PERSIST_LOCAL_DIR:-${SLURM_SUBMIT_DIR:-$PWD}/outputs/${OUTPUT_SUBDIR}/${JOB_ID}}
+RUNTIME_LOG=${RUNTIME_LOG:-$LOCAL_OUTPUT_DIR/runtime.log}
+RUN_METADATA_FILE=${RUN_METADATA_FILE:-$LOCAL_OUTPUT_DIR/run_metadata.txt}
 
 S3_OUTPUT_PATH=${S3_OUTPUT_PATH:-$DEFAULT_S3_OUTPUT_PATH}
 SIF_IMAGE_PATH=${SIF_IMAGE_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v3.sif}
@@ -98,6 +101,7 @@ cp -r ./src/verl "$TMPDIR/verl"
 rclone copy "$SIF_IMAGE_PATH" "$TMPDIR/"
 
 export HF_HOME=${HF_HOME:-$TMPDIR/hf_home}
+export PYTHONUNBUFFERED=1
 
 PARAMETER_SHARING_FLAG=""
 if [[ "$PARAMETER_SHARING" == "1" || "$PARAMETER_SHARING" == "true" || "$PARAMETER_SHARING" == "True" ]]; then
@@ -159,6 +163,26 @@ stage_train_input() {
     fi
 }
 
+write_run_metadata() {
+    cat > "$RUN_METADATA_FILE" <<EOF
+JOB_ID=$JOB_ID
+RUN_KIND=$RUN_KIND
+RUN_ROOT=$RUN_ROOT
+LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR
+PERSIST_LOCAL_DIR=$PERSIST_LOCAL_DIR
+S3_OUTPUT_PATH=$S3_OUTPUT_PATH
+TRAIN_INPUT=${TRAIN_INPUT:-}
+TRAIN_INPUT_STAGE=$TRAIN_INPUT_STAGE
+MODEL_PATH=$MODEL_PATH
+DECOMPOSER_MODEL_PATH=$DECOMPOSER_MODEL_PATH
+SELECTOR_MODEL_PATH=$SELECTOR_MODEL_PATH
+BACKEND=$BACKEND
+TASK=$TASK
+MODE=$MODE
+PHASE=$PHASE
+EOF
+}
+
 persist_outputs() {
     set +e
 
@@ -181,9 +205,21 @@ if [[ "$RUN_KIND" == "train" ]]; then
     stage_train_input
 fi
 
+write_run_metadata
+
+echo "[hierarchical-rema] starting run"
+echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
+echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
+echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
+if [[ "$RUN_KIND" == "train" ]]; then
+    echo "[hierarchical-rema] TRAIN_INPUT_STAGE=$TRAIN_INPUT_STAGE"
+    find "$TRAIN_INPUT_STAGE" -maxdepth 3 -type f | sort || true
+fi
+
 if [[ "$RUN_KIND" == "rollout" ]]; then
     COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export HF_HOME=$TMPDIR/hf_home; \
+export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
 python3 -m hierarchical_rema.demo \
@@ -205,11 +241,11 @@ python3 -m hierarchical_rema.demo \
   --controller-max-new-tokens ${CONTROLLER_MAX_NEW_TOKENS} \
   --worker-max-new-tokens ${WORKER_MAX_NEW_TOKENS} \
   --output-dir ${LOCAL_OUTPUT_DIR} \
-  --best-k ${BEST_K} \
-  > ${LOCAL_OUTPUT_DIR}/demo_stdout.json 2>&1"
+  --best-k ${BEST_K}"
 else
     COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export HF_HOME=$TMPDIR/hf_home; \
+export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
 python3 -m hierarchical_rema.train \
@@ -241,8 +277,7 @@ python3 -m hierarchical_rema.train \
   --save-steps ${SAVE_STEPS} \
   --eval-every-steps ${EVAL_EVERY_STEPS} \
   --device ${DEVICE} \
-  --torch-dtype ${TORCH_DTYPE} \
-  > ${LOCAL_OUTPUT_DIR}/train_stdout.log 2>&1"
+  --torch-dtype ${TORCH_DTYPE}"
 fi
 
 set +e
@@ -251,8 +286,8 @@ srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
     --mount type=bind,src=$TMPDIR/verl,dst=/verl \
     "$TMPDIR/verl-rema-v3.sif" \
-    bash -c "$COMMAND"
-RUN_EXIT_CODE=$?
+    bash -c "$COMMAND" 2>&1 | tee "$RUNTIME_LOG"
+RUN_EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
 persist_outputs
