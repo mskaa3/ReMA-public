@@ -26,6 +26,7 @@ from .schema import (
     WorkerPoolConfig,
     WorkerSpec,
 )
+from .worker_training import train_worker_role_lora_adapters
 
 __all__ = [
     "AlternatingPhase",
@@ -58,4 +59,5 @@ __all__ = [
     "WorkerPerformanceSnapshot",
     "WorkerPoolConfig",
     "WorkerSpec",
+    "train_worker_role_lora_adapters",
 ]

@@ -37,7 +37,7 @@ Current scope:
   - `soft_max_hops`: above this, the decomposer gets a penalty that grows with exceedance
   - `hard_max_hops`: above this, the DAG is truncated to a safe executable form
   - `max_nodes_per_decomposition`: existing hard cap on node count
-- Worker roles are prompt-defined and non-trainable by default, but `WorkerSpec` already carries `lora_adapter_path` and `trainable` flags for later role-specific LoRA work.
+- Worker roles are prompt-defined and non-trainable by default. Future worker-role LoRA training is left as an explicit placeholder, not an active training path.
 - Worker history is frozen per task rollout group, then updated after the rollout finishes, which matches the intended GRPO grouping much better than updating inside the `M x N` tree.
 - Best rollouts and full rollout traces can be saved locally as JSONL logs.
 
@@ -64,3 +64,16 @@ PYTHONPATH=src/verl/verl python -m hierarchical_rema.demo \
 ```
 
 The demo prints the full structured rollout tree plus the decomposer/selector training batches that would be consumed by a future GRPO integration, and it can write JSONL rollout logs under `outputs/hierarchical_rema`.
+
+Train controller policies from saved rollout logs with offline GRPO:
+
+```bash
+PYTHONPATH=src/verl/verl python -m hierarchical_rema.train \
+  --input outputs/hierarchical_rema/5158272 \
+  --model-path /path/to/controller-model \
+  --output-dir outputs/hierarchical_rema_train/run_002
+```
+
+If you want saved train/val/all replay copies for debugging, add `--save-replay-copy`.
+
+Training artifacts are written per policy id, so shared-controller runs will produce one policy folder and separate decomposer/selector runs will produce two. Worker-role LoRA optimization is not implemented yet; see `worker_training.py` for the placeholder.

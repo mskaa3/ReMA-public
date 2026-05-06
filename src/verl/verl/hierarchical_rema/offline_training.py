@@ -1,0 +1,545 @@
+from __future__ import annotations
+
+import json
+import math
+import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, Sequence
+
+from .controller_data import ControllerReplaySample
+
+
+@dataclass
+class OfflineTrainingConfig:
+    model_name_or_path: str
+    output_dir: str
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.0
+    train_batch_size: int = 1
+    grad_accum_steps: int = 8
+    epochs: int = 1
+    max_length: int = 4096
+    truncation: str = "left"
+    clip_range: float = 0.2
+    clip_ratio_c: float = 3.0
+    entropy_coeff: float = 0.0
+    max_grad_norm: float = 1.0
+    warmup_ratio: float = 0.03
+    seed: int = 42
+    logging_steps: int = 10
+    save_steps: int = 200
+    eval_every_steps: int = 0
+    device: str = "cuda"
+    torch_dtype: str = "bfloat16"
+    trust_remote_code: bool = True
+    gradient_checkpointing: bool = True
+
+def _ensure_repo_root_on_path() -> None:
+    import sys
+
+    repo_pkg_root = Path(__file__).resolve().parents[2]
+    if str(repo_pkg_root) not in sys.path:
+        sys.path.insert(0, str(repo_pkg_root))
+
+
+def _lazy_torch():
+    import torch
+
+    return torch
+
+
+def _resolve_dtype(torch, dtype_name: str):
+    if dtype_name == "auto":
+        return "auto"
+    return getattr(torch, dtype_name)
+
+
+def _set_random_seeds(seed: int) -> None:
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except Exception:
+        pass
+
+    torch = _lazy_torch()
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _load_scheduler_factory():
+    _ensure_repo_root_on_path()
+    try:
+        from verl.utils.torch_functional import get_cosine_schedule_with_warmup
+
+        return get_cosine_schedule_with_warmup
+    except Exception:
+        from transformers import get_cosine_schedule_with_warmup
+
+        return get_cosine_schedule_with_warmup
+
+
+def _load_model_and_tokenizer(config: OfflineTrainingConfig):
+    torch = _lazy_torch()
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name_or_path,
+        trust_remote_code=config.trust_remote_code,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    torch_dtype = _resolve_dtype(torch, config.torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_name_or_path,
+        torch_dtype=torch_dtype,
+        trust_remote_code=config.trust_remote_code,
+    )
+    model.config.use_cache = False
+
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    return tokenizer, model, device
+
+
+def _format_prompt(tokenizer, prompt_text: str) -> str:
+    messages = [{"role": "user", "content": prompt_text}]
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        except Exception:
+            pass
+    return f"User:\n{prompt_text}\n\nAssistant:\n"
+
+
+class ControllerReplayDataset:
+    def __init__(self, samples: Sequence[ControllerReplaySample], tokenizer, max_length: int, truncation: str):
+        self.samples = list(samples)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.truncation = truncation
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        self.rows = [self._tokenize_sample(sample_index, sample) for sample_index, sample in enumerate(self.samples)]
+
+    def _tokenize_sample(self, sample_index: int, sample: ControllerReplaySample) -> Dict:
+        torch = _lazy_torch()
+
+        prompt_text = _format_prompt(self.tokenizer, sample.prompt_text)
+        response_text = sample.completion_text + (self.tokenizer.eos_token or "")
+
+        prompt_ids = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+        response_ids = self.tokenizer(response_text, return_tensors="pt", add_special_tokens=False)
+
+        prompt_input_ids = prompt_ids["input_ids"][0]
+        prompt_attention_mask = prompt_ids["attention_mask"][0]
+        response_input_ids = response_ids["input_ids"][0]
+        response_attention_mask = response_ids["attention_mask"][0]
+
+        input_ids = torch.cat((prompt_input_ids, response_input_ids), dim=-1)
+        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
+        prompt_length = prompt_input_ids.shape[0]
+        response_length = response_input_ids.shape[0]
+
+        if input_ids.shape[0] > self.max_length:
+            if self.truncation == "left":
+                input_ids = input_ids[-self.max_length :]
+                attention_mask = attention_mask[-self.max_length :]
+                prompt_length = min(prompt_length, self.max_length)
+            elif self.truncation == "right":
+                input_ids = input_ids[: self.max_length]
+                attention_mask = attention_mask[: self.max_length]
+            else:
+                raise ValueError(
+                    f"Sequence length {input_ids.shape[0]} exceeds max_length={self.max_length}"
+                )
+
+        position_ids = attention_mask.long().cumsum(dim=-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
+
+        loss_mask = attention_mask.clone()
+        if prompt_length > 1:
+            loss_mask[: min(prompt_length, loss_mask.size(0)) - 1] = 0
+        last_idx = min(prompt_length + response_length, loss_mask.size(0)) - 1
+        if last_idx >= 0:
+            loss_mask[last_idx] = 0
+
+        return {
+            "sample_index": sample_index,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "loss_mask": loss_mask,
+            "reward": torch.tensor(sample.reward, dtype=torch.float32),
+            "advantage": torch.tensor(sample.advantage, dtype=torch.float32),
+            "group_id": sample.group_id,
+            "role": sample.role,
+            "policy_id": sample.policy_id,
+            "pad_token_id": self.pad_token_id,
+        }
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> Dict:
+        return self.rows[index]
+
+
+def _collate_rows(rows: Sequence[Dict]) -> Dict:
+    torch = _lazy_torch()
+
+    max_length = max(row["input_ids"].shape[0] for row in rows)
+    batch = {
+        "sample_index": [],
+        "input_ids": [],
+        "attention_mask": [],
+        "position_ids": [],
+        "loss_mask": [],
+        "reward": [],
+        "advantage": [],
+        "group_id": [],
+        "role": [],
+        "policy_id": [],
+    }
+
+    for row in rows:
+        seq_len = row["input_ids"].shape[0]
+        pad_len = max_length - seq_len
+        pad_token_id = row["pad_token_id"]
+        if pad_len > 0:
+            batch["input_ids"].append(
+                torch.cat(
+                    [
+                        row["input_ids"],
+                        torch.full((pad_len,), pad_token_id, dtype=row["input_ids"].dtype),
+                    ]
+                )
+            )
+            batch["attention_mask"].append(
+                torch.cat(
+                    [row["attention_mask"], torch.zeros((pad_len,), dtype=row["attention_mask"].dtype)]
+                )
+            )
+            batch["position_ids"].append(
+                torch.cat(
+                    [row["position_ids"], torch.zeros((pad_len,), dtype=row["position_ids"].dtype)]
+                )
+            )
+            batch["loss_mask"].append(
+                torch.cat([row["loss_mask"], torch.zeros((pad_len,), dtype=row["loss_mask"].dtype)])
+            )
+        else:
+            batch["input_ids"].append(row["input_ids"])
+            batch["attention_mask"].append(row["attention_mask"])
+            batch["position_ids"].append(row["position_ids"])
+            batch["loss_mask"].append(row["loss_mask"])
+
+        batch["sample_index"].append(row["sample_index"])
+        batch["reward"].append(row["reward"])
+        batch["advantage"].append(row["advantage"])
+        batch["group_id"].append(row["group_id"])
+        batch["role"].append(row["role"])
+        batch["policy_id"].append(row["policy_id"])
+
+    return {
+        "sample_index": list(batch["sample_index"]),
+        "input_ids": torch.stack(batch["input_ids"], dim=0),
+        "attention_mask": torch.stack(batch["attention_mask"], dim=0),
+        "position_ids": torch.stack(batch["position_ids"], dim=0),
+        "loss_mask": torch.stack(batch["loss_mask"], dim=0),
+        "reward": torch.stack(batch["reward"], dim=0),
+        "advantage": torch.stack(batch["advantage"], dim=0),
+        "group_id": list(batch["group_id"]),
+        "role": list(batch["role"]),
+        "policy_id": list(batch["policy_id"]),
+    }
+
+
+def _sequence_log_probs(logits, labels):
+    torch = _lazy_torch()
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    gathered = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    return gathered
+
+
+def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_size: int, device) -> Dict[int, "torch.Tensor"]:
+    from torch.utils.data import DataLoader
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=_collate_rows,
+    )
+    cached: Dict[int, "torch.Tensor"] = {}
+    model.eval()
+    with _lazy_torch().no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            position_ids = batch["position_ids"].to(device)
+            loss_mask = batch["loss_mask"][:, :-1]
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+            token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
+            for row_idx, sample_index in enumerate(batch["sample_index"]):
+                cached[sample_index] = token_log_probs[row_idx][loss_mask[row_idx].bool()].detach().cpu()
+    return cached
+
+
+def _gather_old_log_probs(
+    sample_indices,
+    old_log_prob_cache,
+    loss_mask,
+    device,
+    dtype,
+):
+    torch = _lazy_torch()
+    padded = []
+    target_length = loss_mask.shape[1]
+    for row_idx, sample_index in enumerate(sample_indices):
+        old_log_probs = old_log_prob_cache[sample_index]
+        row = torch.zeros((target_length,), dtype=dtype)
+        valid_length = int(loss_mask[row_idx].sum().item())
+        take = min(valid_length, old_log_probs.shape[0], target_length)
+        if take > 0:
+            positions = torch.nonzero(loss_mask[row_idx], as_tuple=False).squeeze(-1)[:take]
+            row[positions] = old_log_probs[:take].to(dtype)
+        padded.append(row)
+    return torch.stack(padded, dim=0).to(device)
+
+
+def _count_parameters(model) -> Dict[str, int]:
+    total = 0
+    trainable = 0
+    for parameter in model.parameters():
+        count = parameter.numel()
+        total += count
+        if parameter.requires_grad:
+            trainable += count
+    return {
+        "num_parameters": total,
+        "num_trainable_parameters": trainable,
+    }
+
+
+def run_offline_policy_training(
+    train_samples: Sequence[ControllerReplaySample],
+    val_samples: Sequence[ControllerReplaySample],
+    config: OfflineTrainingConfig,
+) -> Dict:
+    _ensure_repo_root_on_path()
+    from torch.utils.data import DataLoader
+
+    torch = _lazy_torch()
+    try:
+        from verl.trainer.ppo import core_algos
+    except Exception as exc:
+        raise ImportError("GRPO training requires the repo PPO core_algos module to be importable") from exc
+
+    _set_random_seeds(config.seed)
+    scheduler_factory = _load_scheduler_factory()
+    tokenizer, model, device = _load_model_and_tokenizer(config)
+    train_dataset = ControllerReplayDataset(train_samples, tokenizer, config.max_length, config.truncation)
+    val_dataset = ControllerReplayDataset(val_samples, tokenizer, config.max_length, config.truncation)
+
+    generator = torch.Generator().manual_seed(config.seed)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.train_batch_size,
+        shuffle=True,
+        collate_fn=_collate_rows,
+        generator=generator,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.train_batch_size,
+        shuffle=False,
+        collate_fn=_collate_rows,
+    ) if len(val_dataset) else None
+
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    total_update_steps = max(
+        1,
+        math.ceil(len(train_loader) * config.epochs / max(config.grad_accum_steps, 1)),
+    )
+    warmup_steps = int(total_update_steps * config.warmup_ratio)
+    scheduler = scheduler_factory(
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_update_steps,
+    )
+
+    old_log_prob_cache = _compute_old_log_prob_cache(
+        model=model,
+        dataset=train_dataset,
+        batch_size=config.train_batch_size,
+        device=device,
+    )
+
+    output_dir = Path(config.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_log_path = output_dir / "train_metrics.jsonl"
+    eval_log_path = output_dir / "eval_metrics.jsonl"
+    config_path = output_dir / "train_config.json"
+    with config_path.open("w", encoding="utf-8") as handle:
+        json.dump(asdict(config), handle, indent=2, sort_keys=True)
+
+    training_data_stats = {
+        "num_train_samples": len(train_samples),
+        "num_val_samples": len(val_samples),
+        "objective": "grpo",
+        **_count_parameters(model),
+    }
+    with (output_dir / "training_data_stats.json").open("w", encoding="utf-8") as handle:
+        json.dump(training_data_stats, handle, indent=2, sort_keys=True)
+
+    global_step = 0
+    optimizer.zero_grad(set_to_none=True)
+    best_val_loss = None
+
+    for epoch in range(config.epochs):
+        model.train()
+        for batch_idx, batch in enumerate(train_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            position_ids = batch["position_ids"].to(device)
+            loss_mask = batch["loss_mask"][:, :-1].to(device).float()
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+            token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
+            old_log_probs = _gather_old_log_probs(
+                sample_indices=batch["sample_index"],
+                old_log_prob_cache=old_log_prob_cache,
+                loss_mask=loss_mask,
+                device=device,
+                dtype=token_log_probs.dtype,
+            )
+            advantages = batch["advantage"].to(device).unsqueeze(-1).expand_as(token_log_probs)
+            pg_loss, clipfrac, approx_kl, clipfrac_lower = core_algos.compute_policy_loss(
+                old_log_prob=old_log_probs,
+                log_prob=token_log_probs,
+                advantages=advantages,
+                eos_mask=loss_mask,
+                cliprange=config.clip_range,
+                clip_ratio_c=config.clip_ratio_c,
+            )
+            entropy = core_algos.compute_entropy_loss(outputs.logits[:, :-1, :], loss_mask)
+            loss = pg_loss - config.entropy_coeff * entropy
+
+            loss = loss / max(config.grad_accum_steps, 1)
+            loss.backward()
+
+            should_step = (batch_idx + 1) % max(config.grad_accum_steps, 1) == 0 or (batch_idx + 1) == len(train_loader)
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                metrics = {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "loss": float(loss.detach().item() * max(config.grad_accum_steps, 1)),
+                    "lr": float(scheduler.get_last_lr()[0]),
+                    "objective": "grpo",
+                    "mean_reward": float(batch["reward"].mean().item()),
+                    "mean_advantage": float(batch["advantage"].mean().item()),
+                    "approx_kl": float(approx_kl.detach().item()),
+                    "entropy": float(entropy.detach().item()),
+                    "clipfrac": float(clipfrac.detach().item()),
+                    "clipfrac_lower": float(clipfrac_lower.detach().item()),
+                }
+                with metrics_log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(metrics, sort_keys=True) + "\n")
+
+                if config.eval_every_steps > 0 and val_loader is not None and global_step % config.eval_every_steps == 0:
+                    val_metrics = evaluate_controller_model(
+                        model=model,
+                        dataloader=val_loader,
+                        device=device,
+                    )
+                    if best_val_loss is None or val_metrics["val_loss"] < best_val_loss:
+                        best_val_loss = val_metrics["val_loss"]
+                        _save_model_checkpoint(model, tokenizer, output_dir / "best")
+                    with eval_log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps({"step": global_step, **val_metrics}, sort_keys=True) + "\n")
+
+                if config.save_steps > 0 and global_step % config.save_steps == 0:
+                    _save_model_checkpoint(model, tokenizer, output_dir / f"checkpoint-{global_step}")
+
+    _save_model_checkpoint(model, tokenizer, output_dir / "final")
+    summary = {
+        "output_dir": str(output_dir),
+        "steps": global_step,
+        "num_train_samples": len(train_samples),
+        "num_val_samples": len(val_samples),
+        "objective": "grpo",
+        **_count_parameters(model),
+    }
+    if val_loader is not None:
+        summary.update(evaluate_controller_model(model=model, dataloader=val_loader, device=device))
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+    return summary
+
+
+def evaluate_controller_model(model, dataloader, device) -> Dict[str, float]:
+    torch = _lazy_torch()
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            position_ids = batch["position_ids"].to(device)
+            loss_mask = batch["loss_mask"][:, :-1].to(device).float()
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+            labels = input_ids[:, 1:]
+            per_token_loss = torch.nn.functional.cross_entropy(
+                outputs.logits[:, :-1, :].reshape(-1, outputs.logits.size(-1)),
+                labels.reshape(-1),
+                reduction="none",
+            ).view_as(loss_mask)
+            masked_loss = per_token_loss * loss_mask
+            loss = masked_loss.sum() / torch.clamp(loss_mask.sum(), min=1.0)
+            losses.append(loss.detach().cpu())
+    model.train()
+    if not losses:
+        return {"val_loss": 0.0}
+    return {"val_loss": float(torch.stack(losses).mean().item())}
+
+
+def _save_model_checkpoint(model, tokenizer, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
