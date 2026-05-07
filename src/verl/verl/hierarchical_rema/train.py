@@ -576,6 +576,12 @@ def main() -> None:
         tasks_completed = 0
         task_batches = chunk_tasks(epoch_tasks, args.rollout_task_batch_size)
         for batch_index, task_batch in enumerate(task_batches, start=1):
+            print(
+                f"[hierarchical-rema][integrated] rollout_batch_start "
+                f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
+                f"tasks_in_batch={len(task_batch)} "
+                f"completed_before_batch={tasks_completed}"
+            )
             batch_rollouts = rollout_trainer.run_many(
                 tasks=task_batch,
                 worker_pool=worker_pool,

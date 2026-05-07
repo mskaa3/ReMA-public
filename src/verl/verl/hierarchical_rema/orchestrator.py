@@ -94,6 +94,11 @@ class HierarchicalReMAOrchestrator:
             rollout_config=rollout_config,
             schedule=schedule,
         )
+        print(
+            f"[hierarchical-rema][rollout] stage=decomposer "
+            f"tasks={len(tasks)} decompositions_per_task={num_decompositions} "
+            f"requests={len(tasks) * num_decompositions}"
+        )
 
         decomposition_requests: List[DecompositionRequest] = []
         decomposition_metadata: List[tuple[int, int]] = []
@@ -116,6 +121,11 @@ class HierarchicalReMAOrchestrator:
             decomposition.topological_order()
             task_decompositions[task_index].append(decomposition)
 
+        print(
+            f"[hierarchical-rema][rollout] stage=selector "
+            f"tasks={len(tasks)} selections_per_decomposition={num_selections} "
+            f"requests={len(tasks) * num_decompositions * num_selections}"
+        )
         selection_requests: List[SelectionRequest] = []
         request_metadata: List[tuple[int, int, int]] = []
         for task_index, task in enumerate(tasks):
@@ -257,6 +267,7 @@ class HierarchicalReMAOrchestrator:
             for state in selection_states
         }
         active_states = list(selection_states)
+        frontier_step = 0
         while True:
             worker_requests: List[WorkerExecutionRequest] = []
             request_states: List[_SelectionExecutionState] = []
@@ -285,6 +296,13 @@ class HierarchicalReMAOrchestrator:
 
             if not worker_requests:
                 break
+
+            frontier_step += 1
+            print(
+                f"[hierarchical-rema][rollout] stage=workers "
+                f"frontier_step={frontier_step} active_states={len(active_states)} "
+                f"requests={len(worker_requests)}"
+            )
 
             worker_executions = self.backend.execute_workers_batch(worker_requests)
             for state, execution in zip(request_states, worker_executions):
