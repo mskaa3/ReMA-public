@@ -78,6 +78,7 @@ def build_vllm_rollout_config_dict(
             "do_sample": config.do_sample,
             "disable_log_stats": config.disable_log_stats,
             "enable_chunked_prefill": config.enable_chunked_prefill,
+            "detokenize": config.detokenize,
             "n": 1,
         },
         "actor": {

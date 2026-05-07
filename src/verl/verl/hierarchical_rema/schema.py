@@ -88,6 +88,7 @@ class VLLMBackendConfig:
     worker_max_new_tokens: int = 256
     controller_batch_size: int = 8
     worker_batch_size: int = 16
+    max_format_retries: int = 2
     nnodes: int = 1
     n_gpus_per_node: int = 1
     tensor_model_parallel_size: int = 1
@@ -101,6 +102,7 @@ class VLLMBackendConfig:
     enable_chunked_prefill: bool = True
     load_format: str = "dummy_dtensor"
     disable_log_stats: bool = True
+    detokenize: bool = True
     trust_remote_code: bool = True
 
 
