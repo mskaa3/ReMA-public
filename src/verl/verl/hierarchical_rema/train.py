@@ -552,6 +552,8 @@ def main() -> None:
                 top_p=args.top_p,
                 do_sample=args.temperature > 0.0,
                 prompt_length=args.rollout_prompt_length,
+                controller_max_new_tokens=args.controller_max_new_tokens,
+                worker_max_new_tokens=args.worker_max_new_tokens,
                 controller_batch_size=args.controller_batch_size,
                 worker_batch_size=args.worker_batch_size,
                 nnodes=args.ray_nnodes,

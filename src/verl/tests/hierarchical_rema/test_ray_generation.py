@@ -15,6 +15,8 @@ except ModuleNotFoundError:
 def test_build_vllm_rollout_config_dict_uses_expected_repo_shape() -> None:
     config = VLLMBackendConfig(
         prompt_length=1536,
+        controller_max_new_tokens=384,
+        worker_max_new_tokens=192,
         nnodes=2,
         n_gpus_per_node=4,
         tensor_model_parallel_size=2,
@@ -40,6 +42,8 @@ def test_build_vllm_rollout_config_dict_uses_expected_repo_shape() -> None:
     assert payload["rollout"]["max_num_batched_tokens"] == 16384
     assert payload["rollout"]["max_num_seqs"] == 512
     assert payload["actor"]["strategy"] == "fsdp"
+    assert config.controller_max_new_tokens == 384
+    assert config.worker_max_new_tokens == 192
 
 
 def test_proxy_entropy_penalizes_truncation_more_than_clean_stop() -> None:

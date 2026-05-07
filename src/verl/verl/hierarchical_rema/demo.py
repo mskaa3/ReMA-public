@@ -168,6 +168,8 @@ def main() -> None:
             top_p=args.top_p,
             do_sample=args.temperature > 0.0,
             prompt_length=args.rollout_prompt_length,
+            controller_max_new_tokens=args.controller_max_new_tokens,
+            worker_max_new_tokens=args.worker_max_new_tokens,
             nnodes=args.ray_nnodes,
             n_gpus_per_node=args.ray_n_gpus_per_node,
             tensor_model_parallel_size=args.vllm_tensor_parallel_size,
