@@ -802,12 +802,18 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         results: List[DecompositionCandidate | None] = [None] * len(requests)
         for model_path, grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
+            print(
+                f"[hierarchical-rema][generation] role=decomposer "
+                f"model={model_path} requests={len(grouped_requests)} "
+                f"batch_size={self.config.controller_batch_size}"
+            )
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
                 max_new_tokens=self.config.controller_max_new_tokens,
                 batch_size=self.config.controller_batch_size,
             )
+            repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.task.task_id}-decomp-{request.decomposition_index}"
                 try:
@@ -830,6 +836,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     candidate.raw_payload = payload
                     candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
                 except Exception:
+                    repair_count += 1
                     candidate = self._generate_validated_decomposition(
                         prompt_text=prompt_text,
                         task=request.task,
@@ -846,6 +853,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     )
                     candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
                 results[result_index] = candidate
+            if repair_count:
+                print(
+                    f"[hierarchical-rema][generation] role=decomposer "
+                    f"model={model_path} repair_fallbacks={repair_count}/{len(grouped_requests)}"
+                )
 
         if any(candidate is None for candidate in results):
             raise RuntimeError("Batched decomposition generation did not produce a result for every request")
@@ -874,12 +886,18 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         results: List[SelectionCandidate | None] = [None] * len(requests)
         for model_path, grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
+            print(
+                f"[hierarchical-rema][generation] role=selector "
+                f"model={model_path} requests={len(grouped_requests)} "
+                f"batch_size={self.config.controller_batch_size}"
+            )
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
                 max_new_tokens=self.config.controller_max_new_tokens,
                 batch_size=self.config.controller_batch_size,
             )
+            repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.decomposition.decomposition_id}-sel-{request.selection_index}"
                 try:
@@ -903,6 +921,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     candidate.raw_payload = payload
                     candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
                 except Exception:
+                    repair_count += 1
                     candidate = self._generate_validated_selection(
                         prompt_text=prompt_text,
                         task=request.task,
@@ -920,6 +939,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     )
                     candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
                 results[result_index] = candidate
+            if repair_count:
+                print(
+                    f"[hierarchical-rema][generation] role=selector "
+                    f"model={model_path} repair_fallbacks={repair_count}/{len(grouped_requests)}"
+                )
 
         if any(candidate is None for candidate in results):
             raise RuntimeError("Batched selection generation did not produce a result for every request")
@@ -953,6 +977,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         results: List[WorkerExecution | None] = [None] * len(requests)
         for (base_model_path, lora_adapter_path, system_prompt), grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
+            print(
+                f"[hierarchical-rema][generation] role=worker "
+                f"model={base_model_path} requests={len(grouped_requests)} "
+                f"batch_size={self.config.worker_batch_size}"
+            )
             generated = self._generate_text_batch(
                 base_model_path=base_model_path,
                 prompt_texts=prompt_texts,
