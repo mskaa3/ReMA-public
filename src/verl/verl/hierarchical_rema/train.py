@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import random
 import shutil
 import time
@@ -186,7 +187,7 @@ def _tracking(args: argparse.Namespace, config_payload: Dict[str, Any]):
         print(f"[hierarchical-rema][tracking] wandb disabled due to import/init error: {exc}")
         return None
 
-    experiment_name = args.experiment_name or Path(args.output_dir).name
+    experiment_name = args.experiment_name or os.environ.get("SLURM_JOB_ID") or Path(args.output_dir).name
     print(
         f"[hierarchical-rema][tracking] initializing wandb "
         f"project={args.project_name} experiment={experiment_name}"
@@ -979,7 +980,7 @@ def main() -> None:
                 policy_dir.mkdir(parents=True, exist_ok=True)
                 replay_exports = maybe_save_replay_copy(policy_dir, split, enabled=args.save_replay_copy)
                 model_path = model_path_for_policy(policy_id, split["train"] or split["all"], replay_like_args)
-                experiment_name = args.experiment_name or output_dir.name
+                experiment_name = args.experiment_name or os.environ.get("SLURM_JOB_ID") or output_dir.name
                 experiment_name = f"{experiment_name}-epoch{epoch_number:04d}-{policy_id}"
                 print(
                     f"[hierarchical-rema][integrated] training policy={policy_id} "

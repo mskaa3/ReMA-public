@@ -13,11 +13,16 @@ set -euo pipefail
 export RUN_KIND=${RUN_KIND:-train} 
 export BACKEND=${BACKEND:-vllm} # rollout backend used during training: mock | hf | vllm
 export MODE=${MODE:-alternating} # alternating = epoch 1 selector, epoch 2 decomposer, then switch back and forth
+export PARAMETER_SHARING=${PARAMETER_SHARING:-false} # if true, selector and decomposer share the same weights; if false, they have separate weights and can specialize 
+# Preferred subset-based names for the hierarchical training loop.
+# TRAIN_SUBSET_ROUNDS: how many times we pick a train subset and run the full loop on it.
+# TRAIN_SUBSET_SIZE: how many train tasks are in that subset.
+# GRPO_PASSES_PER_SUBSET: how many update passes we make on rollout samples generated from that one subset.
+# Legacy aliases still work underneath: NUM_EPOCHS, TASKS_PER_EPOCH, EPOCHS.
+export TRAIN_SUBSET_ROUNDS=${TRAIN_SUBSET_ROUNDS:-${NUM_EPOCHS:-20}}
+export GRPO_PASSES_PER_SUBSET=${GRPO_PASSES_PER_SUBSET:-${EPOCHS:-1}}
 
-export NUM_EPOCHS=${NUM_EPOCHS:-20} # outer RL epochs: rollout -> GRPO update -> benchmark validation
-export EPOCHS=${EPOCHS:-1} # inner GRPO passes over replay from one outer epoch; keep small for on-policy freshness
-
-export TASKS_PER_EPOCH=${TASKS_PER_EPOCH:-853} # train tasks used to collect fresh rollouts in one outer epoch
+export TRAIN_SUBSET_SIZE=${TRAIN_SUBSET_SIZE:-${TASKS_PER_EPOCH:-853}}
 export NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-16} # controller rollout width during training
 export NUM_SELECTIONS=${NUM_SELECTIONS:-16} # selector samples per decomposition during training
 export TEMPERATURE=${TEMPERATURE:-0.5} # controller/worker sampling temperature during training rollouts
