@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
-from .backends import HierarchicalBackend, MockHierarchicalBackend, TransformersHierarchicalBackend
+from .backends import (
+    DecompositionRequest,
+    HierarchicalBackend,
+    MockHierarchicalBackend,
+    RayVLLMHierarchicalBackend,
+    SelectionRequest,
+    TransformersHierarchicalBackend,
+    WorkerExecutionRequest,
+)
 from .recording import RolloutRecorder
 from .rewarding import WorkerPerformanceMemory, build_selection_reward, group_relative_advantages
 from .schema import (
@@ -23,8 +31,24 @@ from .schema import (
     TaskRollout,
     TrainingMode,
     TrainingScheduleConfig,
+    VLLMBackendConfig,
+    WorkerExecution,
     WorkerPoolConfig,
 )
+
+
+@dataclass
+class _SelectionExecutionState:
+    task_index: int
+    decomposition_index: int
+    selection_index: int
+    task: TaskExample
+    decomposition: DecompositionCandidate
+    selection: SelectionCandidate
+    topo_order: List[str]
+    next_node_index: int = 0
+    outputs: Dict[str, str] = field(default_factory=dict)
+    executions: List[WorkerExecution] = field(default_factory=list)
 
 
 class HierarchicalReMAOrchestrator:
@@ -46,7 +70,148 @@ class HierarchicalReMAOrchestrator:
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
     ) -> TaskRollout:
+        return self.run_tasks(
+            tasks=[task],
+            worker_pool=worker_pool,
+            policy_config=policy_config,
+            rollout_config=rollout_config,
+            schedule=schedule,
+        )[0]
+
+    def run_tasks(
+        self,
+        tasks: Sequence[TaskExample],
+        worker_pool: WorkerPoolConfig,
+        policy_config: ControllerPolicyConfig,
+        rollout_config: RolloutConfig,
+        schedule: TrainingScheduleConfig,
+    ) -> List[TaskRollout]:
+        if not tasks:
+            return []
+
         frozen_worker_performance = self.worker_memory.snapshot(worker_pool)
+        num_decompositions, num_selections = self._effective_rollout_counts(
+            rollout_config=rollout_config,
+            schedule=schedule,
+        )
+
+        decomposition_requests: List[DecompositionRequest] = []
+        decomposition_metadata: List[tuple[int, int]] = []
+        for task_index, task in enumerate(tasks):
+            for decomposition_index in range(num_decompositions):
+                decomposition_requests.append(
+                    DecompositionRequest(
+                        task=task,
+                        worker_pool=worker_pool,
+                        policy_config=policy_config,
+                        rollout_config=rollout_config,
+                        decomposition_index=decomposition_index,
+                        worker_performance=frozen_worker_performance,
+                    )
+                )
+                decomposition_metadata.append((task_index, decomposition_index))
+        decomposition_candidates = self.backend.sample_decompositions_batch(decomposition_requests)
+        task_decompositions: List[List[DecompositionCandidate]] = [[] for _ in tasks]
+        for (task_index, _), decomposition in zip(decomposition_metadata, decomposition_candidates):
+            decomposition.topological_order()
+            task_decompositions[task_index].append(decomposition)
+
+        selection_requests: List[SelectionRequest] = []
+        request_metadata: List[tuple[int, int, int]] = []
+        for task_index, task in enumerate(tasks):
+            for decomposition_index, decomposition in enumerate(task_decompositions[task_index]):
+                for selection_index in range(num_selections):
+                    selection_requests.append(
+                        SelectionRequest(
+                            task=task,
+                            decomposition=decomposition,
+                            worker_pool=worker_pool,
+                            policy_config=policy_config,
+                            selection_index=selection_index,
+                            worker_performance=frozen_worker_performance,
+                        )
+                    )
+                    request_metadata.append((task_index, decomposition_index, selection_index))
+
+        selection_candidates = self.backend.sample_selections_batch(selection_requests)
+        selection_states: List[_SelectionExecutionState] = []
+        for (task_index, decomposition_index, selection_index), selection in zip(
+            request_metadata,
+            selection_candidates,
+        ):
+            decomposition = task_decompositions[task_index][decomposition_index]
+            selection_states.append(
+                _SelectionExecutionState(
+                    task_index=task_index,
+                    decomposition_index=decomposition_index,
+                    selection_index=selection_index,
+                    task=tasks[task_index],
+                    decomposition=decomposition,
+                    selection=selection,
+                    topo_order=decomposition.topological_order(),
+                )
+            )
+
+        selection_rollout_map = self._execute_selections_batch(
+            selection_states=selection_states,
+            worker_pool=worker_pool,
+        )
+
+        task_rollouts: List[TaskRollout] = []
+        for task_index, task in enumerate(tasks):
+            decomposition_rollouts: List[DecompositionRollout] = []
+            for decomposition_index, decomposition in enumerate(task_decompositions[task_index]):
+                selection_rollouts = [
+                    selection_rollout_map[(task_index, decomposition_index, selection_index)]
+                    for selection_index in range(num_selections)
+                ]
+                selection_advantages = group_relative_advantages(
+                    [selection.reward.total_reward for selection in selection_rollouts]
+                )
+                for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
+                    selection_rollout.selector_advantage = advantage
+
+                base_decomposition_reward = sum(
+                    selection.reward.total_reward for selection in selection_rollouts
+                ) / max(len(selection_rollouts), 1)
+                decomposition_reward = base_decomposition_reward - decomposition.soft_penalty
+                decomposition_rollouts.append(
+                    DecompositionRollout(
+                        decomposition=decomposition,
+                        selections=selection_rollouts,
+                        base_decomposition_reward=base_decomposition_reward,
+                        decomposition_reward=decomposition_reward,
+                    )
+                )
+
+            decomposition_advantages = group_relative_advantages(
+                [decomposition.decomposition_reward for decomposition in decomposition_rollouts]
+            )
+            for decomposition_rollout, advantage in zip(
+                decomposition_rollouts,
+                decomposition_advantages,
+            ):
+                decomposition_rollout.decomposer_advantage = advantage
+
+            self._update_worker_memory(task, decomposition_rollouts)
+            task_rollouts.append(
+                self._finalize_task_rollout(
+                    task=task,
+                    worker_pool=worker_pool,
+                    policy_config=policy_config,
+                    rollout_config=rollout_config,
+                    schedule=schedule,
+                    decomposition_rollouts=decomposition_rollouts,
+                )
+            )
+
+        return task_rollouts
+
+    def _effective_rollout_counts(
+        self,
+        rollout_config: RolloutConfig,
+        schedule: TrainingScheduleConfig,
+    ) -> tuple[int, int]:
         num_decompositions = rollout_config.num_decompositions
         num_selections = rollout_config.num_selections_per_decomposition
         if schedule.mode == TrainingMode.ALTERNATING:
@@ -54,67 +219,17 @@ class HierarchicalReMAOrchestrator:
                 num_decompositions = 1
             else:
                 num_selections = 1
+        return num_decompositions, num_selections
 
-        decomposition_rollouts: List[DecompositionRollout] = []
-        for decomposition_index in range(num_decompositions):
-            decomposition = self.backend.sample_decomposition(
-                task=task,
-                worker_pool=worker_pool,
-                policy_config=policy_config,
-                rollout_config=rollout_config,
-                decomposition_index=decomposition_index,
-                worker_performance=frozen_worker_performance,
-            )
-            decomposition.topological_order()
-
-            selection_rollouts: List[SelectionRollout] = []
-            for selection_index in range(num_selections):
-                selection = self.backend.sample_selection(
-                    task=task,
-                    decomposition=decomposition,
-                    worker_pool=worker_pool,
-                    policy_config=policy_config,
-                    selection_index=selection_index,
-                    worker_performance=frozen_worker_performance,
-                )
-                selection_rollouts.append(
-                    self._execute_selection(
-                        task=task,
-                        decomposition=decomposition,
-                        selection=selection,
-                        worker_pool=worker_pool,
-                    )
-                )
-
-            selection_advantages = group_relative_advantages(
-                [selection.reward.total_reward for selection in selection_rollouts]
-            )
-            for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
-                selection_rollout.selector_advantage = advantage
-
-            base_decomposition_reward = sum(
-                selection.reward.total_reward for selection in selection_rollouts
-            ) / max(len(selection_rollouts), 1)
-            decomposition_reward = base_decomposition_reward - decomposition.soft_penalty
-            decomposition_rollouts.append(
-                DecompositionRollout(
-                    decomposition=decomposition,
-                    selections=selection_rollouts,
-                    base_decomposition_reward=base_decomposition_reward,
-                    decomposition_reward=decomposition_reward,
-                )
-            )
-
-        decomposition_advantages = group_relative_advantages(
-            [decomposition.decomposition_reward for decomposition in decomposition_rollouts]
-        )
-        for decomposition_rollout, advantage in zip(
-            decomposition_rollouts, decomposition_advantages
-        ):
-            decomposition_rollout.decomposer_advantage = advantage
-
-        self._update_worker_memory(task, decomposition_rollouts)
-
+    def _finalize_task_rollout(
+        self,
+        task: TaskExample,
+        worker_pool: WorkerPoolConfig,
+        policy_config: ControllerPolicyConfig,
+        rollout_config: RolloutConfig,
+        schedule: TrainingScheduleConfig,
+        decomposition_rollouts: List[DecompositionRollout],
+    ) -> TaskRollout:
         training_batch = self._build_training_batch(
             task=task,
             worker_pool=worker_pool,
@@ -122,7 +237,6 @@ class HierarchicalReMAOrchestrator:
             schedule=schedule,
             decompositions=decomposition_rollouts,
         )
-
         return TaskRollout(
             task=task,
             policy_config=policy_config,
@@ -131,6 +245,71 @@ class HierarchicalReMAOrchestrator:
             decompositions=decomposition_rollouts,
             training_batch=training_batch,
         )
+
+    def _execute_selections_batch(
+        self,
+        selection_states: Sequence[_SelectionExecutionState],
+        worker_pool: WorkerPoolConfig,
+    ) -> Dict[tuple[int, int, int], SelectionRollout]:
+        worker_map = worker_pool.workers_by_id()
+        node_maps = {
+            (state.task_index, state.decomposition_index): state.decomposition.nodes_by_id()
+            for state in selection_states
+        }
+        active_states = list(selection_states)
+        while True:
+            worker_requests: List[WorkerExecutionRequest] = []
+            request_states: List[_SelectionExecutionState] = []
+            for state in active_states:
+                if state.next_node_index >= len(state.topo_order):
+                    continue
+                node_id = state.topo_order[state.next_node_index]
+                node = node_maps[(state.task_index, state.decomposition_index)][node_id]
+                assignment = state.selection.assignment_for(node_id)
+                worker = worker_map[assignment.worker_id]
+                dependency_outputs = {
+                    dependency: state.outputs[dependency]
+                    for dependency in node.dependencies
+                }
+                worker_requests.append(
+                    WorkerExecutionRequest(
+                        task=state.task,
+                        decomposition=state.decomposition,
+                        node=node,
+                        worker=worker,
+                        dependency_outputs=dependency_outputs,
+                        compatibility=assignment.compatibility,
+                    )
+                )
+                request_states.append(state)
+
+            if not worker_requests:
+                break
+
+            worker_executions = self.backend.execute_workers_batch(worker_requests)
+            for state, execution in zip(request_states, worker_executions):
+                state.executions.append(execution)
+                state.outputs[execution.node_id] = execution.output_text
+                state.next_node_index += 1
+
+        selection_rollout_map: Dict[tuple[int, int, int], SelectionRollout] = {}
+        for state in active_states:
+            final_answer = state.outputs[state.decomposition.final_node_id]
+            reward = build_selection_reward(
+                final_answer=final_answer,
+                ground_truth=state.task.ground_truth,
+                executions=state.executions,
+                weights=self.reward_weights,
+            )
+            selection_rollout_map[
+                (state.task_index, state.decomposition_index, state.selection_index)
+            ] = SelectionRollout(
+                selection=state.selection,
+                executions=state.executions,
+                final_answer=final_answer,
+                reward=reward,
+            )
+        return selection_rollout_map
 
     def _execute_selection(
         self,
@@ -265,6 +444,7 @@ class HierarchicalGRPOTrainer:
     worker_memory: WorkerPerformanceMemory = field(default_factory=WorkerPerformanceMemory)
     backend_type: str = "mock"
     hf_backend_config: HFBackendConfig = field(default_factory=HFBackendConfig)
+    vllm_backend_config: VLLMBackendConfig = field(default_factory=VLLMBackendConfig)
     rollout_recorder: Optional[RolloutRecorder] = None
     rollout_logging_config: Optional[RolloutLoggingConfig] = None
     backend: Optional[HierarchicalBackend] = None
@@ -275,6 +455,8 @@ class HierarchicalGRPOTrainer:
                 self.backend = MockHierarchicalBackend(worker_memory=self.worker_memory)
             elif self.backend_type == "hf":
                 self.backend = TransformersHierarchicalBackend(config=self.hf_backend_config)
+            elif self.backend_type == "vllm":
+                self.backend = RayVLLMHierarchicalBackend(config=self.vllm_backend_config)
             else:
                 raise ValueError(f"Unknown backend_type: {self.backend_type}")
 
@@ -296,16 +478,37 @@ class HierarchicalGRPOTrainer:
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
     ) -> TaskRollout:
-        rollout = self.orchestrator.run_task(
-            task=task,
+        return self.run_many(
+            tasks=[task],
+            worker_pool=worker_pool,
+            policy_config=policy_config,
+            rollout_config=rollout_config,
+            schedule=schedule,
+        )[0]
+
+    def run_many(
+        self,
+        tasks: Sequence[TaskExample],
+        worker_pool: WorkerPoolConfig,
+        policy_config: ControllerPolicyConfig,
+        rollout_config: RolloutConfig,
+        schedule: TrainingScheduleConfig,
+    ) -> List[TaskRollout]:
+        rollouts = self.orchestrator.run_tasks(
+            tasks=tasks,
             worker_pool=worker_pool,
             policy_config=policy_config,
             rollout_config=rollout_config,
             schedule=schedule,
         )
         if self.rollout_recorder is not None:
-            self.rollout_recorder.record_task_rollout(rollout)
-        return rollout
+            for rollout in rollouts:
+                self.rollout_recorder.record_task_rollout(rollout)
+        return rollouts
+
+    def close(self) -> None:
+        if self.backend is not None:
+            self.backend.close()
 
     def next_alternating_schedule(self) -> TrainingScheduleConfig:
         schedule = TrainingScheduleConfig(

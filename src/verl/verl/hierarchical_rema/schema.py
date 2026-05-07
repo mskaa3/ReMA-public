@@ -70,9 +70,35 @@ class HFBackendConfig:
     do_sample: bool = True
     controller_max_new_tokens: int = 768
     worker_max_new_tokens: int = 256
+    controller_batch_size: int = 8
+    worker_batch_size: int = 16
     max_format_retries: int = 2
     device_map: str = "auto"
     torch_dtype: str = "auto"
+    trust_remote_code: bool = True
+
+
+@dataclass
+class VLLMBackendConfig:
+    temperature: float = 0.7
+    top_p: float = 0.95
+    do_sample: bool = True
+    prompt_length: int = 2048
+    controller_batch_size: int = 8
+    worker_batch_size: int = 16
+    nnodes: int = 1
+    n_gpus_per_node: int = 1
+    tensor_model_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.5
+    max_num_batched_tokens: int = 8192
+    max_num_seqs: int = 1024
+    max_model_len: Optional[int] = None
+    dtype: str = "bfloat16"
+    enforce_eager: bool = True
+    free_cache_engine: bool = True
+    enable_chunked_prefill: bool = True
+    load_format: str = "dummy_dtensor"
+    disable_log_stats: bool = True
     trust_remote_code: bool = True
 
 

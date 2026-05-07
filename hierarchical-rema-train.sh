@@ -11,7 +11,7 @@
 set -euo pipefail
 
 export RUN_KIND=${RUN_KIND:-train}
-export BACKEND=${BACKEND:-hf}
+export BACKEND=${BACKEND:-vllm}
 
 SOURCE_DIR=${SLURM_SUBMIT_DIR:-$(pwd)}
 exec bash "$SOURCE_DIR/hierarchical-rema-trainer.sh" "$@"

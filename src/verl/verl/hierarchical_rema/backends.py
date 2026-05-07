@@ -3,7 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Sequence, Tuple
 
 from .prompts import render_decomposer_prompt, render_selector_prompt, render_worker_prompt
 from .rewarding import compatibility_score, entropy_to_confidence_reward, skill_match_score
@@ -20,7 +21,9 @@ from .schema import (
     WorkerPerformanceSnapshot,
     WorkerPoolConfig,
     WorkerSpec,
+    VLLMBackendConfig,
 )
+from .ray_generation import RayVLLMGenerationManager
 from .structured import (
     StructuredOutputError,
     build_fallback_decomposition,
@@ -29,6 +32,36 @@ from .structured import (
     validate_decomposition_payload,
     validate_selection_payload,
 )
+
+
+@dataclass
+class DecompositionRequest:
+    task: TaskExample
+    worker_pool: WorkerPoolConfig
+    policy_config: ControllerPolicyConfig
+    rollout_config: RolloutConfig
+    decomposition_index: int
+    worker_performance: Dict[str, WorkerPerformanceSnapshot]
+
+
+@dataclass
+class SelectionRequest:
+    task: TaskExample
+    decomposition: DecompositionCandidate
+    worker_pool: WorkerPoolConfig
+    policy_config: ControllerPolicyConfig
+    selection_index: int
+    worker_performance: Dict[str, WorkerPerformanceSnapshot]
+
+
+@dataclass
+class WorkerExecutionRequest:
+    task: TaskExample
+    decomposition: DecompositionCandidate
+    node: SubtaskNode
+    worker: WorkerSpec
+    dependency_outputs: Dict[str, str]
+    compatibility: float
 
 
 class HierarchicalBackend(ABC):
@@ -67,6 +100,57 @@ class HierarchicalBackend(ABC):
         compatibility: float,
     ) -> WorkerExecution:
         raise NotImplementedError
+
+    def sample_decompositions_batch(
+        self,
+        requests: Sequence[DecompositionRequest],
+    ) -> List[DecompositionCandidate]:
+        return [
+            self.sample_decomposition(
+                task=request.task,
+                worker_pool=request.worker_pool,
+                policy_config=request.policy_config,
+                rollout_config=request.rollout_config,
+                decomposition_index=request.decomposition_index,
+                worker_performance=request.worker_performance,
+            )
+            for request in requests
+        ]
+
+    def sample_selections_batch(
+        self,
+        requests: Sequence[SelectionRequest],
+    ) -> List[SelectionCandidate]:
+        return [
+            self.sample_selection(
+                task=request.task,
+                decomposition=request.decomposition,
+                worker_pool=request.worker_pool,
+                policy_config=request.policy_config,
+                selection_index=request.selection_index,
+                worker_performance=request.worker_performance,
+            )
+            for request in requests
+        ]
+
+    def execute_workers_batch(
+        self,
+        requests: Sequence[WorkerExecutionRequest],
+    ) -> List[WorkerExecution]:
+        return [
+            self.execute_worker(
+                task=request.task,
+                decomposition=request.decomposition,
+                node=request.node,
+                worker=request.worker,
+                dependency_outputs=request.dependency_outputs,
+                compatibility=request.compatibility,
+            )
+            for request in requests
+        ]
+
+    def close(self) -> None:
+        return None
 
 
 class MockHierarchicalBackend(HierarchicalBackend):
@@ -294,6 +378,8 @@ class MockHierarchicalBackend(HierarchicalBackend):
 
 
 class TransformersHierarchicalBackend(HierarchicalBackend):
+    backend_name = "transformers"
+
     def __init__(self, config: HFBackendConfig | None = None) -> None:
         self.config = config or HFBackendConfig()
         self._bundle_cache: Dict[Tuple[str, str | None], Tuple[object, object]] = {}
@@ -381,17 +467,30 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             return f"System:\n{system_prompt}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
         return user_prompt
 
+    @staticmethod
+    def _chunk_range(total_size: int, chunk_size: int) -> Sequence[Tuple[int, int]]:
+        safe_chunk_size = max(int(chunk_size), 1)
+        return [
+            (start, min(start + safe_chunk_size, total_size))
+            for start in range(0, total_size, safe_chunk_size)
+        ]
+
     def _estimate_entropy(self, scores: List[object]) -> float:
+        entropies = self._estimate_batch_entropy(scores)
+        return entropies[0] if entropies else 0.0
+
+    def _estimate_batch_entropy(self, scores: List[object]) -> List[float]:
         if not scores:
-            return 0.0
+            return []
         import torch
 
         entropies = []
         for step_scores in scores:
             probs = torch.softmax(step_scores.float(), dim=-1)
-            entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1).mean()
-            entropies.append(entropy.item())
-        return float(sum(entropies) / len(entropies))
+            entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
+            entropies.append(entropy)
+        stacked = torch.stack(entropies, dim=0)
+        return stacked.mean(dim=0).detach().cpu().tolist()
 
     def _generate_text(
         self,
@@ -429,16 +528,66 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         entropy = self._estimate_entropy(list(outputs.scores))
         return generated_text, entropy
 
+    def _generate_text_batch(
+        self,
+        base_model_path: str,
+        prompt_texts: Sequence[str],
+        max_new_tokens: int,
+        batch_size: int,
+        lora_adapter_path: str | None = None,
+        system_prompt: str | None = None,
+    ) -> List[Tuple[str, float]]:
+        if not prompt_texts:
+            return []
+
+        tokenizer, model = self._load_bundle(base_model_path, lora_adapter_path=lora_adapter_path)
+
+        import torch
+
+        results: List[Tuple[str, float]] = []
+        for start, end in self._chunk_range(len(prompt_texts), batch_size):
+            prompt_chunk = [
+                self._build_prompt(tokenizer, prompt_text, system_prompt=system_prompt)
+                for prompt_text in prompt_texts[start:end]
+            ]
+            inputs = tokenizer(prompt_chunk, return_tensors="pt", padding=True)
+            model_device = self._safe_model_device(model)
+            inputs = {key: value.to(model_device) for key, value in inputs.items()}
+            input_lengths = inputs["attention_mask"].sum(dim=1)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=self.config.do_sample,
+                    temperature=self.config.temperature,
+                    top_p=self.config.top_p,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+
+            entropies = self._estimate_batch_entropy(list(outputs.scores))
+            for row_idx in range(outputs.sequences.shape[0]):
+                generated_ids = outputs.sequences[row_idx, int(input_lengths[row_idx].item()):]
+                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                entropy = entropies[row_idx] if row_idx < len(entropies) else 0.0
+                results.append((generated_text, float(entropy)))
+
+        return results
+
     def _generate_validated_decomposition(
         self,
         prompt_text: str,
         task: TaskExample,
         policy_config: ControllerPolicyConfig,
         rollout_config: RolloutConfig,
+        fallback_id: str,
     ) -> DecompositionCandidate:
         model_path = policy_config.model_for_role("decomposer")
         if not model_path:
-            raise ValueError("No decomposer model path configured for TransformersHierarchicalBackend")
+            raise ValueError(f"No decomposer model path configured for {type(self).__name__}")
 
         repair_prompt = prompt_text
         errors: List[str] = []
@@ -454,11 +603,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 candidate = validate_decomposition_payload(
                     payload=payload,
                     rollout_config=rollout_config,
-                    fallback_id=f"{task.task_id}-decomp",
+                    fallback_id=fallback_id,
                 )
                 payload["controller_prompt"] = prompt_text
                 payload["validation"] = {
-                    "backend": "transformers",
+                    "backend": self.backend_name,
                     "attempt": attempt,
                     "errors_before_success": list(errors),
                     "fallback_used": False,
@@ -484,7 +633,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         candidate.raw_payload.setdefault("validation", {})
         candidate.raw_payload["validation"].update(
             {
-                "backend": "transformers",
+                "backend": self.backend_name,
                 "errors": list(errors),
             }
         )
@@ -498,10 +647,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         decomposition: DecompositionCandidate,
         worker_pool: WorkerPoolConfig,
         policy_config: ControllerPolicyConfig,
+        fallback_id: str,
     ) -> SelectionCandidate:
+        del task
         model_path = policy_config.model_for_role("selector")
         if not model_path:
-            raise ValueError("No selector model path configured for TransformersHierarchicalBackend")
+            raise ValueError(f"No selector model path configured for {type(self).__name__}")
 
         repair_prompt = prompt_text
         errors: List[str] = []
@@ -514,6 +665,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             )
             try:
                 payload = extract_json_dict(last_raw_text)
+                payload.setdefault("selection_id", fallback_id)
                 candidate = validate_selection_payload(
                     payload=payload,
                     decomposition=decomposition,
@@ -521,7 +673,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 )
                 payload["controller_prompt"] = prompt_text
                 payload["validation"] = {
-                    "backend": "transformers",
+                    "backend": self.backend_name,
                     "attempt": attempt,
                     "errors_before_success": list(errors),
                     "fallback_used": False,
@@ -547,7 +699,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         candidate.raw_payload.setdefault("validation", {})
         candidate.raw_payload["validation"].update(
             {
-                "backend": "transformers",
+                "backend": self.backend_name,
                 "errors": list(errors),
             }
         )
@@ -563,13 +715,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         decomposition_index: int,
         worker_performance: Dict[str, WorkerPerformanceSnapshot],
     ) -> DecompositionCandidate:
-        del decomposition_index
         prompt_text = render_decomposer_prompt(task, worker_pool, worker_performance)
         return self._generate_validated_decomposition(
             prompt_text=prompt_text,
             task=task,
             policy_config=policy_config,
             rollout_config=rollout_config,
+            fallback_id=f"{task.task_id}-decomp-{decomposition_index}",
         )
 
     def sample_selection(
@@ -581,7 +733,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         selection_index: int,
         worker_performance: Dict[str, WorkerPerformanceSnapshot],
     ) -> SelectionCandidate:
-        del selection_index
         prompt_text = render_selector_prompt(task, decomposition, worker_pool, worker_performance)
         return self._generate_validated_selection(
             prompt_text=prompt_text,
@@ -589,6 +740,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             decomposition=decomposition,
             worker_pool=worker_pool,
             policy_config=policy_config,
+            fallback_id=f"{decomposition.decomposition_id}-sel-{selection_index}",
         )
 
     def execute_worker(
@@ -627,3 +779,253 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             completed=completed,
             success=success,
         )
+
+    def sample_decompositions_batch(
+        self,
+        requests: Sequence[DecompositionRequest],
+    ) -> List[DecompositionCandidate]:
+        if not requests:
+            return []
+
+        grouped: Dict[str, List[Tuple[int, DecompositionRequest, str]]] = {}
+        for index, request in enumerate(requests):
+            model_path = request.policy_config.model_for_role("decomposer")
+            if not model_path:
+                raise ValueError(f"No decomposer model path configured for {type(self).__name__}")
+            prompt_text = render_decomposer_prompt(
+                request.task,
+                request.worker_pool,
+                request.worker_performance,
+            )
+            grouped.setdefault(model_path, []).append((index, request, prompt_text))
+
+        results: List[DecompositionCandidate | None] = [None] * len(requests)
+        for model_path, grouped_requests in grouped.items():
+            prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
+            generated = self._generate_text_batch(
+                base_model_path=model_path,
+                prompt_texts=prompt_texts,
+                max_new_tokens=self.config.controller_max_new_tokens,
+                batch_size=self.config.controller_batch_size,
+            )
+            for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
+                fallback_id = f"{request.task.task_id}-decomp-{request.decomposition_index}"
+                try:
+                    payload = extract_json_dict(raw_text)
+                    candidate = validate_decomposition_payload(
+                        payload=payload,
+                        rollout_config=request.rollout_config,
+                        fallback_id=fallback_id,
+                    )
+                    payload["controller_prompt"] = prompt_text
+                    payload["validation"] = {
+                        "backend": self.backend_name,
+                        "attempt": 0,
+                        "errors_before_success": [],
+                        "fallback_used": False,
+                        "raw_model_text": raw_text,
+                        "batch_generated": True,
+                        "entropy": entropy,
+                    }
+                    candidate.raw_payload = payload
+                    candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
+                except Exception:
+                    candidate = self._generate_validated_decomposition(
+                        prompt_text=prompt_text,
+                        task=request.task,
+                        policy_config=request.policy_config,
+                        rollout_config=request.rollout_config,
+                        fallback_id=fallback_id,
+                    )
+                    candidate.raw_payload.setdefault("validation", {})
+                    candidate.raw_payload["validation"].update(
+                        {
+                            "batch_generated": True,
+                            "batch_repair_fallback": True,
+                        }
+                    )
+                    candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
+                results[result_index] = candidate
+
+        if any(candidate is None for candidate in results):
+            raise RuntimeError("Batched decomposition generation did not produce a result for every request")
+        return [candidate for candidate in results if candidate is not None]
+
+    def sample_selections_batch(
+        self,
+        requests: Sequence[SelectionRequest],
+    ) -> List[SelectionCandidate]:
+        if not requests:
+            return []
+
+        grouped: Dict[str, List[Tuple[int, SelectionRequest, str]]] = {}
+        for index, request in enumerate(requests):
+            model_path = request.policy_config.model_for_role("selector")
+            if not model_path:
+                raise ValueError(f"No selector model path configured for {type(self).__name__}")
+            prompt_text = render_selector_prompt(
+                request.task,
+                request.decomposition,
+                request.worker_pool,
+                request.worker_performance,
+            )
+            grouped.setdefault(model_path, []).append((index, request, prompt_text))
+
+        results: List[SelectionCandidate | None] = [None] * len(requests)
+        for model_path, grouped_requests in grouped.items():
+            prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
+            generated = self._generate_text_batch(
+                base_model_path=model_path,
+                prompt_texts=prompt_texts,
+                max_new_tokens=self.config.controller_max_new_tokens,
+                batch_size=self.config.controller_batch_size,
+            )
+            for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
+                fallback_id = f"{request.decomposition.decomposition_id}-sel-{request.selection_index}"
+                try:
+                    payload = extract_json_dict(raw_text)
+                    payload.setdefault("selection_id", fallback_id)
+                    candidate = validate_selection_payload(
+                        payload=payload,
+                        decomposition=request.decomposition,
+                        worker_pool=request.worker_pool,
+                    )
+                    payload["controller_prompt"] = prompt_text
+                    payload["validation"] = {
+                        "backend": self.backend_name,
+                        "attempt": 0,
+                        "errors_before_success": [],
+                        "fallback_used": False,
+                        "raw_model_text": raw_text,
+                        "batch_generated": True,
+                        "entropy": entropy,
+                    }
+                    candidate.raw_payload = payload
+                    candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
+                except Exception:
+                    candidate = self._generate_validated_selection(
+                        prompt_text=prompt_text,
+                        task=request.task,
+                        decomposition=request.decomposition,
+                        worker_pool=request.worker_pool,
+                        policy_config=request.policy_config,
+                        fallback_id=fallback_id,
+                    )
+                    candidate.raw_payload.setdefault("validation", {})
+                    candidate.raw_payload["validation"].update(
+                        {
+                            "batch_generated": True,
+                            "batch_repair_fallback": True,
+                        }
+                    )
+                    candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
+                results[result_index] = candidate
+
+        if any(candidate is None for candidate in results):
+            raise RuntimeError("Batched selection generation did not produce a result for every request")
+        return [candidate for candidate in results if candidate is not None]
+
+    def execute_workers_batch(
+        self,
+        requests: Sequence[WorkerExecutionRequest],
+    ) -> List[WorkerExecution]:
+        if not requests:
+            return []
+
+        grouped: Dict[Tuple[str, str | None, str], List[Tuple[int, WorkerExecutionRequest, str]]] = {}
+        for index, request in enumerate(requests):
+            base_model_path = request.worker.base_model_path
+            if not base_model_path:
+                raise ValueError(f"Worker {request.worker.worker_id} is missing base_model_path")
+            prompt_text = render_worker_prompt(
+                request.task,
+                request.node,
+                request.worker,
+                request.dependency_outputs,
+            )
+            cache_key = (
+                base_model_path,
+                request.worker.lora_adapter_path,
+                request.worker.system_prompt,
+            )
+            grouped.setdefault(cache_key, []).append((index, request, prompt_text))
+
+        results: List[WorkerExecution | None] = [None] * len(requests)
+        for (base_model_path, lora_adapter_path, system_prompt), grouped_requests in grouped.items():
+            prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
+            generated = self._generate_text_batch(
+                base_model_path=base_model_path,
+                prompt_texts=prompt_texts,
+                max_new_tokens=self.config.worker_max_new_tokens,
+                batch_size=self.config.worker_batch_size,
+                lora_adapter_path=lora_adapter_path,
+                system_prompt=system_prompt,
+            )
+            for (result_index, request, _), (output_text, entropy) in zip(grouped_requests, generated):
+                normalized_output = output_text.strip()
+                completed = bool(normalized_output)
+                success = completed and "i don't know" not in normalized_output.lower()
+                results[result_index] = WorkerExecution(
+                    node_id=request.node.node_id,
+                    worker_id=request.worker.worker_id,
+                    output_text=normalized_output,
+                    entropy=float(entropy),
+                    confidence_reward=entropy_to_confidence_reward(entropy, entropy_cap=2.0),
+                    compatibility=request.compatibility,
+                    dependency_outputs=dict(request.dependency_outputs),
+                    completed=completed,
+                    success=success,
+                )
+
+        if any(execution is None for execution in results):
+            raise RuntimeError("Batched worker execution did not produce a result for every request")
+        return [execution for execution in results if execution is not None]
+
+
+class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
+    backend_name = "ray_vllm"
+
+    def __init__(self, config: VLLMBackendConfig | None = None) -> None:
+        self.config = config or VLLMBackendConfig()
+        self._manager = RayVLLMGenerationManager(self.config)
+
+    def _generate_text(
+        self,
+        base_model_path: str,
+        prompt_text: str,
+        max_new_tokens: int,
+        lora_adapter_path: str | None = None,
+        system_prompt: str | None = None,
+    ) -> Tuple[str, float]:
+        if lora_adapter_path is not None:
+            raise NotImplementedError("Worker LoRA adapters are not implemented for the Ray/vLLM backend yet")
+        result = self._manager.generate_one(
+            model_path=base_model_path,
+            prompt_text=prompt_text,
+            max_new_tokens=max_new_tokens,
+            system_prompt=system_prompt,
+        )
+        return result.text, result.entropy
+
+    def _generate_text_batch(
+        self,
+        base_model_path: str,
+        prompt_texts: Sequence[str],
+        max_new_tokens: int,
+        batch_size: int,
+        lora_adapter_path: str | None = None,
+        system_prompt: str | None = None,
+    ) -> List[Tuple[str, float]]:
+        if lora_adapter_path is not None:
+            raise NotImplementedError("Worker LoRA adapters are not implemented for the Ray/vLLM backend yet")
+        generated = self._manager.generate_batch(
+            model_path=base_model_path,
+            prompt_texts=prompt_texts,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            system_prompt=system_prompt,
+        )
+        return [(item.text, item.entropy) for item in generated]
+
+    def close(self) -> None:
+        self._manager.close()

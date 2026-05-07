@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -27,6 +28,7 @@ from .schema import (
     TaskRollout,
     TrainingMode,
     TrainingScheduleConfig,
+    VLLMBackendConfig,
 )
 
 
@@ -41,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks-per-epoch", type=int, default=0, help="How many tasks to rollout per epoch; 0 means all loaded tasks")
     parser.add_argument("--shuffle-tasks", action="store_true")
 
-    parser.add_argument("--backend", choices=["mock", "hf"], default="mock")
+    parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--mode", choices=["joint", "alternating"], default="joint")
     parser.add_argument("--phase", choices=["selector", "decomposer"], default="selector", help="Starting phase when mode=alternating")
     parser.add_argument("--num-epochs", type=int, default=1)
@@ -60,8 +62,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
+    parser.add_argument("--controller-batch-size", type=int, default=8)
+    parser.add_argument("--worker-batch-size", type=int, default=16)
+    parser.add_argument("--rollout-prompt-length", type=int, default=2048)
+    parser.add_argument("--ray-nnodes", type=int, default=1)
+    parser.add_argument("--ray-n-gpus-per-node", type=int, default=1)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=1024)
+    parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--disable-rollout-logging", action="store_true")
     parser.add_argument("--best-k", type=int, default=10)
+    parser.add_argument(
+        "--rollout-task-batch-size",
+        type=int,
+        default=32,
+        help="How many tasks to rollout together in one batched hierarchical pass; 0 means all epoch tasks",
+    )
+    parser.add_argument(
+        "--rollout-progress-every",
+        type=int,
+        default=10,
+        help="Print rollout progress every N tasks during integrated training; 0 disables progress logs",
+    )
 
     parser.add_argument("--policy-id", action="append", default=None, help="Only train these policy ids after rollout generation")
     parser.add_argument("--role", choices=["decomposer", "selector", "both"], default="both", help="Only train these controller roles after rollout generation")
@@ -317,6 +341,19 @@ def select_epoch_tasks(
     return selected
 
 
+def chunk_tasks(
+    tasks: Sequence[TaskExample],
+    batch_size: int,
+) -> List[List[TaskExample]]:
+    task_list = list(tasks)
+    if batch_size <= 0 or batch_size >= len(task_list):
+        return [task_list]
+    return [
+        task_list[start:start + batch_size]
+        for start in range(0, len(task_list), batch_size)
+    ]
+
+
 def build_schedule(mode: str, phase: AlternatingPhase) -> TrainingScheduleConfig:
     return TrainingScheduleConfig(
         mode=TrainingMode(mode),
@@ -326,6 +363,32 @@ def build_schedule(mode: str, phase: AlternatingPhase) -> TrainingScheduleConfig
 
 def next_phase(phase: AlternatingPhase) -> AlternatingPhase:
     return AlternatingPhase.DECOMPOSER if phase == AlternatingPhase.SELECTOR else AlternatingPhase.SELECTOR
+
+
+def rollout_workload_estimate(
+    num_tasks: int,
+    rollout_config: RolloutConfig,
+    schedule: TrainingScheduleConfig,
+) -> Dict[str, int]:
+    num_decompositions = rollout_config.num_decompositions
+    num_selections = rollout_config.num_selections_per_decomposition
+    if schedule.mode == TrainingMode.ALTERNATING:
+        if schedule.alternating_phase == AlternatingPhase.SELECTOR:
+            num_decompositions = 1
+        else:
+            num_selections = 1
+
+    max_nodes = max(int(rollout_config.max_nodes_per_decomposition), 1)
+    controller_generations_per_task = num_decompositions + (num_decompositions * num_selections)
+    worker_generations_per_task_upper_bound = num_decompositions * num_selections * max_nodes
+    return {
+        "num_decompositions": num_decompositions,
+        "num_selections": num_selections,
+        "controller_generations_per_task": controller_generations_per_task,
+        "worker_generations_per_task_upper_bound": worker_generations_per_task_upper_bound,
+        "controller_generations_total": controller_generations_per_task * num_tasks,
+        "worker_generations_total_upper_bound": worker_generations_per_task_upper_bound * num_tasks,
+    }
 
 
 def epoch_rollout_summary(rollouts: Sequence[TaskRollout]) -> Dict[str, Any]:
@@ -457,6 +520,21 @@ def main() -> None:
             f"[hierarchical-rema][integrated] epoch={epoch_number}/{args.num_epochs} "
             f"phase={schedule.alternating_phase.value} tasks={len(epoch_tasks)}"
         )
+        workload = rollout_workload_estimate(
+            num_tasks=len(epoch_tasks),
+            rollout_config=rollout_config,
+            schedule=schedule,
+        )
+        print(
+            f"[hierarchical-rema][integrated] rollout_budget "
+            f"controller_total={workload['controller_generations_total']} "
+            f"worker_total_upper_bound={workload['worker_generations_total_upper_bound']} "
+            f"controller_per_task={workload['controller_generations_per_task']} "
+            f"worker_per_task_upper_bound={workload['worker_generations_per_task_upper_bound']} "
+            f"task_batch_size={args.rollout_task_batch_size} "
+            f"controller_batch_size={args.controller_batch_size} "
+            f"worker_batch_size={args.worker_batch_size}"
+        )
         rollout_trainer = HierarchicalGRPOTrainer(
             backend_type=args.backend,
             hf_backend_config=HFBackendConfig(
@@ -464,21 +542,86 @@ def main() -> None:
                 top_p=args.top_p,
                 controller_max_new_tokens=args.controller_max_new_tokens,
                 worker_max_new_tokens=args.worker_max_new_tokens,
+                controller_batch_size=args.controller_batch_size,
+                worker_batch_size=args.worker_batch_size,
                 trust_remote_code=args.trust_remote_code,
                 torch_dtype=args.torch_dtype,
             ),
+            vllm_backend_config=VLLMBackendConfig(
+                temperature=args.temperature,
+                top_p=args.top_p,
+                do_sample=args.temperature > 0.0,
+                prompt_length=args.rollout_prompt_length,
+                controller_batch_size=args.controller_batch_size,
+                worker_batch_size=args.worker_batch_size,
+                nnodes=args.ray_nnodes,
+                n_gpus_per_node=args.ray_n_gpus_per_node,
+                tensor_model_parallel_size=args.vllm_tensor_parallel_size,
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+                max_num_seqs=args.vllm_max_num_seqs,
+                max_model_len=args.vllm_max_model_len,
+                dtype=args.torch_dtype,
+                trust_remote_code=args.trust_remote_code,
+            ),
             rollout_logging_config=logging_config,
         )
-        rollouts = [
-            rollout_trainer.run(
-                task=task,
+        rollouts: List[TaskRollout] = []
+        rollout_start_time = time.time()
+        running_best_selection_reward = 0.0
+        running_best_decomposition_reward = 0.0
+        running_best_correctness = 0.0
+        tasks_completed = 0
+        task_batches = chunk_tasks(epoch_tasks, args.rollout_task_batch_size)
+        for batch_index, task_batch in enumerate(task_batches, start=1):
+            batch_rollouts = rollout_trainer.run_many(
+                tasks=task_batch,
                 worker_pool=worker_pool,
                 policy_config=policy_config,
                 rollout_config=rollout_config,
                 schedule=schedule,
             )
-            for task in epoch_tasks
-        ]
+            rollouts.extend(batch_rollouts)
+
+            for rollout in batch_rollouts:
+                best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
+                selection_rewards = [
+                    selection.reward.total_reward
+                    for decomposition in rollout.decompositions
+                    for selection in decomposition.selections
+                ]
+                selection_correctness = [
+                    selection.reward.final_answer_correctness
+                    for decomposition in rollout.decompositions
+                    for selection in decomposition.selections
+                ]
+                running_best_selection_reward += max(selection_rewards)
+                running_best_decomposition_reward += best_decomposition.decomposition_reward
+                running_best_correctness += max(selection_correctness) if selection_correctness else 0.0
+
+            tasks_completed += len(batch_rollouts)
+            should_log_progress = (
+                args.rollout_progress_every > 0
+                and (
+                    tasks_completed == len(epoch_tasks)
+                    or tasks_completed == len(batch_rollouts)
+                    or tasks_completed % args.rollout_progress_every == 0
+                )
+            )
+            if should_log_progress:
+                elapsed = time.time() - rollout_start_time
+                avg_seconds_per_task = elapsed / max(tasks_completed, 1)
+                remaining_tasks = len(epoch_tasks) - tasks_completed
+                eta_seconds = avg_seconds_per_task * remaining_tasks
+                print(
+                    f"[hierarchical-rema][integrated] rollout_progress "
+                    f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
+                    f"task={tasks_completed}/{len(epoch_tasks)} "
+                    f"elapsed_s={elapsed:.1f} eta_s={eta_seconds:.1f} "
+                    f"avg_best_selection_reward={running_best_selection_reward / tasks_completed:.4f} "
+                    f"avg_best_decomposition_reward={running_best_decomposition_reward / tasks_completed:.4f} "
+                    f"avg_best_final_correctness={running_best_correctness / tasks_completed:.4f}"
+                )
         rollout_summary = epoch_rollout_summary(rollouts)
         print(
             f"[hierarchical-rema][integrated] epoch={epoch_number} "
@@ -500,6 +643,7 @@ def main() -> None:
         with (epoch_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(rollout_summary, handle, indent=2, sort_keys=True)
 
+        rollout_trainer.close()
         del rollout_trainer
         _release_memory()
 

@@ -14,6 +14,7 @@ from .schema import (
     TaskExample,
     TrainingMode,
     TrainingScheduleConfig,
+    VLLMBackendConfig,
     WorkerPoolConfig,
     WorkerSpec,
 )
@@ -67,7 +68,7 @@ def make_worker_pool(base_model_path: str | None) -> WorkerPoolConfig:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hierarchical ReMA MVP demo")
-    parser.add_argument("--backend", choices=["mock", "hf"], default="mock")
+    parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--task", choices=["all", "algebra", "analysis"], default="all")
     parser.add_argument("--mode", choices=["joint", "alternating"], default="joint")
     parser.add_argument("--phase", choices=["selector", "decomposer"], default="selector")
@@ -85,6 +86,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
+    parser.add_argument("--rollout-prompt-length", type=int, default=2048)
+    parser.add_argument("--ray-nnodes", type=int, default=1)
+    parser.add_argument("--ray-n-gpus-per-node", type=int, default=1)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=1024)
+    parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--output-dir", default="outputs/hierarchical_rema")
     parser.add_argument("--best-k", type=int, default=10)
     parser.add_argument("--print-mode", choices=["summary", "full", "none"], default="summary")
@@ -154,33 +163,50 @@ def main() -> None:
             controller_max_new_tokens=args.controller_max_new_tokens,
             worker_max_new_tokens=args.worker_max_new_tokens,
         ),
+        vllm_backend_config=VLLMBackendConfig(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            do_sample=args.temperature > 0.0,
+            prompt_length=args.rollout_prompt_length,
+            nnodes=args.ray_nnodes,
+            n_gpus_per_node=args.ray_n_gpus_per_node,
+            tensor_model_parallel_size=args.vllm_tensor_parallel_size,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+            max_num_seqs=args.vllm_max_num_seqs,
+            max_model_len=args.vllm_max_model_len,
+            trust_remote_code=True,
+        ),
         rollout_logging_config=logging_config,
     )
-    rollouts = [
-        trainer.run(
-            task=task,
-            worker_pool=worker_pool,
-            policy_config=policy_config,
-            rollout_config=rollout_config,
-            schedule=schedule,
-        )
-        for task in tasks
-    ]
-    if args.print_mode == "none":
-        return
+    try:
+        rollouts = [
+            trainer.run(
+                task=task,
+                worker_pool=worker_pool,
+                policy_config=policy_config,
+                rollout_config=rollout_config,
+                schedule=schedule,
+            )
+            for task in tasks
+        ]
+        if args.print_mode == "none":
+            return
 
-    if args.print_mode == "full":
-        print(json.dumps([rollout.to_dict() for rollout in rollouts], indent=2, sort_keys=True))
-        return
+        if args.print_mode == "full":
+            print(json.dumps([rollout.to_dict() for rollout in rollouts], indent=2, sort_keys=True))
+            return
 
-    summary = {
-        "backend": args.backend,
-        "mode": args.mode,
-        "phase": args.phase,
-        "num_tasks": len(rollouts),
-        "tasks": [_rollout_summary(rollout) for rollout in rollouts],
-    }
-    print(json.dumps(summary, indent=2, sort_keys=True))
+        summary = {
+            "backend": args.backend,
+            "mode": args.mode,
+            "phase": args.phase,
+            "num_tasks": len(rollouts),
+            "tasks": [_rollout_summary(rollout) for rollout in rollouts],
+        }
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    finally:
+        trainer.close()
 
 
 if __name__ == "__main__":

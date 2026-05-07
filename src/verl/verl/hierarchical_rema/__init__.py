@@ -1,4 +1,9 @@
-from .backends import HierarchicalBackend, MockHierarchicalBackend, TransformersHierarchicalBackend
+from .backends import (
+    HierarchicalBackend,
+    MockHierarchicalBackend,
+    RayVLLMHierarchicalBackend,
+    TransformersHierarchicalBackend,
+)
 from .orchestrator import HierarchicalGRPOTrainer, HierarchicalReMAOrchestrator
 from .recording import RolloutRecorder
 from .rewarding import RewardWeights, WorkerPerformanceMemory
@@ -20,6 +25,7 @@ from .schema import (
     TaskRollout,
     TrainingMode,
     TrainingScheduleConfig,
+    VLLMBackendConfig,
     WorkerAssignment,
     WorkerExecution,
     WorkerPerformanceSnapshot,
@@ -40,6 +46,7 @@ __all__ = [
     "HierarchicalReMAOrchestrator",
     "HierarchicalTrainingBatch",
     "MockHierarchicalBackend",
+    "RayVLLMHierarchicalBackend",
     "RewardWeights",
     "RolloutRecorder",
     "RolloutLoggingConfig",
@@ -53,6 +60,7 @@ __all__ = [
     "TrainingMode",
     "TrainingScheduleConfig",
     "TransformersHierarchicalBackend",
+    "VLLMBackendConfig",
     "WorkerAssignment",
     "WorkerExecution",
     "WorkerPerformanceMemory",

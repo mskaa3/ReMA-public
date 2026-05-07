@@ -27,6 +27,7 @@ Backend modes:
 
 - `MockHierarchicalBackend`: deterministic path for tests and workflow debugging.
 - `TransformersHierarchicalBackend`: real controller and worker model calls through HuggingFace `transformers`, with structured-output retries and fallback JSON-safe rollouts.
+- `RayVLLMHierarchicalBackend`: repo-native rollout generation through `RayWorkerGroup` + vLLM, while keeping the same hierarchical decomposition/selection/DAG control flow.
 
 Current scope:
 
@@ -57,10 +58,12 @@ Run with real models:
 
 ```bash
 PYTHONPATH=src/verl/verl python -m hierarchical_rema.demo \
-  --backend hf \
+  --backend vllm \
   --decomposer-model-path /path/to/controller-model \
   --selector-model-path /path/to/controller-model \
-  --worker-base-model-path /path/to/worker-model
+  --worker-base-model-path /path/to/worker-model \
+  --ray-n-gpus-per-node 4 \
+  --rollout-prompt-length 2048
 ```
 
 The demo now defaults to a compact rollout summary in stdout and can write JSONL rollout logs under `outputs/hierarchical_rema`.
@@ -70,7 +73,7 @@ Run integrated controller training:
 ```bash
 PYTHONPATH=src/verl/verl python -m hierarchical_rema.train \
   --task-source data/overall_math/all_test_data.jsonl \
-  --backend mock \
+  --backend vllm \
   --mode joint \
   --num-epochs 2 \
   --model-path /path/to/controller-model \
@@ -88,11 +91,19 @@ This path does the full outer loop inside one job:
 
 Useful flags:
 
+- `--rollout-task-batch-size`: how many tasks are rolled out together in one batched hierarchical pass
+- `--controller-batch-size`: batched decomposer/selector generation size for HF or vLLM rollouts
+- `--worker-batch-size`: batched worker generation size for HF or vLLM rollouts
+- `--rollout-prompt-length`: prompt truncation length for the Ray/vLLM rollout engine
+- `--ray-n-gpus-per-node`: how many GPUs the Ray rollout worker group should use per node
+- `--vllm-tensor-parallel-size`: tensor parallelism for vLLM rollout workers
 - `--tasks-per-epoch`: limit how many tasks are rolled out in one outer epoch
 - `--epochs`: number of GRPO update epochs per outer epoch
 - `--save-replay-copy`: save train/val/all controller samples per policy for inspection
 - `--enable-wandb`: enable W&B logging
 - `--disable-rollout-logging`: skip JSONL rollout logging if you only want training artifacts
+
+The integrated trainer now supports batched hierarchical rollout collection with either HF generation or repo-native Ray/vLLM generation. The hierarchical controller logic stays in this separate folder, while the rollout engine underneath can now use the same `RayWorkerGroup` stack as the rest of the repo.
 
 If you still want the old replay-buffer workflow, it is available separately:
 

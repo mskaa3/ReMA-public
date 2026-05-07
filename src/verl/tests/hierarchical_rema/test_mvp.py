@@ -87,6 +87,27 @@ def test_joint_rollout_builds_selector_and_decomposer_groups() -> None:
     assert rollout.training_batch.frozen_roles == []
 
 
+def test_run_many_builds_rollouts_for_multiple_tasks() -> None:
+    trainer = HierarchicalGRPOTrainer()
+    tasks = [
+        make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5"),
+        make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)"),
+    ]
+    rollouts = trainer.run_many(
+        tasks=tasks,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(num_decompositions=2, num_selections_per_decomposition=2),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+    )
+
+    assert len(rollouts) == 2
+    assert [rollout.task.task_id for rollout in rollouts] == [task.task_id for task in tasks]
+    assert all(len(rollout.decompositions) == 2 for rollout in rollouts)
+    assert all(len(rollout.training_batch.decomposer_samples) == 2 for rollout in rollouts)
+    assert all(len(rollout.training_batch.selector_samples) == 4 for rollout in rollouts)
+
+
 def test_dag_execution_uses_selected_worker_and_tracks_final_answer() -> None:
     trainer = HierarchicalGRPOTrainer()
     task = make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)")
