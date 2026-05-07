@@ -112,6 +112,7 @@ class RolloutLoggingConfig:
     save_all_rollouts: bool = True
     save_best_rollouts: bool = True
     best_k: int = 10
+    compact_mode: bool = False
 
 
 @dataclass

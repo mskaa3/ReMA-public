@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
@@ -73,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-max-num-seqs", type=int, default=1024)
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--disable-rollout-logging", action="store_true")
+    parser.add_argument("--rollout-log-mode", choices=["best", "all"], default="best")
+    parser.add_argument("--rollout-log-detail", choices=["compact", "full"], default="compact")
     parser.add_argument("--best-k", type=int, default=10)
     parser.add_argument(
         "--rollout-task-batch-size",
@@ -110,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--eval-every-steps", type=int, default=0)
+    parser.add_argument("--checkpoint-mode", choices=["final", "all"], default="final")
+    parser.add_argument("--prune-stale-policy-models", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--gradient-checkpointing", action="store_true")
@@ -136,6 +141,16 @@ def _release_memory() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def _prune_policy_artifacts(policy_root: Path) -> None:
+    for subdir_name in ("final", "best"):
+        subdir = policy_root / subdir_name
+        if subdir.exists():
+            shutil.rmtree(subdir, ignore_errors=True)
+    for checkpoint_dir in policy_root.glob("checkpoint-*"):
+        if checkpoint_dir.is_dir():
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
 
 def _tracking(args: argparse.Namespace, config_payload: Dict[str, Any]):
@@ -549,7 +564,10 @@ def main() -> None:
         if not args.disable_rollout_logging:
             logging_config = RolloutLoggingConfig(
                 output_dir=str(rollout_dir),
+                save_all_rollouts=args.rollout_log_mode == "all",
+                save_best_rollouts=True,
                 best_k=args.best_k,
+                compact_mode=args.rollout_log_detail == "compact",
             )
 
         print(
@@ -783,7 +801,11 @@ def main() -> None:
                 project_name=args.project_name,
                 experiment_name=experiment_name,
                 enable_wandb=False,
+                save_final_checkpoint=True,
+                save_best_checkpoint=args.checkpoint_mode == "all" and args.eval_every_steps > 0,
+                save_intermediate_checkpoints=args.checkpoint_mode == "all",
             )
+            previous_model_path = current_paths.get(policy_id)
             summary = run_offline_policy_training(
                 train_samples=split["train"],
                 val_samples=split["val"],
@@ -795,6 +817,10 @@ def main() -> None:
             tracking_step_offset += max(int(summary["steps"]), 1)
             final_model_path = str(policy_dir / "final")
             _update_current_paths(current_paths, policy_id, final_model_path)
+            if args.prune_stale_policy_models and previous_model_path and previous_model_path != final_model_path:
+                previous_policy_root = Path(previous_model_path).expanduser().resolve().parent
+                if previous_policy_root != policy_dir.resolve():
+                    _prune_policy_artifacts(previous_policy_root)
             summary["policy_id"] = policy_id
             summary["model_path"] = model_path
             summary["final_model_path"] = final_model_path

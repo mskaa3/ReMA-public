@@ -95,6 +95,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-max-num-seqs", type=int, default=1024)
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--output-dir", default="outputs/hierarchical_rema")
+    parser.add_argument("--rollout-log-mode", choices=["best", "all"], default="all")
+    parser.add_argument("--rollout-log-detail", choices=["compact", "full"], default="full")
     parser.add_argument("--best-k", type=int, default=10)
     parser.add_argument("--print-mode", choices=["summary", "full", "none"], default="summary")
     parser.add_argument("--disable-rollout-logging", action="store_true")
@@ -152,7 +154,10 @@ def main() -> None:
     if not args.disable_rollout_logging:
         logging_config = RolloutLoggingConfig(
             output_dir=args.output_dir,
+            save_all_rollouts=args.rollout_log_mode == "all",
+            save_best_rollouts=True,
             best_k=args.best_k,
+            compact_mode=args.rollout_log_detail == "compact",
         )
 
     trainer = HierarchicalGRPOTrainer(

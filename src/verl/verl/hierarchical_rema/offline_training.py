@@ -37,6 +37,9 @@ class OfflineTrainingConfig:
     project_name: str = "hierarchical-rema"
     experiment_name: str = "hierarchical-rema-train"
     enable_wandb: bool = False
+    save_final_checkpoint: bool = True
+    save_best_checkpoint: bool = False
+    save_intermediate_checkpoints: bool = False
 
 def _ensure_repo_root_on_path() -> None:
     import sys
@@ -628,7 +631,10 @@ def run_offline_policy_training(
                         dataloader=val_loader,
                         device=device,
                     )
-                    if best_val_loss is None or val_metrics["val_loss"] < best_val_loss:
+                    if (
+                        config.save_best_checkpoint
+                        and (best_val_loss is None or val_metrics["val_loss"] < best_val_loss)
+                    ):
                         best_val_loss = val_metrics["val_loss"]
                         _save_model_checkpoint(model, tokenizer, output_dir / "best")
                     with eval_log_path.open("a", encoding="utf-8") as handle:
@@ -643,14 +649,19 @@ def run_offline_policy_training(
                             step=log_step_offset + global_step,
                         )
 
-                if config.save_steps > 0 and global_step % config.save_steps == 0:
+                if (
+                    config.save_intermediate_checkpoints
+                    and config.save_steps > 0
+                    and global_step % config.save_steps == 0
+                ):
                     _save_model_checkpoint(model, tokenizer, output_dir / f"checkpoint-{global_step}")
                     print(
                         f"[hierarchical-rema][grpo] saved checkpoint step={global_step} "
                         f"path={output_dir / f'checkpoint-{global_step}'}"
                     )
 
-    _save_model_checkpoint(model, tokenizer, output_dir / "final")
+    if config.save_final_checkpoint:
+        _save_model_checkpoint(model, tokenizer, output_dir / "final")
     summary = {
         "output_dir": str(output_dir),
         "steps": global_step,
@@ -659,6 +670,9 @@ def run_offline_policy_training(
         "objective": "grpo",
         "skipped_empty_batches": skipped_empty_batches,
         "skipped_non_finite_batches": skipped_non_finite_batches,
+        "save_final_checkpoint": config.save_final_checkpoint,
+        "save_best_checkpoint": config.save_best_checkpoint,
+        "save_intermediate_checkpoints": config.save_intermediate_checkpoints,
         **_count_parameters(model),
     }
     if val_loader is not None:

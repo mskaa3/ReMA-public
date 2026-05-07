@@ -90,6 +90,8 @@ BEST_K=${BEST_K:-10}
 PRINT_MODE=${PRINT_MODE:-summary}
 ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-32}
 ROLLOUT_PROGRESS_EVERY=${ROLLOUT_PROGRESS_EVERY:-10}
+ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-best}
+ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-compact}
 
 TASK_SOURCE=${TASK_SOURCE:-$TASK_SOURCE_ARG}
 TASK_SOURCE=${TASK_SOURCE:-$SOURCE_DIR/data/overall_math/all_test_data.jsonl}
@@ -125,7 +127,9 @@ MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
 WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-200}
-EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-0}
+EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-10}
+CHECKPOINT_MODE=${CHECKPOINT_MODE:-final}
+PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-false}
 DEVICE=${DEVICE:-cuda}
 TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
@@ -134,6 +138,13 @@ ENABLE_WANDB=${ENABLE_WANDB:-false}
 WANDB_PROJECT=${WANDB_PROJECT:-multi-grpo-rema}
 WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-}
 DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}
+EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-false}
+EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-300}
+
+S3_EPOCHS_PATH=${S3_EPOCHS_PATH:-${S3_OUTPUT_PATH}/epochs}
+S3_BEST_SO_FAR_MODELS_PATH=${S3_BEST_SO_FAR_MODELS_PATH:-${S3_OUTPUT_PATH}/best_so_far_models}
+S3_BEST_VAL_MODELS_PATH=${S3_BEST_VAL_MODELS_PATH:-${S3_OUTPUT_PATH}/best_val_models}
+S3_FINAL_MODELS_PATH=${S3_FINAL_MODELS_PATH:-${S3_OUTPUT_PATH}/final_models}
 
 mkdir -p "$RUN_ROOT" "$LOCAL_OUTPUT_DIR" "$PERSIST_LOCAL_DIR"
 
@@ -176,6 +187,11 @@ fi
 DISABLE_ROLLOUT_LOGGING_FLAG=""
 if [[ "$DISABLE_ROLLOUT_LOGGING" == "1" || "$DISABLE_ROLLOUT_LOGGING" == "true" || "$DISABLE_ROLLOUT_LOGGING" == "True" ]]; then
     DISABLE_ROLLOUT_LOGGING_FLAG="--disable-rollout-logging"
+fi
+
+PRUNE_STALE_POLICY_MODELS_FLAG=""
+if [[ "$PRUNE_STALE_POLICY_MODELS" == "1" || "$PRUNE_STALE_POLICY_MODELS" == "true" || "$PRUNE_STALE_POLICY_MODELS" == "True" ]]; then
+    PRUNE_STALE_POLICY_MODELS_FLAG="--prune-stale-policy-models"
 fi
 
 WANDB_EXPERIMENT_NAME_FLAG=""
@@ -288,7 +304,107 @@ ENABLE_WANDB=$ENABLE_WANDB
 WANDB_PROJECT=$WANDB_PROJECT
 WANDB_EXPERIMENT_NAME=$WANDB_EXPERIMENT_NAME
 DISABLE_ROLLOUT_LOGGING=$DISABLE_ROLLOUT_LOGGING
+ROLLOUT_LOG_MODE=$ROLLOUT_LOG_MODE
+ROLLOUT_LOG_DETAIL=$ROLLOUT_LOG_DETAIL
+CHECKPOINT_MODE=$CHECKPOINT_MODE
+PRUNE_STALE_POLICY_MODELS=$PRUNE_STALE_POLICY_MODELS
+EPOCH_S3_SYNC=$EPOCH_S3_SYNC
+EPOCH_S3_SYNC_INTERVAL=$EPOCH_S3_SYNC_INTERVAL
+S3_EPOCHS_PATH=$S3_EPOCHS_PATH
+S3_BEST_SO_FAR_MODELS_PATH=$S3_BEST_SO_FAR_MODELS_PATH
+S3_BEST_VAL_MODELS_PATH=$S3_BEST_VAL_MODELS_PATH
+S3_FINAL_MODELS_PATH=$S3_FINAL_MODELS_PATH
 EOF
+}
+
+upload_epoch_folder_to_s3() {
+    local epoch_dir="$1"
+    local epoch_name
+    epoch_name=$(basename "$epoch_dir")
+
+    if [[ -z "${S3_OUTPUT_PATH:-}" ]]; then
+        return 0
+    fi
+
+    echo "[hierarchical-rema][s3] uploading epoch folder ${epoch_name} -> ${S3_EPOCHS_PATH}/${epoch_name}"
+    rclone copy "$epoch_dir" "${S3_EPOCHS_PATH}/${epoch_name}" || \
+        echo "Warning: failed to upload epoch folder ${epoch_name} to ${S3_EPOCHS_PATH}/${epoch_name}" >&2
+
+    for policy_dir in "$epoch_dir"/train/*; do
+        [[ -d "$policy_dir" ]] || continue
+        local policy_id
+        policy_id=$(basename "$policy_dir")
+        if [[ -d "$policy_dir/final" ]]; then
+            echo "[hierarchical-rema][s3] syncing best-so-far model ${policy_id} -> ${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"
+            rclone sync "$policy_dir/final" "${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}" || \
+                echo "Warning: failed to sync best-so-far model ${policy_id}" >&2
+        fi
+        if [[ -d "$policy_dir/best" ]]; then
+            echo "[hierarchical-rema][s3] syncing best-val model ${policy_id} -> ${S3_BEST_VAL_MODELS_PATH}/${policy_id}"
+            rclone sync "$policy_dir/best" "${S3_BEST_VAL_MODELS_PATH}/${policy_id}" || \
+                echo "Warning: failed to sync best-val model ${policy_id}" >&2
+        fi
+    done
+}
+
+upload_final_models_to_s3() {
+    local latest_epoch=""
+    local epoch_dir=""
+
+    for epoch_dir in "$LOCAL_OUTPUT_DIR"/epoch_*; do
+        [[ -d "$epoch_dir" ]] || continue
+        latest_epoch="$epoch_dir"
+    done
+
+    [[ -n "$latest_epoch" ]] || return 0
+    [[ -n "${S3_OUTPUT_PATH:-}" ]] || return 0
+
+    for policy_dir in "$latest_epoch"/train/*; do
+        [[ -d "$policy_dir" ]] || continue
+        local policy_id
+        policy_id=$(basename "$policy_dir")
+        if [[ -d "$policy_dir/final" ]]; then
+            echo "[hierarchical-rema][s3] syncing final model ${policy_id} -> ${S3_FINAL_MODELS_PATH}/${policy_id}"
+            rclone sync "$policy_dir/final" "${S3_FINAL_MODELS_PATH}/${policy_id}" || \
+                echo "Warning: failed to sync final model ${policy_id}" >&2
+        fi
+    done
+}
+
+start_epoch_s3_sync_watcher() {
+    [[ "$RUN_KIND" == "train" ]] || return 0
+    [[ -n "${S3_OUTPUT_PATH:-}" ]] || return 0
+    if [[ "$EPOCH_S3_SYNC" != "1" && "$EPOCH_S3_SYNC" != "true" && "$EPOCH_S3_SYNC" != "True" ]]; then
+        return 0
+    fi
+
+    local marker_dir="$RUN_ROOT/.uploaded_epochs"
+    mkdir -p "$marker_dir"
+
+    (
+        while true; do
+            local epoch_dir=""
+            for epoch_dir in "$LOCAL_OUTPUT_DIR"/epoch_*; do
+                [[ -d "$epoch_dir" ]] || continue
+                [[ -f "$epoch_dir/epoch_summary.json" ]] || continue
+                local epoch_name
+                epoch_name=$(basename "$epoch_dir")
+                [[ -f "$marker_dir/$epoch_name" ]] && continue
+                upload_epoch_folder_to_s3 "$epoch_dir"
+                touch "$marker_dir/$epoch_name"
+            done
+            sleep "$EPOCH_S3_SYNC_INTERVAL"
+        done
+    ) &
+    EPOCH_S3_SYNC_PID=$!
+}
+
+stop_epoch_s3_sync_watcher() {
+    if [[ -n "${EPOCH_S3_SYNC_PID:-}" ]]; then
+        kill "$EPOCH_S3_SYNC_PID" >/dev/null 2>&1 || true
+        wait "$EPOCH_S3_SYNC_PID" 2>/dev/null || true
+        unset EPOCH_S3_SYNC_PID
+    fi
 }
 
 persist_outputs() {
@@ -301,6 +417,7 @@ persist_outputs() {
         if [[ -n "${S3_OUTPUT_PATH:-}" ]]; then
             rclone copy "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_PATH" || \
                 echo "Warning: failed to upload outputs to ${S3_OUTPUT_PATH}" >&2
+            upload_final_models_to_s3
         fi
     fi
 
@@ -360,6 +477,8 @@ python3 -m hierarchical_rema.demo \
   --vllm-max-num-seqs ${VLLM_MAX_NUM_SEQS} \
   ${VLLM_MAX_MODEL_LEN_FLAG} \
   --output-dir ${LOCAL_OUTPUT_DIR} \
+  --rollout-log-mode ${ROLLOUT_LOG_MODE} \
+  --rollout-log-detail ${ROLLOUT_LOG_DETAIL} \
   --best-k ${BEST_K} \
   --print-mode ${PRINT_MODE} \
   ${DISABLE_ROLLOUT_LOGGING_FLAG}"
@@ -404,6 +523,8 @@ python3 -m hierarchical_rema.train \
   --vllm-max-num-seqs ${VLLM_MAX_NUM_SEQS} \
   ${VLLM_MAX_MODEL_LEN_FLAG} \
   ${DISABLE_ROLLOUT_LOGGING_FLAG} \
+  --rollout-log-mode ${ROLLOUT_LOG_MODE} \
+  --rollout-log-detail ${ROLLOUT_LOG_DETAIL} \
   --best-k ${BEST_K} \
   --rollout-task-batch-size ${ROLLOUT_TASK_BATCH_SIZE} \
   --rollout-progress-every ${ROLLOUT_PROGRESS_EVERY} \
@@ -436,9 +557,13 @@ python3 -m hierarchical_rema.train \
   --logging-steps ${LOGGING_STEPS} \
   --save-steps ${SAVE_STEPS} \
   --eval-every-steps ${EVAL_EVERY_STEPS} \
+  --checkpoint-mode ${CHECKPOINT_MODE} \
+  ${PRUNE_STALE_POLICY_MODELS_FLAG} \
   --device ${DEVICE} \
   --torch-dtype ${TORCH_DTYPE}"
 fi
+
+start_epoch_s3_sync_watcher
 
 set +e
 srun apptainer exec --nv --writable-tmpfs \
@@ -449,6 +574,8 @@ srun apptainer exec --nv --writable-tmpfs \
     bash -c "$COMMAND" 2>&1 | tee "$RUNTIME_LOG"
 RUN_EXIT_CODE=${PIPESTATUS[0]}
 set -e
+
+stop_epoch_s3_sync_watcher
 
 persist_outputs
 exit $RUN_EXIT_CODE

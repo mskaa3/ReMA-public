@@ -266,6 +266,32 @@ def test_rollout_recorder_writes_jsonl_files(tmp_path) -> None:
     assert (tmp_path / "best_selections.jsonl").exists()
 
 
+def test_rollout_recorder_compact_mode_avoids_full_rollout_tree(tmp_path) -> None:
+    trainer = HierarchicalGRPOTrainer(
+        rollout_logging_config=RolloutLoggingConfig(
+            output_dir=str(tmp_path),
+            save_all_rollouts=False,
+            save_best_rollouts=True,
+            best_k=1,
+            compact_mode=True,
+        )
+    )
+    task = make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)")
+    trainer.run(
+        task=task,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(num_decompositions=2, num_selections_per_decomposition=2),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+    )
+
+    compact_record = json.loads((tmp_path / "best_selections.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert "rollout" not in compact_record
+    assert "assignments" in compact_record
+    assert "executions" in compact_record
+    assert not (tmp_path / "all_rollouts.jsonl").exists()
+
+
 def test_extract_json_dict_accepts_tagged_controller_output() -> None:
     payload = extract_json_dict(
         "<selection_json>\n"
