@@ -844,11 +844,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         results: List[DecompositionCandidate | None] = [None] * len(requests)
         for model_path, grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
-            print(
-                f"[hierarchical-rema][generation] role=decomposer "
-                f"model={model_path} requests={len(grouped_requests)} "
-                f"batch_size={self.config.controller_batch_size}"
-            )
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
@@ -929,11 +924,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         results: List[SelectionCandidate | None] = [None] * len(requests)
         for model_path, grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
-            print(
-                f"[hierarchical-rema][generation] role=selector "
-                f"model={model_path} requests={len(grouped_requests)} "
-                f"batch_size={self.config.controller_batch_size}"
-            )
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
@@ -1021,11 +1011,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         results: List[WorkerExecution | None] = [None] * len(requests)
         for (base_model_path, lora_adapter_path, system_prompt), grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
-            print(
-                f"[hierarchical-rema][generation] role=worker "
-                f"model={base_model_path} requests={len(grouped_requests)} "
-                f"batch_size={self.config.worker_batch_size}"
-            )
             generated = self._generate_text_batch(
                 base_model_path=base_model_path,
                 prompt_texts=prompt_texts,

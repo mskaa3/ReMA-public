@@ -90,3 +90,71 @@ def test_integrated_train_writes_epoch_artifacts(tmp_path, monkeypatch) -> None:
         policy_dir = epoch_dir / "train" / policy_id
         assert (policy_dir / "train_samples.jsonl").exists()
         assert (policy_dir / "all_samples.jsonl").exists()
+
+
+def test_integrated_train_writes_external_validation_summary(tmp_path, monkeypatch) -> None:
+    train_path = tmp_path / "train.jsonl"
+    val_path = tmp_path / "val.jsonl"
+    train_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"question": "What is 2 + 2?", "answer": "4", "idx": 1, "subset": "train_math"}),
+                json.dumps({"question": "Differentiate x^2.", "answer": "2x", "idx": 2, "subset": "train_calc"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    val_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"question": "What is 1 + 1?", "answer": "2", "idx": 10, "subset": "gsm8k"}),
+                json.dumps({"question": "Differentiate sin(x).", "answer": "cos(x)", "idx": 11, "subset": "MATH500"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "trained_with_val"
+    monkeypatch.setattr(
+        train_module,
+        "run_offline_policy_training",
+        lambda train_samples, val_samples, config, tracking=None, tracking_prefix="", log_step_offset=0: {
+            "output_dir": str(Path(config.output_dir)),
+            "steps": 1,
+            "num_train_samples": len(train_samples),
+            "num_val_samples": len(val_samples),
+            "objective": "grpo",
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--task-source",
+            str(train_path),
+            "--val-task-source",
+            str(val_path),
+            "--backend",
+            "mock",
+            "--num-epochs",
+            "1",
+            "--num-decompositions",
+            "1",
+            "--num-selections",
+            "1",
+            "--disable-rollout-logging",
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    train_module.main()
+
+    validation_summary = json.loads(
+        (output_dir / "epoch_0001" / "validation_summary.json").read_text(encoding="utf-8")
+    )
+    assert validation_summary["num_tasks"] == 2
+    assert set(validation_summary["subsets"].keys()) == {"gsm8k", "MATH500"}

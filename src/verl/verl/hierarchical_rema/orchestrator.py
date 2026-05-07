@@ -69,6 +69,7 @@ class HierarchicalReMAOrchestrator:
         policy_config: ControllerPolicyConfig,
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
+        progress_label: str | None = None,
     ) -> TaskRollout:
         return self.run_tasks(
             tasks=[task],
@@ -76,6 +77,7 @@ class HierarchicalReMAOrchestrator:
             policy_config=policy_config,
             rollout_config=rollout_config,
             schedule=schedule,
+            progress_label=progress_label,
         )[0]
 
     def run_tasks(
@@ -85,6 +87,7 @@ class HierarchicalReMAOrchestrator:
         policy_config: ControllerPolicyConfig,
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
+        progress_label: str | None = None,
     ) -> List[TaskRollout]:
         if not tasks:
             return []
@@ -94,9 +97,10 @@ class HierarchicalReMAOrchestrator:
             rollout_config=rollout_config,
             schedule=schedule,
         )
+        progress_suffix = f" epoch_tasks={progress_label}" if progress_label else ""
         print(
             f"[hierarchical-rema][rollout] stage=decomposer "
-            f"tasks={len(tasks)} decompositions_per_task={num_decompositions} "
+            f"tasks={len(tasks)}{progress_suffix} decompositions_per_task={num_decompositions} "
             f"requests={len(tasks) * num_decompositions}"
         )
 
@@ -123,7 +127,7 @@ class HierarchicalReMAOrchestrator:
 
         print(
             f"[hierarchical-rema][rollout] stage=selector "
-            f"tasks={len(tasks)} selections_per_decomposition={num_selections} "
+            f"tasks={len(tasks)}{progress_suffix} selections_per_decomposition={num_selections} "
             f"requests={len(tasks) * num_decompositions * num_selections}"
         )
         selection_requests: List[SelectionRequest] = []
@@ -165,6 +169,7 @@ class HierarchicalReMAOrchestrator:
         selection_rollout_map = self._execute_selections_batch(
             selection_states=selection_states,
             worker_pool=worker_pool,
+            progress_label=progress_label,
         )
 
         task_rollouts: List[TaskRollout] = []
@@ -260,6 +265,7 @@ class HierarchicalReMAOrchestrator:
         self,
         selection_states: Sequence[_SelectionExecutionState],
         worker_pool: WorkerPoolConfig,
+        progress_label: str | None = None,
     ) -> Dict[tuple[int, int, int], SelectionRollout]:
         worker_map = worker_pool.workers_by_id()
         node_maps = {
@@ -268,6 +274,10 @@ class HierarchicalReMAOrchestrator:
         }
         active_states = list(selection_states)
         frontier_step = 0
+        total_states = len(active_states)
+        total_tasks = len({state.task_index for state in active_states})
+        max_frontier_steps = max((len(state.topo_order) for state in active_states), default=0)
+        progress_suffix = f" epoch_tasks={progress_label}" if progress_label else ""
         while True:
             worker_requests: List[WorkerExecutionRequest] = []
             request_states: List[_SelectionExecutionState] = []
@@ -298,17 +308,29 @@ class HierarchicalReMAOrchestrator:
                 break
 
             frontier_step += 1
-            print(
-                f"[hierarchical-rema][rollout] stage=workers "
-                f"frontier_step={frontier_step} active_states={len(active_states)} "
-                f"requests={len(worker_requests)}"
-            )
-
             worker_executions = self.backend.execute_workers_batch(worker_requests)
             for state, execution in zip(request_states, worker_executions):
                 state.executions.append(execution)
                 state.outputs[execution.node_id] = execution.output_text
                 state.next_node_index += 1
+
+            completed_states = sum(
+                1 for state in active_states if state.next_node_index >= len(state.topo_order)
+            )
+            per_task_counts: Dict[int, List[int]] = {}
+            for state in active_states:
+                bucket = per_task_counts.setdefault(state.task_index, [0, 0])
+                bucket[1] += 1
+                if state.next_node_index >= len(state.topo_order):
+                    bucket[0] += 1
+            completed_tasks = sum(1 for done, total in per_task_counts.values() if done == total)
+            print(
+                f"[hierarchical-rema][rollout] stage=workers "
+                f"{progress_suffix.lstrip()} frontier={frontier_step}/{max_frontier_steps} "
+                f"batch_tasks_done={completed_tasks}/{total_tasks} "
+                f"states_done={completed_states}/{total_states} "
+                f"requests={len(worker_requests)}"
+            )
 
         selection_rollout_map: Dict[tuple[int, int, int], SelectionRollout] = {}
         for state in active_states:
@@ -495,6 +517,7 @@ class HierarchicalGRPOTrainer:
         policy_config: ControllerPolicyConfig,
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
+        progress_label: str | None = None,
     ) -> TaskRollout:
         return self.run_many(
             tasks=[task],
@@ -502,6 +525,7 @@ class HierarchicalGRPOTrainer:
             policy_config=policy_config,
             rollout_config=rollout_config,
             schedule=schedule,
+            progress_label=progress_label,
         )[0]
 
     def run_many(
@@ -511,6 +535,7 @@ class HierarchicalGRPOTrainer:
         policy_config: ControllerPolicyConfig,
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
+        progress_label: str | None = None,
     ) -> List[TaskRollout]:
         rollouts = self.orchestrator.run_tasks(
             tasks=tasks,
@@ -518,6 +543,7 @@ class HierarchicalGRPOTrainer:
             policy_config=policy_config,
             rollout_config=rollout_config,
             schedule=schedule,
+            progress_label=progress_label,
         )
         if self.rollout_recorder is not None:
             for rollout in rollouts:

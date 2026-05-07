@@ -94,7 +94,11 @@ ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-best}
 ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-compact}
 
 TASK_SOURCE=${TASK_SOURCE:-$TASK_SOURCE_ARG}
-TASK_SOURCE=${TASK_SOURCE:-$SOURCE_DIR/data/overall_math/all_test_data.jsonl}
+if [[ "$RUN_KIND" == "train" ]]; then
+    TASK_SOURCE=${TASK_SOURCE:-$SOURCE_DIR/data/MATH/train_lv3to5_8k.parquet}
+else
+    TASK_SOURCE=${TASK_SOURCE:-$SOURCE_DIR/data/overall_math/all_test_data.jsonl}
+fi
 TASK_FORMAT=${TASK_FORMAT:-auto}
 PROMPT_KEY=${PROMPT_KEY:-question}
 ANSWER_KEY=${ANSWER_KEY:-answer}
@@ -104,6 +108,23 @@ TASKS_PER_EPOCH=${TASKS_PER_EPOCH:-0}
 SHUFFLE_TASKS=${SHUFFLE_TASKS:-false}
 TASK_SOURCE_STAGE=${TASK_SOURCE_STAGE:-$RUN_ROOT/task_source}
 TASK_SOURCE_RUNTIME=${TASK_SOURCE_RUNTIME:-$TASK_SOURCE}
+VAL_TASK_SOURCE=${VAL_TASK_SOURCE:-$SOURCE_DIR/data/overall_math/test.parquet}
+VAL_TASK_FORMAT=${VAL_TASK_FORMAT:-auto}
+VAL_PROMPT_KEY=${VAL_PROMPT_KEY:-question}
+VAL_ANSWER_KEY=${VAL_ANSWER_KEY:-answer}
+VAL_TASK_ID_KEY=${VAL_TASK_ID_KEY:-idx}
+MAX_VAL_TASKS=${MAX_VAL_TASKS:-0}
+VAL_TASKS_PER_EPOCH=${VAL_TASKS_PER_EPOCH:-0}
+VAL_TASK_SOURCE_STAGE=${VAL_TASK_SOURCE_STAGE:-$RUN_ROOT/val_task_source}
+VAL_TASK_SOURCE_RUNTIME=${VAL_TASK_SOURCE_RUNTIME:-$VAL_TASK_SOURCE}
+DISABLE_EXTERNAL_VALIDATION=${DISABLE_EXTERNAL_VALIDATION:-false}
+VAL_NUM_DECOMPOSITIONS=${VAL_NUM_DECOMPOSITIONS:-1}
+VAL_NUM_SELECTIONS=${VAL_NUM_SELECTIONS:-1}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.0}
+VAL_TOP_P=${VAL_TOP_P:-1.0}
+VAL_CONTROLLER_MAX_NEW_TOKENS=${VAL_CONTROLLER_MAX_NEW_TOKENS:-0}
+VAL_WORKER_MAX_NEW_TOKENS=${VAL_WORKER_MAX_NEW_TOKENS:-0}
+VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-0}
 TRAIN_ROLE=${TRAIN_ROLE:-both}
 TRAIN_POLICY_ID=${TRAIN_POLICY_ID:-}
 TRAIN_VAL_RATIO=${TRAIN_VAL_RATIO:-0.05}
@@ -189,6 +210,11 @@ if [[ "$DISABLE_ROLLOUT_LOGGING" == "1" || "$DISABLE_ROLLOUT_LOGGING" == "true" 
     DISABLE_ROLLOUT_LOGGING_FLAG="--disable-rollout-logging"
 fi
 
+DISABLE_EXTERNAL_VALIDATION_FLAG=""
+if [[ "$DISABLE_EXTERNAL_VALIDATION" == "1" || "$DISABLE_EXTERNAL_VALIDATION" == "true" || "$DISABLE_EXTERNAL_VALIDATION" == "True" ]]; then
+    DISABLE_EXTERNAL_VALIDATION_FLAG="--disable-external-validation"
+fi
+
 PRUNE_STALE_POLICY_MODELS_FLAG=""
 if [[ "$PRUNE_STALE_POLICY_MODELS" == "1" || "$PRUNE_STALE_POLICY_MODELS" == "true" || "$PRUNE_STALE_POLICY_MODELS" == "True" ]]; then
     PRUNE_STALE_POLICY_MODELS_FLAG="--prune-stale-policy-models"
@@ -261,6 +287,53 @@ stage_task_source() {
     fi
 }
 
+stage_val_task_source() {
+    if [[ "$DISABLE_EXTERNAL_VALIDATION" == "1" || "$DISABLE_EXTERNAL_VALIDATION" == "true" || "$DISABLE_EXTERNAL_VALIDATION" == "True" ]]; then
+        VAL_TASK_SOURCE_RUNTIME=""
+        return
+    fi
+
+    if [[ -z "$VAL_TASK_SOURCE" ]]; then
+        VAL_TASK_SOURCE_RUNTIME=""
+        return
+    fi
+
+    if [[ "$VAL_TASK_SOURCE" == "demo" ]]; then
+        VAL_TASK_SOURCE_RUNTIME="demo"
+        return
+    fi
+
+    if [[ "$VAL_TASK_SOURCE" != /* && "$VAL_TASK_SOURCE" != *:* && -e "$SOURCE_DIR/$VAL_TASK_SOURCE" ]]; then
+        VAL_TASK_SOURCE="$SOURCE_DIR/$VAL_TASK_SOURCE"
+    fi
+
+    mkdir -p "$VAL_TASK_SOURCE_STAGE"
+
+    if [[ "$VAL_TASK_SOURCE" == *:* ]]; then
+        rclone copy "$VAL_TASK_SOURCE" "$VAL_TASK_SOURCE_STAGE"
+    elif [[ -d "$VAL_TASK_SOURCE" ]]; then
+        cp -r "$VAL_TASK_SOURCE"/. "$VAL_TASK_SOURCE_STAGE"/
+    elif [[ -f "$VAL_TASK_SOURCE" ]]; then
+        cp "$VAL_TASK_SOURCE" "$VAL_TASK_SOURCE_STAGE"/
+    else
+        echo "VAL_TASK_SOURCE does not exist: $VAL_TASK_SOURCE" >&2
+        exit 1
+    fi
+
+    if [[ -f "$VAL_TASK_SOURCE" ]]; then
+        VAL_TASK_SOURCE_RUNTIME="$VAL_TASK_SOURCE_STAGE/$(basename "$VAL_TASK_SOURCE")"
+    elif [[ "$VAL_TASK_SOURCE" == *:* ]]; then
+        remote_name=$(basename "$VAL_TASK_SOURCE")
+        if [[ "$remote_name" == *.* && -f "$VAL_TASK_SOURCE_STAGE/$remote_name" ]]; then
+            VAL_TASK_SOURCE_RUNTIME="$VAL_TASK_SOURCE_STAGE/$remote_name"
+        else
+            VAL_TASK_SOURCE_RUNTIME="$VAL_TASK_SOURCE_STAGE"
+        fi
+    else
+        VAL_TASK_SOURCE_RUNTIME="$VAL_TASK_SOURCE_STAGE"
+    fi
+}
+
 write_run_metadata() {
     cat > "$RUN_METADATA_FILE" <<EOF
 JOB_ID=$JOB_ID
@@ -279,6 +352,23 @@ TASK_ID_KEY=$TASK_ID_KEY
 MAX_TASKS=$MAX_TASKS
 TASKS_PER_EPOCH=$TASKS_PER_EPOCH
 SHUFFLE_TASKS=$SHUFFLE_TASKS
+VAL_TASK_SOURCE=$VAL_TASK_SOURCE
+VAL_TASK_SOURCE_STAGE=$VAL_TASK_SOURCE_STAGE
+VAL_TASK_SOURCE_RUNTIME=$VAL_TASK_SOURCE_RUNTIME
+VAL_TASK_FORMAT=$VAL_TASK_FORMAT
+VAL_PROMPT_KEY=$VAL_PROMPT_KEY
+VAL_ANSWER_KEY=$VAL_ANSWER_KEY
+VAL_TASK_ID_KEY=$VAL_TASK_ID_KEY
+MAX_VAL_TASKS=$MAX_VAL_TASKS
+VAL_TASKS_PER_EPOCH=$VAL_TASKS_PER_EPOCH
+DISABLE_EXTERNAL_VALIDATION=$DISABLE_EXTERNAL_VALIDATION
+VAL_NUM_DECOMPOSITIONS=$VAL_NUM_DECOMPOSITIONS
+VAL_NUM_SELECTIONS=$VAL_NUM_SELECTIONS
+VAL_TEMPERATURE=$VAL_TEMPERATURE
+VAL_TOP_P=$VAL_TOP_P
+VAL_CONTROLLER_MAX_NEW_TOKENS=$VAL_CONTROLLER_MAX_NEW_TOKENS
+VAL_WORKER_MAX_NEW_TOKENS=$VAL_WORKER_MAX_NEW_TOKENS
+VAL_ROLLOUT_TASK_BATCH_SIZE=$VAL_ROLLOUT_TASK_BATCH_SIZE
 NUM_EPOCHS=$NUM_EPOCHS
 MODEL_PATH=$MODEL_PATH
 DECOMPOSER_MODEL_PATH=$DECOMPOSER_MODEL_PATH
@@ -428,6 +518,7 @@ persist_outputs() {
 
 if [[ "$RUN_KIND" == "train" ]]; then
     stage_task_source
+    stage_val_task_source
 fi
 
 write_run_metadata
@@ -441,6 +532,11 @@ if [[ "$RUN_KIND" == "train" ]]; then
     echo "[hierarchical-rema] TASK_SOURCE_RUNTIME=$TASK_SOURCE_RUNTIME"
     if [[ "$TASK_SOURCE_RUNTIME" != "demo" ]]; then
         find "$TASK_SOURCE_STAGE" -maxdepth 3 -type f | sort || true
+    fi
+    echo "[hierarchical-rema] VAL_TASK_SOURCE=$VAL_TASK_SOURCE"
+    echo "[hierarchical-rema] VAL_TASK_SOURCE_RUNTIME=$VAL_TASK_SOURCE_RUNTIME"
+    if [[ -n "$VAL_TASK_SOURCE_RUNTIME" && "$VAL_TASK_SOURCE_RUNTIME" != "demo" ]]; then
+        find "$VAL_TASK_SOURCE_STAGE" -maxdepth 3 -type f | sort || true
     fi
 fi
 
@@ -497,6 +593,14 @@ python3 -m hierarchical_rema.train \
   --max-tasks ${MAX_TASKS} \
   --tasks-per-epoch ${TASKS_PER_EPOCH} \
   ${SHUFFLE_TASKS_FLAG} \
+  --val-task-source ${VAL_TASK_SOURCE_RUNTIME} \
+  --val-task-format ${VAL_TASK_FORMAT} \
+  --val-prompt-key ${VAL_PROMPT_KEY} \
+  --val-answer-key ${VAL_ANSWER_KEY} \
+  --val-task-id-key ${VAL_TASK_ID_KEY} \
+  --max-val-tasks ${MAX_VAL_TASKS} \
+  --val-tasks-per-epoch ${VAL_TASKS_PER_EPOCH} \
+  ${DISABLE_EXTERNAL_VALIDATION_FLAG} \
   --backend ${BACKEND} \
   --mode ${MODE} \
   --phase ${PHASE} \
@@ -512,6 +616,12 @@ python3 -m hierarchical_rema.train \
   --top-p ${TOP_P} \
   --controller-max-new-tokens ${CONTROLLER_MAX_NEW_TOKENS} \
   --worker-max-new-tokens ${WORKER_MAX_NEW_TOKENS} \
+  --val-num-decompositions ${VAL_NUM_DECOMPOSITIONS} \
+  --val-num-selections ${VAL_NUM_SELECTIONS} \
+  --val-temperature ${VAL_TEMPERATURE} \
+  --val-top-p ${VAL_TOP_P} \
+  --val-controller-max-new-tokens ${VAL_CONTROLLER_MAX_NEW_TOKENS} \
+  --val-worker-max-new-tokens ${VAL_WORKER_MAX_NEW_TOKENS} \
   --controller-batch-size ${CONTROLLER_BATCH_SIZE} \
   --worker-batch-size ${WORKER_BATCH_SIZE} \
   --rollout-prompt-length ${ROLLOUT_PROMPT_LENGTH} \
@@ -527,6 +637,7 @@ python3 -m hierarchical_rema.train \
   --rollout-log-detail ${ROLLOUT_LOG_DETAIL} \
   --best-k ${BEST_K} \
   --rollout-task-batch-size ${ROLLOUT_TASK_BATCH_SIZE} \
+  --val-rollout-task-batch-size ${VAL_ROLLOUT_TASK_BATCH_SIZE} \
   --rollout-progress-every ${ROLLOUT_PROGRESS_EVERY} \
   --role ${TRAIN_ROLE} \
   ${TRAIN_POLICY_ID_FLAG} \
