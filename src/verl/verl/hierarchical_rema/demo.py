@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
     parser.add_argument("--soft-hop-penalty", type=float, default=0.1)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)

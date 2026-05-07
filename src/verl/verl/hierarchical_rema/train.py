@@ -53,12 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decomposer-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--selector-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--worker-base-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--num-decompositions", type=int, default=3)
+    parser.add_argument("--num-decompositions", type=int, default=2)
     parser.add_argument("--num-selections", type=int, default=2)
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
     parser.add_argument("--soft-hop-penalty", type=float, default=0.1)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
@@ -140,18 +140,32 @@ def _release_memory() -> None:
 
 def _tracking(args: argparse.Namespace, config_payload: Dict[str, Any]):
     if not args.enable_wandb:
+        print("[hierarchical-rema][tracking] wandb disabled")
         return None
     try:
-        from verl.utils.tracking import Tracking
-    except Exception:
+        try:
+            from verl.utils.tracking import Tracking
+        except ModuleNotFoundError:
+            from utils.tracking import Tracking
+    except Exception as exc:
+        print(f"[hierarchical-rema][tracking] wandb disabled due to import/init error: {exc}")
         return None
 
-    return Tracking(
-        project_name=args.project_name,
-        experiment_name=args.experiment_name or Path(args.output_dir).name,
-        default_backend=["wandb"],
-        config=config_payload,
+    experiment_name = args.experiment_name or Path(args.output_dir).name
+    print(
+        f"[hierarchical-rema][tracking] initializing wandb "
+        f"project={args.project_name} experiment={experiment_name}"
     )
+    try:
+        return Tracking(
+            project_name=args.project_name,
+            experiment_name=experiment_name,
+            default_backend=["wandb"],
+            config=config_payload,
+        )
+    except Exception as exc:
+        print(f"[hierarchical-rema][tracking] wandb initialization failed: {exc}")
+        return None
 
 
 def _finish_tracking(tracking) -> None:
@@ -161,6 +175,28 @@ def _finish_tracking(tracking) -> None:
         tracking.__del__()
     except Exception:
         pass
+
+
+def _rollout_config_for_schedule(
+    base_rollout_config: RolloutConfig,
+    schedule: TrainingScheduleConfig,
+) -> RolloutConfig:
+    num_decompositions = base_rollout_config.num_decompositions
+    num_selections = base_rollout_config.num_selections_per_decomposition
+    if schedule.mode == TrainingMode.ALTERNATING:
+        if schedule.alternating_phase == AlternatingPhase.SELECTOR:
+            num_selections = max(num_selections, 2)
+        elif schedule.alternating_phase == AlternatingPhase.DECOMPOSER:
+            num_decompositions = max(num_decompositions, 2)
+    return RolloutConfig(
+        num_decompositions=num_decompositions,
+        num_selections_per_decomposition=num_selections,
+        max_nodes_per_decomposition=base_rollout_config.max_nodes_per_decomposition,
+        soft_max_hops=base_rollout_config.soft_max_hops,
+        hard_max_hops=base_rollout_config.hard_max_hops,
+        soft_hop_penalty=base_rollout_config.soft_hop_penalty,
+        soft_hop_penalty_power=base_rollout_config.soft_hop_penalty_power,
+    )
 
 
 def _infer_task_format(task_source: str, task_format: str) -> str:
@@ -465,7 +501,7 @@ def main() -> None:
         max_tasks=args.max_tasks,
     )
     worker_pool = make_worker_pool(base_model_path=args.worker_base_model_path)
-    rollout_config = RolloutConfig(
+    base_rollout_config = RolloutConfig(
         num_decompositions=args.num_decompositions,
         num_selections_per_decomposition=args.num_selections,
         soft_max_hops=args.soft_max_hops,
@@ -520,6 +556,17 @@ def main() -> None:
             f"[hierarchical-rema][integrated] epoch={epoch_number}/{args.num_epochs} "
             f"phase={schedule.alternating_phase.value} tasks={len(epoch_tasks)}"
         )
+        rollout_config = _rollout_config_for_schedule(base_rollout_config, schedule)
+        if (
+            rollout_config.num_decompositions != base_rollout_config.num_decompositions
+            or rollout_config.num_selections_per_decomposition
+            != base_rollout_config.num_selections_per_decomposition
+        ):
+            print(
+                f"[hierarchical-rema][integrated] adjusted_rollout_counts "
+                f"decompositions={rollout_config.num_decompositions} "
+                f"selections={rollout_config.num_selections_per_decomposition}"
+            )
         workload = rollout_workload_estimate(
             num_tasks=len(epoch_tasks),
             rollout_config=rollout_config,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import json
+import re
 from copy import deepcopy
 from json import JSONDecodeError
 from typing import Any, Dict, List
@@ -19,15 +21,200 @@ class StructuredOutputError(ValueError):
     pass
 
 
-def extract_json_dict(text: str) -> Dict[str, Any]:
-    stripped = text.strip()
+KNOWN_CONTROLLER_TAGS = (
+    "decomposition_json",
+    "selection_json",
+    "answer_json",
+    "answer",
+    "json",
+)
+
+KNOWN_DECOMPOSITION_TAGS = (
+    "decomposition_plan",
+    "decomposition_json",
+    "decomposition",
+    "answer_json",
+    "answer",
+    "json",
+)
+
+KNOWN_SELECTION_TAGS = (
+    "selection_plan",
+    "selection_json",
+    "selection",
+    "answer_json",
+    "answer",
+    "json",
+)
+
+def _extract_tagged_content(text: str, tags: tuple[str, ...] = KNOWN_CONTROLLER_TAGS) -> str:
+    for tag in tags:
+        pattern = re.compile(rf"<{tag}>\s*(.*?)\s*</{tag}>", flags=re.DOTALL | re.IGNORECASE)
+        match = pattern.search(text)
+        if match:
+            return match.group(1).strip()
+    return text
+
+
+def _normalize_structured_text(text: str, tags: tuple[str, ...]) -> str:
+    stripped = _extract_tagged_content(text.strip(), tags=tags)
     if stripped.startswith("```"):
         stripped = stripped.strip("`")
         if "\n" in stripped:
             stripped = stripped.split("\n", 1)[1]
         if stripped.endswith("```"):
             stripped = stripped[:-3].rstrip()
+    return stripped.strip()
 
+
+def _parse_csv_field(raw_value: Any) -> List[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    text = str(raw_value).strip()
+    if not text or text.lower() in {"none", "null", "[]", "n/a"}:
+        return []
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
+    lines = [
+        "<decomposition_plan>",
+        f"DECOMPOSITION_ID: {candidate.decomposition_id}",
+        f"SUMMARY: {candidate.summary}",
+        f"FINAL_NODE_ID: {candidate.final_node_id}",
+    ]
+    for node in candidate.nodes:
+        lines.extend(
+            [
+                f"NODE: {node.node_id}",
+                f"INSTRUCTION: {node.instruction}",
+                f"DEPENDENCIES: {', '.join(node.dependencies) if node.dependencies else 'none'}",
+                f"REQUIRED_SKILLS: {', '.join(node.required_skills) if node.required_skills else 'none'}",
+                f"OUTPUT_KEY: {node.output_key}",
+            ]
+        )
+    lines.append("</decomposition_plan>")
+    return "\n".join(lines)
+
+
+def format_selection_plan(candidate: SelectionCandidate) -> str:
+    lines = [
+        "<selection_plan>",
+        f"SELECTION_ID: {candidate.selection_id}",
+    ]
+    for assignment in candidate.assignments:
+        lines.append(
+            "ASSIGN: "
+            f"{assignment.node_id} -> {assignment.worker_id} | "
+            f"compatibility={assignment.compatibility:.4f} | "
+            f"rationale={assignment.rationale}"
+        )
+    lines.append("</selection_plan>")
+    return "\n".join(lines)
+
+
+def _extract_key_value_payload(text: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    current_node: Dict[str, Any] | None = None
+    nodes: List[Dict[str, Any]] = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    def finalize_node() -> None:
+        nonlocal current_node
+        if current_node is not None and current_node.get("node_id"):
+            nodes.append(current_node)
+        current_node = None
+
+    for line in lines:
+        if line.startswith("<") and line.endswith(">"):
+            continue
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        key = key.strip().upper()
+        raw_value = raw_value.strip()
+        if key == "NODE":
+            finalize_node()
+            current_node = {"node_id": raw_value}
+            continue
+        if current_node is not None and key in {"INSTRUCTION", "DEPENDENCIES", "REQUIRED_SKILLS", "SKILLS", "OUTPUT_KEY"}:
+            if key == "INSTRUCTION":
+                current_node["instruction"] = raw_value
+            elif key in {"REQUIRED_SKILLS", "SKILLS"}:
+                current_node["required_skills"] = _parse_csv_field(raw_value)
+            elif key == "DEPENDENCIES":
+                current_node["dependencies"] = _parse_csv_field(raw_value)
+            elif key == "OUTPUT_KEY":
+                current_node["output_key"] = raw_value
+            continue
+        if key == "DECOMPOSITION_ID":
+            payload["decomposition_id"] = raw_value
+        elif key == "SUMMARY":
+            payload["summary"] = raw_value
+        elif key in {"FINAL_NODE_ID", "FINAL_NODE"}:
+            payload["final_node_id"] = raw_value
+
+    finalize_node()
+    if nodes:
+        payload["nodes"] = nodes
+    return payload
+
+
+def _parse_decomposition_plan(text: str) -> Dict[str, Any]:
+    normalized = _normalize_structured_text(text, tags=KNOWN_DECOMPOSITION_TAGS)
+    payload = _extract_key_value_payload(normalized)
+    if payload.get("nodes"):
+        payload.setdefault("summary", "Compact decomposition.")
+        if not payload.get("final_node_id"):
+            payload["final_node_id"] = payload["nodes"][-1]["node_id"]
+        return payload
+    raise StructuredOutputError("Could not parse a decomposition plan from controller output")
+
+
+def _parse_selection_plan(text: str) -> Dict[str, Any]:
+    normalized = _normalize_structured_text(text, tags=KNOWN_SELECTION_TAGS)
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    payload: Dict[str, Any] = {"assignments": []}
+    assignment_pattern = re.compile(
+        r"^ASSIGN(?:MENT)?\s*:?\s*(?P<node_id>.+?)\s*->\s*(?P<worker_id>[^|]+?)"
+        r"(?:\s*\|\s*compatibility\s*[:=]\s*(?P<compatibility>[^|]+?))?"
+        r"(?:\s*\|\s*rationale\s*[:=]\s*(?P<rationale>.*))?$",
+        flags=re.IGNORECASE,
+    )
+
+    for line in lines:
+        if line.startswith("<") and line.endswith(">"):
+            continue
+        if line.upper().startswith("SELECTION_ID:"):
+            payload["selection_id"] = line.split(":", 1)[1].strip()
+            continue
+        match = assignment_pattern.match(line)
+        if not match:
+            continue
+        compatibility_raw = match.group("compatibility")
+        try:
+            compatibility = float(compatibility_raw) if compatibility_raw is not None else 0.0
+        except ValueError:
+            compatibility = 0.0
+        rationale = (match.group("rationale") or "Selected for this node.").strip()
+        payload["assignments"].append(
+            {
+                "node_id": match.group("node_id").strip(),
+                "worker_id": match.group("worker_id").strip(),
+                "compatibility": compatibility,
+                "rationale": rationale,
+            }
+        )
+
+    if payload["assignments"]:
+        payload.setdefault("selection_id", "selection")
+        return payload
+    raise StructuredOutputError("Could not parse a selection plan from controller output")
+
+
+def extract_json_dict(text: str) -> Dict[str, Any]:
+    stripped = _normalize_structured_text(text, tags=KNOWN_CONTROLLER_TAGS)
     decoder = json.JSONDecoder()
     for idx, char in enumerate(stripped):
         if char != "{":
@@ -35,10 +222,27 @@ def extract_json_dict(text: str) -> Dict[str, Any]:
         try:
             obj, _ = decoder.raw_decode(stripped[idx:])
         except JSONDecodeError:
-            continue
+            try:
+                obj = ast.literal_eval(stripped[idx:])
+            except Exception:
+                continue
         if isinstance(obj, dict):
             return obj
     raise StructuredOutputError("Could not find a valid JSON object in controller output")
+
+
+def extract_decomposition_payload(text: str) -> Dict[str, Any]:
+    try:
+        return extract_json_dict(text)
+    except StructuredOutputError:
+        return _parse_decomposition_plan(text)
+
+
+def extract_selection_payload(text: str) -> Dict[str, Any]:
+    try:
+        return extract_json_dict(text)
+    except StructuredOutputError:
+        return _parse_selection_plan(text)
 
 
 def compute_dag_hops(nodes: List[SubtaskNode]) -> int:
@@ -176,10 +380,10 @@ def validate_decomposition_payload(
         instruction = str(node_payload.get("instruction") or "").strip()
         if not instruction:
             raise StructuredOutputError(f"Node {node_id} is missing 'instruction'")
-        dependencies = node_payload.get("dependencies") or []
+        dependencies = _parse_csv_field(node_payload.get("dependencies"))
         if not isinstance(dependencies, list) or not all(isinstance(dep, str) for dep in dependencies):
             raise StructuredOutputError(f"Node {node_id} has invalid 'dependencies'")
-        required_skills = node_payload.get("required_skills") or []
+        required_skills = _parse_csv_field(node_payload.get("required_skills"))
         if not isinstance(required_skills, list) or not all(
             isinstance(skill, str) for skill in required_skills
         ):
@@ -196,7 +400,7 @@ def validate_decomposition_payload(
         )
 
     if not final_node_id:
-        raise StructuredOutputError("Decomposer output is missing 'final_node_id'")
+        final_node_id = nodes[-1].node_id
 
     candidate = DecompositionCandidate(
         decomposition_id=decomposition_id,
@@ -234,10 +438,8 @@ def validate_selection_payload(
         if node_id in seen_node_ids:
             raise StructuredOutputError(f"Duplicate assignment for node_id '{node_id}'")
         seen_node_ids.add(node_id)
-        rationale = str(assignment_payload.get("rationale") or "").strip()
-        if not rationale:
-            raise StructuredOutputError(f"Assignment for node '{node_id}' is missing 'rationale'")
-        compatibility_raw = assignment_payload.get("compatibility")
+        rationale = str(assignment_payload.get("rationale") or f"Selected for node {node_id}.").strip()
+        compatibility_raw = assignment_payload.get("compatibility", 0.0)
         try:
             compatibility = float(compatibility_raw)
         except (TypeError, ValueError) as exc:
@@ -294,7 +496,7 @@ def build_fallback_decomposition(
         fallback_id=payload["decomposition_id"],
     )
     candidate.raw_payload = payload
-    candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
+    candidate.raw_text = format_decomposition_plan(candidate)
     return candidate
 
 
@@ -328,5 +530,5 @@ def build_fallback_selection(
         worker_pool=worker_pool,
     )
     candidate.raw_payload = payload
-    candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
+    candidate.raw_text = format_selection_plan(candidate)
     return candidate

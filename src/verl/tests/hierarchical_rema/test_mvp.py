@@ -16,6 +16,12 @@ try:
     from verl.hierarchical_rema.prompts import (
         DEFAULT_ALGEBRA_WORKER_PROMPT,
         DEFAULT_ANALYSIS_WORKER_PROMPT,
+        render_selector_prompt,
+    )
+    from verl.hierarchical_rema.structured import (
+        extract_decomposition_payload,
+        extract_json_dict,
+        extract_selection_payload,
     )
 except ModuleNotFoundError:
     from hierarchical_rema import (
@@ -33,6 +39,12 @@ except ModuleNotFoundError:
     from hierarchical_rema.prompts import (
         DEFAULT_ALGEBRA_WORKER_PROMPT,
         DEFAULT_ANALYSIS_WORKER_PROMPT,
+        render_selector_prompt,
+    )
+    from hierarchical_rema.structured import (
+        extract_decomposition_payload,
+        extract_json_dict,
+        extract_selection_payload,
     )
 
 
@@ -252,3 +264,92 @@ def test_rollout_recorder_writes_jsonl_files(tmp_path) -> None:
     assert (tmp_path / "all_rollouts.jsonl").exists()
     assert (tmp_path / "best_decompositions.jsonl").exists()
     assert (tmp_path / "best_selections.jsonl").exists()
+
+
+def test_extract_json_dict_accepts_tagged_controller_output() -> None:
+    payload = extract_json_dict(
+        "<selection_json>\n"
+        "{\n"
+        '  "selection_id": "sel-1",\n'
+        '  "assignments": []\n'
+        "}\n"
+        "</selection_json>"
+    )
+
+    assert payload["selection_id"] == "sel-1"
+
+
+def test_selector_prompt_uses_compact_decomposition_context() -> None:
+    trainer = HierarchicalGRPOTrainer()
+    task = make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)")
+    rollout = trainer.run(
+        task=task,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(num_decompositions=1, num_selections_per_decomposition=1),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+    )
+
+    prompt = render_selector_prompt(
+        task=task,
+        decomposition=rollout.decompositions[0].decomposition,
+        worker_pool=make_worker_pool(),
+        worker_performance=trainer.orchestrator.worker_memory.snapshot(make_worker_pool()),
+    )
+
+    assert '"raw_payload"' not in prompt
+    assert '"raw_text"' not in prompt
+
+
+def test_line_based_controller_plans_are_parseable() -> None:
+    decomposition_payload = extract_decomposition_payload(
+        "<decomposition_plan>\n"
+        "DECOMPOSITION_ID: decomp-1\n"
+        "SUMMARY: short plan\n"
+        "FINAL_NODE_ID: n2\n"
+        "NODE: n1\n"
+        "INSTRUCTION: analyze the structure\n"
+        "DEPENDENCIES: none\n"
+        "REQUIRED_SKILLS: analysis\n"
+        "OUTPUT_KEY: structure\n"
+        "NODE: n2\n"
+        "INSTRUCTION: produce final answer\n"
+        "DEPENDENCIES: n1\n"
+        "REQUIRED_SKILLS: algebra\n"
+        "OUTPUT_KEY: final_answer\n"
+        "</decomposition_plan>"
+    )
+    selection_payload = extract_selection_payload(
+        "<selection_plan>\n"
+        "SELECTION_ID: sel-1\n"
+        "ASSIGN: n1 -> analysis_worker | compatibility=0.91 | rationale=best fit\n"
+        "ASSIGN: n2 -> algebra_worker | compatibility=0.88 | rationale=exact arithmetic\n"
+        "</selection_plan>"
+    )
+
+    assert decomposition_payload["final_node_id"] == "n2"
+    assert len(decomposition_payload["nodes"]) == 2
+    assert selection_payload["selection_id"] == "sel-1"
+    assert len(selection_payload["assignments"]) == 2
+
+
+def test_controller_training_completions_are_clean_plan_blocks() -> None:
+    trainer = HierarchicalGRPOTrainer()
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+    rollout = trainer.run(
+        task=task,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(num_decompositions=2, num_selections_per_decomposition=2),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+    )
+
+    decomposer_completion = rollout.training_batch.decomposer_samples[0].completion_text
+    selector_completion = rollout.training_batch.selector_samples[0].completion_text
+
+    assert decomposer_completion.startswith("<decomposition_plan>")
+    assert selector_completion.startswith("<selection_plan>")
+    assert "controller_prompt" not in decomposer_completion
+    assert "validation" not in decomposer_completion
+    assert "controller_prompt" not in selector_completion
+    assert "validation" not in selector_completion

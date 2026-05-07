@@ -25,10 +25,12 @@ from .schema import (
 )
 from .ray_generation import RayVLLMGenerationManager
 from .structured import (
-    StructuredOutputError,
     build_fallback_decomposition,
     build_fallback_selection,
-    extract_json_dict,
+    extract_decomposition_payload,
+    extract_selection_payload,
+    format_decomposition_plan,
+    format_selection_plan,
     validate_decomposition_payload,
     validate_selection_payload,
 )
@@ -257,8 +259,8 @@ class MockHierarchicalBackend(HierarchicalBackend):
             "backend": "mock",
             "fallback_used": False,
         }
-        candidate.raw_text = json.dumps(raw_payload, indent=2, sort_keys=True)
         candidate.raw_payload = raw_payload
+        candidate.raw_text = format_decomposition_plan(candidate)
         return candidate
 
     def sample_selection(
@@ -321,8 +323,8 @@ class MockHierarchicalBackend(HierarchicalBackend):
             "backend": "mock",
             "fallback_used": False,
         }
-        candidate.raw_text = json.dumps(raw_payload, indent=2, sort_keys=True)
         candidate.raw_payload = raw_payload
+        candidate.raw_text = format_selection_plan(candidate)
         return candidate
 
     def execute_worker(
@@ -577,6 +579,46 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
 
         return results
 
+    @staticmethod
+    def _set_decomposition_artifacts(
+        candidate: DecompositionCandidate,
+        prompt_text: str,
+        validation: Dict[str, object],
+    ) -> DecompositionCandidate:
+        candidate.raw_payload = {
+            "decomposition": {
+                "decomposition_id": candidate.decomposition_id,
+                "summary": candidate.summary,
+                "final_node_id": candidate.final_node_id,
+                "num_hops": candidate.num_hops,
+                "effective_num_hops": candidate.effective_num_hops,
+                "soft_penalty": candidate.soft_penalty,
+                "was_hard_truncated": candidate.was_hard_truncated,
+                "nodes": [node.to_dict() for node in candidate.nodes],
+            },
+            "controller_prompt": prompt_text,
+            "validation": dict(validation),
+        }
+        candidate.raw_text = format_decomposition_plan(candidate)
+        return candidate
+
+    @staticmethod
+    def _set_selection_artifacts(
+        candidate: SelectionCandidate,
+        prompt_text: str,
+        validation: Dict[str, object],
+    ) -> SelectionCandidate:
+        candidate.raw_payload = {
+            "selection": {
+                "selection_id": candidate.selection_id,
+                "assignments": [assignment.to_dict() for assignment in candidate.assignments],
+            },
+            "controller_prompt": prompt_text,
+            "validation": dict(validation),
+        }
+        candidate.raw_text = format_selection_plan(candidate)
+        return candidate
+
     def _generate_validated_decomposition(
         self,
         prompt_text: str,
@@ -599,28 +641,28 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 max_new_tokens=self.config.controller_max_new_tokens,
             )
             try:
-                payload = extract_json_dict(last_raw_text)
+                payload = extract_decomposition_payload(last_raw_text)
                 candidate = validate_decomposition_payload(
                     payload=payload,
                     rollout_config=rollout_config,
                     fallback_id=fallback_id,
                 )
-                payload["controller_prompt"] = prompt_text
-                payload["validation"] = {
-                    "backend": self.backend_name,
-                    "attempt": attempt,
-                    "errors_before_success": list(errors),
-                    "fallback_used": False,
-                    "raw_model_text": last_raw_text,
-                }
-                candidate.raw_payload = payload
-                candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
-                return candidate
+                return self._set_decomposition_artifacts(
+                    candidate=candidate,
+                    prompt_text=prompt_text,
+                    validation={
+                        "backend": self.backend_name,
+                        "attempt": attempt,
+                        "errors_before_success": list(errors),
+                        "fallback_used": False,
+                        "raw_model_text": last_raw_text,
+                    },
+                )
             except Exception as exc:
                 errors.append(str(exc))
                 repair_prompt = (
-                    f"{prompt_text}\n\nYour previous answer was invalid JSON for the schema. "
-                    f"Error: {exc}\nReturn ONLY corrected JSON."
+                    f"{prompt_text}\n\nYour previous answer did not match the required decomposition format. "
+                    f"Error: {exc}\nReturn ONLY the corrected <decomposition_plan> block."
                 )
 
         candidate = build_fallback_decomposition(
@@ -637,7 +679,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 "errors": list(errors),
             }
         )
-        candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
+        candidate.raw_text = format_decomposition_plan(candidate)
         return candidate
 
     def _generate_validated_selection(
@@ -664,29 +706,29 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 max_new_tokens=self.config.controller_max_new_tokens,
             )
             try:
-                payload = extract_json_dict(last_raw_text)
+                payload = extract_selection_payload(last_raw_text)
                 payload.setdefault("selection_id", fallback_id)
                 candidate = validate_selection_payload(
                     payload=payload,
                     decomposition=decomposition,
                     worker_pool=worker_pool,
                 )
-                payload["controller_prompt"] = prompt_text
-                payload["validation"] = {
-                    "backend": self.backend_name,
-                    "attempt": attempt,
-                    "errors_before_success": list(errors),
-                    "fallback_used": False,
-                    "raw_model_text": last_raw_text,
-                }
-                candidate.raw_payload = payload
-                candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
-                return candidate
+                return self._set_selection_artifacts(
+                    candidate=candidate,
+                    prompt_text=prompt_text,
+                    validation={
+                        "backend": self.backend_name,
+                        "attempt": attempt,
+                        "errors_before_success": list(errors),
+                        "fallback_used": False,
+                        "raw_model_text": last_raw_text,
+                    },
+                )
             except Exception as exc:
                 errors.append(str(exc))
                 repair_prompt = (
-                    f"{prompt_text}\n\nYour previous answer was invalid JSON for the schema. "
-                    f"Error: {exc}\nReturn ONLY corrected JSON."
+                    f"{prompt_text}\n\nYour previous answer did not match the required selection format. "
+                    f"Error: {exc}\nReturn ONLY the corrected <selection_plan> block."
                 )
 
         candidate = build_fallback_selection(
@@ -703,7 +745,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 "errors": list(errors),
             }
         )
-        candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
+        candidate.raw_text = format_selection_plan(candidate)
         return candidate
 
     def sample_decomposition(
@@ -817,24 +859,25 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.task.task_id}-decomp-{request.decomposition_index}"
                 try:
-                    payload = extract_json_dict(raw_text)
+                    payload = extract_decomposition_payload(raw_text)
                     candidate = validate_decomposition_payload(
                         payload=payload,
                         rollout_config=request.rollout_config,
                         fallback_id=fallback_id,
                     )
-                    payload["controller_prompt"] = prompt_text
-                    payload["validation"] = {
-                        "backend": self.backend_name,
-                        "attempt": 0,
-                        "errors_before_success": [],
-                        "fallback_used": False,
-                        "raw_model_text": raw_text,
-                        "batch_generated": True,
-                        "entropy": entropy,
-                    }
-                    candidate.raw_payload = payload
-                    candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
+                    candidate = self._set_decomposition_artifacts(
+                        candidate=candidate,
+                        prompt_text=prompt_text,
+                        validation={
+                            "backend": self.backend_name,
+                            "attempt": 0,
+                            "errors_before_success": [],
+                            "fallback_used": False,
+                            "raw_model_text": raw_text,
+                            "batch_generated": True,
+                            "entropy": entropy,
+                        },
+                    )
                 except Exception:
                     repair_count += 1
                     candidate = self._generate_validated_decomposition(
@@ -851,7 +894,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             "batch_repair_fallback": True,
                         }
                     )
-                    candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
+                    candidate.raw_text = format_decomposition_plan(candidate)
                 results[result_index] = candidate
             if repair_count:
                 print(
@@ -901,25 +944,26 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.decomposition.decomposition_id}-sel-{request.selection_index}"
                 try:
-                    payload = extract_json_dict(raw_text)
+                    payload = extract_selection_payload(raw_text)
                     payload.setdefault("selection_id", fallback_id)
                     candidate = validate_selection_payload(
                         payload=payload,
                         decomposition=request.decomposition,
                         worker_pool=request.worker_pool,
                     )
-                    payload["controller_prompt"] = prompt_text
-                    payload["validation"] = {
-                        "backend": self.backend_name,
-                        "attempt": 0,
-                        "errors_before_success": [],
-                        "fallback_used": False,
-                        "raw_model_text": raw_text,
-                        "batch_generated": True,
-                        "entropy": entropy,
-                    }
-                    candidate.raw_payload = payload
-                    candidate.raw_text = json.dumps(payload, indent=2, sort_keys=True)
+                    candidate = self._set_selection_artifacts(
+                        candidate=candidate,
+                        prompt_text=prompt_text,
+                        validation={
+                            "backend": self.backend_name,
+                            "attempt": 0,
+                            "errors_before_success": [],
+                            "fallback_used": False,
+                            "raw_model_text": raw_text,
+                            "batch_generated": True,
+                            "entropy": entropy,
+                        },
+                    )
                 except Exception:
                     repair_count += 1
                     candidate = self._generate_validated_selection(
@@ -937,7 +981,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             "batch_repair_fallback": True,
                         }
                     )
-                    candidate.raw_text = json.dumps(candidate.raw_payload, indent=2, sort_keys=True)
+                    candidate.raw_text = format_selection_plan(candidate)
                 results[result_index] = candidate
             if repair_count:
                 print(

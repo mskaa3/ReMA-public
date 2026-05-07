@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable
+from typing import Dict
 
 from .schema import (
     DecompositionCandidate,
@@ -14,27 +14,51 @@ from .schema import (
 
 
 DECOMPOSER_SYSTEM_PROMPT = """You are the Decomposer controller.
-Return a DAG decomposition for the user task as strict JSON.
+Produce a compact DAG decomposition for the task.
+
+Return exactly one block in this format:
+<decomposition_plan>
+DECOMPOSITION_ID: short_id
+SUMMARY: short summary
+FINAL_NODE_ID: n_last
+NODE: n1
+INSTRUCTION: short instruction
+DEPENDENCIES: none
+REQUIRED_SKILLS: algebra
+OUTPUT_KEY: partial_result
+NODE: n_last
+INSTRUCTION: produce the final answer
+DEPENDENCIES: n1
+REQUIRED_SKILLS: analysis
+OUTPUT_KEY: final_answer
+</decomposition_plan>
 
 Rules:
-1. Output only JSON.
-2. Use a DAG, not a linear chain unless the task truly requires one.
-3. Each node must contain: node_id, instruction, dependencies, required_skills, output_key.
-4. The final node must produce the final answer.
-5. Prefer decompositions that fit the available worker pool.
-6. Use worker characteristics and historical performance when deciding the DAG shape.
+1. Do not use markdown fences.
+2. Keep the block compact and easy to parse.
+3. Use a DAG, not a linear chain unless the task truly requires one.
+4. Use short node instructions.
+5. The final node must produce the final answer.
+6. Prefer decompositions that fit the available worker pool and prior worker performance.
 """
 
 
 SELECTOR_SYSTEM_PROMPT = """You are the Selector controller.
-Return a worker assignment for each DAG node as strict JSON.
+Assign workers to the DAG nodes.
+
+Return exactly one block in this format:
+<selection_plan>
+SELECTION_ID: short_id
+ASSIGN: n1 -> worker_a | compatibility=0.95 | rationale=best skill match
+ASSIGN: n2 -> worker_b | compatibility=0.90 | rationale=best final-step fit
+</selection_plan>
 
 Rules:
-1. Output only JSON.
-2. Assign exactly one worker to each node.
-3. Use worker skills, prior compatibility, and decomposition structure.
-4. Each assignment must contain: node_id, worker_id, rationale, compatibility.
-5. Use each worker's performance history, including reward and completion behavior.
+1. Do not use markdown fences.
+2. Keep the block compact and easy to parse.
+3. Assign exactly one worker to each node.
+4. Use worker skills, prior compatibility, and performance history.
+5. Keep rationale short and concrete.
 """
 
 
@@ -50,21 +74,17 @@ Be concise and return the subtask result directly.
 """
 
 
-def _worker_catalog(workers: Iterable[WorkerSpec]) -> str:
-    return json.dumps(
-        [
-            {
-                "worker_id": worker.worker_id,
-                "skills": worker.skills,
-                "description": worker.description,
-                "lora_adapter_path": worker.lora_adapter_path,
-                "trainable": worker.trainable,
-            }
-            for worker in workers
-        ],
-        indent=2,
-        sort_keys=True,
-    )
+def _compact_performance_summary(snapshot: WorkerPerformanceSnapshot) -> dict:
+    return {
+        "ema_outcome": snapshot.ema_outcome,
+        "num_assignments": snapshot.num_assignments,
+        "completion_rate": snapshot.completion_rate,
+        "success_rate": snapshot.success_rate,
+        "average_reward": snapshot.average_reward,
+        "average_confidence_reward": snapshot.average_confidence_reward,
+        "average_compatibility": snapshot.average_compatibility,
+        "recent_history": snapshot.recent_history[-3:],
+    }
 
 
 def _worker_context(
@@ -76,9 +96,13 @@ def _worker_context(
         performance_snapshot = worker_performance.get(worker.worker_id)
         worker_context.append(
             {
-                **worker.to_dict(),
-                "performance_summary": (
-                    performance_snapshot.to_dict()
+                "worker_id": worker.worker_id,
+                "skills": list(worker.skills),
+                "description": worker.description,
+                "trainable": worker.trainable,
+                "lora_adapter_path": worker.lora_adapter_path,
+                "performance_summary": _compact_performance_summary(
+                    performance_snapshot
                     if performance_snapshot is not None
                     else WorkerPerformanceSnapshot(
                         worker_id=worker.worker_id,
@@ -91,11 +115,33 @@ def _worker_context(
                         average_reward=0.0,
                         average_confidence_reward=0.0,
                         average_compatibility=0.0,
-                    ).to_dict()
+                    )
                 ),
             }
         )
     return worker_context
+
+
+def _decomposition_context(decomposition: DecompositionCandidate) -> dict:
+    return {
+        "decomposition_id": decomposition.decomposition_id,
+        "summary": decomposition.summary,
+        "final_node_id": decomposition.final_node_id,
+        "num_hops": decomposition.num_hops,
+        "effective_num_hops": decomposition.effective_num_hops,
+        "soft_penalty": decomposition.soft_penalty,
+        "was_hard_truncated": decomposition.was_hard_truncated,
+        "nodes": [
+            {
+                "node_id": node.node_id,
+                "instruction": node.instruction,
+                "dependencies": list(node.dependencies),
+                "required_skills": list(node.required_skills),
+                "output_key": node.output_key,
+            }
+            for node in decomposition.nodes
+        ],
+    }
 
 
 def render_decomposer_prompt(
@@ -107,20 +153,33 @@ def render_decomposer_prompt(
         "task_id": task.task_id,
         "task": task.prompt,
         "available_workers": _worker_context(worker_pool, worker_performance),
-        "target_schema": {
-            "decomposition_id": "string",
-            "summary": "string",
-            "final_node_id": "string",
-            "nodes": [
-                {
-                    "node_id": "string",
-                    "instruction": "string",
-                    "dependencies": ["node_id"],
-                    "required_skills": ["skill"],
-                    "output_key": "string",
-                }
-            ],
-        },
+        "preferred_output_format": [
+            "<decomposition_plan>",
+            "DECOMPOSITION_ID: short_id",
+            "SUMMARY: short summary",
+            "FINAL_NODE_ID: n_last",
+            "NODE: n1",
+            "INSTRUCTION: short instruction",
+            "DEPENDENCIES: none",
+            "REQUIRED_SKILLS: algebra",
+            "OUTPUT_KEY: partial_result",
+            "NODE: n_last",
+            "INSTRUCTION: produce the final answer",
+            "DEPENDENCIES: n1",
+            "REQUIRED_SKILLS: analysis",
+            "OUTPUT_KEY: final_answer",
+            "</decomposition_plan>",
+        ],
+        "required_fields": [
+            "decomposition_id",
+            "summary",
+            "final_node_id",
+            "nodes[].node_id",
+            "nodes[].instruction",
+            "nodes[].dependencies",
+            "nodes[].required_skills",
+            "nodes[].output_key",
+        ],
     }
     return f"{DECOMPOSER_SYSTEM_PROMPT}\n\n{json.dumps(payload, indent=2, sort_keys=True)}"
 
@@ -134,19 +193,22 @@ def render_selector_prompt(
     payload = {
         "task_id": task.task_id,
         "task": task.prompt,
-        "decomposition": decomposition.to_dict(),
+        "decomposition": _decomposition_context(decomposition),
         "available_workers": _worker_context(worker_pool, worker_performance),
-        "target_schema": {
-            "selection_id": "string",
-            "assignments": [
-                {
-                    "node_id": "string",
-                    "worker_id": "string",
-                    "rationale": "string",
-                    "compatibility": "float in [0, 1]",
-                }
-            ],
-        },
+        "preferred_output_format": [
+            "<selection_plan>",
+            "SELECTION_ID: short_id",
+            "ASSIGN: n1 -> worker_a | compatibility=0.95 | rationale=best skill match",
+            "ASSIGN: n2 -> worker_b | compatibility=0.90 | rationale=best final-step fit",
+            "</selection_plan>",
+        ],
+        "required_fields": [
+            "selection_id",
+            "assignments[].node_id",
+            "assignments[].worker_id",
+            "assignments[].compatibility",
+            "assignments[].rationale",
+        ],
     }
     return f"{SELECTOR_SYSTEM_PROMPT}\n\n{json.dumps(payload, indent=2, sort_keys=True)}"
 

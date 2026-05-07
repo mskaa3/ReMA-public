@@ -88,19 +88,31 @@ def _load_scheduler_factory():
 def _init_tracking(config: OfflineTrainingConfig):
     _ensure_repo_root_on_path()
     try:
-        from verl.utils.tracking import Tracking
-    except Exception:
+        try:
+            from verl.utils.tracking import Tracking
+        except ModuleNotFoundError:
+            from utils.tracking import Tracking
+    except Exception as exc:
+        print(f"[hierarchical-rema][tracking] offline tracking disabled due to import/init error: {exc}")
         return None
 
     backends = ["console"]
     if config.enable_wandb:
         backends.append("wandb")
-    return Tracking(
-        project_name=config.project_name,
-        experiment_name=config.experiment_name,
-        default_backend=backends,
-        config=asdict(config),
+    print(
+        f"[hierarchical-rema][tracking] offline tracking backends={','.join(backends)} "
+        f"project={config.project_name} experiment={config.experiment_name}"
     )
+    try:
+        return Tracking(
+            project_name=config.project_name,
+            experiment_name=config.experiment_name,
+            default_backend=backends,
+            config=asdict(config),
+        )
+    except Exception as exc:
+        print(f"[hierarchical-rema][tracking] offline tracking initialization failed: {exc}")
+        return None
 
 
 def _finish_tracking(tracking) -> None:
@@ -367,6 +379,24 @@ def _count_parameters(model) -> Dict[str, int]:
     }
 
 
+def _filter_batch_rows(batch: Dict, row_mask) -> Dict:
+    filtered = {}
+    keep_rows = row_mask.tolist()
+    for key, value in batch.items():
+        if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == len(keep_rows):
+            filtered[key] = value[row_mask]
+        elif isinstance(value, list) and len(value) == len(keep_rows):
+            filtered[key] = [item for item, keep in zip(value, keep_rows) if keep]
+        else:
+            filtered[key] = value
+    return filtered
+
+
+def _all_finite(*tensors) -> bool:
+    torch = _lazy_torch()
+    return all(bool(torch.isfinite(tensor).all().item()) for tensor in tensors)
+
+
 def run_offline_policy_training(
     train_samples: Sequence[ControllerReplaySample],
     val_samples: Sequence[ControllerReplaySample],
@@ -462,6 +492,8 @@ def run_offline_policy_training(
         )
 
     global_step = 0
+    skipped_empty_batches = 0
+    skipped_non_finite_batches = 0
     optimizer.zero_grad(set_to_none=True)
     best_val_loss = None
 
@@ -469,6 +501,19 @@ def run_offline_policy_training(
         model.train()
         print(f"[hierarchical-rema][grpo] epoch {epoch + 1}/{config.epochs}")
         for batch_idx, batch in enumerate(train_loader):
+            valid_row_mask = batch["loss_mask"][:, :-1].sum(dim=1) > 0
+            if not bool(valid_row_mask.any().item()):
+                skipped_empty_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                print(
+                    f"[hierarchical-rema][grpo] skipping empty batch "
+                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                )
+                continue
+            if not bool(valid_row_mask.all().item()):
+                batch = _filter_batch_rows(batch, valid_row_mask)
+                skipped_empty_batches += 1
+
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             position_ids = batch["position_ids"].to(device)
@@ -480,6 +525,14 @@ def run_offline_policy_training(
                 position_ids=position_ids,
                 use_cache=False,
             )
+            if not _all_finite(outputs.logits):
+                skipped_non_finite_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                print(
+                    f"[hierarchical-rema][grpo] skipping non-finite logits "
+                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                )
+                continue
             token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
             old_log_probs = _gather_old_log_probs(
                 sample_indices=batch["sample_index"],
@@ -489,6 +542,14 @@ def run_offline_policy_training(
                 dtype=token_log_probs.dtype,
             )
             advantages = batch["advantage"].to(device).unsqueeze(-1).expand_as(token_log_probs)
+            if not _all_finite(token_log_probs, old_log_probs, advantages, loss_mask):
+                skipped_non_finite_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                print(
+                    f"[hierarchical-rema][grpo] skipping non-finite batch tensors "
+                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                )
+                continue
             pg_loss, clipfrac, approx_kl, clipfrac_lower = core_algos.compute_policy_loss(
                 old_log_prob=old_log_probs,
                 log_prob=token_log_probs,
@@ -499,6 +560,16 @@ def run_offline_policy_training(
             )
             entropy = core_algos.compute_entropy_loss(outputs.logits[:, :-1, :], loss_mask)
             loss = pg_loss - config.entropy_coeff * entropy
+            if not _all_finite(pg_loss, clipfrac, approx_kl, clipfrac_lower, entropy, loss):
+                skipped_non_finite_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                print(
+                    f"[hierarchical-rema][grpo] skipping non-finite objective "
+                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)} "
+                    f"mean_reward={float(batch['reward'].mean().item()):.4f} "
+                    f"mean_advantage={float(batch['advantage'].mean().item()):.4f}"
+                )
+                continue
 
             loss = loss / max(config.grad_accum_steps, 1)
             loss.backward()
@@ -586,6 +657,8 @@ def run_offline_policy_training(
         "num_train_samples": len(train_samples),
         "num_val_samples": len(val_samples),
         "objective": "grpo",
+        "skipped_empty_batches": skipped_empty_batches,
+        "skipped_non_finite_batches": skipped_non_finite_batches,
         **_count_parameters(model),
     }
     if val_loader is not None:
@@ -594,13 +667,17 @@ def run_offline_policy_training(
         json.dump(summary, handle, indent=2, sort_keys=True)
     print(
         f"[hierarchical-rema][grpo] finished experiment={config.experiment_name} "
-        f"steps={global_step} output_dir={output_dir}"
+        f"steps={global_step} output_dir={output_dir} "
+        f"skipped_empty_batches={skipped_empty_batches} "
+        f"skipped_non_finite_batches={skipped_non_finite_batches}"
     )
     if tracking is not None:
         final_metrics = {
             f"{tracking_prefix}train/final_steps": global_step,
             f"{tracking_prefix}train/num_train_samples": len(train_samples),
             f"{tracking_prefix}train/num_val_samples": len(val_samples),
+            f"{tracking_prefix}train/skipped_empty_batches": skipped_empty_batches,
+            f"{tracking_prefix}train/skipped_non_finite_batches": skipped_non_finite_batches,
         }
         if "val_loss" in summary:
             final_metrics[f"{tracking_prefix}val/final_loss"] = summary["val_loss"]
@@ -620,12 +697,16 @@ def evaluate_controller_model(model, dataloader, device) -> Dict[str, float]:
             attention_mask = batch["attention_mask"].to(device)
             position_ids = batch["position_ids"].to(device)
             loss_mask = batch["loss_mask"][:, :-1].to(device).float()
+            if not bool((loss_mask.sum(dim=1) > 0).any().item()):
+                continue
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
             )
+            if not bool(torch.isfinite(outputs.logits).all().item()):
+                continue
             labels = input_ids[:, 1:]
             per_token_loss = torch.nn.functional.cross_entropy(
                 outputs.logits[:, :-1, :].reshape(-1, outputs.logits.size(-1)),
@@ -634,6 +715,8 @@ def evaluate_controller_model(model, dataloader, device) -> Dict[str, float]:
             ).view_as(loss_mask)
             masked_loss = per_token_loss * loss_mask
             loss = masked_loss.sum() / torch.clamp(loss_mask.sum(), min=1.0)
+            if not bool(torch.isfinite(loss).item()):
+                continue
             losses.append(loss.detach().cpu())
     model.train()
     if not losses:
