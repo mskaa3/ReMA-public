@@ -44,7 +44,9 @@ export PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-true} # delete old
 export SAVE_STEPS=${SAVE_STEPS:-0} # disable checkpoint-N step snapshots to save disk
 export EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-true} # upload completed epoch folders to S3 while the job is still running
 export EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-120} # seconds between checks for finished epoch folders
-export ENABLE_WANDB=${ENABLE_WANDB:-true} 
+export PRUNE_UPLOADED_LOCAL_CHECKPOINTS=${PRUNE_UPLOADED_LOCAL_CHECKPOINTS:-true} # after epoch upload, delete local best/ and checkpoint-* dirs; keep final/ for continued training
+export STRIP_LOCAL_MODELS_AFTER_SYNC=${STRIP_LOCAL_MODELS_AFTER_SYNC:-true} # after final S3 sync, remove local best/final/checkpoint-* before copying outputs home
+export ENABLE_WANDB=${ENABLE_WANDB:-true} # log rollout, training, and validation metrics to W&B
 
 SOURCE_DIR=${SLURM_SUBMIT_DIR:-$(pwd)}
 exec bash "$SOURCE_DIR/hierarchical-rema-trainer.sh" "$@"

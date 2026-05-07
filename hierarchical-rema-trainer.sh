@@ -151,6 +151,8 @@ SAVE_STEPS=${SAVE_STEPS:-200}
 EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-10}
 CHECKPOINT_MODE=${CHECKPOINT_MODE:-final}
 PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-false}
+PRUNE_UPLOADED_LOCAL_CHECKPOINTS=${PRUNE_UPLOADED_LOCAL_CHECKPOINTS:-false}
+STRIP_LOCAL_MODELS_AFTER_SYNC=${STRIP_LOCAL_MODELS_AFTER_SYNC:-false}
 DEVICE=${DEVICE:-cuda}
 TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
@@ -398,6 +400,8 @@ ROLLOUT_LOG_MODE=$ROLLOUT_LOG_MODE
 ROLLOUT_LOG_DETAIL=$ROLLOUT_LOG_DETAIL
 CHECKPOINT_MODE=$CHECKPOINT_MODE
 PRUNE_STALE_POLICY_MODELS=$PRUNE_STALE_POLICY_MODELS
+PRUNE_UPLOADED_LOCAL_CHECKPOINTS=$PRUNE_UPLOADED_LOCAL_CHECKPOINTS
+STRIP_LOCAL_MODELS_AFTER_SYNC=$STRIP_LOCAL_MODELS_AFTER_SYNC
 EPOCH_S3_SYNC=$EPOCH_S3_SYNC
 EPOCH_S3_SYNC_INTERVAL=$EPOCH_S3_SYNC_INTERVAL
 S3_EPOCHS_PATH=$S3_EPOCHS_PATH
@@ -411,14 +415,17 @@ upload_epoch_folder_to_s3() {
     local epoch_dir="$1"
     local epoch_name
     epoch_name=$(basename "$epoch_dir")
+    local upload_status=0
 
     if [[ -z "${S3_OUTPUT_PATH:-}" ]]; then
         return 0
     fi
 
     echo "[hierarchical-rema][s3] uploading epoch folder ${epoch_name} -> ${S3_EPOCHS_PATH}/${epoch_name}"
-    rclone copy "$epoch_dir" "${S3_EPOCHS_PATH}/${epoch_name}" || \
+    if ! rclone copy "$epoch_dir" "${S3_EPOCHS_PATH}/${epoch_name}"; then
         echo "Warning: failed to upload epoch folder ${epoch_name} to ${S3_EPOCHS_PATH}/${epoch_name}" >&2
+        upload_status=1
+    fi
 
     for policy_dir in "$epoch_dir"/train/*; do
         [[ -d "$policy_dir" ]] || continue
@@ -426,14 +433,43 @@ upload_epoch_folder_to_s3() {
         policy_id=$(basename "$policy_dir")
         if [[ -d "$policy_dir/final" ]]; then
             echo "[hierarchical-rema][s3] syncing best-so-far model ${policy_id} -> ${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"
-            rclone sync "$policy_dir/final" "${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}" || \
+            if ! rclone sync "$policy_dir/final" "${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"; then
                 echo "Warning: failed to sync best-so-far model ${policy_id}" >&2
+                upload_status=1
+            fi
         fi
         if [[ -d "$policy_dir/best" ]]; then
             echo "[hierarchical-rema][s3] syncing best-val model ${policy_id} -> ${S3_BEST_VAL_MODELS_PATH}/${policy_id}"
-            rclone sync "$policy_dir/best" "${S3_BEST_VAL_MODELS_PATH}/${policy_id}" || \
+            if ! rclone sync "$policy_dir/best" "${S3_BEST_VAL_MODELS_PATH}/${policy_id}"; then
                 echo "Warning: failed to sync best-val model ${policy_id}" >&2
+                upload_status=1
+            fi
         fi
+    done
+    return "$upload_status"
+}
+
+prune_epoch_local_checkpoints() {
+    local epoch_dir="$1"
+    for policy_dir in "$epoch_dir"/train/*; do
+        [[ -d "$policy_dir" ]] || continue
+        rm -rf "$policy_dir"/best 2>/dev/null || true
+        rm -rf "$policy_dir"/checkpoint-* 2>/dev/null || true
+    done
+}
+
+strip_local_model_artifacts() {
+    local root_dir="$1"
+    local epoch_dir=""
+    for epoch_dir in "$root_dir"/epoch_*; do
+        [[ -d "$epoch_dir" ]] || continue
+        local policy_dir=""
+        for policy_dir in "$epoch_dir"/train/*; do
+            [[ -d "$policy_dir" ]] || continue
+            rm -rf "$policy_dir"/best 2>/dev/null || true
+            rm -rf "$policy_dir"/final 2>/dev/null || true
+            rm -rf "$policy_dir"/checkpoint-* 2>/dev/null || true
+        done
     done
 }
 
@@ -480,8 +516,12 @@ start_epoch_s3_sync_watcher() {
                 local epoch_name
                 epoch_name=$(basename "$epoch_dir")
                 [[ -f "$marker_dir/$epoch_name" ]] && continue
-                upload_epoch_folder_to_s3 "$epoch_dir"
-                touch "$marker_dir/$epoch_name"
+                if upload_epoch_folder_to_s3 "$epoch_dir"; then
+                    if [[ "$PRUNE_UPLOADED_LOCAL_CHECKPOINTS" == "1" || "$PRUNE_UPLOADED_LOCAL_CHECKPOINTS" == "true" || "$PRUNE_UPLOADED_LOCAL_CHECKPOINTS" == "True" ]]; then
+                        prune_epoch_local_checkpoints "$epoch_dir"
+                    fi
+                    touch "$marker_dir/$epoch_name"
+                fi
             done
             sleep "$EPOCH_S3_SYNC_INTERVAL"
         done
@@ -501,14 +541,22 @@ persist_outputs() {
     set +e
 
     if [[ -d "$LOCAL_OUTPUT_DIR" ]]; then
-        mkdir -p "$PERSIST_LOCAL_DIR"
-        cp -r "$LOCAL_OUTPUT_DIR"/. "$PERSIST_LOCAL_DIR"/ 2>/dev/null || true
-
+        local s3_upload_succeeded=0
         if [[ -n "${S3_OUTPUT_PATH:-}" ]]; then
-            rclone copy "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_PATH" || \
+            if rclone copy "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_PATH"; then
+                s3_upload_succeeded=1
+            else
                 echo "Warning: failed to upload outputs to ${S3_OUTPUT_PATH}" >&2
+            fi
             upload_final_models_to_s3
         fi
+
+        if [[ "$s3_upload_succeeded" == "1" && ( "$STRIP_LOCAL_MODELS_AFTER_SYNC" == "1" || "$STRIP_LOCAL_MODELS_AFTER_SYNC" == "true" || "$STRIP_LOCAL_MODELS_AFTER_SYNC" == "True" ) ]]; then
+            strip_local_model_artifacts "$LOCAL_OUTPUT_DIR"
+        fi
+
+        mkdir -p "$PERSIST_LOCAL_DIR"
+        cp -r "$LOCAL_OUTPUT_DIR"/. "$PERSIST_LOCAL_DIR"/ 2>/dev/null || true
     fi
 
     if [[ -n "${TMPDIR:-}" && -d "${TMPDIR:-}" ]]; then
