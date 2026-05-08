@@ -907,6 +907,8 @@ def main() -> None:
         running_best_decomposition_reward = 0.0
         running_best_correctness = 0.0
         tasks_completed = 0
+        rollout_tracking_step = tracking_step_offset
+        rollout_progress_path = epoch_dir / "rollout_progress.json"
         task_batches = chunk_tasks(epoch_tasks, args.rollout_task_batch_size)
         for batch_index, task_batch in enumerate(task_batches, start=1):
             print(
@@ -955,16 +957,47 @@ def main() -> None:
                 avg_seconds_per_task = elapsed / max(tasks_completed, 1)
                 remaining_tasks = len(epoch_tasks) - tasks_completed
                 eta_seconds = avg_seconds_per_task * remaining_tasks
+                progress_metrics = {
+                    "epoch": epoch_number,
+                    "batch": batch_index,
+                    "num_batches": len(task_batches),
+                    "tasks_completed": tasks_completed,
+                    "num_epoch_tasks": len(epoch_tasks),
+                    "progress_fraction": tasks_completed / max(len(epoch_tasks), 1),
+                    "elapsed_s": elapsed,
+                    "eta_s": eta_seconds,
+                    "avg_best_selection_reward": running_best_selection_reward / tasks_completed,
+                    "avg_best_decomposition_reward": running_best_decomposition_reward / tasks_completed,
+                    "avg_best_final_correctness": running_best_correctness / tasks_completed,
+                }
                 print(
                     f"[hierarchical-rema][integrated] rollout_progress "
                     f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
                     f"task={tasks_completed}/{len(epoch_tasks)} "
                     f"elapsed_s={elapsed:.1f} eta_s={eta_seconds:.1f} "
-                    f"avg_best_selection_reward={running_best_selection_reward / tasks_completed:.4f} "
-                    f"avg_best_decomposition_reward={running_best_decomposition_reward / tasks_completed:.4f} "
-                    f"avg_best_final_correctness={running_best_correctness / tasks_completed:.4f}"
+                    f"avg_best_selection_reward={progress_metrics['avg_best_selection_reward']:.4f} "
+                    f"avg_best_decomposition_reward={progress_metrics['avg_best_decomposition_reward']:.4f} "
+                    f"avg_best_final_correctness={progress_metrics['avg_best_final_correctness']:.4f}"
                 )
+                with rollout_progress_path.open("w", encoding="utf-8") as handle:
+                    json.dump(progress_metrics, handle, indent=2, sort_keys=True)
+                if tracking is not None:
+                    rollout_tracking_step += 1
+                    tracking.log(
+                        {
+                            "rollout_progress/tasks_completed": progress_metrics["tasks_completed"],
+                            "rollout_progress/num_tasks": progress_metrics["num_epoch_tasks"],
+                            "rollout_progress/fraction": progress_metrics["progress_fraction"],
+                            "rollout_progress/elapsed_s": progress_metrics["elapsed_s"],
+                            "rollout_progress/eta_s": progress_metrics["eta_s"],
+                            "rollout_progress/avg_best_selection_reward": progress_metrics["avg_best_selection_reward"],
+                            "rollout_progress/avg_best_decomposition_reward": progress_metrics["avg_best_decomposition_reward"],
+                            "rollout_progress/avg_best_final_correctness": progress_metrics["avg_best_final_correctness"],
+                        },
+                        step=rollout_tracking_step,
+                    )
         rollout_summary = epoch_rollout_summary(rollouts)
+        tracking_step_offset = max(tracking_step_offset, rollout_tracking_step)
         print(
             f"[hierarchical-rema][integrated] epoch={epoch_number} "
             f"mean_best_selection_reward={rollout_summary['mean_best_selection_reward']:.4f} "
