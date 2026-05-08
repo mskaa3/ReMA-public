@@ -106,7 +106,7 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.65
     ignore_eos: False
     enforce_eager: False
-    free_cache_engine: True
+    free_cache_engine: False
     load_format: dummy_dtensor
     tensor_model_parallel_size: 1
     max_num_batched_tokens: 4096
