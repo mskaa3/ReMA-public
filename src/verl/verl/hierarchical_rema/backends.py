@@ -514,6 +514,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             return float(self.config.worker_temperature)
         return float(self.config.temperature)
 
+    def _controller_max_new_tokens(self, role: str) -> int:
+        if role == "decomposer" and self.config.decomposer_max_new_tokens is not None:
+            return int(self.config.decomposer_max_new_tokens)
+        if role == "selector" and self.config.selector_max_new_tokens is not None:
+            return int(self.config.selector_max_new_tokens)
+        return int(self.config.controller_max_new_tokens)
+
     def _estimate_entropy(self, scores: List[object]) -> float:
         entropies = self._estimate_batch_entropy(scores)
         return entropies[0] if entropies else 0.0
@@ -679,7 +686,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
-                max_new_tokens=self.config.controller_max_new_tokens,
+                max_new_tokens=self._controller_max_new_tokens("decomposer"),
                 temperature=self._controller_temperature(),
             )
             try:
@@ -746,7 +753,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
-                max_new_tokens=self.config.controller_max_new_tokens,
+                max_new_tokens=self._controller_max_new_tokens("selector"),
                 temperature=self._controller_temperature(),
             )
             try:
@@ -911,7 +918,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
-                max_new_tokens=self.config.controller_max_new_tokens,
+                max_new_tokens=self._controller_max_new_tokens("decomposer"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
             )
@@ -992,7 +999,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
-                max_new_tokens=self.config.controller_max_new_tokens,
+                max_new_tokens=self._controller_max_new_tokens("selector"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
             )

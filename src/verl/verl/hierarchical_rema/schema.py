@@ -71,6 +71,8 @@ class HFBackendConfig:
     top_p: float = 0.95
     do_sample: bool = True
     controller_max_new_tokens: int = 768
+    decomposer_max_new_tokens: Optional[int] = None
+    selector_max_new_tokens: Optional[int] = None
     worker_max_new_tokens: int = 256
     controller_batch_size: int = 8
     worker_batch_size: int = 16
@@ -89,6 +91,8 @@ class VLLMBackendConfig:
     do_sample: bool = True
     prompt_length: int = 2048
     controller_max_new_tokens: int = 768
+    decomposer_max_new_tokens: Optional[int] = None
+    selector_max_new_tokens: Optional[int] = None
     worker_max_new_tokens: int = 256
     controller_batch_size: int = 8
     worker_batch_size: int = 16

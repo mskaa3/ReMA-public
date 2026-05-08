@@ -34,6 +34,8 @@ export TEMPERATURE=${TEMPERATURE:-0.5} # shared fallback temperature; workers us
 export CONTROLLER_TEMPERATURE=${CONTROLLER_TEMPERATURE:-$TEMPERATURE} # decomposer/selector temperature; can be lowered independently if structured output is unstable
 export WORKER_TEMPERATURE=${WORKER_TEMPERATURE:-$TEMPERATURE} # worker temperature; separate from controller so reasoning diversity can stay higher
 export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-384} # max tokens for decomposer/selector outputs; structured plans should stay short
+export DECOMPOSER_MAX_NEW_TOKENS=${DECOMPOSER_MAX_NEW_TOKENS:-1024} # decomposer plans can legitimately be longer because they carry node fields
+export SELECTOR_MAX_NEW_TOKENS=${SELECTOR_MAX_NEW_TOKENS:-256} # selector should stay compact: one worker assignment per node
 export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-512} # max tokens for worker outputs
 export ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-16} # number of train tasks rolled out together
 export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-16} # generation batch size for decomposer/selector calls
@@ -48,6 +50,8 @@ export VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.0} # deterministic validation rollou
 export VAL_CONTROLLER_TEMPERATURE=${VAL_CONTROLLER_TEMPERATURE:-$VAL_TEMPERATURE} # deterministic by default, but can be overridden separately for controllers
 export VAL_WORKER_TEMPERATURE=${VAL_WORKER_TEMPERATURE:-$VAL_TEMPERATURE} # deterministic by default, but can be overridden separately for workers
 export VAL_TOP_P=${VAL_TOP_P:-1.0} # deterministic validation rollout
+export VAL_DECOMPOSER_MAX_NEW_TOKENS=${VAL_DECOMPOSER_MAX_NEW_TOKENS:-0} # 0 = reuse training decomposer setting
+export VAL_SELECTOR_MAX_NEW_TOKENS=${VAL_SELECTOR_MAX_NEW_TOKENS:-0} # 0 = reuse training selector setting
 export MAX_VAL_TASKS=${MAX_VAL_TASKS:-0} # 0 = load the full overall_math validation benchmark
 export VAL_TASKS_PER_EPOCH=${VAL_TASKS_PER_EPOCH:-0} # 0 = validate on all loaded validation tasks each outer epoch
 export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-8} # number of validation tasks rolled out together

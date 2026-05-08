@@ -73,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
+    parser.add_argument("--decomposer-max-new-tokens", type=int, default=0, help="0 reuses --controller-max-new-tokens")
+    parser.add_argument("--selector-max-new-tokens", type=int, default=0, help="0 reuses --controller-max-new-tokens")
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
     parser.add_argument("--val-num-decompositions", type=int, default=1)
     parser.add_argument("--val-num-selections", type=int, default=1)
@@ -81,6 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-worker-temperature", type=float, default=None)
     parser.add_argument("--val-top-p", type=float, default=1.0)
     parser.add_argument("--val-controller-max-new-tokens", type=int, default=0, help="0 reuses --controller-max-new-tokens")
+    parser.add_argument("--val-decomposer-max-new-tokens", type=int, default=0, help="0 reuses the training decomposer/controller setting")
+    parser.add_argument("--val-selector-max-new-tokens", type=int, default=0, help="0 reuses the training selector/controller setting")
     parser.add_argument("--val-worker-max-new-tokens", type=int, default=0, help="0 reuses --worker-max-new-tokens")
     parser.add_argument("--controller-batch-size", type=int, default=8)
     parser.add_argument("--worker-batch-size", type=int, default=16)
@@ -612,6 +616,8 @@ def _build_rollout_trainer(
     worker_temperature: float | None,
     backend_top_p: float,
     controller_max_new_tokens: int,
+    decomposer_max_new_tokens: int | None,
+    selector_max_new_tokens: int | None,
     worker_max_new_tokens: int,
     rollout_logging_config: RolloutLoggingConfig | None,
 ) -> HierarchicalGRPOTrainer:
@@ -624,6 +630,8 @@ def _build_rollout_trainer(
             top_p=backend_top_p,
             do_sample=backend_temperature > 0.0,
             controller_max_new_tokens=controller_max_new_tokens,
+            decomposer_max_new_tokens=decomposer_max_new_tokens,
+            selector_max_new_tokens=selector_max_new_tokens,
             worker_max_new_tokens=worker_max_new_tokens,
             controller_batch_size=args.controller_batch_size,
             worker_batch_size=args.worker_batch_size,
@@ -638,6 +646,8 @@ def _build_rollout_trainer(
             do_sample=backend_temperature > 0.0,
             prompt_length=args.rollout_prompt_length,
             controller_max_new_tokens=controller_max_new_tokens,
+            decomposer_max_new_tokens=decomposer_max_new_tokens,
+            selector_max_new_tokens=selector_max_new_tokens,
             worker_max_new_tokens=worker_max_new_tokens,
             controller_batch_size=args.controller_batch_size,
             worker_batch_size=args.worker_batch_size,
@@ -671,6 +681,24 @@ def run_external_validation(
         args.val_controller_max_new_tokens
         if args.val_controller_max_new_tokens > 0
         else args.controller_max_new_tokens
+    )
+    decomposer_max_new_tokens = (
+        args.val_decomposer_max_new_tokens
+        if args.val_decomposer_max_new_tokens > 0
+        else (
+            args.decomposer_max_new_tokens
+            if args.decomposer_max_new_tokens > 0
+            else controller_max_new_tokens
+        )
+    )
+    selector_max_new_tokens = (
+        args.val_selector_max_new_tokens
+        if args.val_selector_max_new_tokens > 0
+        else (
+            args.selector_max_new_tokens
+            if args.selector_max_new_tokens > 0
+            else controller_max_new_tokens
+        )
     )
     controller_temperature = (
         args.val_controller_temperature
@@ -729,6 +757,8 @@ def run_external_validation(
         worker_temperature=worker_temperature,
         backend_top_p=args.val_top_p,
         controller_max_new_tokens=controller_max_new_tokens,
+        decomposer_max_new_tokens=decomposer_max_new_tokens,
+        selector_max_new_tokens=selector_max_new_tokens,
         worker_max_new_tokens=worker_max_new_tokens,
         rollout_logging_config=None,
     )
@@ -938,6 +968,16 @@ def main() -> None:
             ),
             backend_top_p=args.top_p,
             controller_max_new_tokens=args.controller_max_new_tokens,
+            decomposer_max_new_tokens=(
+                args.decomposer_max_new_tokens
+                if args.decomposer_max_new_tokens > 0
+                else args.controller_max_new_tokens
+            ),
+            selector_max_new_tokens=(
+                args.selector_max_new_tokens
+                if args.selector_max_new_tokens > 0
+                else args.controller_max_new_tokens
+            ),
             worker_max_new_tokens=args.worker_max_new_tokens,
             rollout_logging_config=logging_config,
         )
