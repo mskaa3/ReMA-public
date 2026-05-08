@@ -359,6 +359,22 @@ def test_line_based_controller_plans_are_parseable() -> None:
     assert len(selection_payload["assignments"]) == 2
 
 
+def test_selector_plan_accepts_minimal_assignment_lines() -> None:
+    selection_payload = extract_selection_payload(
+        "<selection_plan>\n"
+        "SELECTION_ID: sel-compact\n"
+        "n1 -> analysis_worker\n"
+        "n2 -> algebra_worker\n"
+        "</selection_plan>"
+    )
+
+    assert selection_payload["selection_id"] == "sel-compact"
+    assert [assignment["worker_id"] for assignment in selection_payload["assignments"]] == [
+        "analysis_worker",
+        "algebra_worker",
+    ]
+
+
 def test_controller_training_completions_are_clean_plan_blocks() -> None:
     trainer = HierarchicalGRPOTrainer()
     task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
@@ -379,3 +395,19 @@ def test_controller_training_completions_are_clean_plan_blocks() -> None:
     assert "validation" not in decomposer_completion
     assert "controller_prompt" not in selector_completion
     assert "validation" not in selector_completion
+    assert "compatibility=" not in selector_completion
+
+
+def test_selector_compatibility_is_computed_even_for_minimal_output() -> None:
+    trainer = HierarchicalGRPOTrainer()
+    task = make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)")
+    rollout = trainer.run(
+        task=task,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(num_decompositions=1, num_selections_per_decomposition=1),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+    )
+
+    selection = rollout.decompositions[0].selections[0].selection
+    assert all(assignment.compatibility > 0.0 for assignment in selection.assignments)

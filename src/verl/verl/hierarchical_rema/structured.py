@@ -104,12 +104,7 @@ def format_selection_plan(candidate: SelectionCandidate) -> str:
         f"SELECTION_ID: {candidate.selection_id}",
     ]
     for assignment in candidate.assignments:
-        lines.append(
-            "ASSIGN: "
-            f"{assignment.node_id} -> {assignment.worker_id} | "
-            f"compatibility={assignment.compatibility:.4f} | "
-            f"rationale={assignment.rationale}"
-        )
+        lines.append(f"{assignment.node_id} -> {assignment.worker_id}")
     lines.append("</selection_plan>")
     return "\n".join(lines)
 
@@ -177,7 +172,7 @@ def _parse_selection_plan(text: str) -> Dict[str, Any]:
     lines = [line.strip() for line in normalized.splitlines() if line.strip()]
     payload: Dict[str, Any] = {"assignments": []}
     assignment_pattern = re.compile(
-        r"^ASSIGN(?:MENT)?\s*:?\s*(?P<node_id>.+?)\s*->\s*(?P<worker_id>[^|]+?)"
+        r"^(?:[-*]\s*)?(?:\d+[.)]\s*)?(?:ASSIGN(?:MENT)?\s*:?\s*)?(?P<node_id>.+?)\s*->\s*(?P<worker_id>[^|]+?)"
         r"(?:\s*\|\s*compatibility\s*[:=]\s*(?P<compatibility>[^|]+?))?"
         r"(?:\s*\|\s*rationale\s*[:=]\s*(?P<rationale>.*))?$",
         flags=re.IGNORECASE,

@@ -66,6 +66,33 @@ class WorkerExecutionRequest:
     compatibility: float
 
 
+def _canonicalize_selection_candidate(
+    candidate: SelectionCandidate,
+    decomposition: DecompositionCandidate,
+    worker_pool: WorkerPoolConfig,
+    worker_performance: Dict[str, WorkerPerformanceSnapshot],
+) -> SelectionCandidate:
+    worker_map = worker_pool.workers_by_id()
+    node_map = decomposition.nodes_by_id()
+    normalized_assignments: List[WorkerAssignment] = []
+    for assignment in candidate.assignments:
+        worker = worker_map[assignment.worker_id]
+        node = node_map[assignment.node_id]
+        normalized_assignments.append(
+            WorkerAssignment(
+                node_id=assignment.node_id,
+                worker_id=assignment.worker_id,
+                rationale=assignment.rationale or f"Selected for node {assignment.node_id}.",
+                compatibility=round(
+                    compatibility_score(node.required_skills, worker, worker_performance),
+                    4,
+                ),
+            )
+        )
+    candidate.assignments = normalized_assignments
+    return candidate
+
+
 class HierarchicalBackend(ABC):
     @abstractmethod
     def sample_decomposition(
@@ -689,6 +716,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         decomposition: DecompositionCandidate,
         worker_pool: WorkerPoolConfig,
         policy_config: ControllerPolicyConfig,
+        worker_performance: Dict[str, WorkerPerformanceSnapshot],
         fallback_id: str,
     ) -> SelectionCandidate:
         del task
@@ -713,6 +741,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     decomposition=decomposition,
                     worker_pool=worker_pool,
                 )
+                candidate = _canonicalize_selection_candidate(
+                    candidate=candidate,
+                    decomposition=decomposition,
+                    worker_pool=worker_pool,
+                    worker_performance=worker_performance,
+                )
                 return self._set_selection_artifacts(
                     candidate=candidate,
                     prompt_text=prompt_text,
@@ -728,7 +762,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 errors.append(str(exc))
                 repair_prompt = (
                     f"{prompt_text}\n\nYour previous answer did not match the required selection format. "
-                    f"Error: {exc}\nReturn ONLY the corrected <selection_plan> block."
+                    f"Error: {exc}\nReturn ONLY the corrected <selection_plan> block. "
+                    "The simplest valid form is:\n"
+                    "<selection_plan>\n"
+                    "SELECTION_ID: short_id\n"
+                    "n1 -> worker_a\n"
+                    "n2 -> worker_b\n"
+                    "</selection_plan>"
                 )
 
         candidate = build_fallback_selection(
@@ -736,6 +776,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             worker_pool=worker_pool,
             raw_text=last_raw_text,
             error_message=" | ".join(errors) if errors else "Unknown selection format error",
+        )
+        candidate = _canonicalize_selection_candidate(
+            candidate=candidate,
+            decomposition=decomposition,
+            worker_pool=worker_pool,
+            worker_performance=worker_performance,
         )
         candidate.raw_payload["controller_prompt"] = prompt_text
         candidate.raw_payload.setdefault("validation", {})
@@ -782,6 +828,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             decomposition=decomposition,
             worker_pool=worker_pool,
             policy_config=policy_config,
+            worker_performance=worker_performance,
             fallback_id=f"{decomposition.decomposition_id}-sel-{selection_index}",
         )
 
@@ -941,6 +988,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         decomposition=request.decomposition,
                         worker_pool=request.worker_pool,
                     )
+                    candidate = _canonicalize_selection_candidate(
+                        candidate=candidate,
+                        decomposition=request.decomposition,
+                        worker_pool=request.worker_pool,
+                        worker_performance=request.worker_performance,
+                    )
                     candidate = self._set_selection_artifacts(
                         candidate=candidate,
                         prompt_text=prompt_text,
@@ -962,6 +1015,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         decomposition=request.decomposition,
                         worker_pool=request.worker_pool,
                         policy_config=request.policy_config,
+                        worker_performance=request.worker_performance,
                         fallback_id=fallback_id,
                     )
                     candidate.raw_payload.setdefault("validation", {})

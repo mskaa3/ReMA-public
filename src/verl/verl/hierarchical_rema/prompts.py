@@ -49,8 +49,8 @@ Assign workers to the DAG nodes.
 Return exactly one block in this format:
 <selection_plan>
 SELECTION_ID: short_id
-ASSIGN: n1 -> worker_a | compatibility=0.95 | rationale=best skill match
-ASSIGN: n2 -> worker_b | compatibility=0.90 | rationale=best final-step fit
+n1 -> worker_a
+n2 -> worker_b
 </selection_plan>
 
 Rules:
@@ -58,7 +58,8 @@ Rules:
 2. Keep the block compact and easy to parse.
 3. Assign exactly one worker to each node.
 4. Use worker skills, prior compatibility, and performance history.
-5. Keep rationale short and concrete.
+5. The simplest valid output is one assignment line per node in the form `node_id -> worker_id`.
+6. Compatibility and rationale are optional; if you include them, keep them short.
 """
 
 
@@ -190,27 +191,36 @@ def render_selector_prompt(
     worker_pool: WorkerPoolConfig,
     worker_performance: Dict[str, WorkerPerformanceSnapshot],
 ) -> str:
-    payload = {
-        "task_id": task.task_id,
-        "task": task.prompt,
-        "decomposition": _decomposition_context(decomposition),
-        "available_workers": _worker_context(worker_pool, worker_performance),
-        "preferred_output_format": [
-            "<selection_plan>",
-            "SELECTION_ID: short_id",
-            "ASSIGN: n1 -> worker_a | compatibility=0.95 | rationale=best skill match",
-            "ASSIGN: n2 -> worker_b | compatibility=0.90 | rationale=best final-step fit",
-            "</selection_plan>",
-        ],
-        "required_fields": [
-            "selection_id",
-            "assignments[].node_id",
-            "assignments[].worker_id",
-            "assignments[].compatibility",
-            "assignments[].rationale",
-        ],
-    }
-    return f"{SELECTOR_SYSTEM_PROMPT}\n\n{json.dumps(payload, indent=2, sort_keys=True)}"
+    node_lines = []
+    for node in decomposition.nodes:
+        dependencies = ",".join(node.dependencies) if node.dependencies else "none"
+        skills = ",".join(node.required_skills) if node.required_skills else "none"
+        node_lines.append(
+            f"- {node.node_id} | deps={dependencies} | skills={skills} | output={node.output_key} | instruction={node.instruction}"
+        )
+
+    worker_lines = []
+    for worker in worker_pool.workers:
+        snapshot = worker_performance.get(worker.worker_id)
+        success_rate = snapshot.success_rate if snapshot is not None else 0.0
+        avg_reward = snapshot.average_reward if snapshot is not None else 0.0
+        skills = ",".join(worker.skills) if worker.skills else "none"
+        worker_lines.append(
+            f"- {worker.worker_id} | skills={skills} | success={success_rate:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
+        )
+
+    return (
+        f"{SELECTOR_SYSTEM_PROMPT}\n\n"
+        f"TASK_ID: {task.task_id}\n"
+        f"TASK: {task.prompt}\n"
+        f"DECOMPOSITION_ID: {decomposition.decomposition_id}\n"
+        f"FINAL_NODE_ID: {decomposition.final_node_id}\n"
+        "NODES:\n"
+        f"{chr(10).join(node_lines)}\n"
+        "AVAILABLE_WORKERS:\n"
+        f"{chr(10).join(worker_lines)}\n\n"
+        "Return ONLY the <selection_plan> block."
+    )
 
 
 def render_worker_prompt(

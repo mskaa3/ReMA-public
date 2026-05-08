@@ -19,12 +19,17 @@ export PARAMETER_SHARING=${PARAMETER_SHARING:-false} # if true, selector and dec
 # TRAIN_SUBSET_SIZE: how many train tasks are in that subset.
 # GRPO_PASSES_PER_SUBSET: how many update passes we make on rollout samples generated from that one subset.
 # Legacy aliases still work underneath: NUM_EPOCHS, TASKS_PER_EPOCH, EPOCHS.
-export TRAIN_SUBSET_ROUNDS=${TRAIN_SUBSET_ROUNDS:-${NUM_EPOCHS:-20}}
+#
+# Default alternating setup below assumes the original train split is about 8523 tasks.
+# With TRAIN_SUBSET_SIZE=426 and alternating mode, TRAIN_SUBSET_ROUNDS=40 gives each controller
+# about 20 subset rounds, i.e. roughly one full pass over the train set per role:
+#   20 * 426 ~= 8520
+export TRAIN_SUBSET_ROUNDS=${TRAIN_SUBSET_ROUNDS:-${NUM_EPOCHS:-40}}
 export GRPO_PASSES_PER_SUBSET=${GRPO_PASSES_PER_SUBSET:-${EPOCHS:-1}}
 
-export TRAIN_SUBSET_SIZE=${TRAIN_SUBSET_SIZE:-${TASKS_PER_EPOCH:-853}}
-export NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-16} # controller rollout width during training
-export NUM_SELECTIONS=${NUM_SELECTIONS:-16} # selector samples per decomposition during training
+export TRAIN_SUBSET_SIZE=${TRAIN_SUBSET_SIZE:-${TASKS_PER_EPOCH:-426}}
+export NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-16} # controller rollout width during training; 16 is expensive but keeps broad exploration
+export NUM_SELECTIONS=${NUM_SELECTIONS:-16} # selector samples per decomposition; 16 is expensive but matches the broad exploration setting
 export TEMPERATURE=${TEMPERATURE:-0.5} # controller/worker sampling temperature during training rollouts
 export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-1024} # max tokens for decomposer/selector outputs
 export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-512} # max tokens for worker outputs
@@ -32,6 +37,8 @@ export ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-16} # number of train 
 export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-16} # generation batch size for decomposer/selector calls
 export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-16} # generation batch size for worker calls
 export ROLLOUT_PROGRESS_EVERY=${ROLLOUT_PROGRESS_EVERY:-1} # print progress after every completed task
+export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-1} # replay microbatch size during GRPO updates
+export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-16} # effective replay samples per optimizer step = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
 
 export VAL_NUM_DECOMPOSITIONS=${VAL_NUM_DECOMPOSITIONS:-1} # validation uses a single decomposition candidate per task
 export VAL_NUM_SELECTIONS=${VAL_NUM_SELECTIONS:-1} # validation uses a single selector sample per task
@@ -46,7 +53,8 @@ export ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-compact} # compact = smaller JSO
 export BEST_K=${BEST_K:-1} # keep only the single best decomposition/selection record per epoch
 export CHECKPOINT_MODE=${CHECKPOINT_MODE:-all} # all = enable best/ checkpoints when eval is on; final = only final/
 export PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-true} # delete older local policy checkpoints after newer ones are produced
-export SAVE_STEPS=${SAVE_STEPS:-0} # disable checkpoint-N step snapshots to save disk
+export SAVE_STEPS=${SAVE_STEPS:-100} # save checkpoint-N during GRPO so long runs visibly progress
+export EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-100} # replay-val cadence during GRPO; full benchmark still runs only after the subset update finishes
 export EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-true} # upload completed epoch folders to S3 while the job is still running
 export EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-120} # seconds between checks for finished epoch folders
 export PRUNE_UPLOADED_LOCAL_CHECKPOINTS=${PRUNE_UPLOADED_LOCAL_CHECKPOINTS:-true} # after epoch upload, delete local best/ and checkpoint-* dirs; keep final/ for continued training
