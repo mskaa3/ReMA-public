@@ -28,7 +28,7 @@ actor_rollout_ref:
   actor:
     strategy: fsdp  # This is for backward-compatibility
     clip_mode: turn
-    ppo_mini_batch_size: 12  # per GPU
+    ppo_mini_batch_size: 4  # per GPU
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: 8
     use_dynamic_bsz: True
