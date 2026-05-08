@@ -60,6 +60,40 @@ DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-$MODEL_PATH}
 SELECTOR_MODEL_PATH=${SELECTOR_MODEL_PATH:-$MODEL_PATH}
 WORKER_BASE_MODEL_PATH=${WORKER_BASE_MODEL_PATH:-$MODEL_PATH}
 
+normalize_name_component() {
+    local value="$1"
+    value="${value##*/}"
+    value="${value//\//-}"
+    value="${value// /-}"
+    value="${value//:/-}"
+    value="${value//,/-}"
+    value="${value//=/-}"
+    value="${value//+/-}"
+    value="${value//(/-}"
+    value="${value//)/-}"
+    while [[ "$value" == *"--"* ]]; do
+        value="${value//--/-}"
+    done
+    value="${value#-}"
+    value="${value%-}"
+    if [[ -z "$value" ]]; then
+        value="unknown"
+    fi
+    printf '%s' "$value"
+}
+
+if [[ "$PARAMETER_SHARING" == "1" || "$PARAMETER_SHARING" == "true" || "$PARAMETER_SHARING" == "True" ]]; then
+    PARAMETER_SHARING_TAG="ps-true"
+else
+    PARAMETER_SHARING_TAG="ps-false"
+fi
+MODE_TAG="mode-$(normalize_name_component "$MODE")"
+if [[ "$DECOMPOSER_MODEL_PATH" == "$SELECTOR_MODEL_PATH" ]]; then
+    MODEL_NAME_TAG="$(normalize_name_component "$DECOMPOSER_MODEL_PATH")"
+else
+    MODEL_NAME_TAG="dec-$(normalize_name_component "$DECOMPOSER_MODEL_PATH")-sel-$(normalize_name_component "$SELECTOR_MODEL_PATH")"
+fi
+
 NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-3}
 NUM_SELECTIONS=${NUM_SELECTIONS:-2}
 SOFT_MAX_HOPS=${SOFT_MAX_HOPS:-3}
@@ -162,7 +196,7 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-false}
 ENABLE_WANDB=${ENABLE_WANDB:-false}
 WANDB_PROJECT=${WANDB_PROJECT:-multi-grpo-rema}
-WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-${RUN_KIND}-${JOB_ID}}
+WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-${MODE_TAG}-${PARAMETER_SHARING_TAG}-${MODEL_NAME_TAG}-${JOB_ID}}
 DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}
 EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-false}
 EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-300}

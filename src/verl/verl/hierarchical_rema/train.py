@@ -187,7 +187,7 @@ def _tracking(args: argparse.Namespace, config_payload: Dict[str, Any]):
         print(f"[hierarchical-rema][tracking] wandb disabled due to import/init error: {exc}")
         return None
 
-    experiment_name = args.experiment_name or os.environ.get("SLURM_JOB_ID") or Path(args.output_dir).name
+    experiment_name = _default_experiment_name(args)
     print(
         f"[hierarchical-rema][tracking] initializing wandb "
         f"project={args.project_name} experiment={experiment_name}"
@@ -202,6 +202,50 @@ def _tracking(args: argparse.Namespace, config_payload: Dict[str, Any]):
     except Exception as exc:
         print(f"[hierarchical-rema][tracking] wandb initialization failed: {exc}")
         return None
+
+
+def _sanitize_experiment_component(value: str) -> str:
+    sanitized = []
+    for char in value:
+        if char.isalnum() or char in {"-", "_", "."}:
+            sanitized.append(char)
+        elif char in {"/", " ", ":", ",", "=", "+", "(", ")"}:
+            sanitized.append("-")
+        else:
+            sanitized.append("-")
+    result = "".join(sanitized).strip("-")
+    while "--" in result:
+        result = result.replace("--", "-")
+    return result or "unknown"
+
+
+def _default_experiment_name(args: argparse.Namespace) -> str:
+    if args.experiment_name:
+        return args.experiment_name
+
+    job_id = os.environ.get("SLURM_JOB_ID")
+    mode = getattr(args, "mode", None) or os.environ.get("MODE") or "unknown"
+    parameter_sharing_raw = os.environ.get("PARAMETER_SHARING", "false").lower()
+    parameter_sharing = parameter_sharing_raw in {"1", "true", "yes"}
+
+    model_path = (
+        getattr(args, "model_path", None)
+        or getattr(args, "shared_model_path", None)
+        or getattr(args, "decomposer_model_path", None)
+        or os.environ.get("MODEL_PATH")
+        or os.environ.get("DECOMPOSER_MODEL_PATH")
+    )
+    model_name = Path(model_path).name if model_path else "model"
+
+    components = [
+        "train",
+        f"mode-{_sanitize_experiment_component(str(mode))}",
+        f"ps-{'true' if parameter_sharing else 'false'}",
+        _sanitize_experiment_component(model_name),
+    ]
+    if job_id:
+        components.append(str(job_id))
+    return "-".join(components)
 
 
 def _finish_tracking(tracking) -> None:
@@ -980,7 +1024,7 @@ def main() -> None:
                 policy_dir.mkdir(parents=True, exist_ok=True)
                 replay_exports = maybe_save_replay_copy(policy_dir, split, enabled=args.save_replay_copy)
                 model_path = model_path_for_policy(policy_id, split["train"] or split["all"], replay_like_args)
-                experiment_name = args.experiment_name or os.environ.get("SLURM_JOB_ID") or output_dir.name
+                experiment_name = _default_experiment_name(args)
                 experiment_name = f"{experiment_name}-epoch{epoch_number:04d}-{policy_id}"
                 print(
                     f"[hierarchical-rema][integrated] training policy={policy_id} "
