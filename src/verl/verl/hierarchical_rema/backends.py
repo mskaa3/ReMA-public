@@ -711,7 +711,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 errors.append(str(exc))
                 repair_prompt = (
                     f"{prompt_text}\n\nYour previous answer did not match the required decomposition format. "
-                    f"Error: {exc}\nReturn ONLY the corrected <decomposition_plan> block."
+                    f"Error: {exc}\nReturn ONLY the corrected <decomposition_plan> block. "
+                    "Do not add commentary, bullets, or repeated task text. "
+                    "Every node must include NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, and OUTPUT_KEY."
                 )
 
         candidate = build_fallback_decomposition(
@@ -786,6 +788,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 repair_prompt = (
                     f"{prompt_text}\n\nYour previous answer did not match the required selection format. "
                     f"Error: {exc}\nReturn ONLY the corrected <selection_plan> block. "
+                    "Do not add commentary, bullets, repeated task text, or extra sections. "
+                    "Use exactly one `node_id -> worker_id` line per node. "
                     "The simplest valid form is:\n"
                     "<selection_plan>\n"
                     "SELECTION_ID: short_id\n"

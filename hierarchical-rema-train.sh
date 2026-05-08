@@ -33,16 +33,16 @@ export NUM_SELECTIONS=${NUM_SELECTIONS:-16} # selector samples per decomposition
 export TEMPERATURE=${TEMPERATURE:-0.5} # shared fallback temperature; workers usually benefit from staying around 0.5
 export CONTROLLER_TEMPERATURE=${CONTROLLER_TEMPERATURE:-$TEMPERATURE} # decomposer/selector temperature; can be lowered independently if structured output is unstable
 export WORKER_TEMPERATURE=${WORKER_TEMPERATURE:-$TEMPERATURE} # worker temperature; separate from controller so reasoning diversity can stay higher
-export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-384} # max tokens for decomposer/selector outputs; structured plans should stay short
+export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-1024} # max tokens for decomposer/selector outputs; structured plans should stay short
 export DECOMPOSER_MAX_NEW_TOKENS=${DECOMPOSER_MAX_NEW_TOKENS:-1024} # decomposer plans can legitimately be longer because they carry node fields
-export SELECTOR_MAX_NEW_TOKENS=${SELECTOR_MAX_NEW_TOKENS:-256} # selector should stay compact: one worker assignment per node
+export SELECTOR_MAX_NEW_TOKENS=${SELECTOR_MAX_NEW_TOKENS:-512} # selector should stay compact: one worker assignment per node
 export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-512} # max tokens for worker outputs
 export ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-16} # number of train tasks rolled out together
 export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-16} # generation batch size for decomposer/selector calls
 export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-16} # generation batch size for worker calls
 export ROLLOUT_PROGRESS_EVERY=${ROLLOUT_PROGRESS_EVERY:-1} # print progress after every completed task
-export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-1} # replay microbatch size during GRPO updates
-export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-16} # effective replay samples per optimizer step = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
+export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4} # replay microbatch size during GRPO updates
+export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4} # effective replay samples per optimizer step = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
 
 export VAL_NUM_DECOMPOSITIONS=${VAL_NUM_DECOMPOSITIONS:-1} # validation uses a single decomposition candidate per task
 export VAL_NUM_SELECTIONS=${VAL_NUM_SELECTIONS:-1} # validation uses a single selector sample per task

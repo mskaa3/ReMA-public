@@ -15,6 +15,8 @@ from .schema import (
 DECOMPOSER_SYSTEM_PROMPT = """You are the Decomposer controller.
 Produce a compact DAG decomposition for the task.
 
+Your entire response must be exactly one XML-like block and nothing else.
+
 Return exactly one block in this format:
 <decomposition_plan>
 DECOMPOSITION_ID: short_id
@@ -34,16 +36,26 @@ OUTPUT_KEY: final_answer
 
 Rules:
 1. Do not use markdown fences.
-2. Keep the block compact and easy to parse.
-3. Use a DAG, not a linear chain unless the task truly requires one.
-4. Use short node instructions.
-5. The final node must produce the final answer.
-6. Prefer decompositions that fit the available worker pool and prior worker performance.
+2. Do not output prose before the opening tag or after the closing tag.
+3. Use the field names exactly as shown: DECOMPOSITION_ID, SUMMARY, FINAL_NODE_ID, NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.
+4. Every NODE must be followed by exactly one INSTRUCTION, one DEPENDENCIES, one REQUIRED_SKILLS, and one OUTPUT_KEY line.
+5. Use a DAG, not a linear chain unless the task truly requires one.
+6. Use short node instructions and short summaries.
+7. Prefer 2 to 4 nodes unless the task truly needs more or fewer.
+8. The final node must produce the final answer, and FINAL_NODE_ID must match one declared node.
+9. Dependencies must be `none` or a comma-separated list of previously declared node IDs.
+10. REQUIRED_SKILLS should match the available worker pool whenever possible.
+11. OUTPUT_KEY values should be short snake_case names.
+12. Do not invent extra sections, commentary, explanations, bullets, or JSON.
+
+If you are unsure, output the simplest valid decomposition_plan block that satisfies the format.
 """
 
 
 SELECTOR_SYSTEM_PROMPT = """You are the Selector controller.
 Assign workers to the DAG nodes.
+
+Your entire response must be exactly one XML-like block and nothing else.
 
 Return exactly one block in this format:
 <selection_plan>
@@ -54,11 +66,17 @@ n2 -> worker_b
 
 Rules:
 1. Do not use markdown fences.
-2. Keep the block compact and easy to parse.
+2. Do not output prose before the opening tag or after the closing tag.
 3. Assign exactly one worker to each node.
-4. Use worker skills, prior compatibility, and performance history.
-5. The simplest valid output is one assignment line per node in the form `node_id -> worker_id`.
-6. Compatibility and rationale are optional; if you include them, keep them short.
+4. Use only node IDs that appear in the prompt.
+5. Use only worker IDs that appear in the prompt.
+6. Output exactly one assignment line per node in the form `node_id -> worker_id`.
+7. Do not skip nodes, duplicate nodes, or assign multiple workers to one node.
+8. Prefer the worker whose skills and past performance best match the node requirements.
+9. Keep the output minimal. Do not include explanations, commentary, bullets, JSON, or repeated task text.
+10. Unless absolutely necessary, do not include compatibility or rationale fields. The preferred answer is only assignment lines.
+
+If you are unsure, output the simplest valid selection_plan block with one assignment per node.
 """
 
 
@@ -163,6 +181,11 @@ def render_decomposer_prompt(
 
     return (
         f"{DECOMPOSER_SYSTEM_PROMPT}\n\n"
+        "OUTPUT CONTRACT:\n"
+        "- Response must start with <decomposition_plan> and end with </decomposition_plan>.\n"
+        "- Use node IDs like n1, n2, n3 in topological order.\n"
+        "- Every node block must include NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
+        "- Do not repeat the task outside the block.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         "AVAILABLE_WORKERS:\n"
@@ -197,6 +220,11 @@ def render_selector_prompt(
 
     return (
         f"{SELECTOR_SYSTEM_PROMPT}\n\n"
+        "OUTPUT CONTRACT:\n"
+        "- Response must start with <selection_plan> and end with </selection_plan>.\n"
+        "- Preferred answer is exactly one `node_id -> worker_id` line per node.\n"
+        "- Do not repeat the task, decomposition, or worker descriptions in the output.\n"
+        "- Do not invent node IDs or worker IDs.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         f"DECOMPOSITION_ID: {decomposition.decomposition_id}\n"
@@ -205,7 +233,12 @@ def render_selector_prompt(
         f"{chr(10).join(node_lines)}\n"
         "AVAILABLE_WORKERS:\n"
         f"{chr(10).join(worker_lines)}\n\n"
-        "Return ONLY the <selection_plan> block."
+        "Return ONLY the <selection_plan> block. The preferred minimal form is:\n"
+        "<selection_plan>\n"
+        "SELECTION_ID: short_id\n"
+        "n1 -> worker_a\n"
+        "n2 -> worker_b\n"
+        "</selection_plan>"
     )
 
 

@@ -328,6 +328,24 @@ def test_selector_prompt_uses_compact_decomposition_context() -> None:
 
     assert '"raw_payload"' not in prompt
     assert '"raw_text"' not in prompt
+    assert "Do not invent node IDs or worker IDs." in prompt
+    assert "Preferred answer is exactly one `node_id -> worker_id` line per node." in prompt
+
+
+def test_decomposer_prompt_declares_strict_output_contract() -> None:
+    trainer = HierarchicalGRPOTrainer()
+    worker_pool = make_worker_pool()
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+
+    prompt = render_decomposer_prompt(
+        task=task,
+        worker_pool=worker_pool,
+        worker_performance=trainer.orchestrator.worker_memory.snapshot(worker_pool),
+    )
+
+    assert "Response must start with <decomposition_plan>" in prompt
+    assert "Use node IDs like n1, n2, n3 in topological order." in prompt
+    assert "Every node block must include NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY." in prompt
 
 
 def test_line_based_controller_plans_are_parseable() -> None:
