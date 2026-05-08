@@ -12,6 +12,9 @@ from .schema import VLLMBackendConfig
 class RayGenerationKey:
     model_path: str
     response_length: int
+    temperature: float
+    top_p: float
+    do_sample: bool
 
 
 @dataclass
@@ -35,6 +38,9 @@ def build_vllm_rollout_config_dict(
     *,
     model_path: str,
     response_length: int,
+    temperature: float,
+    top_p: float,
+    do_sample: bool,
     config: VLLMBackendConfig,
 ) -> Dict:
     max_model_len = config.max_model_len
@@ -57,9 +63,9 @@ def build_vllm_rollout_config_dict(
         },
         "rollout": {
             "name": "vllm",
-            "temperature": config.temperature,
+            "temperature": temperature,
             "top_k": -1,
-            "top_p": config.top_p,
+            "top_p": top_p,
             "prompt_length": config.prompt_length,
             "response_length": response_length,
             "dtype": config.dtype,
@@ -75,7 +81,7 @@ def build_vllm_rollout_config_dict(
             "log_prob_micro_batch_size": None,
             "log_prob_micro_batch_size_per_gpu": 8,
             "use_fire_sampling": False,
-            "do_sample": config.do_sample,
+            "do_sample": do_sample,
             "disable_log_stats": config.disable_log_stats,
             "enable_chunked_prefill": config.enable_chunked_prefill,
             "detokenize": config.detokenize,
@@ -174,6 +180,7 @@ class RayVLLMGenerationManager:
         tokenizer: object,
         prompt_texts: Sequence[str],
         system_prompt: str | None,
+        do_sample: bool,
     ):
         import torch
 
@@ -245,7 +252,7 @@ class RayVLLMGenerationManager:
                 "position_ids": position_ids,
             },
             meta_info={
-                "do_sample": self.config.do_sample,
+                "do_sample": do_sample,
             },
         )
 
@@ -283,6 +290,9 @@ class RayVLLMGenerationManager:
             build_vllm_rollout_config_dict(
                 model_path=key.model_path,
                 response_length=key.response_length,
+                temperature=key.temperature,
+                top_p=key.top_p,
+                do_sample=key.do_sample,
                 config=self.config,
             )
         )
@@ -333,8 +343,17 @@ class RayVLLMGenerationManager:
         *,
         model_path: str,
         response_length: int,
+        temperature: float,
+        top_p: float,
+        do_sample: bool,
     ) -> _RayBundle:
-        key = RayGenerationKey(model_path=model_path, response_length=response_length)
+        key = RayGenerationKey(
+            model_path=model_path,
+            response_length=response_length,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
         if self._active_bundle is not None and self._active_bundle.key == key:
             return self._active_bundle
         if self._active_bundle is not None:
@@ -351,11 +370,20 @@ class RayVLLMGenerationManager:
         max_new_tokens: int,
         batch_size: int,
         system_prompt: str | None = None,
+        temperature: float | None = None,
     ) -> List[RayGenerationResult]:
         if not prompt_texts:
             return []
 
-        bundle = self._get_bundle(model_path=model_path, response_length=max_new_tokens)
+        resolved_temperature = self.config.temperature if temperature is None else float(temperature)
+        resolved_do_sample = resolved_temperature > 0.0
+        bundle = self._get_bundle(
+            model_path=model_path,
+            response_length=max_new_tokens,
+            temperature=resolved_temperature,
+            top_p=self.config.top_p,
+            do_sample=resolved_do_sample,
+        )
         tokenizer = bundle.tokenizer
 
         try:
@@ -370,6 +398,7 @@ class RayVLLMGenerationManager:
                 tokenizer=tokenizer,
                 prompt_texts=prompt_chunk,
                 system_prompt=system_prompt,
+                do_sample=resolved_do_sample,
             )
             padded_prompt_proto, pad_size = pad_dataproto_to_divisor(
                 prompt_proto,
@@ -425,6 +454,7 @@ class RayVLLMGenerationManager:
         prompt_text: str,
         max_new_tokens: int,
         system_prompt: str | None = None,
+        temperature: float | None = None,
     ) -> RayGenerationResult:
         return self.generate_batch(
             model_path=model_path,
@@ -432,4 +462,5 @@ class RayVLLMGenerationManager:
             max_new_tokens=max_new_tokens,
             batch_size=1,
             system_prompt=system_prompt,
+            temperature=temperature,
         )[0]

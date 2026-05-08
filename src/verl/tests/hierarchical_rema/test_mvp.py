@@ -16,6 +16,7 @@ try:
     from verl.hierarchical_rema.prompts import (
         DEFAULT_ALGEBRA_WORKER_PROMPT,
         DEFAULT_ANALYSIS_WORKER_PROMPT,
+        render_decomposer_prompt,
         render_selector_prompt,
     )
     from verl.hierarchical_rema.structured import (
@@ -39,6 +40,7 @@ except ModuleNotFoundError:
     from hierarchical_rema.prompts import (
         DEFAULT_ALGEBRA_WORKER_PROMPT,
         DEFAULT_ANALYSIS_WORKER_PROMPT,
+        render_decomposer_prompt,
         render_selector_prompt,
     )
     from hierarchical_rema.structured import (
@@ -204,16 +206,17 @@ def test_controller_prompts_include_worker_performance_history() -> None:
         schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
     )
 
-    prompt_text = second_rollout.training_batch.decomposer_samples[0].prompt_text
-    prompt_payload = json.loads(prompt_text[prompt_text.index("{"):])
-    worker_summaries = {
-        worker["worker_id"]: worker["performance_summary"]
-        for worker in prompt_payload["available_workers"]
-    }
+    prompt_text = render_decomposer_prompt(
+        second_task,
+        worker_pool,
+        trainer.orchestrator.worker_memory.snapshot(worker_pool),
+    )
 
-    assert "completion_rate" in worker_summaries["algebra_worker"]
-    assert worker_summaries["algebra_worker"]["num_assignments"] > 0
-    assert "recent_history" in worker_summaries["algebra_worker"]
+    assert "AVAILABLE_WORKERS:" in prompt_text
+    assert "algebra_worker" in prompt_text
+    assert "complete=" in prompt_text
+    assert "avg_reward=" in prompt_text
+    assert '"available_workers"' not in prompt_text
 
 
 def test_soft_hop_penalty_and_hard_hop_truncation_are_applied() -> None:

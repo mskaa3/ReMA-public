@@ -504,6 +504,16 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             for start in range(0, total_size, safe_chunk_size)
         ]
 
+    def _controller_temperature(self) -> float:
+        if self.config.controller_temperature is not None:
+            return float(self.config.controller_temperature)
+        return float(self.config.temperature)
+
+    def _worker_temperature(self) -> float:
+        if self.config.worker_temperature is not None:
+            return float(self.config.worker_temperature)
+        return float(self.config.temperature)
+
     def _estimate_entropy(self, scores: List[object]) -> float:
         entropies = self._estimate_batch_entropy(scores)
         return entropies[0] if entropies else 0.0
@@ -528,9 +538,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         max_new_tokens: int,
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
+        temperature: float | None = None,
     ) -> Tuple[str, float]:
         tokenizer, model = self._load_bundle(base_model_path, lora_adapter_path=lora_adapter_path)
         full_prompt = self._build_prompt(tokenizer, prompt_text, system_prompt=system_prompt)
+        resolved_temperature = self.config.temperature if temperature is None else temperature
 
         import torch
 
@@ -543,8 +555,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                do_sample=self.config.do_sample,
-                temperature=self.config.temperature,
+                do_sample=resolved_temperature > 0.0,
+                temperature=resolved_temperature,
                 top_p=self.config.top_p,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
@@ -565,11 +577,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         batch_size: int,
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
+        temperature: float | None = None,
     ) -> List[Tuple[str, float]]:
         if not prompt_texts:
             return []
 
         tokenizer, model = self._load_bundle(base_model_path, lora_adapter_path=lora_adapter_path)
+        resolved_temperature = self.config.temperature if temperature is None else temperature
 
         import torch
 
@@ -588,8 +602,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
-                    do_sample=self.config.do_sample,
-                    temperature=self.config.temperature,
+                    do_sample=resolved_temperature > 0.0,
+                    temperature=resolved_temperature,
                     top_p=self.config.top_p,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
@@ -666,6 +680,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
                 max_new_tokens=self.config.controller_max_new_tokens,
+                temperature=self._controller_temperature(),
             )
             try:
                 payload = extract_decomposition_payload(last_raw_text)
@@ -732,6 +747,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
                 max_new_tokens=self.config.controller_max_new_tokens,
+                temperature=self._controller_temperature(),
             )
             try:
                 payload = extract_selection_payload(last_raw_text)
@@ -853,6 +869,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             prompt_text=prompt_text,
             system_prompt=worker.system_prompt,
             max_new_tokens=self.config.worker_max_new_tokens,
+            temperature=self._worker_temperature(),
         )
         normalized_output = output_text.strip()
         completed = bool(normalized_output)
@@ -896,6 +913,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 prompt_texts=prompt_texts,
                 max_new_tokens=self.config.controller_max_new_tokens,
                 batch_size=self.config.controller_batch_size,
+                temperature=self._controller_temperature(),
             )
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
@@ -976,6 +994,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 prompt_texts=prompt_texts,
                 max_new_tokens=self.config.controller_max_new_tokens,
                 batch_size=self.config.controller_batch_size,
+                temperature=self._controller_temperature(),
             )
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
@@ -1072,6 +1091,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 batch_size=self.config.worker_batch_size,
                 lora_adapter_path=lora_adapter_path,
                 system_prompt=system_prompt,
+                temperature=self._worker_temperature(),
             )
             for (result_index, request, _), (output_text, entropy) in zip(grouped_requests, generated):
                 normalized_output = output_text.strip()
@@ -1108,6 +1128,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
         max_new_tokens: int,
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
+        temperature: float | None = None,
     ) -> Tuple[str, float]:
         if lora_adapter_path is not None:
             raise NotImplementedError("Worker LoRA adapters are not implemented for the Ray/vLLM backend yet")
@@ -1116,6 +1137,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
             prompt_text=prompt_text,
             max_new_tokens=max_new_tokens,
             system_prompt=system_prompt,
+            temperature=self.config.temperature if temperature is None else temperature,
         )
         return result.text, result.entropy
 
@@ -1127,6 +1149,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
         batch_size: int,
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
+        temperature: float | None = None,
     ) -> List[Tuple[str, float]]:
         if lora_adapter_path is not None:
             raise NotImplementedError("Worker LoRA adapters are not implemented for the Ray/vLLM backend yet")
@@ -1136,6 +1159,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
             max_new_tokens=max_new_tokens,
             batch_size=batch_size,
             system_prompt=system_prompt,
+            temperature=self.config.temperature if temperature is None else temperature,
         )
         return [(item.text, item.entropy) for item in generated]
 

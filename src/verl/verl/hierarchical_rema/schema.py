@@ -66,6 +66,8 @@ class TrainingScheduleConfig:
 @dataclass
 class HFBackendConfig:
     temperature: float = 0.5
+    controller_temperature: Optional[float] = None
+    worker_temperature: Optional[float] = None
     top_p: float = 0.95
     do_sample: bool = True
     controller_max_new_tokens: int = 768
@@ -81,6 +83,8 @@ class HFBackendConfig:
 @dataclass
 class VLLMBackendConfig:
     temperature: float = 0.5
+    controller_temperature: Optional[float] = None
+    worker_temperature: Optional[float] = None
     top_p: float = 0.95
     do_sample: bool = True
     prompt_length: int = 2048

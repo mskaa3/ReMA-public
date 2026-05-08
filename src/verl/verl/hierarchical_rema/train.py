@@ -69,12 +69,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-max-hops", type=int, default=None)
     parser.add_argument("--soft-hop-penalty", type=float, default=0.1)
     parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--controller-temperature", type=float, default=None)
+    parser.add_argument("--worker-temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
     parser.add_argument("--val-num-decompositions", type=int, default=1)
     parser.add_argument("--val-num-selections", type=int, default=1)
     parser.add_argument("--val-temperature", type=float, default=0.0)
+    parser.add_argument("--val-controller-temperature", type=float, default=None)
+    parser.add_argument("--val-worker-temperature", type=float, default=None)
     parser.add_argument("--val-top-p", type=float, default=1.0)
     parser.add_argument("--val-controller-max-new-tokens", type=int, default=0, help="0 reuses --controller-max-new-tokens")
     parser.add_argument("--val-worker-max-new-tokens", type=int, default=0, help="0 reuses --worker-max-new-tokens")
@@ -604,6 +608,8 @@ def _build_rollout_trainer(
     args: argparse.Namespace,
     *,
     backend_temperature: float,
+    controller_temperature: float | None,
+    worker_temperature: float | None,
     backend_top_p: float,
     controller_max_new_tokens: int,
     worker_max_new_tokens: int,
@@ -613,6 +619,8 @@ def _build_rollout_trainer(
         backend_type=args.backend,
         hf_backend_config=HFBackendConfig(
             temperature=backend_temperature,
+            controller_temperature=controller_temperature,
+            worker_temperature=worker_temperature,
             top_p=backend_top_p,
             do_sample=backend_temperature > 0.0,
             controller_max_new_tokens=controller_max_new_tokens,
@@ -624,6 +632,8 @@ def _build_rollout_trainer(
         ),
         vllm_backend_config=VLLMBackendConfig(
             temperature=backend_temperature,
+            controller_temperature=controller_temperature,
+            worker_temperature=worker_temperature,
             top_p=backend_top_p,
             do_sample=backend_temperature > 0.0,
             prompt_length=args.rollout_prompt_length,
@@ -662,10 +672,28 @@ def run_external_validation(
         if args.val_controller_max_new_tokens > 0
         else args.controller_max_new_tokens
     )
+    controller_temperature = (
+        args.val_controller_temperature
+        if args.val_controller_temperature is not None
+        else (
+            args.controller_temperature
+            if args.controller_temperature is not None
+            else args.val_temperature
+        )
+    )
     worker_max_new_tokens = (
         args.val_worker_max_new_tokens
         if args.val_worker_max_new_tokens > 0
         else args.worker_max_new_tokens
+    )
+    worker_temperature = (
+        args.val_worker_temperature
+        if args.val_worker_temperature is not None
+        else (
+            args.worker_temperature
+            if args.worker_temperature is not None
+            else args.val_temperature
+        )
     )
     rollout_task_batch_size = (
         args.val_rollout_task_batch_size
@@ -697,6 +725,8 @@ def run_external_validation(
     trainer = _build_rollout_trainer(
         args,
         backend_temperature=args.val_temperature,
+        controller_temperature=controller_temperature,
+        worker_temperature=worker_temperature,
         backend_top_p=args.val_top_p,
         controller_max_new_tokens=controller_max_new_tokens,
         worker_max_new_tokens=worker_max_new_tokens,
@@ -896,6 +926,16 @@ def main() -> None:
         rollout_trainer = _build_rollout_trainer(
             args,
             backend_temperature=args.temperature,
+            controller_temperature=(
+                args.controller_temperature
+                if args.controller_temperature is not None
+                else args.temperature
+            ),
+            worker_temperature=(
+                args.worker_temperature
+                if args.worker_temperature is not None
+                else args.temperature
+            ),
             backend_top_p=args.top_p,
             controller_max_new_tokens=args.controller_max_new_tokens,
             worker_max_new_tokens=args.worker_max_new_tokens,

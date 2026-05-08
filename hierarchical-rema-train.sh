@@ -30,8 +30,10 @@ export GRPO_PASSES_PER_SUBSET=${GRPO_PASSES_PER_SUBSET:-${EPOCHS:-1}}
 export TRAIN_SUBSET_SIZE=${TRAIN_SUBSET_SIZE:-${TASKS_PER_EPOCH:-426}}
 export NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-16} # controller rollout width during training; 16 is expensive but keeps broad exploration
 export NUM_SELECTIONS=${NUM_SELECTIONS:-16} # selector samples per decomposition; 16 is expensive but matches the broad exploration setting
-export TEMPERATURE=${TEMPERATURE:-0.5} # controller/worker sampling temperature during training rollouts
-export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-1024} # max tokens for decomposer/selector outputs
+export TEMPERATURE=${TEMPERATURE:-0.5} # shared fallback temperature; workers usually benefit from staying around 0.5
+export CONTROLLER_TEMPERATURE=${CONTROLLER_TEMPERATURE:-$TEMPERATURE} # decomposer/selector temperature; can be lowered independently if structured output is unstable
+export WORKER_TEMPERATURE=${WORKER_TEMPERATURE:-$TEMPERATURE} # worker temperature; separate from controller so reasoning diversity can stay higher
+export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-384} # max tokens for decomposer/selector outputs; structured plans should stay short
 export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-512} # max tokens for worker outputs
 export ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-16} # number of train tasks rolled out together
 export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-16} # generation batch size for decomposer/selector calls
@@ -43,6 +45,8 @@ export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-16} # effective replay samples per o
 export VAL_NUM_DECOMPOSITIONS=${VAL_NUM_DECOMPOSITIONS:-1} # validation uses a single decomposition candidate per task
 export VAL_NUM_SELECTIONS=${VAL_NUM_SELECTIONS:-1} # validation uses a single selector sample per task
 export VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.0} # deterministic validation rollout
+export VAL_CONTROLLER_TEMPERATURE=${VAL_CONTROLLER_TEMPERATURE:-$VAL_TEMPERATURE} # deterministic by default, but can be overridden separately for controllers
+export VAL_WORKER_TEMPERATURE=${VAL_WORKER_TEMPERATURE:-$VAL_TEMPERATURE} # deterministic by default, but can be overridden separately for workers
 export VAL_TOP_P=${VAL_TOP_P:-1.0} # deterministic validation rollout
 export MAX_VAL_TASKS=${MAX_VAL_TASKS:-0} # 0 = load the full overall_math validation benchmark
 export VAL_TASKS_PER_EPOCH=${VAL_TASKS_PER_EPOCH:-0} # 0 = validate on all loaded validation tasks each outer epoch
