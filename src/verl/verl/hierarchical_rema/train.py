@@ -72,6 +72,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--controller-temperature", type=float, default=None)
     parser.add_argument("--worker-temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument(
+        "--controller-constrained-decoding",
+        dest="controller_constrained_decoding",
+        action="store_true",
+        help="Enable constrained decoding hints for decomposer/selector controllers",
+    )
+    parser.add_argument(
+        "--disable-controller-constrained-decoding",
+        dest="controller_constrained_decoding",
+        action="store_false",
+        help="Disable constrained decoding hints for controllers",
+    )
+    parser.set_defaults(controller_constrained_decoding=True)
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
     parser.add_argument("--decomposer-max-new-tokens", type=int, default=0, help="0 reuses --controller-max-new-tokens")
     parser.add_argument("--selector-max-new-tokens", type=int, default=0, help="0 reuses --controller-max-new-tokens")
@@ -125,6 +138,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-reward", type=float, default=None)
     parser.add_argument("--min-advantage", type=float, default=None)
+    parser.add_argument(
+        "--controller-format-retry-penalty",
+        type=float,
+        default=0.05,
+        help="Penalty subtracted from controller sample reward/advantage when output required format repair",
+    )
+    parser.add_argument(
+        "--controller-format-fallback-penalty",
+        type=float,
+        default=0.25,
+        help="Penalty subtracted from controller sample reward/advantage when fallback output was used",
+    )
     parser.add_argument("--save-replay-copy", action="store_true", help="Save train/val/all sample JSONL files per policy for inspection")
 
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -635,6 +660,7 @@ def _build_rollout_trainer(
             worker_max_new_tokens=worker_max_new_tokens,
             controller_batch_size=args.controller_batch_size,
             worker_batch_size=args.worker_batch_size,
+            controller_constrained_decoding=args.controller_constrained_decoding,
             trust_remote_code=args.trust_remote_code,
             torch_dtype=args.torch_dtype,
         ),
@@ -651,6 +677,7 @@ def _build_rollout_trainer(
             worker_max_new_tokens=worker_max_new_tokens,
             controller_batch_size=args.controller_batch_size,
             worker_batch_size=args.worker_batch_size,
+            controller_constrained_decoding=args.controller_constrained_decoding,
             nnodes=args.ray_nnodes,
             n_gpus_per_node=args.ray_n_gpus_per_node,
             tensor_model_parallel_size=args.vllm_tensor_parallel_size,
@@ -662,6 +689,8 @@ def _build_rollout_trainer(
             trust_remote_code=args.trust_remote_code,
         ),
         rollout_logging_config=rollout_logging_config,
+        controller_format_retry_penalty=args.controller_format_retry_penalty,
+        controller_format_fallback_penalty=args.controller_format_fallback_penalty,
     )
 
 

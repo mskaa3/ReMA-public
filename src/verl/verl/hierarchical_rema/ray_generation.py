@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -181,6 +181,7 @@ class RayVLLMGenerationManager:
         prompt_texts: Sequence[str],
         system_prompt: str | None,
         do_sample: bool,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
     ):
         import torch
 
@@ -245,15 +246,18 @@ class RayVLLMGenerationManager:
 
         attention_mask = inputs["attention_mask"]
         position_ids = compute_position_id_with_mask(attention_mask)
+        meta_info: Dict[str, Any] = {
+            "do_sample": do_sample,
+        }
+        if sampling_overrides:
+            meta_info["sampling_overrides"] = dict(sampling_overrides)
         return DataProto.from_dict(
             tensors={
                 "input_ids": inputs["input_ids"],
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             },
-            meta_info={
-                "do_sample": do_sample,
-            },
+            meta_info=meta_info,
         )
 
     def _build_bundle(
@@ -371,6 +375,7 @@ class RayVLLMGenerationManager:
         batch_size: int,
         system_prompt: str | None = None,
         temperature: float | None = None,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> List[RayGenerationResult]:
         if not prompt_texts:
             return []
@@ -399,6 +404,7 @@ class RayVLLMGenerationManager:
                 prompt_texts=prompt_chunk,
                 system_prompt=system_prompt,
                 do_sample=resolved_do_sample,
+                sampling_overrides=sampling_overrides,
             )
             padded_prompt_proto, pad_size = pad_dataproto_to_divisor(
                 prompt_proto,
@@ -455,6 +461,7 @@ class RayVLLMGenerationManager:
         max_new_tokens: int,
         system_prompt: str | None = None,
         temperature: float | None = None,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> RayGenerationResult:
         return self.generate_batch(
             model_path=model_path,
@@ -463,4 +470,5 @@ class RayVLLMGenerationManager:
             batch_size=1,
             system_prompt=system_prompt,
             temperature=temperature,
+            sampling_overrides=sampling_overrides,
         )[0]

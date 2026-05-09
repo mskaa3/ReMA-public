@@ -5,7 +5,7 @@ import json
 import re
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 from .schema import (
     DecompositionCandidate,
@@ -77,17 +77,67 @@ def _parse_csv_field(raw_value: Any) -> List[str]:
         return []
     return [item.strip() for item in text.split(",") if item.strip()]
 
+
+def _extract_int_list(raw_value: Any) -> List[int]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        values: List[int] = []
+        for item in raw_value:
+            try:
+                parsed = int(item)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                values.append(parsed)
+        return values
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    values: List[int] = []
+    for token in re.findall(r"-?\d+", text):
+        try:
+            parsed = int(token)
+        except ValueError:
+            continue
+        if parsed > 0:
+            values.append(parsed)
+    return values
+
+
+def _normalize_node_id_token(raw_value: Any) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    numeric_match = re.fullmatch(r"[nN]\s*(\d+)", text)
+    if numeric_match:
+        return str(int(numeric_match.group(1)))
+    if text.isdigit():
+        return str(int(text))
+    return text
+
+
+def _next_numeric_node_id(nodes: Sequence[SubtaskNode]) -> str:
+    numeric_ids = [
+        int(normalized)
+        for node in nodes
+        for normalized in [_normalize_node_id_token(node.node_id)]
+        if normalized.isdigit()
+    ]
+    if numeric_ids:
+        return str(max(numeric_ids) + 1)
+    return str(len(nodes) + 1 if nodes else 1)
+
 def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
     lines = [
         "<decomposition_plan>",
-        f"DECOMPOSITION_ID: {candidate.decomposition_id}",
         f"SUMMARY: {candidate.summary}",
         f"FINAL_NODE_ID: {candidate.final_node_id}",
     ]
     for node in candidate.nodes:
         lines.extend(
             [
-                f"NODE: {node.node_id}",
+                f"NODE_ID: {node.node_id}",
                 f"INSTRUCTION: {node.instruction}",
                 f"DEPENDENCIES: {', '.join(node.dependencies) if node.dependencies else 'none'}",
                 f"REQUIRED_SKILLS: {', '.join(node.required_skills) if node.required_skills else 'none'}",
@@ -98,13 +148,27 @@ def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
     return "\n".join(lines)
 
 
-def format_selection_plan(candidate: SelectionCandidate) -> str:
-    lines = [
-        "<selection_plan>",
-        f"SELECTION_ID: {candidate.selection_id}",
-    ]
-    for assignment in candidate.assignments:
-        lines.append(f"{assignment.node_id} -> {assignment.worker_id}")
+def format_selection_plan(
+    candidate: SelectionCandidate,
+    *,
+    node_order: Sequence[str] | None = None,
+    worker_index_by_id: Dict[str, int] | None = None,
+) -> str:
+    lines = ["<selection_plan>"]
+    if node_order is not None and worker_index_by_id is not None:
+        assignment_by_node = {assignment.node_id: assignment for assignment in candidate.assignments}
+        for node_id in node_order:
+            assignment = assignment_by_node.get(node_id)
+            if assignment is None:
+                continue
+            worker_index = worker_index_by_id.get(assignment.worker_id)
+            if worker_index is None:
+                lines.append(f"{node_id}: {assignment.worker_id}")
+                continue
+            lines.append(f"{node_id}: {worker_index}")
+    else:
+        for assignment in candidate.assignments:
+            lines.append(f"{assignment.node_id}: {assignment.worker_id}")
     lines.append("</selection_plan>")
     return "\n".join(lines)
 
@@ -129,7 +193,7 @@ def _extract_key_value_payload(text: str) -> Dict[str, Any]:
         key, raw_value = line.split(":", 1)
         key = key.strip().upper()
         raw_value = raw_value.strip()
-        if key == "NODE":
+        if key in {"NODE", "NODE_ID"}:
             finalize_node()
             current_node = {"node_id": raw_value}
             continue
@@ -171,8 +235,13 @@ def _parse_selection_plan(text: str) -> Dict[str, Any]:
     normalized = _normalize_structured_text(text, tags=KNOWN_SELECTION_TAGS)
     lines = [line.strip() for line in normalized.splitlines() if line.strip()]
     payload: Dict[str, Any] = {"assignments": []}
+    compact_worker_indices: List[int] | None = None
+    indexed_assignment_pattern = re.compile(
+        r"^(?:[-*]\s*)?(?:\d+[.)]\s*)?(?:ASSIGN(?:MENT)?\s*:?\s*)?(?P<node_index>\d+)\s*(?:->|:)\s*(?P<worker_index>\d+)\s*$",
+        flags=re.IGNORECASE,
+    )
     assignment_pattern = re.compile(
-        r"^(?:[-*]\s*)?(?:\d+[.)]\s*)?(?:ASSIGN(?:MENT)?\s*:?\s*)?(?P<node_id>.+?)\s*->\s*(?P<worker_id>[^|]+?)"
+        r"^(?:[-*]\s*)?(?:\d+[.)]\s*)?(?:ASSIGN(?:MENT)?\s*:?\s*)?(?P<node_id>.+?)\s*(?:->|:)\s*(?P<worker_id>[^|]+?)"
         r"(?:\s*\|\s*compatibility\s*[:=]\s*(?P<compatibility>[^|]+?))?"
         r"(?:\s*\|\s*rationale\s*[:=]\s*(?P<rationale>.*))?$",
         flags=re.IGNORECASE,
@@ -181,8 +250,24 @@ def _parse_selection_plan(text: str) -> Dict[str, Any]:
     for line in lines:
         if line.startswith("<") and line.endswith(">"):
             continue
-        if line.upper().startswith("SELECTION_ID:"):
+        upper_line = line.upper()
+        if upper_line.startswith("SELECTION_ID:"):
             payload["selection_id"] = line.split(":", 1)[1].strip()
+            continue
+        if upper_line.startswith("ASSIGNMENTS:") or upper_line.startswith("WORKER_ASSIGNMENTS:"):
+            compact_worker_indices = _extract_int_list(line.split(":", 1)[1].strip())
+            continue
+        indexed_match = indexed_assignment_pattern.match(line)
+        if indexed_match:
+            payload["assignments"].append(
+                {
+                    "node_id": indexed_match.group("node_index"),
+                    "node_index": int(indexed_match.group("node_index")),
+                    "worker_index": int(indexed_match.group("worker_index")),
+                    "compatibility": 0.0,
+                    "rationale": "Selected for this node.",
+                }
+            )
             continue
         match = assignment_pattern.match(line)
         if not match:
@@ -201,6 +286,17 @@ def _parse_selection_plan(text: str) -> Dict[str, Any]:
                 "rationale": rationale,
             }
         )
+
+    if compact_worker_indices is not None:
+        payload["assignments"] = [
+            {
+                "node_index": node_index,
+                "worker_index": worker_index,
+                "compatibility": 0.0,
+                "rationale": "Selected for this node.",
+            }
+            for node_index, worker_index in enumerate(compact_worker_indices, start=1)
+        ]
 
     if payload["assignments"]:
         payload.setdefault("selection_id", "selection")
@@ -296,7 +392,7 @@ def _truncate_to_node_budget(
     synthetic_final = _synthetic_final_node(
         kept_nodes=kept_nodes,
         reason=reason,
-        synthetic_id=f"{candidate.decomposition_id}_hard_limit_final",
+        synthetic_id=_next_numeric_node_id(kept_nodes),
     )
     new_nodes = kept_nodes + [synthetic_final]
     return DecompositionCandidate(
@@ -356,7 +452,7 @@ def validate_decomposition_payload(
 ) -> DecompositionCandidate:
     decomposition_id = str(payload.get("decomposition_id") or fallback_id)
     summary = str(payload.get("summary") or "No summary provided.")
-    final_node_id = str(payload.get("final_node_id") or "")
+    final_node_id = _normalize_node_id_token(payload.get("final_node_id"))
     nodes_payload = payload.get("nodes")
     if not isinstance(nodes_payload, list) or not nodes_payload:
         raise StructuredOutputError("Decomposer output must contain a non-empty 'nodes' list")
@@ -366,7 +462,7 @@ def validate_decomposition_payload(
     for idx, node_payload in enumerate(nodes_payload):
         if not isinstance(node_payload, dict):
             raise StructuredOutputError(f"Node {idx} is not a JSON object")
-        node_id = str(node_payload.get("node_id") or "")
+        node_id = _normalize_node_id_token(node_payload.get("node_id"))
         if not node_id:
             raise StructuredOutputError(f"Node {idx} is missing 'node_id'")
         if node_id in seen_node_ids:
@@ -375,7 +471,10 @@ def validate_decomposition_payload(
         instruction = str(node_payload.get("instruction") or "").strip()
         if not instruction:
             raise StructuredOutputError(f"Node {node_id} is missing 'instruction'")
-        dependencies = _parse_csv_field(node_payload.get("dependencies"))
+        dependencies = [
+            _normalize_node_id_token(dep)
+            for dep in _parse_csv_field(node_payload.get("dependencies"))
+        ]
         if not isinstance(dependencies, list) or not all(isinstance(dep, str) for dep in dependencies):
             raise StructuredOutputError(f"Node {node_id} has invalid 'dependencies'")
         required_skills = _parse_csv_field(node_payload.get("required_skills"))
@@ -419,13 +518,47 @@ def validate_selection_payload(
 
     valid_node_ids = {node.node_id for node in decomposition.nodes}
     valid_worker_ids = set(worker_pool.workers_by_id().keys())
+    ordered_node_ids = [node.node_id for node in decomposition.nodes]
+    ordered_worker_ids = [worker.worker_id for worker in worker_pool.workers]
     assignments: List[WorkerAssignment] = []
     seen_node_ids = set()
     for idx, assignment_payload in enumerate(assignments_payload):
         if not isinstance(assignment_payload, dict):
             raise StructuredOutputError(f"Assignment {idx} is not a JSON object")
-        node_id = str(assignment_payload.get("node_id") or "")
-        worker_id = str(assignment_payload.get("worker_id") or "")
+        raw_node_id = assignment_payload.get("node_id")
+        raw_worker_id = assignment_payload.get("worker_id")
+        raw_node_index = assignment_payload.get("node_index")
+        raw_worker_index = assignment_payload.get("worker_index")
+
+        node_id = _normalize_node_id_token(raw_node_id)
+        worker_id = str(raw_worker_id or "").strip()
+
+        if node_id not in valid_node_ids:
+            node_index_candidates: List[int] = []
+            node_index_candidates.extend(_extract_int_list(raw_node_index))
+            if node_id.isdigit():
+                node_index_candidates.extend(_extract_int_list(node_id))
+            if node_index_candidates:
+                node_index = node_index_candidates[0]
+                if node_index <= 0 or node_index > len(ordered_node_ids):
+                    raise StructuredOutputError(
+                        f"Assignment {idx} references invalid node index '{node_index}'"
+                    )
+                node_id = ordered_node_ids[node_index - 1]
+
+        if worker_id not in valid_worker_ids:
+            worker_index_candidates: List[int] = []
+            worker_index_candidates.extend(_extract_int_list(raw_worker_index))
+            if worker_id.isdigit():
+                worker_index_candidates.extend(_extract_int_list(worker_id))
+            if worker_index_candidates:
+                worker_index = worker_index_candidates[0]
+                if worker_index <= 0 or worker_index > len(ordered_worker_ids):
+                    raise StructuredOutputError(
+                        f"Assignment {idx} references invalid worker index '{worker_index}'"
+                    )
+                worker_id = ordered_worker_ids[worker_index - 1]
+
         if node_id not in valid_node_ids:
             raise StructuredOutputError(f"Assignment {idx} references unknown node_id '{node_id}'")
         if worker_id not in valid_worker_ids:
@@ -469,10 +602,10 @@ def build_fallback_decomposition(
     payload = {
         "decomposition_id": f"{task_id}-fallback-decomposition",
         "summary": "Fallback decomposition due to invalid controller output.",
-        "final_node_id": "fallback_final",
+        "final_node_id": "1",
         "nodes": [
             {
-                "node_id": "fallback_final",
+                "node_id": "1",
                 "instruction": "Provide the best final answer directly.",
                 "dependencies": [],
                 "required_skills": [],

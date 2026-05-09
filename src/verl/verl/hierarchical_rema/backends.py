@@ -4,7 +4,7 @@ import importlib.util
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .prompts import render_decomposer_prompt, render_selector_prompt, render_worker_prompt
 from .rewarding import compatibility_score, entropy_to_confidence_reward, skill_match_score
@@ -205,22 +205,27 @@ class MockHierarchicalBackend(HierarchicalBackend):
         del policy_config
         skill_focus = task.metadata.get("skill_focus", "algebra")
         secondary_skill = "analysis" if skill_focus == "algebra" else "algebra"
-        prompt_text = render_decomposer_prompt(task, worker_pool, worker_performance)
+        prompt_text = render_decomposer_prompt(
+            task,
+            worker_pool,
+            worker_performance,
+            max_nodes_hint=rollout_config.max_nodes_per_decomposition,
+        )
 
         template_index = decomposition_index % 3
         if template_index == 0:
             nodes = [
                 SubtaskNode(
-                    node_id="n1",
+                    node_id="1",
                     instruction="Identify the core mathematical structure.",
                     dependencies=[],
                     required_skills=[skill_focus],
                     output_key="core_structure",
                 ),
                 SubtaskNode(
-                    node_id="n2",
+                    node_id="2",
                     instruction="Use the core structure to compute the final answer.",
-                    dependencies=["n1"],
+                    dependencies=["1"],
                     required_skills=[skill_focus],
                     output_key="final_answer",
                 ),
@@ -229,23 +234,23 @@ class MockHierarchicalBackend(HierarchicalBackend):
         elif template_index == 1:
             nodes = [
                 SubtaskNode(
-                    node_id="n1",
+                    node_id="1",
                     instruction="List the known quantities and target expression.",
                     dependencies=[],
                     required_skills=[skill_focus],
                     output_key="knowns",
                 ),
                 SubtaskNode(
-                    node_id="n2",
+                    node_id="2",
                     instruction="Choose the most relevant theorem or manipulation.",
-                    dependencies=["n1"],
+                    dependencies=["1"],
                     required_skills=[skill_focus],
                     output_key="method",
                 ),
                 SubtaskNode(
-                    node_id="n3",
+                    node_id="3",
                     instruction="Apply the chosen method to produce the final answer.",
-                    dependencies=["n2"],
+                    dependencies=["2"],
                     required_skills=[skill_focus],
                     output_key="final_answer",
                 ),
@@ -254,16 +259,16 @@ class MockHierarchicalBackend(HierarchicalBackend):
         else:
             nodes = [
                 SubtaskNode(
-                    node_id="n1",
+                    node_id="1",
                     instruction="Take an unnecessary detour through a less relevant subdomain.",
                     dependencies=[],
                     required_skills=[secondary_skill],
                     output_key="detour",
                 ),
                 SubtaskNode(
-                    node_id="n2",
+                    node_id="2",
                     instruction="Recover from the detour and attempt the final answer.",
-                    dependencies=["n1"],
+                    dependencies=["1"],
                     required_skills=[skill_focus],
                     output_key="final_answer",
                 ),
@@ -351,7 +356,16 @@ class MockHierarchicalBackend(HierarchicalBackend):
             "fallback_used": False,
         }
         candidate.raw_payload = raw_payload
-        candidate.raw_text = format_selection_plan(candidate)
+        node_order = [node.node_id for node in decomposition.nodes]
+        worker_index_by_id = {
+            worker.worker_id: idx
+            for idx, worker in enumerate(worker_pool.workers, start=1)
+        }
+        candidate.raw_text = format_selection_plan(
+            candidate,
+            node_order=node_order,
+            worker_index_by_id=worker_index_by_id,
+        )
         return candidate
 
     def execute_worker(
@@ -521,6 +535,55 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             return int(self.config.selector_max_new_tokens)
         return int(self.config.controller_max_new_tokens)
 
+    @staticmethod
+    def _selection_index_context(
+        decomposition: DecompositionCandidate,
+        worker_pool: WorkerPoolConfig,
+    ) -> tuple[List[str], Dict[str, int]]:
+        node_order = [node.node_id for node in decomposition.nodes]
+        worker_index_by_id = {
+            worker.worker_id: index
+            for index, worker in enumerate(worker_pool.workers, start=1)
+        }
+        return node_order, worker_index_by_id
+
+    def _format_selection_completion_text(
+        self,
+        *,
+        candidate: SelectionCandidate,
+        decomposition: DecompositionCandidate,
+        worker_pool: WorkerPoolConfig,
+    ) -> str:
+        node_order, worker_index_by_id = self._selection_index_context(
+            decomposition=decomposition,
+            worker_pool=worker_pool,
+        )
+        return format_selection_plan(
+            candidate,
+            node_order=node_order,
+            worker_index_by_id=worker_index_by_id,
+        )
+
+    def _controller_sampling_overrides(
+        self,
+        role: str,
+    ) -> Dict[str, Any]:
+        overrides: Dict[str, Any] = {}
+        stop_tag = "</decomposition_plan>" if role == "decomposer" else "</selection_plan>"
+        overrides["stop"] = [stop_tag]
+        overrides["include_stop_str_in_output"] = True
+
+        if getattr(self.config, "controller_constrained_decoding", False):
+            if role == "decomposer":
+                regex = r"(?s)<decomposition_plan>.*?</decomposition_plan>"
+            else:
+                regex = r"(?s)<selection_plan>\s*(?:\d+\s*:\s*\d+\s*)+</selection_plan>"
+            # Keep alias variants for vLLM versions that differ in field names.
+            overrides["structured_outputs"] = {"regex": regex}
+            overrides["guided_decoding"] = {"regex": regex}
+            overrides["guided_regex"] = regex
+        return overrides
+
     def _estimate_entropy(self, scores: List[object]) -> float:
         entropies = self._estimate_batch_entropy(scores)
         return entropies[0] if entropies else 0.0
@@ -546,7 +609,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
         temperature: float | None = None,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, float]:
+        del sampling_overrides
         tokenizer, model = self._load_bundle(base_model_path, lora_adapter_path=lora_adapter_path)
         full_prompt = self._build_prompt(tokenizer, prompt_text, system_prompt=system_prompt)
         resolved_temperature = self.config.temperature if temperature is None else temperature
@@ -585,7 +650,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
         temperature: float | None = None,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[str, float]]:
+        del sampling_overrides
         if not prompt_texts:
             return []
 
@@ -655,6 +722,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         candidate: SelectionCandidate,
         prompt_text: str,
         validation: Dict[str, object],
+        decomposition: DecompositionCandidate | None = None,
+        worker_pool: WorkerPoolConfig | None = None,
     ) -> SelectionCandidate:
         candidate.raw_payload = {
             "selection": {
@@ -664,7 +733,19 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             "controller_prompt": prompt_text,
             "validation": dict(validation),
         }
-        candidate.raw_text = format_selection_plan(candidate)
+        if decomposition is not None and worker_pool is not None:
+            node_order = [node.node_id for node in decomposition.nodes]
+            worker_index_by_id = {
+                worker.worker_id: idx
+                for idx, worker in enumerate(worker_pool.workers, start=1)
+            }
+            candidate.raw_text = format_selection_plan(
+                candidate,
+                node_order=node_order,
+                worker_index_by_id=worker_index_by_id,
+            )
+        else:
+            candidate.raw_text = format_selection_plan(candidate)
         return candidate
 
     def _generate_validated_decomposition(
@@ -688,6 +769,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 prompt_text=repair_prompt,
                 max_new_tokens=self._controller_max_new_tokens("decomposer"),
                 temperature=self._controller_temperature(),
+                sampling_overrides=self._controller_sampling_overrides("decomposer"),
             )
             try:
                 payload = extract_decomposition_payload(last_raw_text)
@@ -713,7 +795,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     f"{prompt_text}\n\nYour previous answer did not match the required decomposition format. "
                     f"Error: {exc}\nReturn ONLY the corrected <decomposition_plan> block. "
                     "Do not add commentary, bullets, or repeated task text. "
-                    "Every node must include NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, and OUTPUT_KEY."
+                    "Every node must include NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, and OUTPUT_KEY. "
+                    "Use only allowed numeric node IDs (1, 2, ...)."
                 )
 
         candidate = build_fallback_decomposition(
@@ -757,6 +840,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 prompt_text=repair_prompt,
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 temperature=self._controller_temperature(),
+                sampling_overrides=self._controller_sampling_overrides("selector"),
             )
             try:
                 payload = extract_selection_payload(last_raw_text)
@@ -782,6 +866,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         "fallback_used": False,
                         "raw_model_text": last_raw_text,
                     },
+                    decomposition=decomposition,
+                    worker_pool=worker_pool,
                 )
             except Exception as exc:
                 errors.append(str(exc))
@@ -789,12 +875,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     f"{prompt_text}\n\nYour previous answer did not match the required selection format. "
                     f"Error: {exc}\nReturn ONLY the corrected <selection_plan> block. "
                     "Do not add commentary, bullets, repeated task text, or extra sections. "
-                    "Use exactly one `node_id -> worker_id` line per node. "
+                    "Use numeric node IDs only with one `node_id: worker_index` line per node. "
                     "The simplest valid form is:\n"
                     "<selection_plan>\n"
-                    "SELECTION_ID: short_id\n"
-                    "n1 -> worker_a\n"
-                    "n2 -> worker_b\n"
+                    "1: 2\n"
+                    "2: 1\n"
                     "</selection_plan>"
                 )
 
@@ -818,7 +903,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 "errors": list(errors),
             }
         )
-        candidate.raw_text = format_selection_plan(candidate)
+        candidate.raw_text = self._format_selection_completion_text(
+            candidate=candidate,
+            decomposition=decomposition,
+            worker_pool=worker_pool,
+        )
         return candidate
 
     def sample_decomposition(
@@ -830,7 +919,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         decomposition_index: int,
         worker_performance: Dict[str, WorkerPerformanceSnapshot],
     ) -> DecompositionCandidate:
-        prompt_text = render_decomposer_prompt(task, worker_pool, worker_performance)
+        prompt_text = render_decomposer_prompt(
+            task,
+            worker_pool,
+            worker_performance,
+            max_nodes_hint=rollout_config.max_nodes_per_decomposition,
+        )
         return self._generate_validated_decomposition(
             prompt_text=prompt_text,
             task=task,
@@ -913,6 +1007,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 request.task,
                 request.worker_pool,
                 request.worker_performance,
+                max_nodes_hint=request.rollout_config.max_nodes_per_decomposition,
             )
             grouped.setdefault(model_path, []).append((index, request, prompt_text))
 
@@ -925,6 +1020,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 max_new_tokens=self._controller_max_new_tokens("decomposer"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
+                sampling_overrides=self._controller_sampling_overrides("decomposer"),
             )
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
@@ -1006,6 +1102,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
+                sampling_overrides=self._controller_sampling_overrides("selector"),
             )
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
@@ -1036,6 +1133,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             "batch_generated": True,
                             "entropy": entropy,
                         },
+                        decomposition=request.decomposition,
+                        worker_pool=request.worker_pool,
                     )
                 except Exception:
                     repair_count += 1
@@ -1055,7 +1154,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             "batch_repair_fallback": True,
                         }
                     )
-                    candidate.raw_text = format_selection_plan(candidate)
+                    candidate.raw_text = self._format_selection_completion_text(
+                        candidate=candidate,
+                        decomposition=request.decomposition,
+                        worker_pool=request.worker_pool,
+                    )
                 results[result_index] = candidate
             if repair_count:
                 print(
@@ -1140,6 +1243,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
         temperature: float | None = None,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, float]:
         if lora_adapter_path is not None:
             raise NotImplementedError("Worker LoRA adapters are not implemented for the Ray/vLLM backend yet")
@@ -1149,6 +1253,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
             max_new_tokens=max_new_tokens,
             system_prompt=system_prompt,
             temperature=self.config.temperature if temperature is None else temperature,
+            sampling_overrides=sampling_overrides,
         )
         return result.text, result.entropy
 
@@ -1161,6 +1266,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
         lora_adapter_path: str | None = None,
         system_prompt: str | None = None,
         temperature: float | None = None,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[str, float]]:
         if lora_adapter_path is not None:
             raise NotImplementedError("Worker LoRA adapters are not implemented for the Ray/vLLM backend yet")
@@ -1171,6 +1277,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
             batch_size=batch_size,
             system_prompt=system_prompt,
             temperature=self.config.temperature if temperature is None else temperature,
+            sampling_overrides=sampling_overrides,
         )
         return [(item.text, item.entropy) for item in generated]
 

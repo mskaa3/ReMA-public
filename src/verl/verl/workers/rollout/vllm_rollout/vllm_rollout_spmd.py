@@ -170,6 +170,29 @@ class vLLMRollout(BaseRollout):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
 
+    def _resolve_sampling_overrides(self, raw_overrides):
+        if not isinstance(raw_overrides, dict):
+            return {}
+
+        resolved = {}
+        structured_outputs = raw_overrides.get("structured_outputs")
+        guided_decoding = raw_overrides.get("guided_decoding")
+        guided_regex = raw_overrides.get("guided_regex")
+
+        if structured_outputs is not None and hasattr(self.sampling_params, "structured_outputs"):
+            resolved["structured_outputs"] = structured_outputs
+        elif guided_decoding is not None and hasattr(self.sampling_params, "guided_decoding"):
+            resolved["guided_decoding"] = guided_decoding
+        elif guided_regex is not None and hasattr(self.sampling_params, "guided_regex"):
+            resolved["guided_regex"] = guided_regex
+
+        for key, value in raw_overrides.items():
+            if key in {"structured_outputs", "guided_decoding", "guided_regex"}:
+                continue
+            if hasattr(self.sampling_params, key):
+                resolved[key] = value
+        return resolved
+
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
@@ -250,6 +273,9 @@ class vLLMRollout(BaseRollout):
             if prompts.meta_info.get('finish_flag') is not None:
                 kwargs['stop'] = [prompts.meta_info['finish_flag']]
 
+        sampling_overrides = prompts.meta_info.get("sampling_overrides")
+        if isinstance(sampling_overrides, dict):
+            kwargs.update(self._resolve_sampling_overrides(sampling_overrides))
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):

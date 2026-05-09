@@ -77,6 +77,7 @@ class HFBackendConfig:
     controller_batch_size: int = 8
     worker_batch_size: int = 16
     max_format_retries: int = 2
+    controller_constrained_decoding: bool = True
     device_map: str = "auto"
     torch_dtype: str = "auto"
     trust_remote_code: bool = True
@@ -97,6 +98,7 @@ class VLLMBackendConfig:
     controller_batch_size: int = 8
     worker_batch_size: int = 16
     max_format_retries: int = 2
+    controller_constrained_decoding: bool = True
     nnodes: int = 1
     n_gpus_per_node: int = 1
     tensor_model_parallel_size: int = 1

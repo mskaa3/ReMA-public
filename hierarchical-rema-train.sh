@@ -30,9 +30,10 @@ export GRPO_PASSES_PER_SUBSET=${GRPO_PASSES_PER_SUBSET:-${EPOCHS:-1}}
 export TRAIN_SUBSET_SIZE=${TRAIN_SUBSET_SIZE:-${TASKS_PER_EPOCH:-426}}
 export NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-16} # controller rollout width during training; 16 is expensive but keeps broad exploration
 export NUM_SELECTIONS=${NUM_SELECTIONS:-16} # selector samples per decomposition; 16 is expensive but matches the broad exploration setting
-export TEMPERATURE=${TEMPERATURE:-0.5} # shared fallback temperature; workers usually benefit from staying around 0.5
+export TEMPERATURE=${TEMPERATURE:-0.3} # shared fallback temperature; workers usually benefit from staying around 0.5
 export CONTROLLER_TEMPERATURE=${CONTROLLER_TEMPERATURE:-$TEMPERATURE} # decomposer/selector temperature; can be lowered independently if structured output is unstable
 export WORKER_TEMPERATURE=${WORKER_TEMPERATURE:-$TEMPERATURE} # worker temperature; separate from controller so reasoning diversity can stay higher
+export CONTROLLER_CONSTRAINED_DECODING=${CONTROLLER_CONSTRAINED_DECODING:-true} # enable controller constrained decoding hints (regex/structured outputs/stop tags when backend supports them)
 export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-1024} # max tokens for decomposer/selector outputs; structured plans should stay short
 export DECOMPOSER_MAX_NEW_TOKENS=${DECOMPOSER_MAX_NEW_TOKENS:-1024} # decomposer plans can legitimately be longer because they carry node fields
 export SELECTOR_MAX_NEW_TOKENS=${SELECTOR_MAX_NEW_TOKENS:-512} # selector should stay compact: one worker assignment per node
@@ -43,6 +44,8 @@ export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-16} # generation batch size for wo
 export ROLLOUT_PROGRESS_EVERY=${ROLLOUT_PROGRESS_EVERY:-1} # print progress after every completed task
 export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4} # replay microbatch size during GRPO updates
 export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4} # effective replay samples per optimizer step = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
+export CONTROLLER_FORMAT_RETRY_PENALTY=${CONTROLLER_FORMAT_RETRY_PENALTY:-0.05} # subtract from controller reward/advantage when output needed repair
+export CONTROLLER_FORMAT_FALLBACK_PENALTY=${CONTROLLER_FORMAT_FALLBACK_PENALTY:-0.25} # stronger subtract when parser fallback output was used
 
 export VAL_NUM_DECOMPOSITIONS=${VAL_NUM_DECOMPOSITIONS:-1} # validation uses a single decomposition candidate per task
 export VAL_NUM_SELECTIONS=${VAL_NUM_SELECTIONS:-1} # validation uses a single selector sample per task
@@ -54,7 +57,7 @@ export VAL_DECOMPOSER_MAX_NEW_TOKENS=${VAL_DECOMPOSER_MAX_NEW_TOKENS:-0} # 0 = r
 export VAL_SELECTOR_MAX_NEW_TOKENS=${VAL_SELECTOR_MAX_NEW_TOKENS:-0} # 0 = reuse training selector setting
 export MAX_VAL_TASKS=${MAX_VAL_TASKS:-0} # 0 = load the full overall_math validation benchmark
 export VAL_TASKS_PER_EPOCH=${VAL_TASKS_PER_EPOCH:-0} # 0 = validate on all loaded validation tasks each outer epoch
-export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-8} # number of validation tasks rolled out together
+export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-32} # number of validation tasks rolled out together
 
 export ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-best} # best = keep only top-K rollout records instead of every rollout
 export ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-compact} # compact = smaller JSONL artifacts

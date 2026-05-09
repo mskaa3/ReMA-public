@@ -19,17 +19,16 @@ Your entire response must be exactly one XML-like block and nothing else.
 
 Return exactly one block in this format:
 <decomposition_plan>
-DECOMPOSITION_ID: short_id
 SUMMARY: short summary
-FINAL_NODE_ID: n_last
-NODE: n1
+FINAL_NODE_ID: 2
+NODE_ID: 1
 INSTRUCTION: short instruction
 DEPENDENCIES: none
 REQUIRED_SKILLS: algebra
 OUTPUT_KEY: partial_result
-NODE: n_last
+NODE_ID: 2
 INSTRUCTION: produce the final answer
-DEPENDENCIES: n1
+DEPENDENCIES: 1
 REQUIRED_SKILLS: analysis
 OUTPUT_KEY: final_answer
 </decomposition_plan>
@@ -37,16 +36,17 @@ OUTPUT_KEY: final_answer
 Rules:
 1. Do not use markdown fences.
 2. Do not output prose before the opening tag or after the closing tag.
-3. Use the field names exactly as shown: DECOMPOSITION_ID, SUMMARY, FINAL_NODE_ID, NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.
-4. Every NODE must be followed by exactly one INSTRUCTION, one DEPENDENCIES, one REQUIRED_SKILLS, and one OUTPUT_KEY line.
+3. Use the field names exactly as shown: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.
+4. Every NODE_ID must be followed by exactly one INSTRUCTION, one DEPENDENCIES, one REQUIRED_SKILLS, and one OUTPUT_KEY line.
 5. Use a DAG, not a linear chain unless the task truly requires one.
 6. Use short node instructions and short summaries.
 7. Prefer 2 to 4 nodes unless the task truly needs more or fewer.
-8. The final node must produce the final answer, and FINAL_NODE_ID must match one declared node.
+8. The final node must produce the final answer, and FINAL_NODE_ID must match one declared node ID.
 9. Dependencies must be `none` or a comma-separated list of previously declared node IDs.
 10. REQUIRED_SKILLS should match the available worker pool whenever possible.
 11. OUTPUT_KEY values should be short snake_case names.
 12. Do not invent extra sections, commentary, explanations, bullets, or JSON.
+13. Only use plain numeric node IDs like 1, 2, 3, ... and keep them consistent.
 
 If you are unsure, output the simplest valid decomposition_plan block that satisfies the format.
 """
@@ -59,22 +59,21 @@ Your entire response must be exactly one XML-like block and nothing else.
 
 Return exactly one block in this format:
 <selection_plan>
-SELECTION_ID: short_id
-n1 -> worker_a
-n2 -> worker_b
+1: 2
+2: 1
 </selection_plan>
 
 Rules:
 1. Do not use markdown fences.
 2. Do not output prose before the opening tag or after the closing tag.
-3. Assign exactly one worker to each node.
-4. Use only node IDs that appear in the prompt.
-5. Use only worker IDs that appear in the prompt.
-6. Output exactly one assignment line per node in the form `node_id -> worker_id`.
-7. Do not skip nodes, duplicate nodes, or assign multiple workers to one node.
-8. Prefer the worker whose skills and past performance best match the node requirements.
-9. Keep the output minimal. Do not include explanations, commentary, bullets, JSON, or repeated task text.
-10. Unless absolutely necessary, do not include compatibility or rationale fields. The preferred answer is only assignment lines.
+3. Assign exactly one worker to each node ID from the decomposition.
+4. Use only worker indices listed in WORKERS_BY_INDEX from the prompt.
+5. Preferred output is one mapping line per node in the form `node_id: worker_index`.
+6. Do not skip nodes, do not add extra assignments, and do not assign multiple workers to one node.
+7. Prefer the worker whose skills and past performance best match each node.
+8. Keep the output minimal. Do not include explanations, commentary, bullets, JSON, or repeated task text.
+9. Compatibility and rationale are optional; omit them unless explicitly requested.
+10. Legacy `node_id -> worker_id` lines are accepted, but numeric node-ID mapping is preferred.
 
 If you are unsure, output the simplest valid selection_plan block with one assignment per node.
 """
@@ -166,6 +165,7 @@ def render_decomposer_prompt(
     task: TaskExample,
     worker_pool: WorkerPoolConfig,
     worker_performance: Dict[str, WorkerPerformanceSnapshot],
+    max_nodes_hint: int | None = None,
 ) -> str:
     worker_lines = []
     for worker in worker_pool.workers:
@@ -179,13 +179,19 @@ def render_decomposer_prompt(
             f"complete={completion_rate:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
         )
 
+    max_nodes = max(1, int(max_nodes_hint or 4))
+    allowed_node_ids = ", ".join(str(i) for i in range(1, max_nodes + 1))
     return (
         f"{DECOMPOSER_SYSTEM_PROMPT}\n\n"
         "OUTPUT CONTRACT:\n"
         "- Response must start with <decomposition_plan> and end with </decomposition_plan>.\n"
-        "- Use node IDs like n1, n2, n3 in topological order.\n"
-        "- Every node block must include NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
-        "- Do not repeat the task outside the block.\n\n"
+        "- Use plain numeric node IDs like 1, 2, 3 in topological order.\n"
+        "- Every node block must include NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
+        "- Do not repeat the task outside the block.\n"
+        "- Allowed field keys: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
+        f"- Allowed node IDs: {allowed_node_ids}.\n"
+        "- Allowed dependency tokens: `none` or comma-separated node IDs from the allowed set.\n"
+        "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         "AVAILABLE_WORKERS:\n"
@@ -201,43 +207,49 @@ def render_selector_prompt(
     worker_performance: Dict[str, WorkerPerformanceSnapshot],
 ) -> str:
     node_lines = []
+    ordered_node_ids = [node.node_id for node in decomposition.nodes]
     for node in decomposition.nodes:
         dependencies = ",".join(node.dependencies) if node.dependencies else "none"
         skills = ",".join(node.required_skills) if node.required_skills else "none"
         node_lines.append(
-            f"- {node.node_id} | deps={dependencies} | skills={skills} | output={node.output_key} | instruction={node.instruction}"
+            f"{node.node_id}: deps={dependencies} | skills={skills} | output={node.output_key} | instruction={node.instruction}"
         )
 
     worker_lines = []
-    for worker in worker_pool.workers:
+    for worker_index, worker in enumerate(worker_pool.workers, start=1):
         snapshot = worker_performance.get(worker.worker_id)
         success_rate = snapshot.success_rate if snapshot is not None else 0.0
         avg_reward = snapshot.average_reward if snapshot is not None else 0.0
         skills = ",".join(worker.skills) if worker.skills else "none"
         worker_lines.append(
-            f"- {worker.worker_id} | skills={skills} | success={success_rate:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
+            f"{worker_index}: {worker.worker_id} | skills={skills} | success={success_rate:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
         )
 
+    allowed_worker_indices = ", ".join(str(index) for index in range(1, len(worker_pool.workers) + 1))
     return (
         f"{SELECTOR_SYSTEM_PROMPT}\n\n"
         "OUTPUT CONTRACT:\n"
         "- Response must start with <selection_plan> and end with </selection_plan>.\n"
-        "- Preferred answer is exactly one `node_id -> worker_id` line per node.\n"
+        "- Preferred answer is one line per node: `node_id: worker_index`.\n"
+        "- The left side is the numeric node ID from NODES_BY_ID.\n"
+        "- The right side is the worker index from WORKERS_BY_INDEX.\n"
+        f"- Number of mapping lines must equal number of nodes ({len(ordered_node_ids)}).\n"
+        f"- Allowed node IDs: {', '.join(ordered_node_ids)}.\n"
+        f"- Allowed worker indices: {allowed_worker_indices}.\n"
         "- Do not repeat the task, decomposition, or worker descriptions in the output.\n"
-        "- Do not invent node IDs or worker IDs.\n\n"
+        "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
-        f"DECOMPOSITION_ID: {decomposition.decomposition_id}\n"
         f"FINAL_NODE_ID: {decomposition.final_node_id}\n"
-        "NODES:\n"
+        "NODES_BY_ID:\n"
         f"{chr(10).join(node_lines)}\n"
-        "AVAILABLE_WORKERS:\n"
+        "WORKERS_BY_INDEX:\n"
         f"{chr(10).join(worker_lines)}\n\n"
-        "Return ONLY the <selection_plan> block. The preferred minimal form is:\n"
+        "Return ONLY the <selection_plan> block. Preferred minimal form:\n"
         "<selection_plan>\n"
-        "SELECTION_ID: short_id\n"
-        "n1 -> worker_a\n"
-        "n2 -> worker_b\n"
+        "1: 2\n"
+        "2: 1\n"
+        "3: 1\n"
         "</selection_plan>"
     )
 

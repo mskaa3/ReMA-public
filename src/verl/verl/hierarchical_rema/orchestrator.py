@@ -57,10 +57,69 @@ class HierarchicalReMAOrchestrator:
         backend: HierarchicalBackend,
         reward_weights: RewardWeights,
         worker_memory: WorkerPerformanceMemory,
+        controller_format_retry_penalty: float = 0.0,
+        controller_format_fallback_penalty: float = 0.0,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
         self.worker_memory = worker_memory
+        self.controller_format_retry_penalty = max(float(controller_format_retry_penalty), 0.0)
+        self.controller_format_fallback_penalty = max(float(controller_format_fallback_penalty), 0.0)
+
+    @staticmethod
+    def _raw_controller_validation(payload: Dict[str, object]) -> Dict[str, object]:
+        if not isinstance(payload, dict):
+            return {}
+        validation = payload.get("validation")
+        if isinstance(validation, dict):
+            return validation
+        return {}
+
+    @staticmethod
+    def _controller_validation_info(payload: Dict[str, object]) -> Dict[str, object]:
+        validation = HierarchicalReMAOrchestrator._raw_controller_validation(payload)
+        if not validation:
+            return {}
+        errors_before_success = validation.get("errors_before_success")
+        errors = validation.get("errors")
+        attempt_raw = validation.get("attempt", 0)
+        try:
+            attempt = max(int(attempt_raw), 0)
+        except (TypeError, ValueError):
+            attempt = 0
+        return {
+            "backend": validation.get("backend"),
+            "attempt": attempt,
+            "fallback_used": bool(validation.get("fallback_used")),
+            "batch_repair_fallback": bool(validation.get("batch_repair_fallback")),
+            "num_errors_before_success": len(errors_before_success) if isinstance(errors_before_success, list) else 0,
+            "num_errors": len(errors) if isinstance(errors, list) else 0,
+        }
+
+    def _controller_format_penalty(self, payload: Dict[str, object]) -> float:
+        validation = self._raw_controller_validation(payload)
+        if not validation:
+            return 0.0
+
+        fallback_used = bool(validation.get("fallback_used"))
+        if fallback_used:
+            return self.controller_format_fallback_penalty
+
+        attempt_raw = validation.get("attempt", 0)
+        try:
+            attempt_count = max(int(attempt_raw), 0)
+        except (TypeError, ValueError):
+            attempt_count = 0
+
+        errors_before_success = validation.get("errors_before_success")
+        if isinstance(errors_before_success, list):
+            attempt_count = max(attempt_count, len(errors_before_success))
+        if validation.get("batch_repair_fallback"):
+            attempt_count = max(attempt_count, 1)
+
+        if attempt_count <= 0:
+            return 0.0
+        return attempt_count * self.controller_format_retry_penalty
 
     def run_task(
         self,
@@ -429,6 +488,11 @@ class HierarchicalReMAOrchestrator:
 
         if include_decomposer:
             for decomposition_rollout in decompositions:
+                format_penalty = self._controller_format_penalty(
+                    decomposition_rollout.decomposition.raw_payload
+                )
+                adjusted_reward = decomposition_rollout.decomposition_reward - format_penalty
+                adjusted_advantage = decomposition_rollout.decomposer_advantage - format_penalty
                 decomposer_samples.append(
                     ControllerTrainingSample(
                         role="decomposer",
@@ -436,11 +500,17 @@ class HierarchicalReMAOrchestrator:
                         group_id=task.task_id,
                         prompt_text=decomposition_rollout.decomposition.raw_payload["controller_prompt"],
                         completion_text=decomposition_rollout.decomposition.raw_text,
-                        reward=decomposition_rollout.decomposition_reward,
-                        advantage=decomposition_rollout.decomposer_advantage,
+                        reward=adjusted_reward,
+                        advantage=adjusted_advantage,
                         metadata={
                             "model_path": policy_config.model_for_role("decomposer"),
                             "parameter_sharing": policy_config.parameter_sharing,
+                            "reward_before_format_penalty": decomposition_rollout.decomposition_reward,
+                            "advantage_before_format_penalty": decomposition_rollout.decomposer_advantage,
+                            "format_penalty": format_penalty,
+                            "format_validation": self._controller_validation_info(
+                                decomposition_rollout.decomposition.raw_payload
+                            ),
                         },
                     )
                 )
@@ -448,6 +518,11 @@ class HierarchicalReMAOrchestrator:
         if include_selector:
             for decomposition_rollout in decompositions:
                 for selection_rollout in decomposition_rollout.selections:
+                    format_penalty = self._controller_format_penalty(
+                        selection_rollout.selection.raw_payload
+                    )
+                    adjusted_reward = selection_rollout.reward.total_reward - format_penalty
+                    adjusted_advantage = selection_rollout.selector_advantage - format_penalty
                     selector_samples.append(
                         ControllerTrainingSample(
                             role="selector",
@@ -455,11 +530,17 @@ class HierarchicalReMAOrchestrator:
                             group_id=decomposition_rollout.decomposition.decomposition_id,
                             prompt_text=selection_rollout.selection.raw_payload["controller_prompt"],
                             completion_text=selection_rollout.selection.raw_text,
-                            reward=selection_rollout.reward.total_reward,
-                            advantage=selection_rollout.selector_advantage,
+                            reward=adjusted_reward,
+                            advantage=adjusted_advantage,
                             metadata={
                                 "model_path": policy_config.model_for_role("selector"),
                                 "parameter_sharing": policy_config.parameter_sharing,
+                                "reward_before_format_penalty": selection_rollout.reward.total_reward,
+                                "advantage_before_format_penalty": selection_rollout.selector_advantage,
+                                "format_penalty": format_penalty,
+                                "format_validation": self._controller_validation_info(
+                                    selection_rollout.selection.raw_payload
+                                ),
                             },
                         )
                     )
@@ -488,6 +569,8 @@ class HierarchicalGRPOTrainer:
     rollout_recorder: Optional[RolloutRecorder] = None
     rollout_logging_config: Optional[RolloutLoggingConfig] = None
     backend: Optional[HierarchicalBackend] = None
+    controller_format_retry_penalty: float = 0.0
+    controller_format_fallback_penalty: float = 0.0
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -507,6 +590,8 @@ class HierarchicalGRPOTrainer:
             backend=self.backend,
             reward_weights=self.reward_weights,
             worker_memory=self.worker_memory,
+            controller_format_retry_penalty=self.controller_format_retry_penalty,
+            controller_format_fallback_penalty=self.controller_format_fallback_penalty,
         )
         self._current_phase = AlternatingPhase.SELECTOR
 
