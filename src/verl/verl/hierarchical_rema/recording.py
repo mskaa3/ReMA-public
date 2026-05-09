@@ -32,11 +32,44 @@ class RolloutRecorder:
         if not self.config.save_best_rollouts:
             return
 
+        best_decomposition = max(
+            rollout.decompositions,
+            key=lambda item: item.decomposition_reward,
+        )
+        self._append_jsonl(
+            self.output_dir / "best_decompositions.jsonl",
+            self._decomposition_payload(
+                task_rollout=rollout,
+                decomposition_rollout=best_decomposition,
+                timestamp=timestamp,
+                best_for_task=True,
+            ),
+        )
+        best_selection_decomposition, best_selection = max(
+            (
+                (decomposition, selection)
+                for decomposition in rollout.decompositions
+                for selection in decomposition.selections
+            ),
+            key=lambda item: item[1].reward.total_reward,
+        )
+        self._append_jsonl(
+            self.output_dir / "best_selections.jsonl",
+            self._selection_payload(
+                task_rollout=rollout,
+                decomposition_rollout=best_selection_decomposition,
+                selection_rollout=best_selection,
+                timestamp=timestamp,
+                best_for_task=True,
+            ),
+        )
+
         for decomposition in rollout.decompositions:
             decomposition_payload = self._decomposition_payload(
                 task_rollout=rollout,
                 decomposition_rollout=decomposition,
                 timestamp=timestamp,
+                best_for_task=False,
             )
             self._push_best(
                 self._best_decomposition_records,
@@ -50,6 +83,7 @@ class RolloutRecorder:
                     decomposition_rollout=decomposition,
                     selection_rollout=selection,
                     timestamp=timestamp,
+                    best_for_task=False,
                 )
                 self._push_best(
                     self._best_selection_records,
@@ -58,11 +92,11 @@ class RolloutRecorder:
                 )
 
         self._rewrite_jsonl(
-            self.output_dir / "best_decompositions.jsonl",
+            self.output_dir / "topk_best_decompositions.jsonl",
             [record.payload for record in self._best_decomposition_records],
         )
         self._rewrite_jsonl(
-            self.output_dir / "best_selections.jsonl",
+            self.output_dir / "topk_best_selections.jsonl",
             [record.payload for record in self._best_selection_records],
         )
 
@@ -108,11 +142,19 @@ class RolloutRecorder:
         task_rollout: TaskRollout,
         decomposition_rollout,
         timestamp: str,
+        best_for_task: bool,
     ) -> Dict:
         if not self.config.compact_mode:
             return {
                 "timestamp": timestamp,
                 "task_id": task_rollout.task.task_id,
+                "task_prompt": task_rollout.task.prompt,
+                "ground_truth": task_rollout.task.ground_truth,
+                "schedule": {
+                    "mode": task_rollout.schedule.mode.value,
+                    "phase": task_rollout.schedule.alternating_phase.value,
+                },
+                "best_for_task": best_for_task,
                 "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
                 "score": decomposition_rollout.decomposition_reward,
                 "rollout": decomposition_rollout.to_dict(),
@@ -122,6 +164,12 @@ class RolloutRecorder:
             "timestamp": timestamp,
             "task_id": task_rollout.task.task_id,
             "task_prompt": task_rollout.task.prompt,
+            "ground_truth": task_rollout.task.ground_truth,
+            "schedule": {
+                "mode": task_rollout.schedule.mode.value,
+                "phase": task_rollout.schedule.alternating_phase.value,
+            },
+            "best_for_task": best_for_task,
             "decomposition_id": decomposition.decomposition_id,
             "score": decomposition_rollout.decomposition_reward,
             "base_reward": decomposition_rollout.base_decomposition_reward,
@@ -131,9 +179,12 @@ class RolloutRecorder:
             "effective_num_hops": decomposition.effective_num_hops,
             "soft_penalty": decomposition.soft_penalty,
             "was_hard_truncated": decomposition.was_hard_truncated,
+            "controller_prompt": decomposition.raw_payload.get("controller_prompt"),
+            "decomposition_raw_text": decomposition.raw_text,
             "nodes": [
                 {
                     "node_id": node.node_id,
+                    "instruction": node.instruction,
                     "dependencies": list(node.dependencies),
                     "required_skills": list(node.required_skills),
                     "output_key": node.output_key,
@@ -148,11 +199,19 @@ class RolloutRecorder:
         decomposition_rollout,
         selection_rollout,
         timestamp: str,
+        best_for_task: bool,
     ) -> Dict:
         if not self.config.compact_mode:
             return {
                 "timestamp": timestamp,
                 "task_id": task_rollout.task.task_id,
+                "task_prompt": task_rollout.task.prompt,
+                "ground_truth": task_rollout.task.ground_truth,
+                "schedule": {
+                    "mode": task_rollout.schedule.mode.value,
+                    "phase": task_rollout.schedule.alternating_phase.value,
+                },
+                "best_for_task": best_for_task,
                 "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
                 "selection_id": selection_rollout.selection.selection_id,
                 "score": selection_rollout.reward.total_reward,
@@ -162,10 +221,20 @@ class RolloutRecorder:
             "timestamp": timestamp,
             "task_id": task_rollout.task.task_id,
             "task_prompt": task_rollout.task.prompt,
+            "ground_truth": task_rollout.task.ground_truth,
+            "schedule": {
+                "mode": task_rollout.schedule.mode.value,
+                "phase": task_rollout.schedule.alternating_phase.value,
+            },
+            "best_for_task": best_for_task,
             "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
+            "decomposition_summary": decomposition_rollout.decomposition.summary,
+            "decomposition_raw_text": decomposition_rollout.decomposition.raw_text,
             "selection_id": selection_rollout.selection.selection_id,
             "score": selection_rollout.reward.total_reward,
             "advantage": selection_rollout.selector_advantage,
+            "controller_prompt": selection_rollout.selection.raw_payload.get("controller_prompt"),
+            "selection_raw_text": selection_rollout.selection.raw_text,
             "final_answer": selection_rollout.final_answer,
             "reward": selection_rollout.reward.to_dict(),
             "assignments": [assignment.to_dict() for assignment in selection_rollout.selection.assignments],

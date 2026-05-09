@@ -267,7 +267,44 @@ def test_rollout_recorder_compact_mode_avoids_full_rollout_tree(tmp_path) -> Non
     assert "rollout" not in compact_record
     assert "assignments" in compact_record
     assert "executions" in compact_record
+    assert "decomposition_raw_text" in compact_record
+    assert "selection_raw_text" in compact_record
+    assert compact_record["best_for_task"] is True
+    assert compact_record["schedule"]["mode"] == "joint"
     assert not (tmp_path / "all_rollouts.jsonl").exists()
+    assert (tmp_path / "topk_best_selections.jsonl").exists()
+
+
+def test_best_rollout_logs_append_one_record_per_task(tmp_path) -> None:
+    trainer = HierarchicalGRPOTrainer(
+        rollout_logging_config=RolloutLoggingConfig(
+            output_dir=str(tmp_path),
+            save_all_rollouts=False,
+            save_best_rollouts=True,
+            best_k=1,
+            compact_mode=True,
+        )
+    )
+    tasks = [
+        make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5"),
+        make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)"),
+    ]
+    for task in tasks:
+        trainer.run(
+            task=task,
+            worker_pool=make_worker_pool(),
+            policy_config=ControllerPolicyConfig(parameter_sharing=False),
+            rollout_config=RolloutConfig(num_decompositions=2, num_selections_per_decomposition=2),
+            schedule=TrainingScheduleConfig(mode=TrainingMode.ALTERNATING, alternating_phase=AlternatingPhase.SELECTOR),
+        )
+
+    best_decompositions = (tmp_path / "best_decompositions.jsonl").read_text(encoding="utf-8").splitlines()
+    best_selections = (tmp_path / "best_selections.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(best_decompositions) == 2
+    assert len(best_selections) == 2
+    first_selection = json.loads(best_selections[0])
+    assert first_selection["schedule"]["phase"] == "selector"
+    assert "task_prompt" in first_selection
 
 
 def test_extract_json_dict_accepts_tagged_controller_output() -> None:
