@@ -13,12 +13,8 @@ try:
         WorkerPoolConfig,
         WorkerSpec,
     )
-    from verl.hierarchical_rema.prompts import (
-        DEFAULT_ALGEBRA_WORKER_PROMPT,
-        DEFAULT_ANALYSIS_WORKER_PROMPT,
-        render_decomposer_prompt,
-        render_selector_prompt,
-    )
+    from verl.hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
+    from verl.hierarchical_rema.prompts import render_decomposer_prompt, render_selector_prompt
     from verl.hierarchical_rema.structured import (
         extract_decomposition_payload,
         extract_json_dict,
@@ -37,12 +33,8 @@ except ModuleNotFoundError:
         WorkerPoolConfig,
         WorkerSpec,
     )
-    from hierarchical_rema.prompts import (
-        DEFAULT_ALGEBRA_WORKER_PROMPT,
-        DEFAULT_ANALYSIS_WORKER_PROMPT,
-        render_decomposer_prompt,
-        render_selector_prompt,
-    )
+    from hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
+    from hierarchical_rema.prompts import render_decomposer_prompt, render_selector_prompt
     from hierarchical_rema.structured import (
         extract_decomposition_payload,
         extract_json_dict,
@@ -51,24 +43,7 @@ except ModuleNotFoundError:
 
 
 def make_worker_pool() -> WorkerPoolConfig:
-    return WorkerPoolConfig(
-        base_model_path="mock-model",
-        enable_role_lora=False,
-        workers=[
-            WorkerSpec(
-                worker_id="algebra_worker",
-                description="Exact symbolic manipulation specialist.",
-                skills=["algebra", "symbolic_manipulation"],
-                system_prompt=DEFAULT_ALGEBRA_WORKER_PROMPT,
-            ),
-            WorkerSpec(
-                worker_id="analysis_worker",
-                description="Calculus and theorem-driven analysis specialist.",
-                skills=["analysis", "calculus"],
-                system_prompt=DEFAULT_ANALYSIS_WORKER_PROMPT,
-            ),
-        ],
-    )
+    return make_default_worker_pool(base_model_path="mock-model")
 
 
 def make_task(skill_focus: str, prompt: str, ground_truth: str, distractor: str) -> TaskExample:
@@ -213,7 +188,7 @@ def test_controller_prompts_include_worker_performance_history() -> None:
     )
 
     assert "AVAILABLE_WORKERS:" in prompt_text
-    assert "algebra_worker" in prompt_text
+    assert "arithmetic_prealgebra_worker" in prompt_text
     assert "complete=" in prompt_text
     assert "avg_reward=" in prompt_text
     assert '"available_workers"' not in prompt_text
@@ -328,8 +303,8 @@ def test_selector_prompt_uses_compact_decomposition_context() -> None:
 
     assert '"raw_payload"' not in prompt
     assert '"raw_text"' not in prompt
-    assert "Do not invent node IDs or worker IDs." in prompt
-    assert "Preferred answer is exactly one `node_id -> worker_id` line per node." in prompt
+    assert "Allowed node IDs:" in prompt
+    assert "Preferred answer is one line per node: `node_id: worker_index`." in prompt
 
 
 def test_decomposer_prompt_declares_strict_output_contract() -> None:
@@ -344,8 +319,8 @@ def test_decomposer_prompt_declares_strict_output_contract() -> None:
     )
 
     assert "Response must start with <decomposition_plan>" in prompt
-    assert "Use node IDs like n1, n2, n3 in topological order." in prompt
-    assert "Every node block must include NODE, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY." in prompt
+    assert "Use plain numeric node IDs like 1, 2, 3 in topological order." in prompt
+    assert "Every node block must include NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY." in prompt
 
 
 def test_line_based_controller_plans_are_parseable() -> None:
@@ -353,15 +328,15 @@ def test_line_based_controller_plans_are_parseable() -> None:
         "<decomposition_plan>\n"
         "DECOMPOSITION_ID: decomp-1\n"
         "SUMMARY: short plan\n"
-        "FINAL_NODE_ID: n2\n"
-        "NODE: n1\n"
+        "FINAL_NODE_ID: 2\n"
+        "NODE_ID: 1\n"
         "INSTRUCTION: analyze the structure\n"
         "DEPENDENCIES: none\n"
         "REQUIRED_SKILLS: analysis\n"
         "OUTPUT_KEY: structure\n"
-        "NODE: n2\n"
+        "NODE_ID: 2\n"
         "INSTRUCTION: produce final answer\n"
-        "DEPENDENCIES: n1\n"
+        "DEPENDENCIES: 1\n"
         "REQUIRED_SKILLS: algebra\n"
         "OUTPUT_KEY: final_answer\n"
         "</decomposition_plan>"
@@ -369,12 +344,12 @@ def test_line_based_controller_plans_are_parseable() -> None:
     selection_payload = extract_selection_payload(
         "<selection_plan>\n"
         "SELECTION_ID: sel-1\n"
-        "ASSIGN: n1 -> analysis_worker | compatibility=0.91 | rationale=best fit\n"
-        "ASSIGN: n2 -> algebra_worker | compatibility=0.88 | rationale=exact arithmetic\n"
+        "1: 4\n"
+        "2: 2\n"
         "</selection_plan>"
     )
 
-    assert decomposition_payload["final_node_id"] == "n2"
+    assert decomposition_payload["final_node_id"] == "2"
     assert len(decomposition_payload["nodes"]) == 2
     assert selection_payload["selection_id"] == "sel-1"
     assert len(selection_payload["assignments"]) == 2
@@ -384,15 +359,19 @@ def test_selector_plan_accepts_minimal_assignment_lines() -> None:
     selection_payload = extract_selection_payload(
         "<selection_plan>\n"
         "SELECTION_ID: sel-compact\n"
-        "n1 -> analysis_worker\n"
-        "n2 -> algebra_worker\n"
+        "1: 4\n"
+        "2: 2\n"
         "</selection_plan>"
     )
 
     assert selection_payload["selection_id"] == "sel-compact"
-    assert [assignment["worker_id"] for assignment in selection_payload["assignments"]] == [
-        "analysis_worker",
-        "algebra_worker",
+    assert [assignment["node_id"] for assignment in selection_payload["assignments"]] == [
+        "1",
+        "2",
+    ]
+    assert [assignment["worker_index"] for assignment in selection_payload["assignments"]] == [
+        4,
+        2,
     ]
 
 

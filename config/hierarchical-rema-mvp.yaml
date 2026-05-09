@@ -21,14 +21,29 @@ workers:
   base_model_path: Qwen/Qwen2.5-1.5B-Instruct
   enable_role_lora: false
   pool:
-    - worker_id: algebra_worker
-      description: Exact symbolic manipulation specialist.
-      skills: [algebra, symbolic_manipulation]
+    - worker_id: arithmetic_prealgebra_worker
+      description: Exact arithmetic, fractions, ratios, and simplification specialist.
+      skills: [arithmetic, prealgebra, fractions, simplification]
       lora_adapter_path: null
       trainable: false
-    - worker_id: analysis_worker
-      description: Calculus and theorem-driven analysis specialist.
-      skills: [analysis, calculus]
+    - worker_id: algebra_symbolic_worker
+      description: Equation solving and symbolic algebra specialist.
+      skills: [algebra, symbolic_manipulation, equations, polynomials]
+      lora_adapter_path: null
+      trainable: false
+    - worker_id: geometry_trigonometry_worker
+      description: Geometry, trigonometry, and coordinate methods specialist.
+      skills: [geometry, trigonometry, coordinate_geometry]
+      lora_adapter_path: null
+      trainable: false
+    - worker_id: calculus_analysis_worker
+      description: Calculus, limits, and function analysis specialist.
+      skills: [analysis, calculus, functions, limits]
+      lora_adapter_path: null
+      trainable: false
+    - worker_id: discrete_number_theory_worker
+      description: Counting, probability, and number theory specialist.
+      skills: [combinatorics, probability, number_theory, discrete_math]
       lora_adapter_path: null
       trainable: false
 

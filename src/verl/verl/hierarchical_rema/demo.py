@@ -4,7 +4,13 @@ import argparse
 import json
 
 from .orchestrator import HierarchicalGRPOTrainer
-from .prompts import DEFAULT_ALGEBRA_WORKER_PROMPT, DEFAULT_ANALYSIS_WORKER_PROMPT
+from .prompts import (
+    DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT,
+    DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT,
+    DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT,
+    DEFAULT_DISCRETE_NUMBER_THEORY_WORKER_PROMPT,
+    DEFAULT_GEOMETRY_TRIGONOMETRY_WORKER_PROMPT,
+)
 from .schema import (
     AlternatingPhase,
     ControllerPolicyConfig,
@@ -49,17 +55,38 @@ def make_worker_pool(base_model_path: str | None) -> WorkerPoolConfig:
         enable_role_lora=False,
         workers=[
             WorkerSpec(
-                worker_id="algebra_worker",
-                description="Exact symbolic manipulation specialist.",
-                skills=["algebra", "symbolic_manipulation"],
-                system_prompt=DEFAULT_ALGEBRA_WORKER_PROMPT,
+                worker_id="arithmetic_prealgebra_worker",
+                description="Exact arithmetic, fractions, ratios, and simplification specialist.",
+                skills=["arithmetic", "prealgebra", "fractions", "simplification"],
+                system_prompt=DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
             WorkerSpec(
-                worker_id="analysis_worker",
-                description="Calculus and theorem-driven analysis specialist.",
-                skills=["analysis", "calculus"],
-                system_prompt=DEFAULT_ANALYSIS_WORKER_PROMPT,
+                worker_id="algebra_symbolic_worker",
+                description="Equation solving and symbolic algebra specialist.",
+                skills=["algebra", "symbolic_manipulation", "equations", "polynomials"],
+                system_prompt=DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT,
+                base_model_path=base_model_path,
+            ),
+            WorkerSpec(
+                worker_id="geometry_trigonometry_worker",
+                description="Geometry, trigonometry, and coordinate methods specialist.",
+                skills=["geometry", "trigonometry", "coordinate_geometry"],
+                system_prompt=DEFAULT_GEOMETRY_TRIGONOMETRY_WORKER_PROMPT,
+                base_model_path=base_model_path,
+            ),
+            WorkerSpec(
+                worker_id="calculus_analysis_worker",
+                description="Calculus, limits, and function analysis specialist.",
+                skills=["analysis", "calculus", "functions", "limits"],
+                system_prompt=DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT,
+                base_model_path=base_model_path,
+            ),
+            WorkerSpec(
+                worker_id="discrete_number_theory_worker",
+                description="Counting, probability, and number theory specialist.",
+                skills=["combinatorics", "probability", "number_theory", "discrete_math"],
+                system_prompt=DEFAULT_DISCRETE_NUMBER_THEORY_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
         ],
