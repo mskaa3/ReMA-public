@@ -464,6 +464,7 @@ class HierarchicalReMAOrchestrator:
                         task_id=task.task_id,
                         execution=execution,
                         selection_reward=selection_rollout.reward,
+                        reward_mode=self.reward_weights.worker_reward_mode,
                     )
 
     def _build_training_batch(

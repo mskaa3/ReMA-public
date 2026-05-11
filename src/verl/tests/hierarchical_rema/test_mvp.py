@@ -5,11 +5,13 @@ try:
         AlternatingPhase,
         ControllerPolicyConfig,
         HierarchicalGRPOTrainer,
+        RewardWeights,
         RolloutLoggingConfig,
         RolloutConfig,
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        WorkerRewardMode,
         WorkerPoolConfig,
         WorkerSpec,
     )
@@ -25,11 +27,13 @@ except ModuleNotFoundError:
         AlternatingPhase,
         ControllerPolicyConfig,
         HierarchicalGRPOTrainer,
+        RewardWeights,
         RolloutLoggingConfig,
         RolloutConfig,
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        WorkerRewardMode,
         WorkerPoolConfig,
         WorkerSpec,
     )
@@ -116,6 +120,29 @@ def test_dag_execution_uses_selected_worker_and_tracks_final_answer() -> None:
     assert strong_selection.reward.final_answer_correctness == 1.0
     assert weak_selection.reward.total_reward <= strong_selection.reward.total_reward
     assert all(execution.worker_id for execution in strong_selection.executions)
+
+
+def test_final_answer_correctness_only_reward_mode_clamps_worker_reward() -> None:
+    trainer = HierarchicalGRPOTrainer(
+        reward_weights=RewardWeights(
+            worker_reward_mode=WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY
+        )
+    )
+    task = make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)")
+    rollout = trainer.run(
+        task=task,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=True, shared_model_path="mock-shared"),
+        rollout_config=RolloutConfig(num_decompositions=1, num_selections_per_decomposition=2),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+    )
+
+    strong_selection = rollout.decompositions[0].selections[0]
+    weak_selection = rollout.decompositions[0].selections[1]
+
+    assert strong_selection.reward.total_reward == 1.0
+    assert strong_selection.reward.total_reward == strong_selection.reward.final_answer_correctness
+    assert weak_selection.reward.total_reward == weak_selection.reward.final_answer_correctness
 
 
 def test_alternating_selector_phase_freezes_decomposer() -> None:

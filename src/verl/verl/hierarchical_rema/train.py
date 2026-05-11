@@ -24,6 +24,7 @@ from .schema import (
     AlternatingPhase,
     ControllerPolicyConfig,
     HFBackendConfig,
+    RewardWeights,
     RolloutLoggingConfig,
     RolloutConfig,
     TaskExample,
@@ -31,6 +32,7 @@ from .schema import (
     TrainingMode,
     TrainingScheduleConfig,
     VLLMBackendConfig,
+    WorkerRewardMode,
 )
 
 
@@ -72,6 +74,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--controller-temperature", type=float, default=None)
     parser.add_argument("--worker-temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument(
+        "--final-answer-correctness-reward-only",
+        action="store_true",
+        help=(
+            "Make selection/worker reward depend only on final-answer correctness. "
+            "Controller-specific penalties still apply on top."
+        ),
+    )
     parser.add_argument(
         "--controller-constrained-decoding",
         dest="controller_constrained_decoding",
@@ -646,7 +656,13 @@ def _build_rollout_trainer(
     worker_max_new_tokens: int,
     rollout_logging_config: RolloutLoggingConfig | None,
 ) -> HierarchicalGRPOTrainer:
+    worker_reward_mode = (
+        WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY
+        if args.final_answer_correctness_reward_only
+        else WorkerRewardMode.CURRENT
+    )
     return HierarchicalGRPOTrainer(
+        reward_weights=RewardWeights(worker_reward_mode=worker_reward_mode),
         backend_type=args.backend,
         hf_backend_config=HFBackendConfig(
             temperature=backend_temperature,

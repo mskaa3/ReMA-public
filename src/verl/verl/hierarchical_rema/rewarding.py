@@ -8,6 +8,7 @@ from .schema import (
     SelectionRewardBreakdown,
     WorkerExecution,
     WorkerPerformanceSnapshot,
+    WorkerRewardMode,
     WorkerPoolConfig,
     WorkerSpec,
 )
@@ -76,6 +77,7 @@ class WorkerPerformanceMemory:
         task_id: str,
         execution: WorkerExecution,
         selection_reward: SelectionRewardBreakdown,
+        reward_mode: WorkerRewardMode = WorkerRewardMode.CURRENT,
     ) -> None:
         stats = self._stats_for(execution.worker_id)
         stats["num_assignments"] += 1
@@ -100,8 +102,11 @@ class WorkerPerformanceMemory:
         if len(stats["recent_history"]) > self.max_recent_history:
             stats["recent_history"] = stats["recent_history"][-self.max_recent_history:]
 
-        blended_outcome = 0.5 * float(execution.success) + 0.5 * selection_reward.final_answer_correctness
-        self.update(execution.worker_id, blended_outcome)
+        if reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
+            outcome = selection_reward.final_answer_correctness
+        else:
+            outcome = 0.5 * float(execution.success) + 0.5 * selection_reward.final_answer_correctness
+        self.update(execution.worker_id, outcome)
 
     def snapshot_for(self, worker_id: str) -> WorkerPerformanceSnapshot:
         stats = self._stats_for(worker_id)
@@ -178,11 +183,14 @@ def build_selection_reward(
         if executions
         else 0.0
     )
-    total_reward = (
-        weights.final_answer * final_correct
-        + weights.confidence * confidence_reward
-        + weights.compatibility * compatibility_reward
-    )
+    if weights.worker_reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
+        total_reward = final_correct
+    else:
+        total_reward = (
+            weights.final_answer * final_correct
+            + weights.confidence * confidence_reward
+            + weights.compatibility * compatibility_reward
+        )
     return SelectionRewardBreakdown(
         final_answer_correctness=final_correct,
         confidence_reward=confidence_reward,

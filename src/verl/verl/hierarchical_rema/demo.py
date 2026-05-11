@@ -15,12 +15,14 @@ from .schema import (
     AlternatingPhase,
     ControllerPolicyConfig,
     HFBackendConfig,
+    RewardWeights,
     RolloutLoggingConfig,
     RolloutConfig,
     TaskExample,
     TrainingMode,
     TrainingScheduleConfig,
     VLLMBackendConfig,
+    WorkerRewardMode,
     WorkerPoolConfig,
     WorkerSpec,
 )
@@ -111,6 +113,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-hop-penalty", type=float, default=0.1)
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument(
+        "--final-answer-correctness-reward-only",
+        action="store_true",
+        help="Make worker/selection reward depend only on final-answer correctness.",
+    )
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
     parser.add_argument("--rollout-prompt-length", type=int, default=2048)
@@ -188,6 +195,13 @@ def main() -> None:
         )
 
     trainer = HierarchicalGRPOTrainer(
+        reward_weights=RewardWeights(
+            worker_reward_mode=(
+                WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY
+                if args.final_answer_correctness_reward_only
+                else WorkerRewardMode.CURRENT
+            )
+        ),
         backend_type=args.backend,
         hf_backend_config=HFBackendConfig(
             temperature=args.temperature,

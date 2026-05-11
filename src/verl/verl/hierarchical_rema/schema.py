@@ -16,6 +16,11 @@ class AlternatingPhase(str, Enum):
     DECOMPOSER = "decomposer"
 
 
+class WorkerRewardMode(str, Enum):
+    CURRENT = "current"
+    FINAL_ANSWER_CORRECTNESS_ONLY = "final_answer_correctness_only"
+
+
 @dataclass
 class ControllerPolicyConfig:
     parameter_sharing: bool = False
@@ -44,6 +49,7 @@ class RewardWeights:
     confidence: float = 0.2
     compatibility: float = 0.2
     entropy_cap: float = 2.0
+    worker_reward_mode: WorkerRewardMode = WorkerRewardMode.CURRENT
 
 
 @dataclass

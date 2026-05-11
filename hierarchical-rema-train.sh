@@ -46,6 +46,7 @@ export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4} # replay microbatch size during G
 export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4} # effective replay samples per optimizer step = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
 export CONTROLLER_FORMAT_RETRY_PENALTY=${CONTROLLER_FORMAT_RETRY_PENALTY:-0.05} # subtract from controller reward/advantage when output needed repair
 export CONTROLLER_FORMAT_FALLBACK_PENALTY=${CONTROLLER_FORMAT_FALLBACK_PENALTY:-0.25} # stronger subtract when parser fallback output was used
+export FINAL_ANSWER_CORRECTNESS_REWARD_ONLY=${FINAL_ANSWER_CORRECTNESS_REWARD_ONLY:-false} # if true, worker/selection reward is exactly final-answer correctness; if false, keep the current blended reward
 
 export VAL_NUM_DECOMPOSITIONS=${VAL_NUM_DECOMPOSITIONS:-1} # validation uses a single decomposition candidate per task
 export VAL_NUM_SELECTIONS=${VAL_NUM_SELECTIONS:-1} # validation uses a single selector sample per task
