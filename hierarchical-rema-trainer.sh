@@ -223,6 +223,7 @@ EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-300}
 
 LOCAL_VERL_DIR=${LOCAL_VERL_DIR:-$TMPDIR/verl}
 LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH:-$TMPDIR/verl-rema-v3.sif}
+RAY_LOCAL_TMPDIR=${RAY_LOCAL_TMPDIR:-/tmp/${USER:-user}/hierarchical_rema_${JOB_ID}/ray}
 
 S3_EPOCHS_PATH=${S3_EPOCHS_PATH:-${S3_OUTPUT_PATH}/epochs}
 S3_BEST_SO_FAR_MODELS_PATH=${S3_BEST_SO_FAR_MODELS_PATH:-${S3_OUTPUT_PATH}/best_so_far_models}
@@ -367,6 +368,7 @@ stage_runtime_payload() {
     local image_done_file="${LOCAL_SIF_IMAGE_PATH}.stage_complete"
 
     mkdir -p "$TMPDIR"
+    mkdir -p "$RAY_LOCAL_TMPDIR"
 
     if [[ ! -f "$runtime_done_file" ]]; then
         while ! mkdir "$runtime_lock_dir" 2>/dev/null; do
@@ -412,6 +414,7 @@ image_lock_dir=\"${LOCAL_SIF_IMAGE_PATH}.stage_lock\"
 image_done_file=\"${LOCAL_SIF_IMAGE_PATH}.stage_complete\"
 
 mkdir -p \"$TMPDIR\"
+mkdir -p \"$RAY_LOCAL_TMPDIR\"
 
 if [[ ! -f \"\$runtime_done_file\" ]]; then
     while ! mkdir \"\$runtime_lock_dir\" 2>/dev/null; do
@@ -470,10 +473,11 @@ wait_for_ray_head() {
         if srun --overlap --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" \
             apptainer exec --nv --writable-tmpfs \
             --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+            --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
             --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
             --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
             "$LOCAL_SIF_IMAGE_PATH" \
-            bash -lc "python3 -m ray.scripts.scripts status --address '${RAY_ADDRESS_VALUE}' >/dev/null 2>&1"; then
+            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts status --address '${RAY_ADDRESS_VALUE}' >/dev/null 2>&1"; then
             echo "[hierarchical-rema][ray] head is ready address=${RAY_ADDRESS_VALUE}"
             return
         fi
@@ -499,10 +503,11 @@ start_ray_cluster() {
     srun --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" \
         apptainer exec --nv --writable-tmpfs \
         --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+        --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
         --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
         --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
         "$LOCAL_SIF_IMAGE_PATH" \
-        bash -lc "python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
     RAY_CLUSTER_PIDS+=("$!")
     wait_for_ray_head
 
@@ -514,10 +519,11 @@ start_ray_cluster() {
         srun --nodes=1 --ntasks=1 -w "$node_i" \
             apptainer exec --nv --writable-tmpfs \
             --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+            --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
             --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
             --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
             "$LOCAL_SIF_IMAGE_PATH" \
-            bash -lc "python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --address '${RAY_ADDRESS_VALUE}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --address '${RAY_ADDRESS_VALUE}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
         RAY_CLUSTER_PIDS+=("$!")
         sleep 5
         idx=$((idx + 1))
@@ -532,10 +538,11 @@ stop_ray_cluster() {
     srun --nodes="${RAY_NNODES}" --ntasks="${RAY_NNODES}" \
         apptainer exec --nv --writable-tmpfs \
         --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+        --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
         --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
         --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
         "$LOCAL_SIF_IMAGE_PATH" \
-        bash -lc "python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
 
     local pid=""
     for pid in "${RAY_CLUSTER_PIDS[@]}"; do
@@ -922,6 +929,8 @@ if [[ "$RUN_KIND" == "rollout" ]]; then
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
+export TMPDIR=${RAY_LOCAL_TMPDIR}; \
+export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
 export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
@@ -970,6 +979,8 @@ else
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
+export TMPDIR=${RAY_LOCAL_TMPDIR}; \
+export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
 export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 export HIERARCHICAL_REMA_HOST_TMPDIR=${TMPDIR}; \
@@ -1084,6 +1095,7 @@ start_epoch_s3_sync_watcher
 set +e
 srun --overlap --nodes=1 --ntasks=1 ${RAY_DRIVER_NODE_FLAG} apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+    --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
     --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
     "$LOCAL_SIF_IMAGE_PATH" \
