@@ -447,17 +447,42 @@ resolve_ray_head_node() {
 
     mapfile -t SLURM_HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
     RAY_HEAD_NODE="${SLURM_HOSTS[0]}"
-    RAY_HEAD_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" hostname --ip-address)
-    if [[ "$RAY_HEAD_NODE_IP" == *" "* ]]; then
-        read -r -a RAY_ADDR_PARTS <<<"$RAY_HEAD_NODE_IP"
-        if [[ ${#RAY_ADDR_PARTS[0]} -gt 16 ]]; then
-            RAY_HEAD_NODE_IP="${RAY_ADDR_PARTS[1]}"
-        else
-            RAY_HEAD_NODE_IP="${RAY_ADDR_PARTS[0]}"
-        fi
+    RAY_HEAD_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" bash -lc "hostname -I | awk '{for(i=1;i<=NF;i++) if(\$i !~ /:/){print \$i; exit}}'")
+    if [[ -z "$RAY_HEAD_NODE_IP" ]]; then
+        RAY_HEAD_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" bash -lc "hostname --ip-address | awk '{print \$1}'")
+    fi
+    if [[ -z "$RAY_HEAD_NODE_IP" ]]; then
+        echo "Failed to resolve an IPv4 address for Ray head node ${RAY_HEAD_NODE}" >&2
+        exit 1
     fi
     RAY_ADDRESS_VALUE="${RAY_HEAD_NODE_IP}:${RAY_PORT}"
     RAY_DRIVER_NODE_FLAG="-w ${RAY_HEAD_NODE}"
+}
+
+wait_for_ray_head() {
+    if [[ "$MULTINODE_RAY_ENABLED" == "0" ]]; then
+        return
+    fi
+
+    local attempt=0
+    local max_attempts=45
+    while [[ "$attempt" -lt "$max_attempts" ]]; do
+        if srun --overlap --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" \
+            apptainer exec --nv --writable-tmpfs \
+            --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+            --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
+            --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
+            "$LOCAL_SIF_IMAGE_PATH" \
+            bash -lc "ray status --address '${RAY_ADDRESS_VALUE}' >/dev/null 2>&1"; then
+            echo "[hierarchical-rema][ray] head is ready address=${RAY_ADDRESS_VALUE}"
+            return
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    echo "[hierarchical-rema][ray] head failed to become ready address=${RAY_ADDRESS_VALUE}" >&2
+    exit 1
 }
 
 start_ray_cluster() {
@@ -479,7 +504,7 @@ start_ray_cluster() {
         "$LOCAL_SIF_IMAGE_PATH" \
         bash -lc "ray stop --force >/dev/null 2>&1 || true; ray start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
     RAY_CLUSTER_PIDS+=("$!")
-    sleep 10
+    wait_for_ray_head
 
     local worker_num=$((RAY_NNODES - 1))
     local idx=0
