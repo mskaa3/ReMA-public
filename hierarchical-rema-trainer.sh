@@ -959,6 +959,7 @@ python3 -m hierarchical_rema.demo \
   --rollout-prompt-length ${ROLLOUT_PROMPT_LENGTH} \
   --ray-nnodes ${RAY_NNODES} \
   --ray-n-gpus-per-node ${RAY_N_GPUS_PER_NODE} \
+  --ray-cpus-per-node ${RAY_CPUS_PER_NODE} \
   ${OFFLINE_GRPO_DISTRIBUTED_FLAG} \
   --offline-grpo-nnodes ${OFFLINE_GRPO_NNODES} \
   --offline-grpo-gpus-per-node ${OFFLINE_GRPO_GPUS_PER_NODE} \
@@ -1040,6 +1041,7 @@ python3 -m hierarchical_rema.train \
   --rollout-prompt-length ${ROLLOUT_PROMPT_LENGTH} \
   --ray-nnodes ${RAY_NNODES} \
   --ray-n-gpus-per-node ${RAY_N_GPUS_PER_NODE} \
+  --ray-cpus-per-node ${RAY_CPUS_PER_NODE} \
   --vllm-tensor-parallel-size ${VLLM_TENSOR_PARALLEL_SIZE} \
   --vllm-gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION} \
   --vllm-max-num-batched-tokens ${VLLM_MAX_NUM_BATCHED_TOKENS} \

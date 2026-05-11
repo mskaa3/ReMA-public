@@ -128,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-prompt-length", type=int, default=2048)
     parser.add_argument("--ray-nnodes", type=int, default=1)
     parser.add_argument("--ray-n-gpus-per-node", type=int, default=1)
+    parser.add_argument("--ray-cpus-per-node", type=int, default=0, help="0 reuses the backend default; otherwise shapes Ray rollout bundle CPU reservations")
     parser.add_argument("--offline-grpo-distributed", action="store_true")
     parser.add_argument("--offline-grpo-nnodes", type=int, default=1)
     parser.add_argument("--offline-grpo-gpus-per-node", type=int, default=1)
@@ -884,6 +885,7 @@ def _build_rollout_trainer(
             controller_constrained_decoding=args.controller_constrained_decoding,
             nnodes=args.ray_nnodes,
             n_gpus_per_node=args.ray_n_gpus_per_node,
+            cpus_per_node=(args.ray_cpus_per_node if args.ray_cpus_per_node > 0 else None),
             tensor_model_parallel_size=args.vllm_tensor_parallel_size,
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             max_num_batched_tokens=args.vllm_max_num_batched_tokens,

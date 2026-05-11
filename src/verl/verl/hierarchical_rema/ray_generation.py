@@ -308,8 +308,13 @@ class RayVLLMGenerationManager:
                 config=self.config,
             )
         )
+        cpus_per_node = self.config.cpus_per_node
+        max_collocate_count = 5
+        if cpus_per_node is not None and self.config.n_gpus_per_node > 0:
+            max_collocate_count = max(1, int(cpus_per_node) // int(self.config.n_gpus_per_node))
         resource_pool = RayResourcePool(
             process_on_nodes=[self.config.n_gpus_per_node] * self.config.nnodes,
+            max_colocate_count=max_collocate_count,
         )
         ray_cls_with_init = RayClassWithInitArgs(
             cls=ray.remote(ActorRolloutRefWorker),
