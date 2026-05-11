@@ -360,12 +360,42 @@ RAY_HEAD_NODE_IP=""
 RAY_ADDRESS_VALUE=""
 RAY_DRIVER_NODE_FLAG=""
 
-stage_runtime_on_current_node() {
+stage_runtime_payload() {
+    local runtime_lock_dir="${LOCAL_VERL_DIR}.stage_lock"
+    local runtime_done_file="${LOCAL_VERL_DIR}.stage_complete"
+    local image_lock_dir="${LOCAL_SIF_IMAGE_PATH}.stage_lock"
+    local image_done_file="${LOCAL_SIF_IMAGE_PATH}.stage_complete"
+
     mkdir -p "$TMPDIR"
-    rm -rf "$LOCAL_VERL_DIR"
-    cp -r "$SOURCE_DIR/src/verl" "$LOCAL_VERL_DIR"
-    rm -f "$LOCAL_SIF_IMAGE_PATH"
-    rclone copyto "$SIF_IMAGE_PATH" "$LOCAL_SIF_IMAGE_PATH"
+
+    if [[ ! -f "$runtime_done_file" ]]; then
+        while ! mkdir "$runtime_lock_dir" 2>/dev/null; do
+            sleep 1
+        done
+        if [[ ! -f "$runtime_done_file" ]]; then
+            rm -rf "$LOCAL_VERL_DIR"
+            mkdir -p "$LOCAL_VERL_DIR"
+            cp -r "$SOURCE_DIR/src/verl/." "$LOCAL_VERL_DIR"/
+            touch "$runtime_done_file"
+        fi
+        rmdir "$runtime_lock_dir" >/dev/null 2>&1 || true
+    fi
+
+    if [[ ! -f "$image_done_file" ]]; then
+        while ! mkdir "$image_lock_dir" 2>/dev/null; do
+            sleep 1
+        done
+        if [[ ! -f "$image_done_file" ]]; then
+            rm -f "$LOCAL_SIF_IMAGE_PATH"
+            rclone copyto "$SIF_IMAGE_PATH" "$LOCAL_SIF_IMAGE_PATH"
+            touch "$image_done_file"
+        fi
+        rmdir "$image_lock_dir" >/dev/null 2>&1 || true
+    fi
+}
+
+stage_runtime_on_current_node() {
+    stage_runtime_payload
 }
 
 stage_runtime_on_allocated_nodes() {
@@ -376,11 +406,37 @@ stage_runtime_on_allocated_nodes() {
 
     srun --nodes="${RUNTIME_STAGE_NNODES}" --ntasks="${RUNTIME_STAGE_NNODES}" bash -lc "
 set -euo pipefail
+runtime_lock_dir=\"${LOCAL_VERL_DIR}.stage_lock\"
+runtime_done_file=\"${LOCAL_VERL_DIR}.stage_complete\"
+image_lock_dir=\"${LOCAL_SIF_IMAGE_PATH}.stage_lock\"
+image_done_file=\"${LOCAL_SIF_IMAGE_PATH}.stage_complete\"
+
 mkdir -p \"$TMPDIR\"
-rm -rf \"$LOCAL_VERL_DIR\"
-cp -r \"$SOURCE_DIR/src/verl\" \"$LOCAL_VERL_DIR\"
-rm -f \"$LOCAL_SIF_IMAGE_PATH\"
-rclone copyto \"$SIF_IMAGE_PATH\" \"$LOCAL_SIF_IMAGE_PATH\"
+
+if [[ ! -f \"\$runtime_done_file\" ]]; then
+    while ! mkdir \"\$runtime_lock_dir\" 2>/dev/null; do
+        sleep 1
+    done
+    if [[ ! -f \"\$runtime_done_file\" ]]; then
+        rm -rf \"$LOCAL_VERL_DIR\"
+        mkdir -p \"$LOCAL_VERL_DIR\"
+        cp -r \"$SOURCE_DIR/src/verl/.\" \"$LOCAL_VERL_DIR\"/
+        touch \"\$runtime_done_file\"
+    fi
+    rmdir \"\$runtime_lock_dir\" >/dev/null 2>&1 || true
+fi
+
+if [[ ! -f \"\$image_done_file\" ]]; then
+    while ! mkdir \"\$image_lock_dir\" 2>/dev/null; do
+        sleep 1
+    done
+    if [[ ! -f \"\$image_done_file\" ]]; then
+        rm -f \"$LOCAL_SIF_IMAGE_PATH\"
+        rclone copyto \"$SIF_IMAGE_PATH\" \"$LOCAL_SIF_IMAGE_PATH\"
+        touch \"\$image_done_file\"
+    fi
+    rmdir \"\$image_lock_dir\" >/dev/null 2>&1 || true
+fi
 "
 }
 
