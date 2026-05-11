@@ -27,6 +27,22 @@ class ControllerReplaySample:
     def to_dict(self) -> Dict:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, payload: Dict) -> "ControllerReplaySample":
+        return cls(
+            role=str(payload["role"]),
+            policy_id=str(payload["policy_id"]),
+            group_id=str(payload["group_id"]),
+            prompt_text=str(payload["prompt_text"]),
+            completion_text=str(payload["completion_text"]),
+            reward=float(payload["reward"]),
+            advantage=float(payload["advantage"]),
+            metadata=dict(payload.get("metadata", {})),
+            task_id=str(payload["task_id"]),
+            source_path=str(payload.get("source_path", "")),
+            timestamp=payload.get("timestamp"),
+        )
+
 
 def discover_rollout_files(
     inputs: Sequence[str],
@@ -185,6 +201,18 @@ def write_samples_to_jsonl(
         for sample in samples:
             handle.write(json.dumps(sample.to_dict(), sort_keys=True) + "\n")
     return str(output)
+
+
+def load_samples_from_jsonl(input_path: str) -> List[ControllerReplaySample]:
+    path = Path(input_path).expanduser().resolve()
+    samples: List[ControllerReplaySample] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            samples.append(ControllerReplaySample.from_dict(json.loads(line)))
+    return samples
 
 
 def summarize_samples_by_policy(

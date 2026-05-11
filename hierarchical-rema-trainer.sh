@@ -118,13 +118,20 @@ if [[ "$SLURM_GPUS_RAW" == *:* ]]; then
 else
     DEFAULT_RAY_N_GPUS_PER_NODE=${SLURM_GPUS_RAW}
 fi
-RAY_NNODES=${RAY_NNODES:-1}
+RAY_NNODES=${RAY_NNODES:-${SLURM_JOB_NUM_NODES:-1}}
 RAY_N_GPUS_PER_NODE=${RAY_N_GPUS_PER_NODE:-$DEFAULT_RAY_N_GPUS_PER_NODE}
 VLLM_TENSOR_PARALLEL_SIZE=${VLLM_TENSOR_PARALLEL_SIZE:-1}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.5}
 VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1024}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-}
+RAY_PORT=${RAY_PORT:-6379}
+RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
+RAY_NAMESPACE=${RAY_NAMESPACE:-verl}
+OFFLINE_GRPO_DISTRIBUTED=${OFFLINE_GRPO_DISTRIBUTED:-false}
+OFFLINE_GRPO_NNODES=${OFFLINE_GRPO_NNODES:-$RAY_NNODES}
+OFFLINE_GRPO_GPUS_PER_NODE=${OFFLINE_GRPO_GPUS_PER_NODE:-$RAY_N_GPUS_PER_NODE}
+OFFLINE_GRPO_MASTER_PORT=${OFFLINE_GRPO_MASTER_PORT:-29501}
 BEST_K=${BEST_K:-10}
 PRINT_MODE=${PRINT_MODE:-summary}
 ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-32}
@@ -155,6 +162,7 @@ VAL_ANSWER_KEY=${VAL_ANSWER_KEY:-answer}
 VAL_TASK_ID_KEY=${VAL_TASK_ID_KEY:-idx}
 MAX_VAL_TASKS=${MAX_VAL_TASKS:-0}
 VAL_TASKS_PER_EPOCH=${VAL_TASKS_PER_EPOCH:-0}
+EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS:-0}
 VAL_TASK_SOURCE_STAGE=${VAL_TASK_SOURCE_STAGE:-$RUN_ROOT/val_task_source}
 VAL_TASK_SOURCE_RUNTIME=${VAL_TASK_SOURCE_RUNTIME:-$VAL_TASK_SOURCE}
 DISABLE_EXTERNAL_VALIDATION=${DISABLE_EXTERNAL_VALIDATION:-false}
@@ -213,6 +221,9 @@ DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}
 EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-false}
 EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-300}
 
+LOCAL_VERL_DIR=${LOCAL_VERL_DIR:-$TMPDIR/verl}
+LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH:-$TMPDIR/verl-rema-v3.sif}
+
 S3_EPOCHS_PATH=${S3_EPOCHS_PATH:-${S3_OUTPUT_PATH}/epochs}
 S3_BEST_SO_FAR_MODELS_PATH=${S3_BEST_SO_FAR_MODELS_PATH:-${S3_OUTPUT_PATH}/best_so_far_models}
 S3_BEST_VAL_MODELS_PATH=${S3_BEST_VAL_MODELS_PATH:-${S3_OUTPUT_PATH}/best_val_models}
@@ -220,8 +231,13 @@ S3_FINAL_MODELS_PATH=${S3_FINAL_MODELS_PATH:-${S3_OUTPUT_PATH}/final_models}
 
 mkdir -p "$RUN_ROOT" "$LOCAL_OUTPUT_DIR" "$PERSIST_LOCAL_DIR"
 
-cp -r "$SOURCE_DIR/src/verl" "$TMPDIR/verl"
-rclone copy "$SIF_IMAGE_PATH" "$TMPDIR/"
+if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
+    RAY_CPUS_PER_NODE=${RAY_CPUS_PER_NODE:-$SLURM_CPUS_PER_TASK}
+elif [[ -n "${SLURM_CPUS_PER_GPU:-}" ]]; then
+    RAY_CPUS_PER_NODE=${RAY_CPUS_PER_NODE:-$(( SLURM_CPUS_PER_GPU * RAY_N_GPUS_PER_NODE ))}
+else
+    RAY_CPUS_PER_NODE=${RAY_CPUS_PER_NODE:-1}
+fi
 
 export HF_HOME=${HF_HOME:-$TMPDIR/hf_home}
 export PYTHONUNBUFFERED=1
@@ -239,6 +255,11 @@ fi
 FINAL_ANSWER_CORRECTNESS_REWARD_ONLY_FLAG=""
 if [[ "$FINAL_ANSWER_CORRECTNESS_REWARD_ONLY" == "1" || "$FINAL_ANSWER_CORRECTNESS_REWARD_ONLY" == "true" || "$FINAL_ANSWER_CORRECTNESS_REWARD_ONLY" == "True" ]]; then
     FINAL_ANSWER_CORRECTNESS_REWARD_ONLY_FLAG="--final-answer-correctness-reward-only"
+fi
+
+OFFLINE_GRPO_DISTRIBUTED_FLAG=""
+if [[ "$OFFLINE_GRPO_DISTRIBUTED" == "1" || "$OFFLINE_GRPO_DISTRIBUTED" == "true" || "$OFFLINE_GRPO_DISTRIBUTED" == "True" ]]; then
+    OFFLINE_GRPO_DISTRIBUTED_FLAG="--offline-grpo-distributed"
 fi
 
 GRADIENT_CHECKPOINTING_FLAG=""
@@ -310,6 +331,138 @@ VLLM_MAX_MODEL_LEN_FLAG=""
 if [[ -n "$VLLM_MAX_MODEL_LEN" ]]; then
     VLLM_MAX_MODEL_LEN_FLAG="--vllm-max-model-len ${VLLM_MAX_MODEL_LEN}"
 fi
+
+MULTINODE_RAY_ENABLED=0
+if [[ "$BACKEND" == "vllm" && "${RAY_NNODES:-1}" -gt 1 ]]; then
+    MULTINODE_RAY_ENABLED=1
+fi
+if [[ -n "${SLURM_JOB_NUM_NODES:-}" && "${RAY_NNODES:-1}" -gt "${SLURM_JOB_NUM_NODES:-1}" ]]; then
+    echo "RAY_NNODES=${RAY_NNODES} exceeds allocated SLURM_JOB_NUM_NODES=${SLURM_JOB_NUM_NODES}" >&2
+    exit 1
+fi
+if [[ -n "${SLURM_JOB_NUM_NODES:-}" && "${OFFLINE_GRPO_NNODES:-1}" -gt "${SLURM_JOB_NUM_NODES:-1}" ]]; then
+    echo "OFFLINE_GRPO_NNODES=${OFFLINE_GRPO_NNODES} exceeds allocated SLURM_JOB_NUM_NODES=${SLURM_JOB_NUM_NODES}" >&2
+    exit 1
+fi
+RUNTIME_STAGE_NNODES=1
+if [[ "$MULTINODE_RAY_ENABLED" == "1" ]]; then
+    RUNTIME_STAGE_NNODES=$RAY_NNODES
+fi
+if [[ "$OFFLINE_GRPO_DISTRIBUTED" == "1" || "$OFFLINE_GRPO_DISTRIBUTED" == "true" || "$OFFLINE_GRPO_DISTRIBUTED" == "True" ]]; then
+    if [[ "${OFFLINE_GRPO_NNODES:-1}" -gt "$RUNTIME_STAGE_NNODES" ]]; then
+        RUNTIME_STAGE_NNODES=$OFFLINE_GRPO_NNODES
+    fi
+fi
+
+RAY_CLUSTER_PIDS=()
+RAY_HEAD_NODE=""
+RAY_HEAD_NODE_IP=""
+RAY_ADDRESS_VALUE=""
+RAY_DRIVER_NODE_FLAG=""
+
+stage_runtime_on_current_node() {
+    mkdir -p "$TMPDIR"
+    rm -rf "$LOCAL_VERL_DIR"
+    cp -r "$SOURCE_DIR/src/verl" "$LOCAL_VERL_DIR"
+    rm -f "$LOCAL_SIF_IMAGE_PATH"
+    rclone copyto "$SIF_IMAGE_PATH" "$LOCAL_SIF_IMAGE_PATH"
+}
+
+stage_runtime_on_allocated_nodes() {
+    if [[ "$RUNTIME_STAGE_NNODES" -le 1 ]]; then
+        stage_runtime_on_current_node
+        return
+    fi
+
+    srun --nodes="${RUNTIME_STAGE_NNODES}" --ntasks="${RUNTIME_STAGE_NNODES}" bash -lc "
+set -euo pipefail
+mkdir -p \"$TMPDIR\"
+rm -rf \"$LOCAL_VERL_DIR\"
+cp -r \"$SOURCE_DIR/src/verl\" \"$LOCAL_VERL_DIR\"
+rm -f \"$LOCAL_SIF_IMAGE_PATH\"
+rclone copyto \"$SIF_IMAGE_PATH\" \"$LOCAL_SIF_IMAGE_PATH\"
+"
+}
+
+resolve_ray_head_node() {
+    if [[ "$MULTINODE_RAY_ENABLED" == "0" ]]; then
+        return
+    fi
+
+    mapfile -t SLURM_HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+    RAY_HEAD_NODE="${SLURM_HOSTS[0]}"
+    RAY_HEAD_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" hostname --ip-address)
+    if [[ "$RAY_HEAD_NODE_IP" == *" "* ]]; then
+        read -r -a RAY_ADDR_PARTS <<<"$RAY_HEAD_NODE_IP"
+        if [[ ${#RAY_ADDR_PARTS[0]} -gt 16 ]]; then
+            RAY_HEAD_NODE_IP="${RAY_ADDR_PARTS[1]}"
+        else
+            RAY_HEAD_NODE_IP="${RAY_ADDR_PARTS[0]}"
+        fi
+    fi
+    RAY_ADDRESS_VALUE="${RAY_HEAD_NODE_IP}:${RAY_PORT}"
+    RAY_DRIVER_NODE_FLAG="-w ${RAY_HEAD_NODE}"
+}
+
+start_ray_cluster() {
+    if [[ "$MULTINODE_RAY_ENABLED" == "0" ]]; then
+        return
+    fi
+
+    resolve_ray_head_node
+    export RAY_ADDRESS="$RAY_ADDRESS_VALUE"
+    export RAY_NAMESPACE
+
+    echo "[hierarchical-rema][ray] starting head node=${RAY_HEAD_NODE} address=${RAY_ADDRESS_VALUE} nnodes=${RAY_NNODES} gpus_per_node=${RAY_N_GPUS_PER_NODE}"
+
+    srun --nodes=1 --ntasks=1 -w "$RAY_HEAD_NODE" \
+        apptainer exec --nv --writable-tmpfs \
+        --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+        --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
+        --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
+        "$LOCAL_SIF_IMAGE_PATH" \
+        bash -lc "ray stop --force >/dev/null 2>&1 || true; ray start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+    RAY_CLUSTER_PIDS+=("$!")
+    sleep 10
+
+    local worker_num=$((RAY_NNODES - 1))
+    local idx=0
+    while [[ "$idx" -lt "$worker_num" ]]; do
+        local node_i="${SLURM_HOSTS[$((idx + 1))]}"
+        echo "[hierarchical-rema][ray] starting worker node=${node_i} address=${RAY_ADDRESS_VALUE}"
+        srun --nodes=1 --ntasks=1 -w "$node_i" \
+            apptainer exec --nv --writable-tmpfs \
+            --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+            --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
+            --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
+            "$LOCAL_SIF_IMAGE_PATH" \
+            bash -lc "ray stop --force >/dev/null 2>&1 || true; ray start --address '${RAY_ADDRESS_VALUE}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+        RAY_CLUSTER_PIDS+=("$!")
+        sleep 5
+        idx=$((idx + 1))
+    done
+}
+
+stop_ray_cluster() {
+    if [[ "$MULTINODE_RAY_ENABLED" == "0" ]]; then
+        return
+    fi
+
+    srun --nodes="${RAY_NNODES}" --ntasks="${RAY_NNODES}" \
+        apptainer exec --nv --writable-tmpfs \
+        --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
+        --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
+        --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
+        "$LOCAL_SIF_IMAGE_PATH" \
+        bash -lc "ray stop --force >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+
+    local pid=""
+    for pid in "${RAY_CLUSTER_PIDS[@]}"; do
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" 2>/dev/null || true
+    done
+    RAY_CLUSTER_PIDS=()
+}
 
 stage_task_source() {
     if [[ "$TASK_SOURCE" == "demo" ]]; then
@@ -423,6 +576,7 @@ VAL_ANSWER_KEY=$VAL_ANSWER_KEY
 VAL_TASK_ID_KEY=$VAL_TASK_ID_KEY
 MAX_VAL_TASKS=$MAX_VAL_TASKS
 VAL_TASKS_PER_EPOCH=$VAL_TASKS_PER_EPOCH
+EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=$EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS
 DISABLE_EXTERNAL_VALIDATION=$DISABLE_EXTERNAL_VALIDATION
 VAL_NUM_DECOMPOSITIONS=$VAL_NUM_DECOMPOSITIONS
 VAL_NUM_SELECTIONS=$VAL_NUM_SELECTIONS
@@ -461,8 +615,17 @@ CONTROLLER_FORMAT_RETRY_PENALTY=$CONTROLLER_FORMAT_RETRY_PENALTY
 CONTROLLER_FORMAT_FALLBACK_PENALTY=$CONTROLLER_FORMAT_FALLBACK_PENALTY
 FINAL_ANSWER_CORRECTNESS_REWARD_ONLY=$FINAL_ANSWER_CORRECTNESS_REWARD_ONLY
 ROLLOUT_PROMPT_LENGTH=$ROLLOUT_PROMPT_LENGTH
+RAY_CPUS_PER_NODE=$RAY_CPUS_PER_NODE
+MULTINODE_RAY_ENABLED=$MULTINODE_RAY_ENABLED
 RAY_NNODES=$RAY_NNODES
 RAY_N_GPUS_PER_NODE=$RAY_N_GPUS_PER_NODE
+RAY_PORT=$RAY_PORT
+RAY_DASHBOARD_PORT=$RAY_DASHBOARD_PORT
+RAY_NAMESPACE=$RAY_NAMESPACE
+OFFLINE_GRPO_DISTRIBUTED=$OFFLINE_GRPO_DISTRIBUTED
+OFFLINE_GRPO_NNODES=$OFFLINE_GRPO_NNODES
+OFFLINE_GRPO_GPUS_PER_NODE=$OFFLINE_GRPO_GPUS_PER_NODE
+OFFLINE_GRPO_MASTER_PORT=$OFFLINE_GRPO_MASTER_PORT
 VLLM_TENSOR_PARALLEL_SIZE=$VLLM_TENSOR_PARALLEL_SIZE
 VLLM_GPU_MEMORY_UTILIZATION=$VLLM_GPU_MEMORY_UTILIZATION
 VLLM_MAX_NUM_BATCHED_TOKENS=$VLLM_MAX_NUM_BATCHED_TOKENS
@@ -645,6 +808,8 @@ if [[ "$RUN_KIND" == "train" ]]; then
     stage_task_source
     stage_val_task_source
 fi
+stage_runtime_on_allocated_nodes
+start_ray_cluster
 
 write_run_metadata
 
@@ -652,6 +817,12 @@ echo "[hierarchical-rema] starting run"
 echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
 echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
 echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
+if [[ "$MULTINODE_RAY_ENABLED" == "1" ]]; then
+    echo "[hierarchical-rema] RAY_ADDRESS=${RAY_ADDRESS_VALUE}"
+    echo "[hierarchical-rema] RAY_NAMESPACE=${RAY_NAMESPACE}"
+    echo "[hierarchical-rema] RAY_NNODES=${RAY_NNODES}"
+    echo "[hierarchical-rema] RAY_N_GPUS_PER_NODE=${RAY_N_GPUS_PER_NODE}"
+fi
 if [[ "$RUN_KIND" == "train" ]]; then
     echo "[hierarchical-rema] TASK_SOURCE=$TASK_SOURCE"
     echo "[hierarchical-rema] TASK_SOURCE_RUNTIME=$TASK_SOURCE_RUNTIME"
@@ -670,6 +841,8 @@ if [[ "$RUN_KIND" == "rollout" ]]; then
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
+export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
+export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
 python3 -m hierarchical_rema.demo \
   --backend ${BACKEND} \
@@ -696,6 +869,10 @@ python3 -m hierarchical_rema.demo \
   --rollout-prompt-length ${ROLLOUT_PROMPT_LENGTH} \
   --ray-nnodes ${RAY_NNODES} \
   --ray-n-gpus-per-node ${RAY_N_GPUS_PER_NODE} \
+  ${OFFLINE_GRPO_DISTRIBUTED_FLAG} \
+  --offline-grpo-nnodes ${OFFLINE_GRPO_NNODES} \
+  --offline-grpo-gpus-per-node ${OFFLINE_GRPO_GPUS_PER_NODE} \
+  --offline-grpo-master-port ${OFFLINE_GRPO_MASTER_PORT} \
   --vllm-tensor-parallel-size ${VLLM_TENSOR_PARALLEL_SIZE} \
   --vllm-gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION} \
   --vllm-max-num-batched-tokens ${VLLM_MAX_NUM_BATCHED_TOKENS} \
@@ -712,6 +889,11 @@ else
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
+export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
+export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
+export HIERARCHICAL_REMA_HOST_TMPDIR=${TMPDIR}; \
+export HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR=${LOCAL_VERL_DIR}; \
+export HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
 python3 -m hierarchical_rema.train \
   --task-source ${TASK_SOURCE_RUNTIME} \
@@ -729,6 +911,7 @@ python3 -m hierarchical_rema.train \
   --val-task-id-key ${VAL_TASK_ID_KEY} \
   --max-val-tasks ${MAX_VAL_TASKS} \
   --val-tasks-per-epoch ${VAL_TASKS_PER_EPOCH} \
+  --external-validation-every-n-epochs ${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS} \
   ${DISABLE_EXTERNAL_VALIDATION_FLAG} \
   --backend ${BACKEND} \
   --mode ${MODE} \
@@ -818,16 +1001,17 @@ fi
 start_epoch_s3_sync_watcher
 
 set +e
-srun apptainer exec --nv --writable-tmpfs \
+srun --overlap --nodes=1 --ntasks=1 ${RAY_DRIVER_NODE_FLAG} apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
-    --mount type=bind,src=$TMPDIR/verl,dst=/verl \
-    "$TMPDIR/verl-rema-v3.sif" \
+    --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
+    "$LOCAL_SIF_IMAGE_PATH" \
     bash -c "$COMMAND" 2>&1 | tee "$RUNTIME_LOG"
 RUN_EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
 stop_epoch_s3_sync_watcher
+stop_ray_cluster
 
 persist_outputs
 exit $RUN_EXIT_CODE

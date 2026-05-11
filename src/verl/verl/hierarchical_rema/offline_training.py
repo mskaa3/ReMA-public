@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import os
 import random
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Sequence
 
-from .controller_data import ControllerReplaySample
+from .controller_data import ControllerReplaySample, load_samples_from_jsonl
 
 
 @dataclass
@@ -40,6 +43,15 @@ class OfflineTrainingConfig:
     save_final_checkpoint: bool = True
     save_best_checkpoint: bool = False
     save_intermediate_checkpoints: bool = False
+
+
+@dataclass
+class DistributedTrainingContext:
+    enabled: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+    backend: str = "nccl"
 
 def _ensure_repo_root_on_path() -> None:
     import sys
@@ -74,6 +86,70 @@ def _set_random_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _distributed_context_from_env() -> DistributedTrainingContext:
+    world_size = int(os.environ.get("WORLD_SIZE") or os.environ.get("SLURM_NTASKS") or 1)
+    rank = int(os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or 0)
+    local_rank = int(os.environ.get("LOCAL_RANK") or os.environ.get("SLURM_LOCALID") or 0)
+    torch = _lazy_torch()
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    return DistributedTrainingContext(
+        enabled=world_size > 1,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        backend=backend,
+    )
+
+
+def _init_distributed_training() -> DistributedTrainingContext:
+    context = _distributed_context_from_env()
+    if not context.enabled:
+        return context
+
+    torch = _lazy_torch()
+    import torch.distributed as dist
+
+    if "MASTER_ADDR" not in os.environ or "MASTER_PORT" not in os.environ:
+        raise RuntimeError(
+            "Distributed offline GRPO requires MASTER_ADDR and MASTER_PORT to be set."
+        )
+    if torch.cuda.is_available():
+        torch.cuda.set_device(context.local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend=context.backend,
+            init_method="env://",
+            timeout=timedelta(minutes=30),
+        )
+    return context
+
+
+def _destroy_distributed_training(context: DistributedTrainingContext) -> None:
+    if not context.enabled:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def _is_primary_process(context: DistributedTrainingContext) -> bool:
+    return (not context.enabled) or context.rank == 0
+
+
+def _all_reduce_mean(value: float, device, context: DistributedTrainingContext) -> float:
+    if not context.enabled:
+        return float(value)
+    torch = _lazy_torch()
+    import torch.distributed as dist
+
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= max(context.world_size, 1)
+    return float(tensor.item())
 
 
 def _load_scheduler_factory():
@@ -127,7 +203,10 @@ def _finish_tracking(tracking) -> None:
         pass
 
 
-def _load_model_and_tokenizer(config: OfflineTrainingConfig):
+def _load_model_and_tokenizer(
+    config: OfflineTrainingConfig,
+    distributed_context: DistributedTrainingContext,
+):
     torch = _lazy_torch()
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -149,7 +228,13 @@ def _load_model_and_tokenizer(config: OfflineTrainingConfig):
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device_name = config.device
+        if distributed_context.enabled:
+            device_name = f"cuda:{distributed_context.local_rank}"
+        device = torch.device(device_name)
+    else:
+        device = torch.device("cpu")
     model.to(device)
     return tokenizer, model, device
 
@@ -412,6 +497,8 @@ def run_offline_policy_training(
     from torch.utils.data import DataLoader
 
     torch = _lazy_torch()
+    distributed_context = _init_distributed_training()
+    is_primary = _is_primary_process(distributed_context)
     try:
         from verl.trainer.ppo import core_algos
     except Exception as exc:
@@ -419,22 +506,54 @@ def run_offline_policy_training(
 
     _set_random_seeds(config.seed)
     scheduler_factory = _load_scheduler_factory()
-    tokenizer, model, device = _load_model_and_tokenizer(config)
+    tokenizer, model, device = _load_model_and_tokenizer(config, distributed_context)
+    if distributed_context.enabled:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        model = DDP(
+            model,
+            device_ids=[distributed_context.local_rank] if device.type == "cuda" else None,
+            output_device=distributed_context.local_rank if device.type == "cuda" else None,
+            find_unused_parameters=False,
+        )
     train_dataset = ControllerReplayDataset(train_samples, tokenizer, config.max_length, config.truncation)
     val_dataset = ControllerReplayDataset(val_samples, tokenizer, config.max_length, config.truncation)
 
     generator = torch.Generator().manual_seed(config.seed)
+    train_sampler = None
+    val_sampler = None
+    if distributed_context.enabled:
+        from torch.utils.data import DistributedSampler
+
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=distributed_context.world_size,
+            rank=distributed_context.rank,
+            shuffle=True,
+            seed=config.seed,
+            drop_last=False,
+        )
+        if len(val_dataset):
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=distributed_context.world_size,
+                rank=distributed_context.rank,
+                shuffle=False,
+                drop_last=False,
+            )
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.train_batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         collate_fn=_collate_rows,
-        generator=generator,
+        generator=generator if train_sampler is None else None,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.train_batch_size,
         shuffle=False,
+        sampler=val_sampler,
         collate_fn=_collate_rows,
     ) if len(val_dataset) else None
 
@@ -464,12 +583,16 @@ def run_offline_policy_training(
     output_dir = Path(config.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     owns_tracking = tracking is None
-    tracking = tracking or _init_tracking(config)
+    if is_primary:
+        tracking = tracking or _init_tracking(config)
+    else:
+        tracking = None
     metrics_log_path = output_dir / "train_metrics.jsonl"
     eval_log_path = output_dir / "eval_metrics.jsonl"
     config_path = output_dir / "train_config.json"
-    with config_path.open("w", encoding="utf-8") as handle:
-        json.dump(asdict(config), handle, indent=2, sort_keys=True)
+    if is_primary:
+        with config_path.open("w", encoding="utf-8") as handle:
+            json.dump(asdict(config), handle, indent=2, sort_keys=True)
 
     training_data_stats = {
         "num_train_samples": len(train_samples),
@@ -477,22 +600,23 @@ def run_offline_policy_training(
         "objective": "grpo",
         **_count_parameters(model),
     }
-    with (output_dir / "training_data_stats.json").open("w", encoding="utf-8") as handle:
-        json.dump(training_data_stats, handle, indent=2, sort_keys=True)
-    print(
-        f"[hierarchical-rema][grpo] experiment={config.experiment_name} "
-        f"train_samples={len(train_samples)} val_samples={len(val_samples)} "
-        f"updates={total_update_steps}"
-    )
-    if tracking is not None:
-        tracking.log(
-            {
-                "train/num_train_samples": len(train_samples),
-                "train/num_val_samples": len(val_samples),
-                "train/total_update_steps": total_update_steps,
-            },
-            step=log_step_offset,
+    if is_primary:
+        with (output_dir / "training_data_stats.json").open("w", encoding="utf-8") as handle:
+            json.dump(training_data_stats, handle, indent=2, sort_keys=True)
+        print(
+            f"[hierarchical-rema][grpo] experiment={config.experiment_name} "
+            f"train_samples={len(train_samples)} val_samples={len(val_samples)} "
+            f"updates={total_update_steps} world_size={distributed_context.world_size}"
         )
+        if tracking is not None:
+            tracking.log(
+                {
+                    "train/num_train_samples": len(train_samples),
+                    "train/num_val_samples": len(val_samples),
+                    "train/total_update_steps": total_update_steps,
+                },
+                step=log_step_offset,
+            )
 
     global_step = 0
     skipped_empty_batches = 0
@@ -501,17 +625,21 @@ def run_offline_policy_training(
     best_val_loss = None
 
     for epoch in range(config.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
-        print(f"[hierarchical-rema][grpo] epoch {epoch + 1}/{config.epochs}")
+        if is_primary:
+            print(f"[hierarchical-rema][grpo] epoch {epoch + 1}/{config.epochs}")
         for batch_idx, batch in enumerate(train_loader):
             valid_row_mask = batch["loss_mask"][:, :-1].sum(dim=1) > 0
             if not bool(valid_row_mask.any().item()):
                 skipped_empty_batches += 1
                 optimizer.zero_grad(set_to_none=True)
-                print(
-                    f"[hierarchical-rema][grpo] skipping empty batch "
-                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
-                )
+                if is_primary:
+                    print(
+                        f"[hierarchical-rema][grpo] skipping empty batch "
+                        f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                    )
                 continue
             if not bool(valid_row_mask.all().item()):
                 batch = _filter_batch_rows(batch, valid_row_mask)
@@ -531,10 +659,11 @@ def run_offline_policy_training(
             if not _all_finite(outputs.logits):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
-                print(
-                    f"[hierarchical-rema][grpo] skipping non-finite logits "
-                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
-                )
+                if is_primary:
+                    print(
+                        f"[hierarchical-rema][grpo] skipping non-finite logits "
+                        f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                    )
                 continue
             token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
             old_log_probs = _gather_old_log_probs(
@@ -548,10 +677,11 @@ def run_offline_policy_training(
             if not _all_finite(token_log_probs, old_log_probs, advantages, loss_mask):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
-                print(
-                    f"[hierarchical-rema][grpo] skipping non-finite batch tensors "
-                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
-                )
+                if is_primary:
+                    print(
+                        f"[hierarchical-rema][grpo] skipping non-finite batch tensors "
+                        f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                    )
                 continue
             pg_loss, clipfrac, approx_kl, clipfrac_lower = core_algos.compute_policy_loss(
                 old_log_prob=old_log_probs,
@@ -566,12 +696,13 @@ def run_offline_policy_training(
             if not _all_finite(pg_loss, clipfrac, approx_kl, clipfrac_lower, entropy, loss):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
-                print(
-                    f"[hierarchical-rema][grpo] skipping non-finite objective "
-                    f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)} "
-                    f"mean_reward={float(batch['reward'].mean().item()):.4f} "
-                    f"mean_advantage={float(batch['advantage'].mean().item()):.4f}"
-                )
+                if is_primary:
+                    print(
+                        f"[hierarchical-rema][grpo] skipping non-finite objective "
+                        f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)} "
+                        f"mean_reward={float(batch['reward'].mean().item()):.4f} "
+                        f"mean_advantage={float(batch['advantage'].mean().item()):.4f}"
+                    )
                 continue
 
             loss = loss / max(config.grad_accum_steps, 1)
@@ -588,79 +719,88 @@ def run_offline_policy_training(
                 metrics = {
                     "step": global_step,
                     "epoch": epoch,
-                    "loss": float(loss.detach().item() * max(config.grad_accum_steps, 1)),
+                    "loss": _all_reduce_mean(
+                        float(loss.detach().item() * max(config.grad_accum_steps, 1)),
+                        device,
+                        distributed_context,
+                    ),
                     "lr": float(scheduler.get_last_lr()[0]),
                     "objective": "grpo",
-                    "mean_reward": float(batch["reward"].mean().item()),
-                    "mean_advantage": float(batch["advantage"].mean().item()),
-                    "approx_kl": float(approx_kl.detach().item()),
-                    "entropy": float(entropy.detach().item()),
-                    "clipfrac": float(clipfrac.detach().item()),
-                    "clipfrac_lower": float(clipfrac_lower.detach().item()),
+                    "mean_reward": _all_reduce_mean(float(batch["reward"].mean().item()), device, distributed_context),
+                    "mean_advantage": _all_reduce_mean(float(batch["advantage"].mean().item()), device, distributed_context),
+                    "approx_kl": _all_reduce_mean(float(approx_kl.detach().item()), device, distributed_context),
+                    "entropy": _all_reduce_mean(float(entropy.detach().item()), device, distributed_context),
+                    "clipfrac": _all_reduce_mean(float(clipfrac.detach().item()), device, distributed_context),
+                    "clipfrac_lower": _all_reduce_mean(float(clipfrac_lower.detach().item()), device, distributed_context),
                 }
-                with metrics_log_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(metrics, sort_keys=True) + "\n")
-                if (
-                    global_step == 1
-                    or global_step % max(config.logging_steps, 1) == 0
-                    or global_step == total_update_steps
-                ):
-                    concise_metrics = {
-                        f"{tracking_prefix}train/loss": metrics["loss"],
-                        f"{tracking_prefix}train/lr": metrics["lr"],
-                        f"{tracking_prefix}train/mean_reward": metrics["mean_reward"],
-                        f"{tracking_prefix}train/mean_advantage": metrics["mean_advantage"],
-                        f"{tracking_prefix}train/approx_kl": metrics["approx_kl"],
-                        f"{tracking_prefix}train/entropy": metrics["entropy"],
-                        f"{tracking_prefix}train/clipfrac": metrics["clipfrac"],
-                    }
-                    print(
-                        f"[hierarchical-rema][grpo] step={global_step}/{total_update_steps} "
-                        f"epoch={epoch + 1}/{config.epochs} "
-                        f"loss={metrics['loss']:.6f} "
-                        f"mean_reward={metrics['mean_reward']:.4f} "
-                        f"mean_advantage={metrics['mean_advantage']:.4f} "
-                        f"approx_kl={metrics['approx_kl']:.6f}"
-                    )
-                    if tracking is not None:
-                        tracking.log(concise_metrics, step=log_step_offset + global_step)
+                if is_primary:
+                    with metrics_log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(metrics, sort_keys=True) + "\n")
+                    if (
+                        global_step == 1
+                        or global_step % max(config.logging_steps, 1) == 0
+                        or global_step == total_update_steps
+                    ):
+                        concise_metrics = {
+                            f"{tracking_prefix}train/loss": metrics["loss"],
+                            f"{tracking_prefix}train/lr": metrics["lr"],
+                            f"{tracking_prefix}train/mean_reward": metrics["mean_reward"],
+                            f"{tracking_prefix}train/mean_advantage": metrics["mean_advantage"],
+                            f"{tracking_prefix}train/approx_kl": metrics["approx_kl"],
+                            f"{tracking_prefix}train/entropy": metrics["entropy"],
+                            f"{tracking_prefix}train/clipfrac": metrics["clipfrac"],
+                        }
+                        print(
+                            f"[hierarchical-rema][grpo] step={global_step}/{total_update_steps} "
+                            f"epoch={epoch + 1}/{config.epochs} "
+                            f"loss={metrics['loss']:.6f} "
+                            f"mean_reward={metrics['mean_reward']:.4f} "
+                            f"mean_advantage={metrics['mean_advantage']:.4f} "
+                            f"approx_kl={metrics['approx_kl']:.6f}"
+                        )
+                        if tracking is not None:
+                            tracking.log(concise_metrics, step=log_step_offset + global_step)
 
                 if config.eval_every_steps > 0 and val_loader is not None and global_step % config.eval_every_steps == 0:
                     val_metrics = evaluate_controller_model(
                         model=model,
                         dataloader=val_loader,
                         device=device,
+                        distributed_context=distributed_context,
                     )
                     if (
                         config.save_best_checkpoint
                         and (best_val_loss is None or val_metrics["val_loss"] < best_val_loss)
                     ):
                         best_val_loss = val_metrics["val_loss"]
-                        _save_model_checkpoint(model, tokenizer, output_dir / "best")
-                    with eval_log_path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps({"step": global_step, **val_metrics}, sort_keys=True) + "\n")
-                    print(
-                        f"[hierarchical-rema][grpo] eval step={global_step} "
-                        f"val_loss={val_metrics['val_loss']:.6f}"
-                    )
-                    if tracking is not None:
-                        tracking.log(
-                            {f"{tracking_prefix}val/val_loss": val_metrics["val_loss"]},
-                            step=log_step_offset + global_step,
+                        if is_primary:
+                            _save_model_checkpoint(model, tokenizer, output_dir / "best")
+                    if is_primary:
+                        with eval_log_path.open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps({"step": global_step, **val_metrics}, sort_keys=True) + "\n")
+                        print(
+                            f"[hierarchical-rema][grpo] eval step={global_step} "
+                            f"val_loss={val_metrics['val_loss']:.6f}"
                         )
+                        if tracking is not None:
+                            tracking.log(
+                                {f"{tracking_prefix}val/val_loss": val_metrics["val_loss"]},
+                                step=log_step_offset + global_step,
+                            )
 
                 if (
                     config.save_intermediate_checkpoints
                     and config.save_steps > 0
                     and global_step % config.save_steps == 0
                 ):
-                    _save_model_checkpoint(model, tokenizer, output_dir / f"checkpoint-{global_step}")
-                    print(
-                        f"[hierarchical-rema][grpo] saved checkpoint step={global_step} "
-                        f"path={output_dir / f'checkpoint-{global_step}'}"
-                    )
+                    if is_primary:
+                        _save_model_checkpoint(model, tokenizer, output_dir / f"checkpoint-{global_step}")
+                        print(
+                            f"[hierarchical-rema][grpo] saved checkpoint step={global_step} "
+                            f"path={output_dir / f'checkpoint-{global_step}'}"
+                        )
 
-    if config.save_final_checkpoint:
+    if config.save_final_checkpoint and is_primary:
         _save_model_checkpoint(model, tokenizer, output_dir / "final")
     summary = {
         "output_dir": str(output_dir),
@@ -676,35 +816,51 @@ def run_offline_policy_training(
         **_count_parameters(model),
     }
     if val_loader is not None:
-        summary.update(evaluate_controller_model(model=model, dataloader=val_loader, device=device))
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, sort_keys=True)
-    print(
-        f"[hierarchical-rema][grpo] finished experiment={config.experiment_name} "
-        f"steps={global_step} output_dir={output_dir} "
-        f"skipped_empty_batches={skipped_empty_batches} "
-        f"skipped_non_finite_batches={skipped_non_finite_batches}"
-    )
-    if tracking is not None:
-        final_metrics = {
-            f"{tracking_prefix}train/final_steps": global_step,
-            f"{tracking_prefix}train/num_train_samples": len(train_samples),
-            f"{tracking_prefix}train/num_val_samples": len(val_samples),
-            f"{tracking_prefix}train/skipped_empty_batches": skipped_empty_batches,
-            f"{tracking_prefix}train/skipped_non_finite_batches": skipped_non_finite_batches,
-        }
-        if "val_loss" in summary:
-            final_metrics[f"{tracking_prefix}val/final_loss"] = summary["val_loss"]
-        tracking.log(final_metrics, step=log_step_offset + max(global_step, 1))
-        if owns_tracking:
-            _finish_tracking(tracking)
+        summary.update(
+            evaluate_controller_model(
+                model=model,
+                dataloader=val_loader,
+                device=device,
+                distributed_context=distributed_context,
+            )
+        )
+    if is_primary:
+        with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True)
+        print(
+            f"[hierarchical-rema][grpo] finished experiment={config.experiment_name} "
+            f"steps={global_step} output_dir={output_dir} "
+            f"skipped_empty_batches={skipped_empty_batches} "
+            f"skipped_non_finite_batches={skipped_non_finite_batches}"
+        )
+        if tracking is not None:
+            final_metrics = {
+                f"{tracking_prefix}train/final_steps": global_step,
+                f"{tracking_prefix}train/num_train_samples": len(train_samples),
+                f"{tracking_prefix}train/num_val_samples": len(val_samples),
+                f"{tracking_prefix}train/skipped_empty_batches": skipped_empty_batches,
+                f"{tracking_prefix}train/skipped_non_finite_batches": skipped_non_finite_batches,
+            }
+            if "val_loss" in summary:
+                final_metrics[f"{tracking_prefix}val/final_loss"] = summary["val_loss"]
+            tracking.log(final_metrics, step=log_step_offset + max(global_step, 1))
+            if owns_tracking:
+                _finish_tracking(tracking)
+    _destroy_distributed_training(distributed_context)
     return summary
 
 
-def evaluate_controller_model(model, dataloader, device) -> Dict[str, float]:
+def evaluate_controller_model(
+    model,
+    dataloader,
+    device,
+    distributed_context: DistributedTrainingContext | None = None,
+) -> Dict[str, float]:
     torch = _lazy_torch()
+    distributed_context = distributed_context or DistributedTrainingContext()
     model.eval()
-    losses = []
+    total_loss_sum = torch.tensor(0.0, device=device)
+    total_weight_sum = torch.tensor(0.0, device=device)
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
@@ -728,17 +884,55 @@ def evaluate_controller_model(model, dataloader, device) -> Dict[str, float]:
                 reduction="none",
             ).view_as(loss_mask)
             masked_loss = per_token_loss * loss_mask
-            loss = masked_loss.sum() / torch.clamp(loss_mask.sum(), min=1.0)
-            if not bool(torch.isfinite(loss).item()):
-                continue
-            losses.append(loss.detach().cpu())
+            total_loss_sum += masked_loss.sum()
+            total_weight_sum += torch.clamp(loss_mask.sum(), min=0.0)
+    if distributed_context.enabled:
+        import torch.distributed as dist
+
+        dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_weight_sum, op=dist.ReduceOp.SUM)
     model.train()
-    if not losses:
+    if float(total_weight_sum.item()) <= 0.0:
         return {"val_loss": 0.0}
-    return {"val_loss": float(torch.stack(losses).mean().item())}
+    loss = total_loss_sum / torch.clamp(total_weight_sum, min=1.0)
+    if not bool(torch.isfinite(loss).item()):
+        return {"val_loss": 0.0}
+    return {"val_loss": float(loss.detach().cpu().item())}
 
 
 def _save_model_checkpoint(model, tokenizer, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(output_dir)
+    base_model = model.module if hasattr(model, "module") else model
+    base_model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+
+
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run offline hierarchical ReMA GRPO training from saved replay samples")
+    parser.add_argument("--train-samples-jsonl", required=True)
+    parser.add_argument("--val-samples-jsonl", default="")
+    parser.add_argument("--config-json", required=True)
+    return parser.parse_args()
+
+
+def _load_config_from_json(config_path: str) -> OfflineTrainingConfig:
+    path = Path(config_path).expanduser().resolve()
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return OfflineTrainingConfig(**payload)
+
+
+def main() -> None:
+    args = _parse_cli_args()
+    train_samples = load_samples_from_jsonl(args.train_samples_jsonl)
+    val_samples = load_samples_from_jsonl(args.val_samples_jsonl) if args.val_samples_jsonl else []
+    config = _load_config_from_json(args.config_json)
+    run_offline_policy_training(
+        train_samples=train_samples,
+        val_samples=val_samples,
+        config=config,
+    )
+
+
+if __name__ == "__main__":
+    main()

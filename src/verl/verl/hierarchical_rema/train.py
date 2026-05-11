@@ -5,12 +5,16 @@ import gc
 import json
 import os
 import random
+import shlex
 import shutil
+import socket
+import subprocess
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
-from .controller_data import controller_samples_from_task_rollouts
+from .controller_data import controller_samples_from_task_rollouts, write_samples_to_jsonl
 from .demo import make_demo_tasks, make_worker_pool
 from .offline_training import OfflineTrainingConfig, run_offline_policy_training
 from .orchestrator import HierarchicalGRPOTrainer
@@ -53,6 +57,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-task-id-key", default="idx")
     parser.add_argument("--max-val-tasks", type=int, default=0, help="Limit the total number of loaded validation tasks; 0 means all")
     parser.add_argument("--val-tasks-per-epoch", type=int, default=0, help="How many validation tasks to run per epoch; 0 means all loaded validation tasks")
+    parser.add_argument(
+        "--external-validation-every-n-epochs",
+        type=int,
+        default=0,
+        help=(
+            "How often to run the full external benchmark validation. "
+            "1 = every outer epoch, 5 = every fifth outer epoch, "
+            "0 = final outer epoch only, negative values disable it entirely."
+        ),
+    )
     parser.add_argument("--disable-external-validation", action="store_true")
 
     parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
@@ -114,6 +128,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-prompt-length", type=int, default=2048)
     parser.add_argument("--ray-nnodes", type=int, default=1)
     parser.add_argument("--ray-n-gpus-per-node", type=int, default=1)
+    parser.add_argument("--offline-grpo-distributed", action="store_true")
+    parser.add_argument("--offline-grpo-nnodes", type=int, default=1)
+    parser.add_argument("--offline-grpo-gpus-per-node", type=int, default=1)
+    parser.add_argument("--offline-grpo-master-port", type=int, default=29501)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=8192)
@@ -205,6 +223,176 @@ def _release_memory() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def _relay_offline_metrics_to_tracking(
+    output_dir: Path,
+    tracking,
+    tracking_prefix: str,
+    log_step_offset: int,
+    num_train_samples: int,
+    num_val_samples: int,
+) -> None:
+    if tracking is None:
+        return
+
+    tracking.log(
+        {
+            f"{tracking_prefix}train/num_train_samples": num_train_samples,
+            f"{tracking_prefix}train/num_val_samples": num_val_samples,
+        },
+        step=log_step_offset,
+    )
+
+    metrics_log_path = output_dir / "train_metrics.jsonl"
+    if metrics_log_path.exists():
+        with metrics_log_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                step = log_step_offset + int(record["step"])
+                tracking.log(
+                    {
+                        f"{tracking_prefix}train/loss": float(record["loss"]),
+                        f"{tracking_prefix}train/lr": float(record["lr"]),
+                        f"{tracking_prefix}train/mean_reward": float(record["mean_reward"]),
+                        f"{tracking_prefix}train/mean_advantage": float(record["mean_advantage"]),
+                        f"{tracking_prefix}train/approx_kl": float(record["approx_kl"]),
+                        f"{tracking_prefix}train/entropy": float(record["entropy"]),
+                        f"{tracking_prefix}train/clipfrac": float(record["clipfrac"]),
+                    },
+                    step=step,
+                )
+
+    eval_log_path = output_dir / "eval_metrics.jsonl"
+    if eval_log_path.exists():
+        with eval_log_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                step = log_step_offset + int(record["step"])
+                tracking.log(
+                    {f"{tracking_prefix}val/val_loss": float(record["val_loss"])},
+                    step=step,
+                )
+
+    summary_path = output_dir / "summary.json"
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        final_metrics = {
+            f"{tracking_prefix}train/final_steps": int(summary.get("steps", 0)),
+            f"{tracking_prefix}train/skipped_empty_batches": int(summary.get("skipped_empty_batches", 0)),
+            f"{tracking_prefix}train/skipped_non_finite_batches": int(summary.get("skipped_non_finite_batches", 0)),
+        }
+        if "val_loss" in summary:
+            final_metrics[f"{tracking_prefix}val/final_loss"] = float(summary["val_loss"])
+        tracking.log(final_metrics, step=log_step_offset + max(int(summary.get("steps", 0)), 1))
+
+
+def _run_distributed_offline_policy_training(
+    train_samples,
+    val_samples,
+    config: OfflineTrainingConfig,
+    tracking,
+    tracking_prefix: str,
+    log_step_offset: int,
+    nnodes: int,
+    gpus_per_node: int,
+    master_port: int,
+) -> Dict[str, Any]:
+    if shutil.which("srun") is None:
+        raise RuntimeError("offline distributed GRPO requested, but srun is not available in PATH")
+
+    host_local_verl_dir = os.environ.get("HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR")
+    host_local_sif_image_path = os.environ.get("HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH")
+    host_tmpdir = os.environ.get("HIERARCHICAL_REMA_HOST_TMPDIR") or os.environ.get("TMPDIR")
+    if not host_local_verl_dir or not host_local_sif_image_path or not host_tmpdir:
+        raise RuntimeError(
+            "offline distributed GRPO requested, but host runtime paths are missing. "
+            "Expected HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR, "
+            "HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH, and HIERARCHICAL_REMA_HOST_TMPDIR."
+        )
+
+    output_dir = Path(config.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    train_jsonl = write_samples_to_jsonl(train_samples, output_dir / "train_samples.jsonl")
+    val_jsonl = write_samples_to_jsonl(val_samples, output_dir / "val_samples.jsonl") if val_samples else ""
+    config_json = output_dir / "distributed_train_config.json"
+    with config_json.open("w", encoding="utf-8") as handle:
+        json.dump(asdict(config), handle, indent=2, sort_keys=True)
+
+    master_addr = (
+        os.environ.get("HIERARCHICAL_REMA_OFFLINE_MASTER_ADDR")
+        or os.environ.get("SLURMD_NODENAME")
+        or os.environ.get("HOSTNAME")
+        or socket.gethostname()
+    )
+    world_size = nnodes * gpus_per_node
+    launch_script = " ".join(
+        [
+            "export HF_HOME=" + shlex.quote(str(Path(host_tmpdir) / "hf_home")) + ";",
+            "export PYTHONUNBUFFERED=1;",
+            "export PYTHONPATH=/verl/verl:$PYTHONPATH;",
+            "export MASTER_ADDR=" + shlex.quote(master_addr) + ";",
+            "export MASTER_PORT=" + shlex.quote(str(master_port)) + ";",
+            "python3 -m hierarchical_rema.offline_training",
+            "--train-samples-jsonl",
+            shlex.quote(train_jsonl),
+            "--val-samples-jsonl",
+            shlex.quote(val_jsonl),
+            "--config-json",
+            shlex.quote(str(config_json)),
+        ]
+    )
+    command = [
+        "srun",
+        "--overlap",
+        f"--nodes={nnodes}",
+        f"--ntasks={world_size}",
+        f"--ntasks-per-node={gpus_per_node}",
+        "--gpus-per-task=1",
+        "apptainer",
+        "exec",
+        "--nv",
+        "--writable-tmpfs",
+        "--mount",
+        f"type=bind,src={host_tmpdir},dst={host_tmpdir}",
+        "--mount",
+        f"type=bind,src={host_tmpdir},dst=/root/tmpdir",
+        "--mount",
+        f"type=bind,src={host_local_verl_dir},dst=/verl",
+        host_local_sif_image_path,
+        "bash",
+        "-lc",
+        launch_script,
+    ]
+    print(
+        f"[hierarchical-rema][grpo] launching distributed offline learner "
+        f"nnodes={nnodes} gpus_per_node={gpus_per_node} world_size={world_size} "
+        f"policy_output_dir={output_dir}"
+    )
+    subprocess.run(command, check=True)
+
+    summary_path = output_dir / "summary.json"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Distributed offline GRPO completed without writing {summary_path}")
+    with summary_path.open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+
+    _relay_offline_metrics_to_tracking(
+        output_dir=output_dir,
+        tracking=tracking,
+        tracking_prefix=tracking_prefix,
+        log_step_offset=log_step_offset,
+        num_train_samples=len(train_samples),
+        num_val_samples=len(val_samples),
+    )
+    return summary
 
 
 def _prune_policy_artifacts(policy_root: Path) -> None:
@@ -1220,14 +1408,27 @@ def main() -> None:
                     save_intermediate_checkpoints=args.checkpoint_mode == "all",
                 )
                 previous_model_path = current_paths.get(policy_id)
-                summary = run_offline_policy_training(
-                    train_samples=split["train"],
-                    val_samples=split["val"],
-                    config=training_config,
-                    tracking=tracking,
-                    tracking_prefix=f"{policy_id}/",
-                    log_step_offset=tracking_step_offset,
-                )
+                if args.offline_grpo_distributed:
+                    summary = _run_distributed_offline_policy_training(
+                        train_samples=split["train"],
+                        val_samples=split["val"],
+                        config=training_config,
+                        tracking=tracking,
+                        tracking_prefix=f"{policy_id}/",
+                        log_step_offset=tracking_step_offset,
+                        nnodes=args.offline_grpo_nnodes,
+                        gpus_per_node=args.offline_grpo_gpus_per_node,
+                        master_port=args.offline_grpo_master_port,
+                    )
+                else:
+                    summary = run_offline_policy_training(
+                        train_samples=split["train"],
+                        val_samples=split["val"],
+                        config=training_config,
+                        tracking=tracking,
+                        tracking_prefix=f"{policy_id}/",
+                        log_step_offset=tracking_step_offset,
+                    )
                 tracking_step_offset += max(int(summary["steps"]), 1)
                 final_model_path = str(policy_dir / "final")
                 _update_current_paths(current_paths, policy_id, final_model_path)
@@ -1247,7 +1448,15 @@ def main() -> None:
                 _release_memory()
 
         validation_summary = None
+        should_run_external_validation = False
         if val_tasks:
+            validation_interval = int(args.external_validation_every_n_epochs)
+            should_run_external_validation = epoch_number == args.num_epochs
+            if validation_interval < 0:
+                should_run_external_validation = False
+            elif validation_interval > 0 and epoch_number % validation_interval == 0:
+                should_run_external_validation = True
+        if should_run_external_validation:
             epoch_val_tasks = select_epoch_tasks(
                 tasks=val_tasks,
                 epoch_index=epoch_index,
@@ -1266,6 +1475,11 @@ def main() -> None:
                 tracking_step=tracking_step_offset,
                 base_rollout_config=base_rollout_config,
             )
+        elif val_tasks:
+            print(
+                f"[hierarchical-rema][validation] skipped epoch={epoch_number} "
+                f"interval={args.external_validation_every_n_epochs}"
+            )
 
         epoch_summary = {
             "epoch": epoch_number,
@@ -1276,6 +1490,7 @@ def main() -> None:
             "rollout_summary": rollout_summary,
             "training_summaries": training_summaries,
             "validation_summary": validation_summary,
+            "external_validation_ran": should_run_external_validation,
             "current_policy_paths": dict(current_paths),
         }
         if training_skipped is not None:

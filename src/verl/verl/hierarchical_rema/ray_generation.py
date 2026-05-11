@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -153,15 +154,22 @@ class RayVLLMGenerationManager:
 
         if ray.is_initialized():
             return
-        ray.init(
-            runtime_env={
+        ray_address = os.environ.get("RAY_ADDRESS", "").strip()
+        ray_namespace = os.environ.get("RAY_NAMESPACE", "").strip()
+        init_kwargs: Dict[str, Any] = {
+            "runtime_env": {
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true",
                     "NCCL_DEBUG": "WARN",
                     "VLLM_LOGGING_LEVEL": "WARN",
                 }
             }
-        )
+        }
+        if ray_address:
+            init_kwargs["address"] = ray_address
+        if ray_namespace:
+            init_kwargs["namespace"] = ray_namespace
+        ray.init(**init_kwargs)
 
     @staticmethod
     def _build_chat_messages(
