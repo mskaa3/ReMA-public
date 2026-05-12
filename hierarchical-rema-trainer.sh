@@ -27,6 +27,7 @@ HOST_SRUN_LD_EXPORT=""
 HOST_SLURM_CONF=${HOST_SLURM_CONF:-${SLURM_CONF:-/etc/slurm/slurm.conf}}
 HOST_SLURM_CONF_DIR=""
 HOST_SLURM_CONF_EXPORT=""
+HOST_IDENTITY_BIND_FLAGS=""
 if [[ -n "$HOST_SRUN_BIN" ]]; then
     HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
     if [[ "$HOST_SRUN_DIR" == */bin || "$HOST_SRUN_DIR" == */sbin ]]; then
@@ -63,6 +64,11 @@ if [[ -n "$HOST_SLURM_CONF" && -f "$HOST_SLURM_CONF" ]]; then
         HOST_SLURM_CONF_EXPORT="export SLURM_CONF=${HOST_SLURM_CONF};"
     fi
 fi
+for identity_file in /etc/passwd /etc/group /etc/nsswitch.conf; do
+    if [[ -f "$identity_file" ]]; then
+        HOST_IDENTITY_BIND_FLAGS+=" --mount type=bind,src=${identity_file},dst=${identity_file}"
+    fi
+done
 
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
 if [[ "$DEBUG_LAUNCHER" == "1" || "$DEBUG_LAUNCHER" == "true" || "$DEBUG_LAUNCHER" == "True" ]]; then
@@ -1164,6 +1170,7 @@ start_epoch_s3_sync_watcher
 set +e
 srun --overlap --nodes=1 --ntasks=1 ${RAY_DRIVER_NODE_FLAG} apptainer exec --nv --writable-tmpfs \
     ${HOST_SRUN_BIND_FLAGS} \
+    ${HOST_IDENTITY_BIND_FLAGS} \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
