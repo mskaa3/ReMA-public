@@ -24,6 +24,9 @@ HOST_SRUN_BIND_FLAGS=""
 HOST_SRUN_LD_LIBRARY_PATH=""
 HOST_SRUN_PATH_EXPORT=""
 HOST_SRUN_LD_EXPORT=""
+HOST_SLURM_CONF=${HOST_SLURM_CONF:-${SLURM_CONF:-/etc/slurm/slurm.conf}}
+HOST_SLURM_CONF_DIR=""
+HOST_SLURM_CONF_EXPORT=""
 if [[ -n "$HOST_SRUN_BIN" ]]; then
     HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
     if [[ "$HOST_SRUN_DIR" == */bin || "$HOST_SRUN_DIR" == */sbin ]]; then
@@ -48,6 +51,17 @@ if [[ -n "$HOST_SRUN_DIR" ]]; then
 fi
 if [[ -n "$HOST_SRUN_LD_LIBRARY_PATH" ]]; then
     HOST_SRUN_LD_EXPORT="export LD_LIBRARY_PATH=${HOST_SRUN_LD_LIBRARY_PATH}:\${LD_LIBRARY_PATH:-};"
+fi
+if [[ -n "$HOST_SLURM_CONF" && -f "$HOST_SLURM_CONF" ]]; then
+    HOST_SLURM_CONF_REAL=$(readlink -f "$HOST_SLURM_CONF" 2>/dev/null || true)
+    if [[ -n "$HOST_SLURM_CONF_REAL" ]]; then
+        HOST_SLURM_CONF="$HOST_SLURM_CONF_REAL"
+    fi
+    HOST_SLURM_CONF_DIR=$(dirname "$HOST_SLURM_CONF")
+    if [[ -d "$HOST_SLURM_CONF_DIR" ]]; then
+        HOST_SRUN_BIND_FLAGS+=" --mount type=bind,src=${HOST_SLURM_CONF_DIR},dst=${HOST_SLURM_CONF_DIR}"
+        HOST_SLURM_CONF_EXPORT="export SLURM_CONF=${HOST_SLURM_CONF};"
+    fi
 fi
 
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
@@ -946,6 +960,9 @@ echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
 if [[ -n "$HOST_SRUN_BIN" ]]; then
     echo "[hierarchical-rema] HOST_SRUN_BIN=$HOST_SRUN_BIN"
 fi
+if [[ -n "$HOST_SLURM_CONF_EXPORT" ]]; then
+    echo "[hierarchical-rema] HOST_SLURM_CONF=$HOST_SLURM_CONF"
+fi
 if [[ "$MULTINODE_RAY_ENABLED" == "1" ]]; then
     echo "[hierarchical-rema] RAY_ADDRESS=${RAY_ADDRESS_VALUE}"
     echo "[hierarchical-rema] RAY_NAMESPACE=${RAY_NAMESPACE}"
@@ -1023,6 +1040,7 @@ export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
 ${HOST_SRUN_PATH_EXPORT} \
 ${HOST_SRUN_LD_EXPORT} \
+${HOST_SLURM_CONF_EXPORT} \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
