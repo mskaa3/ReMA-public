@@ -306,8 +306,12 @@ def _run_distributed_offline_policy_training(
     gpus_per_node: int,
     master_port: int,
 ) -> Dict[str, Any]:
-    if shutil.which("srun") is None:
-        raise RuntimeError("offline distributed GRPO requested, but srun is not available in PATH")
+    srun_bin = os.environ.get("HIERARCHICAL_REMA_HOST_SRUN_BIN") or shutil.which("srun")
+    if not srun_bin:
+        raise RuntimeError(
+            "offline distributed GRPO requested, but srun is not available. "
+            "Expected HIERARCHICAL_REMA_HOST_SRUN_BIN or srun on PATH."
+        )
 
     host_local_verl_dir = os.environ.get("HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR")
     host_local_sif_image_path = os.environ.get("HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH")
@@ -351,7 +355,7 @@ def _run_distributed_offline_policy_training(
         ]
     )
     command = [
-        "srun",
+        srun_bin,
         "--overlap",
         f"--nodes={nnodes}",
         f"--ntasks={world_size}",

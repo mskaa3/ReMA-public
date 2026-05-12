@@ -11,6 +11,11 @@
 set -euo pipefail
 
 SOURCE_DIR=${SLURM_SUBMIT_DIR:-$PWD}
+HOST_SRUN_BIN=${HOST_SRUN_BIN:-$(command -v srun 2>/dev/null || true)}
+HOST_SRUN_DIR=""
+if [[ -n "$HOST_SRUN_BIN" ]]; then
+    HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
+fi
 
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
 if [[ "$DEBUG_LAUNCHER" == "1" || "$DEBUG_LAUNCHER" == "true" || "$DEBUG_LAUNCHER" == "True" ]]; then
@@ -980,6 +985,7 @@ else
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
+if [[ -n "${HIERARCHICAL_REMA_HOST_SRUN_DIR:-}" ]]; then export PATH=${HIERARCHICAL_REMA_HOST_SRUN_DIR}:\$PATH; fi; \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
@@ -987,6 +993,8 @@ export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 export HIERARCHICAL_REMA_HOST_TMPDIR=${TMPDIR}; \
 export HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR=${LOCAL_VERL_DIR}; \
 export HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH}; \
+export HIERARCHICAL_REMA_HOST_SRUN_BIN=${HOST_SRUN_BIN}; \
+export HIERARCHICAL_REMA_HOST_SRUN_DIR=${HOST_SRUN_DIR}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
 python3 -m hierarchical_rema.train \
   --task-source ${TASK_SOURCE_RUNTIME} \
