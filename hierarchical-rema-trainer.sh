@@ -16,6 +16,8 @@ HOST_SRUN_DIR=""
 HOST_SRUN_PREFIX=""
 HOST_SRUN_BIND_FLAGS=""
 HOST_SRUN_LD_LIBRARY_PATH=""
+HOST_SRUN_PATH_EXPORT=""
+HOST_SRUN_LD_EXPORT=""
 if [[ -n "$HOST_SRUN_BIN" ]]; then
     HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
     if [[ "$HOST_SRUN_DIR" == */bin || "$HOST_SRUN_DIR" == */sbin ]]; then
@@ -34,6 +36,12 @@ if [[ -n "$HOST_SRUN_BIN" ]]; then
             fi
         fi
     done
+fi
+if [[ -n "$HOST_SRUN_DIR" ]]; then
+    HOST_SRUN_PATH_EXPORT="export PATH=${HOST_SRUN_DIR}:\$PATH;"
+fi
+if [[ -n "$HOST_SRUN_LD_LIBRARY_PATH" ]]; then
+    HOST_SRUN_LD_EXPORT="export LD_LIBRARY_PATH=${HOST_SRUN_LD_LIBRARY_PATH}:\${LD_LIBRARY_PATH:-};"
 fi
 
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
@@ -1004,8 +1012,8 @@ else
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
-if [[ -n "${HOST_SRUN_DIR}" ]]; then export PATH=${HOST_SRUN_DIR}:\$PATH; fi; \
-if [[ -n "${HOST_SRUN_LD_LIBRARY_PATH}" ]]; then export LD_LIBRARY_PATH=${HOST_SRUN_LD_LIBRARY_PATH}:\${LD_LIBRARY_PATH:-}; fi; \
+${HOST_SRUN_PATH_EXPORT} \
+${HOST_SRUN_LD_EXPORT} \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
