@@ -230,7 +230,7 @@ algorithm:
     train_agent_roles: [decomposer, selector, algebra_worker, functional_analysis_worker, general_math_worker, finalizer]
     start_agent: decomposer
     default_worker: general_math_worker
-    pass_question_to_workers: False
+    pass_question_to_workers: True
     worker_specs:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning
