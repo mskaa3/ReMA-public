@@ -985,7 +985,7 @@ else
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
-if [[ -n "${HIERARCHICAL_REMA_HOST_SRUN_DIR:-}" ]]; then export PATH=${HIERARCHICAL_REMA_HOST_SRUN_DIR}:\$PATH; fi; \
+if [[ -n "${HOST_SRUN_DIR}" ]]; then export PATH=${HOST_SRUN_DIR}:\$PATH; fi; \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
