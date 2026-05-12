@@ -943,6 +943,9 @@ echo "[hierarchical-rema] starting run"
 echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
 echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
 echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
+if [[ -n "$HOST_SRUN_BIN" ]]; then
+    echo "[hierarchical-rema] HOST_SRUN_BIN=$HOST_SRUN_BIN"
+fi
 if [[ "$MULTINODE_RAY_ENABLED" == "1" ]]; then
     echo "[hierarchical-rema] RAY_ADDRESS=${RAY_ADDRESS_VALUE}"
     echo "[hierarchical-rema] RAY_NAMESPACE=${RAY_NAMESPACE}"

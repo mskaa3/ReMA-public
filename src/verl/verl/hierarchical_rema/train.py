@@ -379,7 +379,7 @@ def _run_distributed_offline_policy_training(
     print(
         f"[hierarchical-rema][grpo] launching distributed offline learner "
         f"nnodes={nnodes} gpus_per_node={gpus_per_node} world_size={world_size} "
-        f"policy_output_dir={output_dir}"
+        f"policy_output_dir={output_dir} srun_bin={srun_bin}"
     )
     subprocess.run(command, check=True)
 
