@@ -12,6 +12,12 @@ set -euo pipefail
 
 SOURCE_DIR=${SLURM_SUBMIT_DIR:-$PWD}
 HOST_SRUN_BIN=${HOST_SRUN_BIN:-$(command -v srun 2>/dev/null || true)}
+if [[ -n "$HOST_SRUN_BIN" ]]; then
+    HOST_SRUN_REAL_BIN=$(readlink -f "$HOST_SRUN_BIN" 2>/dev/null || true)
+    if [[ -n "$HOST_SRUN_REAL_BIN" ]]; then
+        HOST_SRUN_BIN="$HOST_SRUN_REAL_BIN"
+    fi
+fi
 HOST_SRUN_DIR=""
 HOST_SRUN_PREFIX=""
 HOST_SRUN_BIND_FLAGS=""
