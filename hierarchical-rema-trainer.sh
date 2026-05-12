@@ -13,8 +13,27 @@ set -euo pipefail
 SOURCE_DIR=${SLURM_SUBMIT_DIR:-$PWD}
 HOST_SRUN_BIN=${HOST_SRUN_BIN:-$(command -v srun 2>/dev/null || true)}
 HOST_SRUN_DIR=""
+HOST_SRUN_PREFIX=""
+HOST_SRUN_BIND_FLAGS=""
+HOST_SRUN_LD_LIBRARY_PATH=""
 if [[ -n "$HOST_SRUN_BIN" ]]; then
     HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
+    if [[ "$HOST_SRUN_DIR" == */bin || "$HOST_SRUN_DIR" == */sbin ]]; then
+        HOST_SRUN_PREFIX=$(dirname "$HOST_SRUN_DIR")
+    fi
+    if [[ -d "$HOST_SRUN_DIR" ]]; then
+        HOST_SRUN_BIND_FLAGS+=" --mount type=bind,src=${HOST_SRUN_DIR},dst=${HOST_SRUN_DIR}"
+    fi
+    for candidate in "${HOST_SRUN_PREFIX}/lib" "${HOST_SRUN_PREFIX}/lib64"; do
+        if [[ -n "$HOST_SRUN_PREFIX" && -d "$candidate" ]]; then
+            HOST_SRUN_BIND_FLAGS+=" --mount type=bind,src=${candidate},dst=${candidate}"
+            if [[ -n "$HOST_SRUN_LD_LIBRARY_PATH" ]]; then
+                HOST_SRUN_LD_LIBRARY_PATH="${candidate}:${HOST_SRUN_LD_LIBRARY_PATH}"
+            else
+                HOST_SRUN_LD_LIBRARY_PATH="${candidate}"
+            fi
+        fi
+    done
 fi
 
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
@@ -986,6 +1005,7 @@ export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
 if [[ -n "${HOST_SRUN_DIR}" ]]; then export PATH=${HOST_SRUN_DIR}:\$PATH; fi; \
+if [[ -n "${HOST_SRUN_LD_LIBRARY_PATH}" ]]; then export LD_LIBRARY_PATH=${HOST_SRUN_LD_LIBRARY_PATH}:\${LD_LIBRARY_PATH:-}; fi; \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
@@ -1108,6 +1128,7 @@ start_epoch_s3_sync_watcher
 
 set +e
 srun --overlap --nodes=1 --ntasks=1 ${RAY_DRIVER_NODE_FLAG} apptainer exec --nv --writable-tmpfs \
+    ${HOST_SRUN_BIND_FLAGS} \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
