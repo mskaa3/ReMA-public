@@ -28,6 +28,7 @@ HOST_SLURM_CONF=${HOST_SLURM_CONF:-${SLURM_CONF:-/etc/slurm/slurm.conf}}
 HOST_SLURM_CONF_DIR=""
 HOST_SLURM_CONF_EXPORT=""
 HOST_IDENTITY_BIND_FLAGS=""
+HOST_SRUN_DEP_BIND_FLAGS=""
 if [[ -n "$HOST_SRUN_BIN" ]]; then
     HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
     if [[ "$HOST_SRUN_DIR" == */bin || "$HOST_SRUN_DIR" == */sbin ]]; then
@@ -67,6 +68,22 @@ fi
 for identity_file in /etc/passwd /etc/group /etc/nsswitch.conf; do
     if [[ -f "$identity_file" ]]; then
         HOST_IDENTITY_BIND_FLAGS+=" --mount type=bind,src=${identity_file},dst=${identity_file}"
+    fi
+done
+if command -v ldd >/dev/null 2>&1; then
+    for dep_target in "$HOST_SRUN_BIN" "${HOST_SRUN_PREFIX}/lib64/slurm/auth_munge.so"; do
+        if [[ -n "$dep_target" && -f "$dep_target" ]]; then
+            while IFS= read -r dep_path; do
+                if [[ -n "$dep_path" && -f "$dep_path" ]]; then
+                    HOST_SRUN_DEP_BIND_FLAGS+=" --mount type=bind,src=${dep_path},dst=${dep_path}"
+                fi
+            done < <(ldd "$dep_target" 2>/dev/null | awk '{for (i = 1; i <= NF; ++i) if ($i ~ /^\//) print $i}')
+        fi
+    done
+fi
+for runtime_dir in /run/munge /var/run/munge /etc/munge; do
+    if [[ -d "$runtime_dir" ]]; then
+        HOST_SRUN_DEP_BIND_FLAGS+=" --mount type=bind,src=${runtime_dir},dst=${runtime_dir}"
     fi
 done
 
@@ -1171,6 +1188,7 @@ set +e
 srun --overlap --nodes=1 --ntasks=1 ${RAY_DRIVER_NODE_FLAG} apptainer exec --nv --writable-tmpfs \
     ${HOST_SRUN_BIND_FLAGS} \
     ${HOST_IDENTITY_BIND_FLAGS} \
+    ${HOST_SRUN_DEP_BIND_FLAGS} \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
