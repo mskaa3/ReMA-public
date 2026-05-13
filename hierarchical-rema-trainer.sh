@@ -29,6 +29,15 @@ HOST_SLURM_CONF_DIR=""
 HOST_SLURM_CONF_EXPORT=""
 HOST_IDENTITY_BIND_FLAGS=""
 HOST_SRUN_DEP_BIND_FLAGS=""
+append_unique_bind_mount() {
+    local src_path="$1"
+    [[ -n "$src_path" && -e "$src_path" ]] || return 0
+    local mount_fragment=" --mount type=bind,src=${src_path},dst=${src_path}"
+    case "$HOST_SRUN_DEP_BIND_FLAGS" in
+        *"$mount_fragment"*) ;;
+        *) HOST_SRUN_DEP_BIND_FLAGS+="$mount_fragment" ;;
+    esac
+}
 if [[ -n "$HOST_SRUN_BIN" ]]; then
     HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
     if [[ "$HOST_SRUN_DIR" == */bin || "$HOST_SRUN_DIR" == */sbin ]]; then
@@ -70,21 +79,15 @@ for identity_file in /etc/passwd /etc/group /etc/nsswitch.conf; do
         HOST_IDENTITY_BIND_FLAGS+=" --mount type=bind,src=${identity_file},dst=${identity_file}"
     fi
 done
-if command -v ldd >/dev/null 2>&1; then
-    for dep_target in "$HOST_SRUN_BIN" "${HOST_SRUN_PREFIX}/lib64/slurm/auth_munge.so"; do
-        if [[ -n "$dep_target" && -f "$dep_target" ]]; then
-            while IFS= read -r dep_path; do
-                if [[ -n "$dep_path" && -f "$dep_path" ]]; then
-                    HOST_SRUN_DEP_BIND_FLAGS+=" --mount type=bind,src=${dep_path},dst=${dep_path}"
-                fi
-            done < <(ldd "$dep_target" 2>/dev/null | awk '{for (i = 1; i <= NF; ++i) if ($i ~ /^\//) print $i}')
-        fi
-    done
-fi
+for libmunge_path in \
+    /lib64/libmunge.so* \
+    /usr/lib64/libmunge.so* \
+    /lib/x86_64-linux-gnu/libmunge.so* \
+    /usr/lib/x86_64-linux-gnu/libmunge.so*; do
+    append_unique_bind_mount "$libmunge_path"
+done
 for runtime_dir in /run/munge /var/run/munge /etc/munge; do
-    if [[ -d "$runtime_dir" ]]; then
-        HOST_SRUN_DEP_BIND_FLAGS+=" --mount type=bind,src=${runtime_dir},dst=${runtime_dir}"
-    fi
+    append_unique_bind_mount "$runtime_dir"
 done
 
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
