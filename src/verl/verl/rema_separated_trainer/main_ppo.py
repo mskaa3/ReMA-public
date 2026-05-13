@@ -60,14 +60,24 @@ def run_ppo(config) -> None:
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
-        # this is for local ray cluster
-        ray.init(runtime_env={
+        ray_address = os.environ.get("RAY_ADDRESS")
+        runtime_env = {
             'env_vars': {
                 'TOKENIZERS_PARALLELISM': 'true',
                 'NCCL_DEBUG': 'WARN',
                 'VLLM_LOGGING_LEVEL': 'WARN'
             }
-        })
+        }
+        if os.environ.get("HF_HOME"):
+            runtime_env["env_vars"]["HF_HOME"] = os.environ["HF_HOME"]
+        init_kwargs = {"runtime_env": runtime_env}
+        if ray_address:
+            # Connect to the Slurm-started Ray cluster instead of creating a local one.
+            init_kwargs["address"] = ray_address
+        else:
+            # Local fallback for single-node development and existing scripts.
+            print("RAY_ADDRESS is not set; starting a local Ray runtime.")
+        ray.init(**init_kwargs)
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
