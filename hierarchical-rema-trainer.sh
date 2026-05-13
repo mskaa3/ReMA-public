@@ -11,84 +11,6 @@
 set -euo pipefail
 
 SOURCE_DIR=${SLURM_SUBMIT_DIR:-$PWD}
-HOST_SRUN_BIN=${HOST_SRUN_BIN:-$(command -v srun 2>/dev/null || true)}
-if [[ -n "$HOST_SRUN_BIN" ]]; then
-    HOST_SRUN_REAL_BIN=$(readlink -f "$HOST_SRUN_BIN" 2>/dev/null || true)
-    if [[ -n "$HOST_SRUN_REAL_BIN" ]]; then
-        HOST_SRUN_BIN="$HOST_SRUN_REAL_BIN"
-    fi
-fi
-HOST_SRUN_DIR=""
-HOST_SRUN_PREFIX=""
-HOST_SRUN_BIND_FLAGS=""
-HOST_SRUN_LD_LIBRARY_PATH=""
-HOST_SRUN_PATH_EXPORT=""
-HOST_SRUN_LD_EXPORT=""
-HOST_SLURM_CONF=${HOST_SLURM_CONF:-${SLURM_CONF:-/etc/slurm/slurm.conf}}
-HOST_SLURM_CONF_DIR=""
-HOST_SLURM_CONF_EXPORT=""
-HOST_IDENTITY_BIND_FLAGS=""
-HOST_SRUN_DEP_BIND_FLAGS=""
-append_unique_bind_mount() {
-    local src_path="$1"
-    [[ -n "$src_path" && -e "$src_path" ]] || return 0
-    local mount_fragment=" --mount type=bind,src=${src_path},dst=${src_path}"
-    case "$HOST_SRUN_DEP_BIND_FLAGS" in
-        *"$mount_fragment"*) ;;
-        *) HOST_SRUN_DEP_BIND_FLAGS+="$mount_fragment" ;;
-    esac
-}
-if [[ -n "$HOST_SRUN_BIN" ]]; then
-    HOST_SRUN_DIR=$(dirname "$HOST_SRUN_BIN")
-    if [[ "$HOST_SRUN_DIR" == */bin || "$HOST_SRUN_DIR" == */sbin ]]; then
-        HOST_SRUN_PREFIX=$(dirname "$HOST_SRUN_DIR")
-    fi
-    if [[ -d "$HOST_SRUN_DIR" ]]; then
-        HOST_SRUN_BIND_FLAGS+=" --mount type=bind,src=${HOST_SRUN_DIR},dst=${HOST_SRUN_DIR}"
-    fi
-    for candidate in "${HOST_SRUN_PREFIX}/lib" "${HOST_SRUN_PREFIX}/lib64"; do
-        if [[ -n "$HOST_SRUN_PREFIX" && -d "$candidate" ]]; then
-            HOST_SRUN_BIND_FLAGS+=" --mount type=bind,src=${candidate},dst=${candidate}"
-            if [[ -n "$HOST_SRUN_LD_LIBRARY_PATH" ]]; then
-                HOST_SRUN_LD_LIBRARY_PATH="${candidate}:${HOST_SRUN_LD_LIBRARY_PATH}"
-            else
-                HOST_SRUN_LD_LIBRARY_PATH="${candidate}"
-            fi
-        fi
-    done
-fi
-if [[ -n "$HOST_SRUN_DIR" ]]; then
-    HOST_SRUN_PATH_EXPORT="export PATH=${HOST_SRUN_DIR}:\$PATH;"
-fi
-if [[ -n "$HOST_SRUN_LD_LIBRARY_PATH" ]]; then
-    HOST_SRUN_LD_EXPORT="export LD_LIBRARY_PATH=${HOST_SRUN_LD_LIBRARY_PATH}:\${LD_LIBRARY_PATH:-};"
-fi
-if [[ -n "$HOST_SLURM_CONF" && -f "$HOST_SLURM_CONF" ]]; then
-    HOST_SLURM_CONF_REAL=$(readlink -f "$HOST_SLURM_CONF" 2>/dev/null || true)
-    if [[ -n "$HOST_SLURM_CONF_REAL" ]]; then
-        HOST_SLURM_CONF="$HOST_SLURM_CONF_REAL"
-    fi
-    HOST_SLURM_CONF_DIR=$(dirname "$HOST_SLURM_CONF")
-    if [[ -d "$HOST_SLURM_CONF_DIR" ]]; then
-        HOST_SRUN_BIND_FLAGS+=" --mount type=bind,src=${HOST_SLURM_CONF_DIR},dst=${HOST_SLURM_CONF_DIR}"
-        HOST_SLURM_CONF_EXPORT="export SLURM_CONF=${HOST_SLURM_CONF};"
-    fi
-fi
-for identity_file in /etc/passwd /etc/group /etc/nsswitch.conf; do
-    if [[ -f "$identity_file" ]]; then
-        HOST_IDENTITY_BIND_FLAGS+=" --mount type=bind,src=${identity_file},dst=${identity_file}"
-    fi
-done
-for libmunge_path in \
-    /lib64/libmunge.so* \
-    /usr/lib64/libmunge.so* \
-    /lib/x86_64-linux-gnu/libmunge.so* \
-    /usr/lib/x86_64-linux-gnu/libmunge.so*; do
-    append_unique_bind_mount "$libmunge_path"
-done
-for runtime_dir in /run/munge /var/run/munge /etc/munge; do
-    append_unique_bind_mount "$runtime_dir"
-done
 
 DEBUG_LAUNCHER=${DEBUG_LAUNCHER:-false}
 if [[ "$DEBUG_LAUNCHER" == "1" || "$DEBUG_LAUNCHER" == "true" || "$DEBUG_LAUNCHER" == "True" ]]; then
@@ -983,12 +905,6 @@ echo "[hierarchical-rema] starting run"
 echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
 echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
 echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
-if [[ -n "$HOST_SRUN_BIN" ]]; then
-    echo "[hierarchical-rema] HOST_SRUN_BIN=$HOST_SRUN_BIN"
-fi
-if [[ -n "$HOST_SLURM_CONF_EXPORT" ]]; then
-    echo "[hierarchical-rema] HOST_SLURM_CONF=$HOST_SLURM_CONF"
-fi
 if [[ "$MULTINODE_RAY_ENABLED" == "1" ]]; then
     echo "[hierarchical-rema] RAY_ADDRESS=${RAY_ADDRESS_VALUE}"
     echo "[hierarchical-rema] RAY_NAMESPACE=${RAY_NAMESPACE}"
@@ -1064,18 +980,10 @@ else
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
 export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
-${HOST_SRUN_PATH_EXPORT} \
-${HOST_SRUN_LD_EXPORT} \
-${HOST_SLURM_CONF_EXPORT} \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
 export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
-export HIERARCHICAL_REMA_HOST_TMPDIR=${TMPDIR}; \
-export HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR=${LOCAL_VERL_DIR}; \
-export HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH}; \
-export HIERARCHICAL_REMA_HOST_SRUN_BIN=${HOST_SRUN_BIN}; \
-export HIERARCHICAL_REMA_HOST_SRUN_DIR=${HOST_SRUN_DIR}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
 python3 -m hierarchical_rema.train \
   --task-source ${TASK_SOURCE_RUNTIME} \
@@ -1189,9 +1097,6 @@ start_epoch_s3_sync_watcher
 
 set +e
 srun --overlap --nodes=1 --ntasks=1 ${RAY_DRIVER_NODE_FLAG} apptainer exec --nv --writable-tmpfs \
-    ${HOST_SRUN_BIND_FLAGS} \
-    ${HOST_IDENTITY_BIND_FLAGS} \
-    ${HOST_SRUN_DEP_BIND_FLAGS} \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
     --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
     --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \

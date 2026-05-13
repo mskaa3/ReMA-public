@@ -5,10 +5,7 @@ import gc
 import json
 import os
 import random
-import shlex
 import shutil
-import socket
-import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -295,6 +292,59 @@ def _relay_offline_metrics_to_tracking(
         tracking.log(final_metrics, step=log_step_offset + max(int(summary.get("steps", 0)), 1))
 
 
+class _RayOfflineGRPOWorker:
+    def get_node_ip(self) -> str:
+        import ray
+
+        return ray.util.get_node_ip_address()
+
+    def run(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        master_addr: str,
+        master_port: int,
+        train_samples_jsonl: str,
+        val_samples_jsonl: str,
+        config_json: str,
+    ):
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = str(master_port)
+        os.environ["PYTHONUNBUFFERED"] = "1"
+
+        from .offline_training import run_offline_policy_training_from_jsonl
+
+        summary = run_offline_policy_training_from_jsonl(
+            train_samples_jsonl=train_samples_jsonl,
+            val_samples_jsonl=val_samples_jsonl,
+            config_json=config_json,
+        )
+        return {
+            "rank": rank,
+            "node_ip": master_addr if rank == 0 else self.get_node_ip(),
+            "summary": summary,
+        }
+
+
+def _ensure_ray_initialized_for_offline_training() -> None:
+    import ray
+
+    if ray.is_initialized():
+        return
+    ray_address = os.environ.get("RAY_ADDRESS", "").strip()
+    ray_namespace = os.environ.get("RAY_NAMESPACE", "").strip()
+    init_kwargs: Dict[str, Any] = {}
+    if ray_address:
+        init_kwargs["address"] = ray_address
+    if ray_namespace:
+        init_kwargs["namespace"] = ray_namespace
+    ray.init(**init_kwargs)
+
+
 def _run_distributed_offline_policy_training(
     train_samples,
     val_samples,
@@ -306,22 +356,8 @@ def _run_distributed_offline_policy_training(
     gpus_per_node: int,
     master_port: int,
 ) -> Dict[str, Any]:
-    srun_bin = os.environ.get("HIERARCHICAL_REMA_HOST_SRUN_BIN") or shutil.which("srun")
-    if not srun_bin:
-        raise RuntimeError(
-            "offline distributed GRPO requested, but srun is not available. "
-            "Expected HIERARCHICAL_REMA_HOST_SRUN_BIN or srun on PATH."
-        )
-
-    host_local_verl_dir = os.environ.get("HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR")
-    host_local_sif_image_path = os.environ.get("HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH")
-    host_tmpdir = os.environ.get("HIERARCHICAL_REMA_HOST_TMPDIR") or os.environ.get("TMPDIR")
-    if not host_local_verl_dir or not host_local_sif_image_path or not host_tmpdir:
-        raise RuntimeError(
-            "offline distributed GRPO requested, but host runtime paths are missing. "
-            "Expected HIERARCHICAL_REMA_HOST_LOCAL_VERL_DIR, "
-            "HIERARCHICAL_REMA_HOST_LOCAL_SIF_IMAGE_PATH, and HIERARCHICAL_REMA_HOST_TMPDIR."
-        )
+    _ensure_ray_initialized_for_offline_training()
+    import ray
 
     output_dir = Path(config.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -331,57 +367,52 @@ def _run_distributed_offline_policy_training(
     with config_json.open("w", encoding="utf-8") as handle:
         json.dump(asdict(config), handle, indent=2, sort_keys=True)
 
-    master_addr = (
-        os.environ.get("HIERARCHICAL_REMA_OFFLINE_MASTER_ADDR")
-        or os.environ.get("SLURMD_NODENAME")
-        or os.environ.get("HOSTNAME")
-        or socket.gethostname()
-    )
     world_size = nnodes * gpus_per_node
-    launch_script = " ".join(
-        [
-            "export HF_HOME=" + shlex.quote(str(Path(host_tmpdir) / "hf_home")) + ";",
-            "export PYTHONUNBUFFERED=1;",
-            "export PYTHONPATH=/verl/verl:$PYTHONPATH;",
-            "export MASTER_ADDR=" + shlex.quote(master_addr) + ";",
-            "export MASTER_PORT=" + shlex.quote(str(master_port)) + ";",
-            "python3 -m hierarchical_rema.offline_training",
-            "--train-samples-jsonl",
-            shlex.quote(train_jsonl),
-            "--val-samples-jsonl",
-            shlex.quote(val_jsonl),
-            "--config-json",
-            shlex.quote(str(config_json)),
-        ]
-    )
-    command = [
-        srun_bin,
-        "--overlap",
-        f"--nodes={nnodes}",
-        f"--ntasks={world_size}",
-        f"--ntasks-per-node={gpus_per_node}",
-        "--gpus-per-task=1",
-        "apptainer",
-        "exec",
-        "--nv",
-        "--writable-tmpfs",
-        "--mount",
-        f"type=bind,src={host_tmpdir},dst={host_tmpdir}",
-        "--mount",
-        f"type=bind,src={host_tmpdir},dst=/root/tmpdir",
-        "--mount",
-        f"type=bind,src={host_local_verl_dir},dst=/verl",
-        host_local_sif_image_path,
-        "bash",
-        "-lc",
-        launch_script,
+    cluster_resources = ray.cluster_resources()
+    cluster_gpus = float(cluster_resources.get("GPU", 0.0))
+    if cluster_gpus + 1e-6 < world_size:
+        raise RuntimeError(
+            f"offline distributed GRPO requested world_size={world_size}, "
+            f"but Ray cluster only reports GPU={cluster_gpus}"
+        )
+
+    worker_cls = ray.remote(num_gpus=1, num_cpus=1, max_restarts=0)(_RayOfflineGRPOWorker)
+    workers = [
+        worker_cls.options(scheduling_strategy="SPREAD").remote()
+        for _ in range(world_size)
     ]
+    master_addr = ray.get(workers[0].get_node_ip.remote())
     print(
         f"[hierarchical-rema][grpo] launching distributed offline learner "
         f"nnodes={nnodes} gpus_per_node={gpus_per_node} world_size={world_size} "
-        f"policy_output_dir={output_dir} srun_bin={srun_bin}"
+        f"policy_output_dir={output_dir} backend=ray master_addr={master_addr} "
+        f"cluster_gpu={cluster_gpus:.0f}"
     )
-    subprocess.run(command, check=True)
+    try:
+        results = ray.get(
+            [
+                worker.run.remote(
+                    rank=rank,
+                    world_size=world_size,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    train_samples_jsonl=train_jsonl,
+                    val_samples_jsonl=val_jsonl,
+                    config_json=str(config_json),
+                )
+                for rank, worker in enumerate(workers)
+            ]
+        )
+    finally:
+        for worker in workers:
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception:
+                pass
+
+    rank0_result = next((item for item in results if int(item.get("rank", -1)) == 0), None)
+    if rank0_result is None:
+        raise RuntimeError("Distributed offline GRPO finished without a rank-0 result")
 
     summary_path = output_dir / "summary.json"
     if not summary_path.exists():

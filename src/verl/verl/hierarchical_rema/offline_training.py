@@ -922,15 +922,28 @@ def _load_config_from_json(config_path: str) -> OfflineTrainingConfig:
     return OfflineTrainingConfig(**payload)
 
 
-def main() -> None:
-    args = _parse_cli_args()
-    train_samples = load_samples_from_jsonl(args.train_samples_jsonl)
-    val_samples = load_samples_from_jsonl(args.val_samples_jsonl) if args.val_samples_jsonl else []
-    config = _load_config_from_json(args.config_json)
-    run_offline_policy_training(
+def run_offline_policy_training_from_jsonl(
+    *,
+    train_samples_jsonl: str,
+    val_samples_jsonl: str = "",
+    config_json: str,
+):
+    train_samples = load_samples_from_jsonl(train_samples_jsonl)
+    val_samples = load_samples_from_jsonl(val_samples_jsonl) if val_samples_jsonl else []
+    config = _load_config_from_json(config_json)
+    return run_offline_policy_training(
         train_samples=train_samples,
         val_samples=val_samples,
         config=config,
+    )
+
+
+def main() -> None:
+    args = _parse_cli_args()
+    run_offline_policy_training_from_jsonl(
+        train_samples_jsonl=args.train_samples_jsonl,
+        val_samples_jsonl=args.val_samples_jsonl,
+        config_json=args.config_json,
     )
 
 
