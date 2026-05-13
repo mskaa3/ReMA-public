@@ -17,9 +17,12 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 # This trainer creates two GPU pools, so this is GPUs per node per pool.
 POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
 RAY_PORT=${RAY_PORT:-6379}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+
 SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
 SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/${SIF_NAME}}
+
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+
 export JOB_TMP=${JOB_TMP:-${TMPDIR:-/tmp/${USER}/rema-${SLURM_JOB_ID}}}
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
@@ -35,18 +38,13 @@ if [[ "$HEAD_NODE_IP" == *" "* ]]; then
 fi
 IP_HEAD=${HEAD_NODE_IP}:${RAY_PORT}
 
-echo "Preparing node-local TMPDIR on all nodes"
-srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
-    set -euo pipefail
-    cd "$SLURM_SUBMIT_DIR"
-    source ./env.sh
-    mkdir -p "$JOB_TMP"
-    rm -rf "$JOB_TMP/overall_math" "$JOB_TMP/MATH" "$JOB_TMP/verl"
-    cp -r ./data/overall_math "$JOB_TMP/overall_math"
-    cp -r ./data/MATH "$JOB_TMP/MATH"
-    cp -r ./src/verl "$JOB_TMP/verl"
-    rclone copy "'"${SIF_REMOTE}"'" "$JOB_TMP/"
-'
+echo "Preparing shared JOB_TMP at ${JOB_TMP}"
+mkdir -p "$JOB_TMP"
+rm -rf "$JOB_TMP/overall_math" "$JOB_TMP/MATH" "$JOB_TMP/verl"
+cp -r ./data/overall_math "$JOB_TMP/overall_math"
+cp -r ./data/MATH "$JOB_TMP/MATH"
+cp -r ./src/verl "$JOB_TMP/verl"
+rclone copy "$SIF_REMOTE" "$JOB_TMP/"
 
 COMMON_MOUNTS=(
     --mount "type=bind,src=${JOB_TMP},dst=${JOB_TMP}"
@@ -98,5 +96,5 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
     bash -c "$COMMAND"
 
 if [[ -n ${JOB_TMP:-} ]]; then
-    srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc 'rm -rf "$JOB_TMP"/*'
+    rm -rf "$JOB_TMP"/*
 fi
