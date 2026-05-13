@@ -15,8 +15,8 @@ from .controller_data import controller_samples_from_task_rollouts, write_sample
 from .demo import make_demo_tasks, make_worker_pool
 from .offline_training import (
     OfflineTrainingConfig,
+    RayOfflineGRPOWorker,
     run_offline_policy_training,
-    run_offline_policy_training_from_jsonl,
 )
 from .orchestrator import HierarchicalGRPOTrainer
 from .replay_train import (
@@ -296,40 +296,34 @@ def _relay_offline_metrics_to_tracking(
         tracking.log(final_metrics, step=log_step_offset + max(int(summary.get("steps", 0)), 1))
 
 
-class _RayOfflineGRPOWorker:
-    def get_node_ip(self) -> str:
-        import ray
-
-        return ray.util.get_node_ip_address()
-
-    def run(
-        self,
-        *,
-        rank: int,
-        world_size: int,
-        master_addr: str,
-        master_port: int,
-        train_samples_jsonl: str,
-        val_samples_jsonl: str,
-        config_json: str,
+def _offline_training_ray_runtime_env() -> Dict[str, Any]:
+    repo_pkg_root = str(Path(__file__).resolve().parents[1])
+    pythonpath_entries = [
+        entry
+        for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if entry
+    ]
+    if repo_pkg_root not in pythonpath_entries:
+        pythonpath_entries.insert(0, repo_pkg_root)
+    env_vars = {
+        "PYTHONPATH": os.pathsep.join(pythonpath_entries),
+        "PYTHONUNBUFFERED": "1",
+    }
+    for env_name in (
+        "HF_HOME",
+        "TRANSFORMERS_CACHE",
+        "HF_DATASETS_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "WANDB_API_KEY",
+        "WANDB_BASE_URL",
+        "WANDB_MODE",
+        "TOKENIZERS_PARALLELISM",
+        "NCCL_DEBUG",
     ):
-        os.environ["WORLD_SIZE"] = str(world_size)
-        os.environ["RANK"] = str(rank)
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = str(master_port)
-        os.environ["PYTHONUNBUFFERED"] = "1"
-
-        summary = run_offline_policy_training_from_jsonl(
-            train_samples_jsonl=train_samples_jsonl,
-            val_samples_jsonl=val_samples_jsonl,
-            config_json=config_json,
-        )
-        return {
-            "rank": rank,
-            "node_ip": master_addr if rank == 0 else self.get_node_ip(),
-            "summary": summary,
-        }
+        env_value = os.environ.get(env_name)
+        if env_value:
+            env_vars[env_name] = env_value
+    return {"env_vars": env_vars}
 
 
 def _ensure_ray_initialized_for_offline_training() -> None:
@@ -340,6 +334,7 @@ def _ensure_ray_initialized_for_offline_training() -> None:
     ray_address = os.environ.get("RAY_ADDRESS", "").strip()
     ray_namespace = os.environ.get("RAY_NAMESPACE", "").strip()
     init_kwargs: Dict[str, Any] = {}
+    init_kwargs["runtime_env"] = _offline_training_ray_runtime_env()
     if ray_address:
         init_kwargs["address"] = ray_address
     if ray_namespace:
@@ -378,7 +373,12 @@ def _run_distributed_offline_policy_training(
             f"but Ray cluster only reports GPU={cluster_gpus}"
         )
 
-    worker_cls = ray.remote(num_gpus=1, num_cpus=1, max_restarts=0)(_RayOfflineGRPOWorker)
+    worker_cls = ray.remote(
+        num_gpus=1,
+        num_cpus=1,
+        max_restarts=0,
+        runtime_env=_offline_training_ray_runtime_env(),
+    )(RayOfflineGRPOWorker)
     workers = [
         worker_cls.options(scheduling_strategy="SPREAD").remote()
         for _ in range(world_size)

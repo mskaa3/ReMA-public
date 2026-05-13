@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -154,11 +155,20 @@ class RayVLLMGenerationManager:
 
         if ray.is_initialized():
             return
+        repo_pkg_root = str(Path(__file__).resolve().parents[1])
+        pythonpath_entries = [
+            entry
+            for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+            if entry
+        ]
+        if repo_pkg_root not in pythonpath_entries:
+            pythonpath_entries.insert(0, repo_pkg_root)
         ray_address = os.environ.get("RAY_ADDRESS", "").strip()
         ray_namespace = os.environ.get("RAY_NAMESPACE", "").strip()
         init_kwargs: Dict[str, Any] = {
             "runtime_env": {
                 "env_vars": {
+                    "PYTHONPATH": os.pathsep.join(pythonpath_entries),
                     "TOKENIZERS_PARALLELISM": "true",
                     "NCCL_DEBUG": "WARN",
                     "VLLM_LOGGING_LEVEL": "WARN",

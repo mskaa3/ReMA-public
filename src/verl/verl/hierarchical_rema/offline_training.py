@@ -56,9 +56,54 @@ class DistributedTrainingContext:
 def _ensure_repo_root_on_path() -> None:
     import sys
 
-    repo_pkg_root = Path(__file__).resolve().parents[2]
-    if str(repo_pkg_root) not in sys.path:
-        sys.path.insert(0, str(repo_pkg_root))
+    package_roots = (
+        Path(__file__).resolve().parents[1],
+        Path(__file__).resolve().parents[2],
+    )
+    for package_root in reversed(package_roots):
+        package_root_str = str(package_root)
+        if package_root_str not in sys.path:
+            sys.path.insert(0, package_root_str)
+
+
+class RayOfflineGRPOWorker:
+    def __init__(self) -> None:
+        _ensure_repo_root_on_path()
+
+    def get_node_ip(self) -> str:
+        import ray
+
+        return ray.util.get_node_ip_address()
+
+    def run(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        master_addr: str,
+        master_port: int,
+        train_samples_jsonl: str,
+        val_samples_jsonl: str,
+        config_json: str,
+    ):
+        _ensure_repo_root_on_path()
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = str(master_port)
+        os.environ["PYTHONUNBUFFERED"] = "1"
+
+        summary = run_offline_policy_training_from_jsonl(
+            train_samples_jsonl=train_samples_jsonl,
+            val_samples_jsonl=val_samples_jsonl,
+            config_json=config_json,
+        )
+        return {
+            "rank": rank,
+            "node_ip": master_addr if rank == 0 else self.get_node_ip(),
+            "summary": summary,
+        }
 
 
 def _lazy_torch():

@@ -477,7 +477,7 @@ wait_for_ray_head() {
             --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
             --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
             "$LOCAL_SIF_IMAGE_PATH" \
-            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts status --address '${RAY_ADDRESS_VALUE}' >/dev/null 2>&1"; then
+            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts status --address '${RAY_ADDRESS_VALUE}' >/dev/null 2>&1"; then
             echo "[hierarchical-rema][ray] head is ready address=${RAY_ADDRESS_VALUE}"
             return
         fi
@@ -507,7 +507,7 @@ start_ray_cluster() {
         --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
         --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
         "$LOCAL_SIF_IMAGE_PATH" \
-        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
     RAY_CLUSTER_PIDS+=("$!")
     wait_for_ray_head
 
@@ -523,7 +523,7 @@ start_ray_cluster() {
             --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
             --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
             "$LOCAL_SIF_IMAGE_PATH" \
-            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --address '${RAY_ADDRESS_VALUE}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --address '${RAY_ADDRESS_VALUE}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
         RAY_CLUSTER_PIDS+=("$!")
         sleep 5
         idx=$((idx + 1))
@@ -542,7 +542,7 @@ stop_ray_cluster() {
         --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
         --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
         "$LOCAL_SIF_IMAGE_PATH" \
-        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
 
     local pid=""
     for pid in "${RAY_CLUSTER_PIDS[@]}"; do
