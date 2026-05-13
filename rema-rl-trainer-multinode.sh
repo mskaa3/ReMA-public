@@ -72,8 +72,6 @@ for ((i = 1; i <= WORKER_COUNT; i++)); do
 done
 
 COMMAND="unset ROCR_VISIBLE_DEVICES; \
-python3 -m pip install --force-reinstall math-verify; \
-python3 -m pip install --force-reinstall --no-deps antlr4-python3-runtime==4.9.3; \
 export HF_HOME=/root/tmpdir/hf_home; \
 export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH; \
 export RAY_ADDRESS=${IP_HEAD}; \
