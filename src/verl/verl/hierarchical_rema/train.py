@@ -13,7 +13,11 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 from .controller_data import controller_samples_from_task_rollouts, write_samples_to_jsonl
 from .demo import make_demo_tasks, make_worker_pool
-from .offline_training import OfflineTrainingConfig, run_offline_policy_training
+from .offline_training import (
+    OfflineTrainingConfig,
+    run_offline_policy_training,
+    run_offline_policy_training_from_jsonl,
+)
 from .orchestrator import HierarchicalGRPOTrainer
 from .replay_train import (
     maybe_save_replay_copy,
@@ -315,8 +319,6 @@ class _RayOfflineGRPOWorker:
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["PYTHONUNBUFFERED"] = "1"
-
-        from .offline_training import run_offline_policy_training_from_jsonl
 
         summary = run_offline_policy_training_from_jsonl(
             train_samples_jsonl=train_samples_jsonl,
