@@ -8,6 +8,7 @@ from json import JSONDecodeError
 from typing import Any, Dict, List, Sequence
 
 from .schema import (
+    CANONICAL_SKILL_TAGS,
     DecompositionCandidate,
     RolloutConfig,
     SelectionCandidate,
@@ -76,6 +77,41 @@ def _parse_csv_field(raw_value: Any) -> List[str]:
     if not text or text.lower() in {"none", "null", "[]", "n/a"}:
         return []
     return [item.strip() for item in text.split(",") if item.strip()]
+
+
+_SKILL_TAG_ALIASES = {
+    "pre_algebra": "prealgebra",
+    "symbolic": "symbolic_manipulation",
+    "symbolic_algebra": "symbolic_manipulation",
+    "equation_solving": "equations",
+    "coordinate_geometry": "coordinate_geometry",
+    "coordinategeo": "coordinate_geometry",
+    "number_theory": "number_theory",
+    "numbertheory": "number_theory",
+    "discrete_math": "discrete_math",
+    "discretemath": "discrete_math",
+}
+
+
+def _normalize_skill_tag(raw_value: Any) -> str:
+    text = str(raw_value or "").strip().lower()
+    if not text or text in {"none", "null", "n/a"}:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    text = _SKILL_TAG_ALIASES.get(text, text)
+    return text if text in CANONICAL_SKILL_TAGS else ""
+
+
+def _normalize_required_skills(raw_value: Any) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for item in _parse_csv_field(raw_value):
+        skill_tag = _normalize_skill_tag(item)
+        if not skill_tag or skill_tag in seen:
+            continue
+        seen.add(skill_tag)
+        normalized.append(skill_tag)
+    return normalized
 
 
 def _extract_int_list(raw_value: Any) -> List[int]:
@@ -477,11 +513,9 @@ def validate_decomposition_payload(
         ]
         if not isinstance(dependencies, list) or not all(isinstance(dep, str) for dep in dependencies):
             raise StructuredOutputError(f"Node {node_id} has invalid 'dependencies'")
-        required_skills = _parse_csv_field(node_payload.get("required_skills"))
-        if not isinstance(required_skills, list) or not all(
-            isinstance(skill, str) for skill in required_skills
-        ):
-            raise StructuredOutputError(f"Node {node_id} has invalid 'required_skills'")
+        required_skills = _normalize_required_skills(
+            node_payload.get("required_skills")
+        )
         output_key = str(node_payload.get("output_key") or f"{node_id}_output")
         nodes.append(
             SubtaskNode(

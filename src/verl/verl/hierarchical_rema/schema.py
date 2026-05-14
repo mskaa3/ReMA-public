@@ -5,6 +5,28 @@ from enum import Enum
 from graphlib import CycleError, TopologicalSorter
 from typing import Any, Dict, List, Optional, Sequence
 
+CANONICAL_SKILL_TAGS: tuple[str, ...] = (
+    "arithmetic",
+    "prealgebra",
+    "fractions",
+    "simplification",
+    "algebra",
+    "symbolic_manipulation",
+    "equations",
+    "polynomials",
+    "geometry",
+    "trigonometry",
+    "coordinate_geometry",
+    "analysis",
+    "calculus",
+    "functions",
+    "limits",
+    "combinatorics",
+    "probability",
+    "number_theory",
+    "discrete_math",
+)
+
 
 class TrainingMode(str, Enum):
     JOINT = "joint"

@@ -207,9 +207,9 @@ class MockHierarchicalBackend(HierarchicalBackend):
         secondary_skill = "analysis" if skill_focus == "algebra" else "algebra"
         prompt_text = render_decomposer_prompt(
             task,
-            worker_pool,
-            worker_performance,
             max_nodes_hint=rollout_config.max_nodes_per_decomposition,
+            soft_max_hops_hint=rollout_config.soft_max_hops,
+            hard_max_hops_hint=rollout_config.hard_max_hops,
         )
 
         template_index = decomposition_index % 3
@@ -921,9 +921,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
     ) -> DecompositionCandidate:
         prompt_text = render_decomposer_prompt(
             task,
-            worker_pool,
-            worker_performance,
             max_nodes_hint=rollout_config.max_nodes_per_decomposition,
+            soft_max_hops_hint=rollout_config.soft_max_hops,
+            hard_max_hops_hint=rollout_config.hard_max_hops,
         )
         return self._generate_validated_decomposition(
             prompt_text=prompt_text,
@@ -1005,9 +1005,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 raise ValueError(f"No decomposer model path configured for {type(self).__name__}")
             prompt_text = render_decomposer_prompt(
                 request.task,
-                request.worker_pool,
-                request.worker_performance,
                 max_nodes_hint=request.rollout_config.max_nodes_per_decomposition,
+                soft_max_hops_hint=request.rollout_config.soft_max_hops,
+                hard_max_hops_hint=request.rollout_config.hard_max_hops,
             )
             grouped.setdefault(model_path, []).append((index, request, prompt_text))
 
