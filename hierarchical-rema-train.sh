@@ -42,8 +42,8 @@ export WORKER_TEMPERATURE=${WORKER_TEMPERATURE:-$TEMPERATURE} # worker temperatu
 export CONTROLLER_CONSTRAINED_DECODING=${CONTROLLER_CONSTRAINED_DECODING:-true} # enable controller constrained decoding hints (regex/structured outputs/stop tags when backend supports them)
 export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-1024} # max tokens for decomposer/selector outputs; structured plans should stay short
 export DECOMPOSER_MAX_NEW_TOKENS=${DECOMPOSER_MAX_NEW_TOKENS:-1024} # decomposer plans can legitimately be longer because they carry node fields
-export SELECTOR_MAX_NEW_TOKENS=${SELECTOR_MAX_NEW_TOKENS:-512} # selector should stay compact: one worker assignment per node
-export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-512} # max tokens for worker outputs
+export SELECTOR_MAX_NEW_TOKENS=${SELECTOR_MAX_NEW_TOKENS:-256} # selector should stay compact: one worker assignment per node
+export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-256} # max tokens for worker outputs
 export RAY_NNODES=${RAY_NNODES:-${SLURM_JOB_NUM_NODES:-2}} # for BACKEND=vllm, how many Slurm nodes should join the Ray rollout cluster; >1 enables multinode rollout
 export RAY_N_GPUS_PER_NODE=${RAY_N_GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE##*:}} # GPUs per Ray node; override if Slurm exposes GPUs in a different format
 export RAY_PORT=${RAY_PORT:-6379} # Ray head GCS port used by worker nodes to connect
@@ -53,9 +53,9 @@ export OFFLINE_GRPO_DISTRIBUTED=${OFFLINE_GRPO_DISTRIBUTED:-true} # if true, run
 export OFFLINE_GRPO_NNODES=${OFFLINE_GRPO_NNODES:-$RAY_NNODES} # number of nodes for the distributed offline learner
 export OFFLINE_GRPO_GPUS_PER_NODE=${OFFLINE_GRPO_GPUS_PER_NODE:-$RAY_N_GPUS_PER_NODE} # GPUs per node for the distributed offline learner
 export OFFLINE_GRPO_MASTER_PORT=${OFFLINE_GRPO_MASTER_PORT:-29501} # rendezvous port for distributed offline GRPO
-export ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-16} # number of train tasks rolled out together
-export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-16} # generation batch size for decomposer/selector calls
-export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-16} # generation batch size for worker calls
+export ROLLOUT_TASK_BATCH_SIZE=${ROLLOUT_TASK_BATCH_SIZE:-32} # number of train tasks rolled out together
+export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-32} # generation batch size for decomposer/selector calls
+export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-32} # generation batch size for worker calls
 export ROLLOUT_PROGRESS_EVERY=${ROLLOUT_PROGRESS_EVERY:-1} # print progress after every completed task
 export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16} # replay microbatch size during GRPO updates
 export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4} # effective replay samples per optimizer step = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
@@ -73,7 +73,7 @@ export VAL_DECOMPOSER_MAX_NEW_TOKENS=${VAL_DECOMPOSER_MAX_NEW_TOKENS:-0} # 0 = r
 export VAL_SELECTOR_MAX_NEW_TOKENS=${VAL_SELECTOR_MAX_NEW_TOKENS:-0} # 0 = reuse training selector setting
 export MAX_VAL_TASKS=${MAX_VAL_TASKS:-0} # 0 = load the full overall_math validation benchmark
 export VAL_TASKS_PER_EPOCH=${VAL_TASKS_PER_EPOCH:-0} # 0 = validate on all loaded validation tasks each outer epoch
-export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-32} # number of validation tasks rolled out together
+export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-64} # number of validation tasks rolled out together
 # EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS controls when the full benchmark runs.
 # It is counted in outer rounds, not separately per role.
 #   0  = run benchmark only on the final outer round
@@ -82,7 +82,7 @@ export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-32} # number o
 # In alternating mode starting from selector:
 #   round 1 = selector, round 2 = decomposer, round 3 = selector, round 4 = decomposer
 # so EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=4 means validation after 2 rounds of each role.
-export EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS:-4}
+export EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS:-6}
 
 export ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-best} # best = keep only top-K rollout records instead of every rollout
 export ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-compact} # compact = smaller JSONL artifacts
