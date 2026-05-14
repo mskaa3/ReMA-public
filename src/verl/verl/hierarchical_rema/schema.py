@@ -131,8 +131,8 @@ class VLLMBackendConfig:
     n_gpus_per_node: int = 1
     cpus_per_node: Optional[int] = None
     tensor_model_parallel_size: int = 1
-    gpu_memory_utilization: float = 0.5
-    max_num_batched_tokens: int = 8192
+    gpu_memory_utilization: float = 0.75
+    max_num_batched_tokens: int = 16384
     max_num_seqs: int = 1024
     max_model_len: Optional[int] = None
     dtype: str = "bfloat16"

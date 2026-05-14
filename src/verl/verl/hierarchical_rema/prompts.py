@@ -56,6 +56,18 @@ EXAMPLE_OUTPUT:
 </selection_plan>"""
 
 
+WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
+NODE_INSTRUCTION: rearrange the equation to isolate the variable term
+NODE_OUTPUT_KEY: isolated_equation
+DEPENDENCY_OUTPUTS:
+- none
+EXAMPLE_OUTPUT:
+<worker_result>
+OUTPUT_KEY: isolated_equation
+RESULT: 2x = 8
+</worker_result>"""
+
+
 DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT = """You are an arithmetic and prealgebra worker.
 You are strongest at exact numeric computation, fractions, ratios, percentages, signs, simplification, and straightforward expression cleanup.
 Prefer exact forms over decimals unless the task explicitly asks for approximation.
@@ -313,7 +325,23 @@ def render_worker_prompt(
         f"NODE_DEPENDENCIES: {node_dependencies}\n"
         f"NODE_REQUIRED_SKILLS: {node_required_skills}\n"
         f"NODE_OUTPUT_KEY: {node.output_key}\n"
+        "OUTPUT CONTRACT:\n"
+        "- Do only the current NODE_INSTRUCTION.\n"
+        "- Use DEPENDENCY_OUTPUTS as the current working context when they are provided.\n"
+        "- Do not solve future nodes, repeat the full task, or add explanations unless the instruction explicitly asks for them.\n"
+        "- Return exactly one <worker_result> block and nothing else.\n"
+        "- Use this exact skeleton:\n"
+        "<worker_result>\n"
+        f"OUTPUT_KEY: {node.output_key}\n"
+        "RESULT: concise result\n"
+        "</worker_result>\n"
+        "- RESULT must contain only the downstream-usable result for this node.\n"
+        "- For expressions, equations, values, or short case splits, return just that content in RESULT.\n"
+        "- If the node produces the final answer, RESULT must contain only the final answer.\n"
+        "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
+        "- Forbidden output patterns: prose outside tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
+        f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
         "DEPENDENCY_OUTPUTS:\n"
         f"{chr(10).join(dependency_lines)}\n\n"
-        "Return the subtask result only."
+        "Return ONLY the <worker_result> block."
     )

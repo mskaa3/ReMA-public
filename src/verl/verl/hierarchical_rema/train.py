@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
+from .backends import MockHierarchicalBackend, RayVLLMHierarchicalBackend, TransformersHierarchicalBackend
 from .controller_data import controller_samples_from_task_rollouts, write_samples_to_jsonl
 from .demo import make_demo_tasks, make_worker_pool
 from .offline_training import (
@@ -19,6 +20,7 @@ from .offline_training import (
     run_offline_policy_training,
 )
 from .orchestrator import HierarchicalGRPOTrainer
+from .rewarding import WorkerPerformanceMemory
 from .replay_train import (
     maybe_save_replay_copy,
     model_path_for_policy,
@@ -135,8 +137,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offline-grpo-gpus-per-node", type=int, default=1)
     parser.add_argument("--offline-grpo-master-port", type=int, default=29501)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
-    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.75)
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--vllm-max-num-seqs", type=int, default=1024)
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--disable-rollout-logging", action="store_true")
@@ -881,6 +883,7 @@ def _build_rollout_trainer(
     selector_max_new_tokens: int | None,
     worker_max_new_tokens: int,
     rollout_logging_config: RolloutLoggingConfig | None,
+    backend: Any | None = None,
 ) -> HierarchicalGRPOTrainer:
     worker_reward_mode = (
         WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY
@@ -932,9 +935,71 @@ def _build_rollout_trainer(
             trust_remote_code=args.trust_remote_code,
         ),
         rollout_logging_config=rollout_logging_config,
+        backend=backend,
         controller_format_retry_penalty=args.controller_format_retry_penalty,
         controller_format_fallback_penalty=args.controller_format_fallback_penalty,
     )
+
+
+def _build_rollout_backend(
+    args: argparse.Namespace,
+    *,
+    backend_temperature: float,
+    controller_temperature: float | None,
+    worker_temperature: float | None,
+    backend_top_p: float,
+    controller_max_new_tokens: int,
+    decomposer_max_new_tokens: int | None,
+    selector_max_new_tokens: int | None,
+    worker_max_new_tokens: int,
+):
+    hf_config = HFBackendConfig(
+        temperature=backend_temperature,
+        controller_temperature=controller_temperature,
+        worker_temperature=worker_temperature,
+        top_p=backend_top_p,
+        do_sample=backend_temperature > 0.0,
+        controller_max_new_tokens=controller_max_new_tokens,
+        decomposer_max_new_tokens=decomposer_max_new_tokens,
+        selector_max_new_tokens=selector_max_new_tokens,
+        worker_max_new_tokens=worker_max_new_tokens,
+        controller_batch_size=args.controller_batch_size,
+        worker_batch_size=args.worker_batch_size,
+        controller_constrained_decoding=args.controller_constrained_decoding,
+        trust_remote_code=args.trust_remote_code,
+        torch_dtype=args.torch_dtype,
+    )
+    if args.backend == "mock":
+        return MockHierarchicalBackend(worker_memory=WorkerPerformanceMemory())
+    if args.backend == "hf":
+        return TransformersHierarchicalBackend(config=hf_config)
+
+    vllm_config = VLLMBackendConfig(
+        temperature=backend_temperature,
+        controller_temperature=controller_temperature,
+        worker_temperature=worker_temperature,
+        top_p=backend_top_p,
+        do_sample=backend_temperature > 0.0,
+        prompt_length=args.rollout_prompt_length,
+        controller_max_new_tokens=controller_max_new_tokens,
+        decomposer_max_new_tokens=decomposer_max_new_tokens,
+        selector_max_new_tokens=selector_max_new_tokens,
+        worker_max_new_tokens=worker_max_new_tokens,
+        controller_batch_size=args.controller_batch_size,
+        worker_batch_size=args.worker_batch_size,
+        controller_constrained_decoding=args.controller_constrained_decoding,
+        nnodes=args.ray_nnodes,
+        n_gpus_per_node=args.ray_n_gpus_per_node,
+        cpus_per_node=(args.ray_cpus_per_node if args.ray_cpus_per_node > 0 else None),
+        tensor_model_parallel_size=args.vllm_tensor_parallel_size,
+        gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+        max_num_seqs=args.vllm_max_num_seqs,
+        max_model_len=args.vllm_max_model_len,
+        dtype=args.torch_dtype,
+        trust_remote_code=args.trust_remote_code,
+    )
+    return RayVLLMHierarchicalBackend(config=vllm_config)
 
 
 def run_external_validation(
@@ -1170,6 +1235,34 @@ def main() -> None:
             f"val_task_source={resolved_val_task_source}"
         )
 
+    shared_rollout_backend = _build_rollout_backend(
+        args,
+        backend_temperature=args.temperature,
+        controller_temperature=(
+            args.controller_temperature
+            if args.controller_temperature is not None
+            else args.temperature
+        ),
+        worker_temperature=(
+            args.worker_temperature
+            if args.worker_temperature is not None
+            else args.temperature
+        ),
+        backend_top_p=args.top_p,
+        controller_max_new_tokens=args.controller_max_new_tokens,
+        decomposer_max_new_tokens=(
+            args.decomposer_max_new_tokens
+            if args.decomposer_max_new_tokens > 0
+            else args.controller_max_new_tokens
+        ),
+        selector_max_new_tokens=(
+            args.selector_max_new_tokens
+            if args.selector_max_new_tokens > 0
+            else args.controller_max_new_tokens
+        ),
+        worker_max_new_tokens=args.worker_max_new_tokens,
+    )
+
     for epoch_index in range(args.num_epochs):
         epoch_number = epoch_index + 1
         epoch_dir = output_dir / f"epoch_{epoch_number:04d}"
@@ -1252,6 +1345,7 @@ def main() -> None:
             ),
             worker_max_new_tokens=args.worker_max_new_tokens,
             rollout_logging_config=logging_config,
+            backend=shared_rollout_backend,
         )
         rollouts: List[TaskRollout] = []
         rollout_start_time = time.time()
@@ -1370,7 +1464,6 @@ def main() -> None:
         with (epoch_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(rollout_summary, handle, indent=2, sort_keys=True)
 
-        rollout_trainer.close()
         del rollout_trainer
         _release_memory()
 
@@ -1544,6 +1637,7 @@ def main() -> None:
     with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(job_summary, handle, indent=2, sort_keys=True)
     print(f"[hierarchical-rema][integrated] wrote job summary to {output_dir / 'training_summary.json'}")
+    shared_rollout_backend.close()
     _finish_tracking(tracking)
 
 

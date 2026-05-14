@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -13,10 +14,7 @@ from .schema import VLLMBackendConfig
 @dataclass(frozen=True)
 class RayGenerationKey:
     model_path: str
-    response_length: int
-    temperature: float
-    top_p: float
-    do_sample: bool
+    bundle_response_length: int
 
 
 @dataclass
@@ -125,7 +123,25 @@ def proxy_entropy_from_generation(
 class RayVLLMGenerationManager:
     def __init__(self, config: VLLMBackendConfig) -> None:
         self.config = config
-        self._active_bundle: Optional[_RayBundle] = None
+        self._bundle_cache: OrderedDict[RayGenerationKey, _RayBundle] = OrderedDict()
+
+    def _configured_bundle_response_length(self) -> int:
+        response_lengths = [
+            int(self.config.controller_max_new_tokens),
+            int(self.config.worker_max_new_tokens),
+        ]
+        if self.config.decomposer_max_new_tokens is not None:
+            response_lengths.append(int(self.config.decomposer_max_new_tokens))
+        if self.config.selector_max_new_tokens is not None:
+            response_lengths.append(int(self.config.selector_max_new_tokens))
+        return max(max(response_lengths, default=1), 1)
+
+    def _required_bundle_response_length(self, requested_response_length: int) -> int:
+        return max(self._configured_bundle_response_length(), int(requested_response_length), 1)
+
+    @staticmethod
+    def _max_cached_bundles() -> int:
+        return 2
 
     @staticmethod
     def _require_runtime() -> None:
@@ -311,10 +327,10 @@ class RayVLLMGenerationManager:
         worker_config = OmegaConf.create(
             build_vllm_rollout_config_dict(
                 model_path=key.model_path,
-                response_length=key.response_length,
-                temperature=key.temperature,
-                top_p=key.top_p,
-                do_sample=key.do_sample,
+                response_length=key.bundle_response_length,
+                temperature=self.config.temperature,
+                top_p=self.config.top_p,
+                do_sample=self.config.do_sample,
                 config=self.config,
             )
         )
@@ -360,34 +376,31 @@ class RayVLLMGenerationManager:
                 pass
 
     def close(self) -> None:
-        if self._active_bundle is None:
-            return
-        self._close_bundle(self._active_bundle)
-        self._active_bundle = None
+        for bundle in self._bundle_cache.values():
+            self._close_bundle(bundle)
+        self._bundle_cache.clear()
 
     def _get_bundle(
         self,
         *,
         model_path: str,
         response_length: int,
-        temperature: float,
-        top_p: float,
-        do_sample: bool,
     ) -> _RayBundle:
         key = RayGenerationKey(
             model_path=model_path,
-            response_length=response_length,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=do_sample,
+            bundle_response_length=self._required_bundle_response_length(response_length),
         )
-        if self._active_bundle is not None and self._active_bundle.key == key:
-            return self._active_bundle
-        if self._active_bundle is not None:
-            self._close_bundle(self._active_bundle)
-            self._active_bundle = None
-        self._active_bundle = self._build_bundle(key)
-        return self._active_bundle
+        cached = self._bundle_cache.pop(key, None)
+        if cached is not None:
+            self._bundle_cache[key] = cached
+            return cached
+
+        bundle = self._build_bundle(key)
+        self._bundle_cache[key] = bundle
+        while len(self._bundle_cache) > self._max_cached_bundles():
+            _, stale_bundle = self._bundle_cache.popitem(last=False)
+            self._close_bundle(stale_bundle)
+        return bundle
 
     def generate_batch(
         self,
@@ -408,11 +421,13 @@ class RayVLLMGenerationManager:
         bundle = self._get_bundle(
             model_path=model_path,
             response_length=max_new_tokens,
-            temperature=resolved_temperature,
-            top_p=self.config.top_p,
-            do_sample=resolved_do_sample,
         )
         tokenizer = bundle.tokenizer
+        resolved_sampling_overrides = dict(sampling_overrides or {})
+        resolved_sampling_overrides.setdefault("max_tokens", int(max_new_tokens))
+        resolved_sampling_overrides.setdefault("top_p", float(self.config.top_p))
+        if resolved_do_sample:
+            resolved_sampling_overrides.setdefault("temperature", resolved_temperature)
 
         try:
             from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -427,7 +442,7 @@ class RayVLLMGenerationManager:
                 prompt_texts=prompt_chunk,
                 system_prompt=system_prompt,
                 do_sample=resolved_do_sample,
-                sampling_overrides=sampling_overrides,
+                sampling_overrides=resolved_sampling_overrides,
             )
             padded_prompt_proto, pad_size = pad_dataproto_to_divisor(
                 prompt_proto,

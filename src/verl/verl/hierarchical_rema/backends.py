@@ -27,6 +27,7 @@ from .ray_generation import RayVLLMGenerationManager
 from .structured import (
     build_fallback_decomposition,
     build_fallback_selection,
+    extract_worker_result_text,
     extract_decomposition_payload,
     extract_selection_payload,
     format_decomposition_plan,
@@ -976,9 +977,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             max_new_tokens=self.config.worker_max_new_tokens,
             temperature=self._worker_temperature(),
         )
-        normalized_output = output_text.strip()
+        normalized_output = extract_worker_result_text(
+            output_text,
+            expected_output_key=node.output_key,
+        ).strip()
         completed = bool(normalized_output)
-        success = completed and "i don't know" not in normalized_output.lower()
+        success = completed and "i don't know" not in output_text.lower()
         return WorkerExecution(
             node_id=node.node_id,
             worker_id=worker.worker_id,
@@ -1208,9 +1212,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 temperature=self._worker_temperature(),
             )
             for (result_index, request, _), (output_text, entropy) in zip(grouped_requests, generated):
-                normalized_output = output_text.strip()
+                normalized_output = extract_worker_result_text(
+                    output_text,
+                    expected_output_key=request.node.output_key,
+                ).strip()
                 completed = bool(normalized_output)
-                success = completed and "i don't know" not in normalized_output.lower()
+                success = completed and "i don't know" not in output_text.lower()
                 results[result_index] = WorkerExecution(
                     node_id=request.node.node_id,
                     worker_id=request.worker.worker_id,
