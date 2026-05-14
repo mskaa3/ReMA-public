@@ -1,5 +1,5 @@
 DECOMPOSER_SYSTEM_PROMPT = """You are the Decomposer.
-Given the original math task, break it into a small ordered plan of executable subtasks.
+Given the original task, break it into a small ordered plan of executable subtasks.
 
 Output only this format:
 PLAN:
