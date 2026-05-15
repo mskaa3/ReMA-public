@@ -131,13 +131,13 @@ class VLLMBackendConfig:
     n_gpus_per_node: int = 1
     cpus_per_node: Optional[int] = None
     tensor_model_parallel_size: int = 1
-    gpu_memory_utilization: float = 0.75
+    gpu_memory_utilization: float = 0.8
     max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 1024
+    max_num_seqs: int = 2048
     max_model_len: Optional[int] = None
     dtype: str = "bfloat16"
-    enforce_eager: bool = True
-    free_cache_engine: bool = True
+    enforce_eager: bool = False
+    free_cache_engine: bool = False
     enable_chunked_prefill: bool = True
     load_format: str = "dummy_dtensor"
     disable_log_stats: bool = True

@@ -59,11 +59,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-answer-key", default="answer")
     parser.add_argument("--val-task-id-key", default="idx")
     parser.add_argument("--max-val-tasks", type=int, default=0, help="Limit the total number of loaded validation tasks; 0 means all")
-    parser.add_argument("--val-tasks-per-epoch", type=int, default=0, help="How many validation tasks to run per epoch; 0 means all loaded validation tasks")
+    parser.add_argument(
+        "--val-tasks-per-epoch",
+        type=int,
+        default=128,
+        help="How many validation tasks to run per epoch; 0 means all loaded validation tasks",
+    )
     parser.add_argument(
         "--external-validation-every-n-epochs",
         type=int,
-        default=0,
+        default=10,
         help=(
             "How often to run the full external benchmark validation. "
             "1 = every outer epoch, 5 = every fifth outer epoch, "
@@ -82,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decomposer-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--selector-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--worker-base-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--num-decompositions", type=int, default=2)
+    parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
@@ -137,9 +142,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offline-grpo-gpus-per-node", type=int, default=1)
     parser.add_argument("--offline-grpo-master-port", type=int, default=29501)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.75)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=16384)
-    parser.add_argument("--vllm-max-num-seqs", type=int, default=1024)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=2048)
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--disable-rollout-logging", action="store_true")
     parser.add_argument("--rollout-log-mode", choices=["best", "all"], default="best")
@@ -152,6 +157,15 @@ def parse_args() -> argparse.Namespace:
         help="How many tasks to rollout together in one batched hierarchical pass; 0 means all epoch tasks",
     )
     parser.add_argument(
+        "--update-every-n-rollout-batches",
+        type=int,
+        default=2,
+        help=(
+            "How many rollout task batches to collect before running an offline GRPO update. "
+            "1 = update after every rollout batch, 2 = update every two rollout batches."
+        ),
+    )
+    parser.add_argument(
         "--rollout-progress-every",
         type=int,
         default=10,
@@ -160,7 +174,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-rollout-task-batch-size",
         type=int,
-        default=0,
+        default=64,
         help="How many validation tasks to rollout together per batch; 0 reuses --rollout-task-batch-size",
     )
 
@@ -186,8 +200,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--train-batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum-steps", type=int, default=8)
+    parser.add_argument("--train-batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum-steps", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=1, help="Number of GRPO update epochs per outer training epoch")
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--truncation", choices=["left", "right", "error"], default="left")
@@ -808,7 +822,11 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
     }
 
 
-def epoch_rollout_summary(rollouts: Sequence[TaskRollout], include_subsets: bool = False) -> Dict[str, Any]:
+def epoch_rollout_summary(
+    rollouts: Sequence[TaskRollout],
+    include_subsets: bool = False,
+    include_tasks: bool = True,
+) -> Dict[str, Any]:
     task_summaries = []
     best_decomposition_rewards = []
     best_selection_rewards = []
@@ -822,13 +840,14 @@ def epoch_rollout_summary(rollouts: Sequence[TaskRollout], include_subsets: bool
         mean_selection_rewards.append(metrics["mean_selection_reward"])
         best_correctness.append(metrics["best_final_correctness"])
         subset_name = _task_subset_name(rollout.task)
-        task_summaries.append(
-            {
-                "task_id": rollout.task.task_id,
-                "subset": subset_name,
-                **metrics,
-            }
-        )
+        if include_tasks:
+            task_summaries.append(
+                {
+                    "task_id": rollout.task.task_id,
+                    "subset": subset_name,
+                    **metrics,
+                }
+            )
         if include_subsets:
             bucket = subset_metrics.setdefault(
                 subset_name,
@@ -854,7 +873,7 @@ def epoch_rollout_summary(rollouts: Sequence[TaskRollout], include_subsets: bool
         "mean_best_selection_reward": sum(best_selection_rewards) / max(len(best_selection_rewards), 1),
         "mean_selection_reward": sum(mean_selection_rewards) / max(len(mean_selection_rewards), 1),
         "mean_best_final_correctness": sum(best_correctness) / max(len(best_correctness), 1),
-        "tasks": task_summaries,
+        "tasks": task_summaries if include_tasks else [],
     }
     if include_subsets:
         summary["subsets"] = {
@@ -867,6 +886,84 @@ def epoch_rollout_summary(rollouts: Sequence[TaskRollout], include_subsets: bool
                 "mean_best_final_correctness": sum(bucket["best_correctness"]) / max(bucket["num_tasks"], 1),
             }
             for subset_name, bucket in subset_metrics.items()
+        }
+    return summary
+
+
+def combine_rollout_summaries(
+    summaries: Sequence[Dict[str, Any]],
+    *,
+    include_subsets: bool = False,
+    include_tasks: bool = True,
+) -> Dict[str, Any]:
+    total_tasks = 0
+    total_best_decomposition_reward = 0.0
+    total_best_selection_reward = 0.0
+    total_mean_selection_reward = 0.0
+    total_best_final_correctness = 0.0
+    combined_tasks: List[Dict[str, Any]] = []
+    subset_accumulators: Dict[str, Dict[str, float]] = {}
+
+    for summary in summaries:
+        num_tasks = int(summary.get("num_tasks", 0))
+        total_tasks += num_tasks
+        total_best_decomposition_reward += float(summary.get("mean_best_decomposition_reward", 0.0)) * num_tasks
+        total_best_selection_reward += float(summary.get("mean_best_selection_reward", 0.0)) * num_tasks
+        total_mean_selection_reward += float(summary.get("mean_selection_reward", 0.0)) * num_tasks
+        total_best_final_correctness += float(summary.get("mean_best_final_correctness", 0.0)) * num_tasks
+
+        if include_tasks:
+            combined_tasks.extend(summary.get("tasks", []))
+
+        if not include_subsets:
+            continue
+        for subset_name, subset_summary in summary.get("subsets", {}).items():
+            bucket = subset_accumulators.setdefault(
+                subset_name,
+                {
+                    "num_tasks": 0.0,
+                    "num_correct": 0.0,
+                    "best_decomposition_reward_sum": 0.0,
+                    "best_selection_reward_sum": 0.0,
+                    "mean_selection_reward_sum": 0.0,
+                    "best_final_correctness_sum": 0.0,
+                },
+            )
+            subset_tasks = int(subset_summary.get("num_tasks", 0))
+            bucket["num_tasks"] += subset_tasks
+            bucket["num_correct"] += float(subset_summary.get("num_correct", 0.0))
+            bucket["best_decomposition_reward_sum"] += (
+                float(subset_summary.get("mean_best_decomposition_reward", 0.0)) * subset_tasks
+            )
+            bucket["best_selection_reward_sum"] += (
+                float(subset_summary.get("mean_best_selection_reward", 0.0)) * subset_tasks
+            )
+            bucket["mean_selection_reward_sum"] += (
+                float(subset_summary.get("mean_selection_reward", 0.0)) * subset_tasks
+            )
+            bucket["best_final_correctness_sum"] += (
+                float(subset_summary.get("mean_best_final_correctness", 0.0)) * subset_tasks
+            )
+
+    summary = {
+        "num_tasks": total_tasks,
+        "mean_best_decomposition_reward": total_best_decomposition_reward / max(total_tasks, 1),
+        "mean_best_selection_reward": total_best_selection_reward / max(total_tasks, 1),
+        "mean_selection_reward": total_mean_selection_reward / max(total_tasks, 1),
+        "mean_best_final_correctness": total_best_final_correctness / max(total_tasks, 1),
+        "tasks": combined_tasks if include_tasks else [],
+    }
+    if include_subsets:
+        summary["subsets"] = {
+            subset_name: {
+                "num_tasks": int(bucket["num_tasks"]),
+                "num_correct": bucket["num_correct"],
+                "mean_best_decomposition_reward": bucket["best_decomposition_reward_sum"] / max(bucket["num_tasks"], 1.0),
+                "mean_best_selection_reward": bucket["best_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
+                "mean_selection_reward": bucket["mean_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
+                "mean_best_final_correctness": bucket["best_final_correctness_sum"] / max(bucket["num_tasks"], 1.0),
+            }
+            for subset_name, bucket in subset_accumulators.items()
         }
     return summary
 
@@ -1101,30 +1198,55 @@ def run_external_validation(
     )
 
     try:
-        rollouts: List[TaskRollout] = []
+        batch_summaries: List[Dict[str, Any]] = []
         val_batches = chunk_tasks(val_tasks, rollout_task_batch_size)
+        validation_start_time = time.time()
+        validation_tasks_completed = 0
         for batch_index, task_batch in enumerate(val_batches, start=1):
             print(
                 f"[hierarchical-rema][validation] batch_start "
                 f"epoch={epoch_number} batch={batch_index}/{len(val_batches)} "
                 f"tasks_in_batch={len(task_batch)}"
             )
-            rollouts.extend(
-                trainer.run_many(
-                    tasks=task_batch,
-                    worker_pool=worker_pool,
-                    policy_config=policy_config,
-                    rollout_config=validation_rollout_config,
-                    schedule=validation_schedule,
-                    progress_label=f"{sum(len(batch) for batch in val_batches[:batch_index - 1]) + 1}-{sum(len(batch) for batch in val_batches[:batch_index])}/{len(val_tasks)}",
+            batch_rollouts = trainer.run_many(
+                tasks=task_batch,
+                worker_pool=worker_pool,
+                policy_config=policy_config,
+                rollout_config=validation_rollout_config,
+                schedule=validation_schedule,
+                progress_label=(
+                    f"{validation_tasks_completed + 1}-"
+                    f"{validation_tasks_completed + len(task_batch)}/{len(val_tasks)}"
+                ),
+            )
+            batch_summaries.append(
+                epoch_rollout_summary(
+                    batch_rollouts,
+                    include_subsets=True,
+                    include_tasks=False,
                 )
             )
+            validation_tasks_completed += len(batch_rollouts)
+            elapsed = time.time() - validation_start_time
+            avg_seconds_per_task = elapsed / max(validation_tasks_completed, 1)
+            remaining_tasks = len(val_tasks) - validation_tasks_completed
+            eta_seconds = avg_seconds_per_task * remaining_tasks
+            print(
+                f"[hierarchical-rema][validation] progress "
+                f"epoch={epoch_number} task={validation_tasks_completed}/{len(val_tasks)} "
+                f"elapsed_s={elapsed:.1f} eta_s={eta_seconds:.1f}"
+            )
+            del batch_rollouts
     finally:
         trainer.close()
         del trainer
         _release_memory()
 
-    summary = epoch_rollout_summary(rollouts, include_subsets=True)
+    summary = combine_rollout_summaries(
+        batch_summaries,
+        include_subsets=True,
+        include_tasks=False,
+    )
     with (output_dir / "validation_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
 
@@ -1160,6 +1282,14 @@ def _current_policy_config(args: argparse.Namespace, current_paths: Dict[str, st
     return ControllerPolicyConfig(
         parameter_sharing=False,
         shared_model_path=None,
+        decomposer_model_path=current_paths["decomposer_controller"],
+        selector_model_path=current_paths["selector_controller"],
+    )
+
+
+def _replay_model_args(current_paths: Dict[str, str]) -> argparse.Namespace:
+    return argparse.Namespace(
+        model_path=None,
         decomposer_model_path=current_paths["decomposer_controller"],
         selector_model_path=current_paths["selector_controller"],
     )
@@ -1235,34 +1365,6 @@ def main() -> None:
             f"val_task_source={resolved_val_task_source}"
         )
 
-    shared_rollout_backend = _build_rollout_backend(
-        args,
-        backend_temperature=args.temperature,
-        controller_temperature=(
-            args.controller_temperature
-            if args.controller_temperature is not None
-            else args.temperature
-        ),
-        worker_temperature=(
-            args.worker_temperature
-            if args.worker_temperature is not None
-            else args.temperature
-        ),
-        backend_top_p=args.top_p,
-        controller_max_new_tokens=args.controller_max_new_tokens,
-        decomposer_max_new_tokens=(
-            args.decomposer_max_new_tokens
-            if args.decomposer_max_new_tokens > 0
-            else args.controller_max_new_tokens
-        ),
-        selector_max_new_tokens=(
-            args.selector_max_new_tokens
-            if args.selector_max_new_tokens > 0
-            else args.controller_max_new_tokens
-        ),
-        worker_max_new_tokens=args.worker_max_new_tokens,
-    )
-
     for epoch_index in range(args.num_epochs):
         epoch_number = epoch_index + 1
         epoch_dir = output_dir / f"epoch_{epoch_number:04d}"
@@ -1276,17 +1378,7 @@ def main() -> None:
             shuffle_tasks=args.shuffle_tasks,
             seed=args.seed,
         )
-        policy_config = _current_policy_config(args, current_paths)
         schedule = build_schedule(args.mode, current_phase)
-        logging_config = None
-        if not args.disable_rollout_logging:
-            logging_config = RolloutLoggingConfig(
-                output_dir=str(rollout_dir),
-                save_all_rollouts=args.rollout_log_mode == "all",
-                save_best_rollouts=True,
-                best_k=args.best_k,
-                compact_mode=args.rollout_log_detail == "compact",
-            )
 
         print(
             f"[hierarchical-rema][integrated] epoch={epoch_number}/{args.num_epochs} "
@@ -1318,36 +1410,11 @@ def main() -> None:
             f"controller_batch_size={args.controller_batch_size} "
             f"worker_batch_size={args.worker_batch_size}"
         )
-        rollout_trainer = _build_rollout_trainer(
-            args,
-            backend_temperature=args.temperature,
-            controller_temperature=(
-                args.controller_temperature
-                if args.controller_temperature is not None
-                else args.temperature
-            ),
-            worker_temperature=(
-                args.worker_temperature
-                if args.worker_temperature is not None
-                else args.temperature
-            ),
-            backend_top_p=args.top_p,
-            controller_max_new_tokens=args.controller_max_new_tokens,
-            decomposer_max_new_tokens=(
-                args.decomposer_max_new_tokens
-                if args.decomposer_max_new_tokens > 0
-                else args.controller_max_new_tokens
-            ),
-            selector_max_new_tokens=(
-                args.selector_max_new_tokens
-                if args.selector_max_new_tokens > 0
-                else args.controller_max_new_tokens
-            ),
-            worker_max_new_tokens=args.worker_max_new_tokens,
-            rollout_logging_config=logging_config,
-            backend=shared_rollout_backend,
-        )
         rollouts: List[TaskRollout] = []
+        training_updates: List[Dict[str, Any]] = []
+        training_summaries: Dict[str, Any] = {}
+        segment_summaries: List[Dict[str, Any]] = []
+        training_skipped_messages: List[str] = []
         rollout_start_time = time.time()
         running_best_selection_reward = 0.0
         running_best_decomposition_reward = 0.0
@@ -1356,92 +1423,318 @@ def main() -> None:
         rollout_tracking_step = tracking_step_offset
         rollout_progress_path = epoch_dir / "rollout_progress.json"
         task_batches = chunk_tasks(epoch_tasks, args.rollout_task_batch_size)
-        for batch_index, task_batch in enumerate(task_batches, start=1):
+        update_every_n_rollout_batches = max(int(args.update_every_n_rollout_batches), 1)
+        batch_cursor = 0
+        segment_index = 0
+        while batch_cursor < len(task_batches):
+            segment_index += 1
+            policy_config = _current_policy_config(args, current_paths)
+            replay_like_args = _replay_model_args(current_paths)
+            segment_batches = task_batches[batch_cursor:batch_cursor + update_every_n_rollout_batches]
+            segment_rollout_dir = rollout_dir / f"segment_{segment_index:04d}"
+            segment_train_dir = train_dir / f"segment_{segment_index:04d}"
+            segment_train_dir.mkdir(parents=True, exist_ok=True)
+            segment_logging_config = None
+            if not args.disable_rollout_logging:
+                segment_logging_config = RolloutLoggingConfig(
+                    output_dir=str(segment_rollout_dir),
+                    save_all_rollouts=args.rollout_log_mode == "all",
+                    save_best_rollouts=True,
+                    best_k=args.best_k,
+                    compact_mode=args.rollout_log_detail == "compact",
+                )
+
             print(
-                f"[hierarchical-rema][integrated] rollout_batch_start "
-                f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
-                f"tasks_in_batch={len(task_batch)} "
-                f"completed_before_batch={tasks_completed}"
+                f"[hierarchical-rema][integrated] rollout_update_segment "
+                f"epoch={epoch_number} segment={segment_index} "
+                f"batches={batch_cursor + 1}-{batch_cursor + len(segment_batches)}/{len(task_batches)}"
             )
-            batch_rollouts = rollout_trainer.run_many(
-                tasks=task_batch,
-                worker_pool=worker_pool,
-                policy_config=policy_config,
-                rollout_config=rollout_config,
-                schedule=schedule,
-                progress_label=f"{tasks_completed + 1}-{tasks_completed + len(task_batch)}/{len(epoch_tasks)}",
-            )
-            rollouts.extend(batch_rollouts)
 
-            for rollout in batch_rollouts:
-                best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
-                selection_rewards = [
-                    selection.reward.total_reward
-                    for decomposition in rollout.decompositions
-                    for selection in decomposition.selections
-                ]
-                selection_correctness = [
-                    selection.reward.final_answer_correctness
-                    for decomposition in rollout.decompositions
-                    for selection in decomposition.selections
-                ]
-                running_best_selection_reward += max(selection_rewards)
-                running_best_decomposition_reward += best_decomposition.decomposition_reward
-                running_best_correctness += max(selection_correctness) if selection_correctness else 0.0
-
-            tasks_completed += len(batch_rollouts)
-            should_log_progress = (
-                args.rollout_progress_every > 0
-                and (
-                    tasks_completed == len(epoch_tasks)
-                    or tasks_completed == len(batch_rollouts)
-                    or tasks_completed % args.rollout_progress_every == 0
-                )
+            segment_backend = _build_rollout_backend(
+                args,
+                backend_temperature=args.temperature,
+                controller_temperature=(
+                    args.controller_temperature
+                    if args.controller_temperature is not None
+                    else args.temperature
+                ),
+                worker_temperature=(
+                    args.worker_temperature
+                    if args.worker_temperature is not None
+                    else args.temperature
+                ),
+                backend_top_p=args.top_p,
+                controller_max_new_tokens=args.controller_max_new_tokens,
+                decomposer_max_new_tokens=(
+                    args.decomposer_max_new_tokens
+                    if args.decomposer_max_new_tokens > 0
+                    else args.controller_max_new_tokens
+                ),
+                selector_max_new_tokens=(
+                    args.selector_max_new_tokens
+                    if args.selector_max_new_tokens > 0
+                    else args.controller_max_new_tokens
+                ),
+                worker_max_new_tokens=args.worker_max_new_tokens,
             )
-            if should_log_progress:
-                elapsed = time.time() - rollout_start_time
-                avg_seconds_per_task = elapsed / max(tasks_completed, 1)
-                remaining_tasks = len(epoch_tasks) - tasks_completed
-                eta_seconds = avg_seconds_per_task * remaining_tasks
-                progress_metrics = {
-                    "epoch": epoch_number,
-                    "batch": batch_index,
-                    "num_batches": len(task_batches),
-                    "tasks_completed": tasks_completed,
-                    "num_epoch_tasks": len(epoch_tasks),
-                    "progress_fraction": tasks_completed / max(len(epoch_tasks), 1),
-                    "elapsed_s": elapsed,
-                    "eta_s": eta_seconds,
-                    "avg_best_selection_reward": running_best_selection_reward / tasks_completed,
-                    "avg_best_decomposition_reward": running_best_decomposition_reward / tasks_completed,
-                    "avg_best_final_correctness": running_best_correctness / tasks_completed,
-                }
-                print(
-                    f"[hierarchical-rema][integrated] rollout_progress "
-                    f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
-                    f"task={tasks_completed}/{len(epoch_tasks)} "
-                    f"elapsed_s={elapsed:.1f} eta_s={eta_seconds:.1f} "
-                    f"avg_best_selection_reward={progress_metrics['avg_best_selection_reward']:.4f} "
-                    f"avg_best_decomposition_reward={progress_metrics['avg_best_decomposition_reward']:.4f} "
-                    f"avg_best_final_correctness={progress_metrics['avg_best_final_correctness']:.4f}"
-                )
-                with rollout_progress_path.open("w", encoding="utf-8") as handle:
-                    json.dump(progress_metrics, handle, indent=2, sort_keys=True)
-                if tracking is not None:
-                    rollout_tracking_step += 1
-                    tracking.log(
-                        {
-                            "rollout_progress/tasks_completed": progress_metrics["tasks_completed"],
-                            "rollout_progress/num_tasks": progress_metrics["num_epoch_tasks"],
-                            "rollout_progress/fraction": progress_metrics["progress_fraction"],
-                            "rollout_progress/elapsed_s": progress_metrics["elapsed_s"],
-                            "rollout_progress/eta_s": progress_metrics["eta_s"],
-                            "rollout_progress/avg_best_selection_reward": progress_metrics["avg_best_selection_reward"],
-                            "rollout_progress/avg_best_decomposition_reward": progress_metrics["avg_best_decomposition_reward"],
-                            "rollout_progress/avg_best_final_correctness": progress_metrics["avg_best_final_correctness"],
-                        },
-                        step=rollout_tracking_step,
+            rollout_trainer = _build_rollout_trainer(
+                args,
+                backend_temperature=args.temperature,
+                controller_temperature=(
+                    args.controller_temperature
+                    if args.controller_temperature is not None
+                    else args.temperature
+                ),
+                worker_temperature=(
+                    args.worker_temperature
+                    if args.worker_temperature is not None
+                    else args.temperature
+                ),
+                backend_top_p=args.top_p,
+                controller_max_new_tokens=args.controller_max_new_tokens,
+                decomposer_max_new_tokens=(
+                    args.decomposer_max_new_tokens
+                    if args.decomposer_max_new_tokens > 0
+                    else args.controller_max_new_tokens
+                ),
+                selector_max_new_tokens=(
+                    args.selector_max_new_tokens
+                    if args.selector_max_new_tokens > 0
+                    else args.controller_max_new_tokens
+                ),
+                worker_max_new_tokens=args.worker_max_new_tokens,
+                rollout_logging_config=segment_logging_config,
+                backend=segment_backend,
+            )
+            segment_rollouts: List[TaskRollout] = []
+            try:
+                for segment_offset, task_batch in enumerate(segment_batches):
+                    batch_index = batch_cursor + segment_offset + 1
+                    print(
+                        f"[hierarchical-rema][integrated] rollout_batch_start "
+                        f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
+                        f"tasks_in_batch={len(task_batch)} "
+                        f"completed_before_batch={tasks_completed}"
                     )
+                    batch_rollouts = rollout_trainer.run_many(
+                        tasks=task_batch,
+                        worker_pool=worker_pool,
+                        policy_config=policy_config,
+                        rollout_config=rollout_config,
+                        schedule=schedule,
+                        progress_label=f"{tasks_completed + 1}-{tasks_completed + len(task_batch)}/{len(epoch_tasks)}",
+                    )
+                    segment_rollouts.extend(batch_rollouts)
+                    rollouts.extend(batch_rollouts)
+
+                    for rollout in batch_rollouts:
+                        best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
+                        selection_rewards = [
+                            selection.reward.total_reward
+                            for decomposition in rollout.decompositions
+                            for selection in decomposition.selections
+                        ]
+                        selection_correctness = [
+                            selection.reward.final_answer_correctness
+                            for decomposition in rollout.decompositions
+                            for selection in decomposition.selections
+                        ]
+                        running_best_selection_reward += max(selection_rewards)
+                        running_best_decomposition_reward += best_decomposition.decomposition_reward
+                        running_best_correctness += max(selection_correctness) if selection_correctness else 0.0
+
+                    tasks_completed += len(batch_rollouts)
+                    should_log_progress = (
+                        args.rollout_progress_every > 0
+                        and (
+                            tasks_completed == len(epoch_tasks)
+                            or tasks_completed == len(batch_rollouts)
+                            or tasks_completed % args.rollout_progress_every == 0
+                        )
+                    )
+                    if should_log_progress:
+                        elapsed = time.time() - rollout_start_time
+                        avg_seconds_per_task = elapsed / max(tasks_completed, 1)
+                        remaining_tasks = len(epoch_tasks) - tasks_completed
+                        eta_seconds = avg_seconds_per_task * remaining_tasks
+                        progress_metrics = {
+                            "epoch": epoch_number,
+                            "batch": batch_index,
+                            "num_batches": len(task_batches),
+                            "tasks_completed": tasks_completed,
+                            "num_epoch_tasks": len(epoch_tasks),
+                            "progress_fraction": tasks_completed / max(len(epoch_tasks), 1),
+                            "elapsed_s": elapsed,
+                            "eta_s": eta_seconds,
+                            "avg_best_selection_reward": running_best_selection_reward / tasks_completed,
+                            "avg_best_decomposition_reward": running_best_decomposition_reward / tasks_completed,
+                            "avg_best_final_correctness": running_best_correctness / tasks_completed,
+                        }
+                        print(
+                            f"[hierarchical-rema][integrated] rollout_progress "
+                            f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
+                            f"task={tasks_completed}/{len(epoch_tasks)} "
+                            f"elapsed_s={elapsed:.1f} eta_s={eta_seconds:.1f} "
+                            f"avg_best_selection_reward={progress_metrics['avg_best_selection_reward']:.4f} "
+                            f"avg_best_decomposition_reward={progress_metrics['avg_best_decomposition_reward']:.4f} "
+                            f"avg_best_final_correctness={progress_metrics['avg_best_final_correctness']:.4f}"
+                        )
+                        with rollout_progress_path.open("w", encoding="utf-8") as handle:
+                            json.dump(progress_metrics, handle, indent=2, sort_keys=True)
+                        if tracking is not None:
+                            rollout_tracking_step += 1
+                            tracking.log(
+                                {
+                                    "rollout_progress/tasks_completed": progress_metrics["tasks_completed"],
+                                    "rollout_progress/num_tasks": progress_metrics["num_epoch_tasks"],
+                                    "rollout_progress/fraction": progress_metrics["progress_fraction"],
+                                    "rollout_progress/elapsed_s": progress_metrics["elapsed_s"],
+                                    "rollout_progress/eta_s": progress_metrics["eta_s"],
+                                    "rollout_progress/avg_best_selection_reward": progress_metrics["avg_best_selection_reward"],
+                                    "rollout_progress/avg_best_decomposition_reward": progress_metrics["avg_best_decomposition_reward"],
+                                    "rollout_progress/avg_best_final_correctness": progress_metrics["avg_best_final_correctness"],
+                                },
+                                step=rollout_tracking_step,
+                            )
+                segment_rollout_summary = epoch_rollout_summary(segment_rollouts)
+                with (segment_train_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
+                    json.dump(segment_rollout_summary, handle, indent=2, sort_keys=True)
+            finally:
+                rollout_trainer.close()
+                del rollout_trainer
+                _release_memory()
+
+            segment_training_updates: List[Dict[str, Any]] = []
+            segment_training_skipped = None
+            try:
+                samples = controller_samples_from_task_rollouts(
+                    task_rollouts=segment_rollouts,
+                    roles=_selected_roles(args.role),
+                    min_reward=args.min_reward,
+                    min_advantage=args.min_advantage,
+                    source_path=str(segment_rollout_dir),
+                )
+                policy_splits = prepare_policy_splits(
+                    samples=samples,
+                    policy_ids=args.policy_id,
+                    val_ratio=args.val_ratio,
+                    seed=args.seed + epoch_index + segment_index,
+                )
+            except ValueError as exc:
+                segment_training_skipped = str(exc)
+                training_skipped_messages.append(
+                    f"segment={segment_index} batches={batch_cursor + 1}-{batch_cursor + len(segment_batches)}: {exc}"
+                )
+            else:
+                write_policy_manifest(
+                    output_dir=segment_train_dir,
+                    policy_splits=policy_splits,
+                    model_path_resolver=lambda policy_id, sample_subset: model_path_for_policy(policy_id, sample_subset, replay_like_args),
+                )
+
+                for policy_id, split in policy_splits.items():
+                    policy_dir = segment_train_dir / policy_id
+                    policy_dir.mkdir(parents=True, exist_ok=True)
+                    replay_exports = maybe_save_replay_copy(policy_dir, split, enabled=args.save_replay_copy)
+                    model_path = model_path_for_policy(policy_id, split["train"] or split["all"], replay_like_args)
+                    experiment_name = _default_experiment_name(args)
+                    experiment_name = (
+                        f"{experiment_name}-epoch{epoch_number:04d}-segment{segment_index:04d}-{policy_id}"
+                    )
+                    print(
+                        f"[hierarchical-rema][integrated] training policy={policy_id} "
+                        f"segment={segment_index} train_samples={len(split['train'])} "
+                        f"val_samples={len(split['val'])} model={model_path}"
+                    )
+                    training_config = OfflineTrainingConfig(
+                        model_name_or_path=model_path,
+                        output_dir=str(policy_dir),
+                        learning_rate=args.learning_rate,
+                        weight_decay=args.weight_decay,
+                        train_batch_size=args.train_batch_size,
+                        grad_accum_steps=args.grad_accum_steps,
+                        epochs=args.epochs,
+                        max_length=args.max_length,
+                        truncation=args.truncation,
+                        clip_range=args.clip_range,
+                        clip_ratio_c=args.clip_ratio_c,
+                        entropy_coeff=args.entropy_coeff,
+                        max_grad_norm=args.max_grad_norm,
+                        warmup_ratio=args.warmup_ratio,
+                        seed=args.seed + epoch_index + segment_index,
+                        logging_steps=args.logging_steps,
+                        save_steps=args.save_steps,
+                        eval_every_steps=args.eval_every_steps,
+                        device=args.device,
+                        torch_dtype=args.torch_dtype,
+                        trust_remote_code=args.trust_remote_code,
+                        gradient_checkpointing=args.gradient_checkpointing,
+                        project_name=args.project_name,
+                        experiment_name=experiment_name,
+                        enable_wandb=False,
+                        save_final_checkpoint=True,
+                        save_best_checkpoint=args.checkpoint_mode == "all" and args.eval_every_steps > 0,
+                        save_intermediate_checkpoints=args.checkpoint_mode == "all",
+                    )
+                    previous_model_path = current_paths.get(policy_id)
+                    if args.offline_grpo_distributed:
+                        summary = _run_distributed_offline_policy_training(
+                            train_samples=split["train"],
+                            val_samples=split["val"],
+                            config=training_config,
+                            tracking=tracking,
+                            tracking_prefix=f"{policy_id}/",
+                            log_step_offset=tracking_step_offset,
+                            nnodes=args.offline_grpo_nnodes,
+                            gpus_per_node=args.offline_grpo_gpus_per_node,
+                            master_port=args.offline_grpo_master_port,
+                        )
+                    else:
+                        summary = run_offline_policy_training(
+                            train_samples=split["train"],
+                            val_samples=split["val"],
+                            config=training_config,
+                            tracking=tracking,
+                            tracking_prefix=f"{policy_id}/",
+                            log_step_offset=tracking_step_offset,
+                        )
+                    tracking_step_offset += max(int(summary["steps"]), 1)
+                    final_model_path = str(policy_dir / "final")
+                    _update_current_paths(current_paths, policy_id, final_model_path)
+                    if args.prune_stale_policy_models and previous_model_path and previous_model_path != final_model_path:
+                        previous_policy_root = Path(previous_model_path).expanduser().resolve().parent
+                        if previous_policy_root != policy_dir.resolve():
+                            _prune_policy_artifacts(previous_policy_root)
+                    summary["policy_id"] = policy_id
+                    summary["model_path"] = model_path
+                    summary["final_model_path"] = final_model_path
+                    summary["segment"] = segment_index
+                    summary["batch_start"] = batch_cursor + 1
+                    summary["batch_end"] = batch_cursor + len(segment_batches)
+                    summary.update(replay_exports)
+                    training_summaries[policy_id] = summary
+                    training_updates.append(summary)
+                    segment_training_updates.append(summary)
+                    print(
+                        f"[hierarchical-rema][integrated] finished policy={policy_id} "
+                        f"segment={segment_index} steps={summary['steps']} "
+                        f"final_model_path={final_model_path}"
+                    )
+                    _release_memory()
+
+            segment_summaries.append(
+                {
+                    "segment": segment_index,
+                    "batch_start": batch_cursor + 1,
+                    "batch_end": batch_cursor + len(segment_batches),
+                    "num_tasks": sum(len(batch) for batch in segment_batches),
+                    "rollout_summary": segment_rollout_summary,
+                    "training_updates": segment_training_updates,
+                    "training_skipped": segment_training_skipped,
+                }
+            )
+            batch_cursor += len(segment_batches)
+
         rollout_summary = epoch_rollout_summary(rollouts)
         tracking_step_offset = max(tracking_step_offset, rollout_tracking_step)
         print(
@@ -1463,121 +1756,6 @@ def main() -> None:
 
         with (epoch_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(rollout_summary, handle, indent=2, sort_keys=True)
-
-        del rollout_trainer
-        _release_memory()
-
-        training_skipped = None
-        training_summaries: Dict[str, Any] = {}
-        replay_like_args = argparse.Namespace(
-            model_path=args.model_path,
-            decomposer_model_path=policy_config.decomposer_model_path,
-            selector_model_path=policy_config.selector_model_path,
-        )
-        try:
-            samples = controller_samples_from_task_rollouts(
-                task_rollouts=rollouts,
-                roles=_selected_roles(args.role),
-                min_reward=args.min_reward,
-                min_advantage=args.min_advantage,
-                source_path=str(epoch_dir / "rollouts"),
-            )
-            policy_splits = prepare_policy_splits(
-                samples=samples,
-                policy_ids=args.policy_id,
-                val_ratio=args.val_ratio,
-                seed=args.seed + epoch_index,
-            )
-        except ValueError as exc:
-            training_skipped = str(exc)
-        else:
-            write_policy_manifest(
-                output_dir=train_dir,
-                policy_splits=policy_splits,
-                model_path_resolver=lambda policy_id, sample_subset: model_path_for_policy(policy_id, sample_subset, replay_like_args),
-            )
-
-            for policy_id, split in policy_splits.items():
-                policy_dir = train_dir / policy_id
-                policy_dir.mkdir(parents=True, exist_ok=True)
-                replay_exports = maybe_save_replay_copy(policy_dir, split, enabled=args.save_replay_copy)
-                model_path = model_path_for_policy(policy_id, split["train"] or split["all"], replay_like_args)
-                experiment_name = _default_experiment_name(args)
-                experiment_name = f"{experiment_name}-epoch{epoch_number:04d}-{policy_id}"
-                print(
-                    f"[hierarchical-rema][integrated] training policy={policy_id} "
-                    f"train_samples={len(split['train'])} val_samples={len(split['val'])} "
-                    f"model={model_path}"
-                )
-                training_config = OfflineTrainingConfig(
-                    model_name_or_path=model_path,
-                    output_dir=str(policy_dir),
-                    learning_rate=args.learning_rate,
-                    weight_decay=args.weight_decay,
-                    train_batch_size=args.train_batch_size,
-                    grad_accum_steps=args.grad_accum_steps,
-                    epochs=args.epochs,
-                    max_length=args.max_length,
-                    truncation=args.truncation,
-                    clip_range=args.clip_range,
-                    clip_ratio_c=args.clip_ratio_c,
-                    entropy_coeff=args.entropy_coeff,
-                    max_grad_norm=args.max_grad_norm,
-                    warmup_ratio=args.warmup_ratio,
-                    seed=args.seed + epoch_index,
-                    logging_steps=args.logging_steps,
-                    save_steps=args.save_steps,
-                    eval_every_steps=args.eval_every_steps,
-                    device=args.device,
-                    torch_dtype=args.torch_dtype,
-                    trust_remote_code=args.trust_remote_code,
-                    gradient_checkpointing=args.gradient_checkpointing,
-                    project_name=args.project_name,
-                    experiment_name=experiment_name,
-                    enable_wandb=False,
-                    save_final_checkpoint=True,
-                    save_best_checkpoint=args.checkpoint_mode == "all" and args.eval_every_steps > 0,
-                    save_intermediate_checkpoints=args.checkpoint_mode == "all",
-                )
-                previous_model_path = current_paths.get(policy_id)
-                if args.offline_grpo_distributed:
-                    summary = _run_distributed_offline_policy_training(
-                        train_samples=split["train"],
-                        val_samples=split["val"],
-                        config=training_config,
-                        tracking=tracking,
-                        tracking_prefix=f"{policy_id}/",
-                        log_step_offset=tracking_step_offset,
-                        nnodes=args.offline_grpo_nnodes,
-                        gpus_per_node=args.offline_grpo_gpus_per_node,
-                        master_port=args.offline_grpo_master_port,
-                    )
-                else:
-                    summary = run_offline_policy_training(
-                        train_samples=split["train"],
-                        val_samples=split["val"],
-                        config=training_config,
-                        tracking=tracking,
-                        tracking_prefix=f"{policy_id}/",
-                        log_step_offset=tracking_step_offset,
-                    )
-                tracking_step_offset += max(int(summary["steps"]), 1)
-                final_model_path = str(policy_dir / "final")
-                _update_current_paths(current_paths, policy_id, final_model_path)
-                if args.prune_stale_policy_models and previous_model_path and previous_model_path != final_model_path:
-                    previous_policy_root = Path(previous_model_path).expanduser().resolve().parent
-                    if previous_policy_root != policy_dir.resolve():
-                        _prune_policy_artifacts(previous_policy_root)
-                summary["policy_id"] = policy_id
-                summary["model_path"] = model_path
-                summary["final_model_path"] = final_model_path
-                summary.update(replay_exports)
-                training_summaries[policy_id] = summary
-                print(
-                    f"[hierarchical-rema][integrated] finished policy={policy_id} "
-                    f"steps={summary['steps']} final_model_path={final_model_path}"
-                )
-                _release_memory()
 
         validation_summary = None
         should_run_external_validation = False
@@ -1620,13 +1798,15 @@ def main() -> None:
                 "phase": schedule.alternating_phase.value,
             },
             "rollout_summary": rollout_summary,
+            "segment_summaries": segment_summaries,
+            "training_updates": training_updates,
             "training_summaries": training_summaries,
             "validation_summary": validation_summary,
             "external_validation_ran": should_run_external_validation,
             "current_policy_paths": dict(current_paths),
         }
-        if training_skipped is not None:
-            epoch_summary["training_skipped"] = training_skipped
+        if training_skipped_messages:
+            epoch_summary["training_skipped"] = training_skipped_messages
         with (epoch_dir / "epoch_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(epoch_summary, handle, indent=2, sort_keys=True)
         job_summary["epochs"].append(epoch_summary)
@@ -1637,7 +1817,6 @@ def main() -> None:
     with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(job_summary, handle, indent=2, sort_keys=True)
     print(f"[hierarchical-rema][integrated] wrote job summary to {output_dir / 'training_summary.json'}")
-    shared_rollout_backend.close()
     _finish_tracking(tracking)
 
 
