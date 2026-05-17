@@ -124,6 +124,7 @@ class RayVLLMGenerationManager:
     def __init__(self, config: VLLMBackendConfig) -> None:
         self.config = config
         self._bundle_cache: OrderedDict[RayGenerationKey, _RayBundle] = OrderedDict()
+        self._bundle_sequence = 0
 
     def _configured_bundle_response_length(self) -> int:
         response_lengths = [
@@ -338,9 +339,15 @@ class RayVLLMGenerationManager:
         max_collocate_count = 5
         if cpus_per_node is not None and self.config.n_gpus_per_node > 0:
             max_collocate_count = max(1, int(cpus_per_node) // int(self.config.n_gpus_per_node))
+        # Ray placement-group names are cluster-global. Recreating rollout bundles across
+        # semi-online update phases can race with placement-group cleanup, so each bundle
+        # needs its own unique prefix instead of the default shared `verl_group_*` name.
+        self._bundle_sequence += 1
+        bundle_name_prefix = f"hr_{os.getpid()}_{self._bundle_sequence}_"
         resource_pool = RayResourcePool(
             process_on_nodes=[self.config.n_gpus_per_node] * self.config.nnodes,
             max_colocate_count=max_collocate_count,
+            name_prefix=bundle_name_prefix,
         )
         ray_cls_with_init = RayClassWithInitArgs(
             cls=ray.remote(ActorRolloutRefWorker),
