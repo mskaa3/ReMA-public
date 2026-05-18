@@ -460,10 +460,11 @@ class RayReMASeparatedTrainer(object):
     def _build_rollout_meta_info(self, max_num_turns: int) -> Dict:
         if self._hierarchy_enabled():
             from prompt.math.hierarchical_mamrp import HIERARCHICAL_SYSTEM_PROMPTS
+            from prompt import FINISH_FLAG
             hierarchy_config = self._get_hierarchy_config()
             return {
                 'agent_roles': hierarchy_config['agent_roles'],
-                'finish_flag': None,
+                'finish_flag': FINISH_FLAG,
                 'system_prompts': HIERARCHICAL_SYSTEM_PROMPTS,
                 'max_num_turns': max_num_turns,
                 'hierarchy': hierarchy_config,
