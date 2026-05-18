@@ -83,46 +83,36 @@ def extract_worker_result_payload(text: str) -> Dict[str, str] | None:
     if normalized == stripped and "<worker_result" not in stripped.lower():
         return None
 
-    output_key = ""
     result_lines: List[str] = []
-    seen_result = False
     for raw_line in normalized.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         upper_line = line.upper()
         if upper_line.startswith("OUTPUT_KEY:"):
-            output_key = line.split(":", 1)[1].strip()
             continue
         if upper_line.startswith("RESULT:"):
-            seen_result = True
             first_result_line = line.split(":", 1)[1].strip()
             if first_result_line:
                 result_lines.append(first_result_line)
             continue
-        if seen_result:
-            result_lines.append(line)
+        result_lines.append(line)
 
-    if not output_key and not seen_result:
+    if not result_lines:
         return None
 
     return {
-        "output_key": output_key,
         "result_text": "\n".join(result_lines).strip(),
     }
 
 
-def extract_worker_result_text(text: str, expected_output_key: str | None = None) -> str:
+def extract_worker_result_text(text: str) -> str:
     payload = extract_worker_result_payload(text)
     if payload is None:
         return text.strip()
 
     result_text = payload["result_text"].strip()
     if not result_text:
-        return text.strip()
-
-    output_key = payload["output_key"].strip()
-    if expected_output_key and output_key and output_key != expected_output_key:
         return text.strip()
     return result_text
 

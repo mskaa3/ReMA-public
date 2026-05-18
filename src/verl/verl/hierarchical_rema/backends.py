@@ -378,13 +378,12 @@ class MockHierarchicalBackend(HierarchicalBackend):
         dependency_outputs: Dict[str, str],
         compatibility: float,
     ) -> WorkerExecution:
-        del decomposition
-        prompt_text = render_worker_prompt(task, node, worker, dependency_outputs)
+        prompt_text = render_worker_prompt(task, decomposition, node, worker, dependency_outputs)
         required_match = skill_match_score(node.required_skills, worker)
         upstream_failed = any("[incorrect]" in output for output in dependency_outputs.values())
         success = required_match >= 0.99 and not upstream_failed
 
-        if node.output_key == "final_answer":
+        if node.node_id == decomposition.final_node_id:
             if success:
                 output_text = task.ground_truth
             else:
@@ -963,12 +962,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         dependency_outputs: Dict[str, str],
         compatibility: float,
     ) -> WorkerExecution:
-        del decomposition
         base_model_path = worker.base_model_path
         if not base_model_path:
             raise ValueError(f"Worker {worker.worker_id} is missing base_model_path")
 
-        prompt_text = render_worker_prompt(task, node, worker, dependency_outputs)
+        prompt_text = render_worker_prompt(task, decomposition, node, worker, dependency_outputs)
         output_text, entropy = self._generate_text(
             base_model_path=base_model_path,
             lora_adapter_path=worker.lora_adapter_path,
@@ -977,10 +975,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             max_new_tokens=self.config.worker_max_new_tokens,
             temperature=self._worker_temperature(),
         )
-        normalized_output = extract_worker_result_text(
-            output_text,
-            expected_output_key=node.output_key,
-        ).strip()
+        normalized_output = extract_worker_result_text(output_text).strip()
         completed = bool(normalized_output)
         success = completed and "i don't know" not in output_text.lower()
         return WorkerExecution(
@@ -1188,6 +1183,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 raise ValueError(f"Worker {request.worker.worker_id} is missing base_model_path")
             prompt_text = render_worker_prompt(
                 request.task,
+                request.decomposition,
                 request.node,
                 request.worker,
                 request.dependency_outputs,
@@ -1212,10 +1208,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 temperature=self._worker_temperature(),
             )
             for (result_index, request, _), (output_text, entropy) in zip(grouped_requests, generated):
-                normalized_output = extract_worker_result_text(
-                    output_text,
-                    expected_output_key=request.node.output_key,
-                ).strip()
+                normalized_output = extract_worker_result_text(output_text).strip()
                 completed = bool(normalized_output)
                 success = completed and "i don't know" not in output_text.lower()
                 results[result_index] = WorkerExecution(

@@ -57,14 +57,13 @@ EXAMPLE_OUTPUT:
 
 
 WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
-NODE_INSTRUCTION: rearrange the equation to isolate the variable term
-NODE_OUTPUT_KEY: isolated_equation
-DEPENDENCY_OUTPUTS:
-- none
+NODE_INSTRUCTION: compute the value of x and return the final answer
+FINAL_NODE: yes
+DEPENDENCY_RESULTS:
+- NODE 1 (rearrange the equation to isolate the variable term): 2x = 8
 EXAMPLE_OUTPUT:
 <worker_result>
-OUTPUT_KEY: isolated_equation
-RESULT: 2x = 8
+4
 </worker_result>"""
 
 
@@ -298,19 +297,39 @@ def render_selector_prompt(
 
 def render_worker_prompt(
     task: TaskExample,
+    decomposition: DecompositionCandidate,
     node: SubtaskNode,
     worker: WorkerSpec,
     dependency_outputs: dict[str, str],
 ) -> str:
+    node_map = decomposition.nodes_by_id()
     dependency_lines = []
-    for dependency_id, dependency_output in dependency_outputs.items():
-        dependency_lines.append(f"- {dependency_id}: {dependency_output}")
+    for dependency_id in node.dependencies:
+        dependency_output = dependency_outputs.get(dependency_id, "").strip()
+        dependency_node = node_map.get(dependency_id)
+        dependency_instruction = dependency_node.instruction if dependency_node else ""
+        rendered_output = dependency_output.replace("\n", "\n  ") if dependency_output else "[missing]"
+        if dependency_instruction:
+            dependency_lines.append(
+                f"- NODE {dependency_id} ({dependency_instruction}): {rendered_output}"
+            )
+        else:
+            dependency_lines.append(f"- NODE {dependency_id}: {rendered_output}")
     if not dependency_lines:
         dependency_lines.append("- none")
 
     skills = ",".join(worker.skills) if worker.skills else "none"
     node_dependencies = ",".join(node.dependencies) if node.dependencies else "none"
     node_required_skills = ",".join(node.required_skills) if node.required_skills else "none"
+    is_final_node = decomposition.final_node_id == node.node_id
+    final_node_contract = (
+        "- This is the FINAL_NODE. Put only the final answer inside <worker_result>.\n"
+        "- Do not include explanations, labels, sentences, or variable assignments such as `x = 4`; write only `4`.\n"
+    )
+    if not is_final_node:
+        final_node_contract = (
+            "- This is an intermediate node. Put only the minimal downstream-usable result inside <worker_result>.\n"
+        )
 
     return (
         f"TASK_ID: {task.task_id}\n"
@@ -320,26 +339,26 @@ def render_worker_prompt(
         f"WORKER_DESCRIPTION: {worker.description}\n"
         f"NODE_ID: {node.node_id}\n"
         f"NODE_INSTRUCTION: {node.instruction}\n"
+        f"FINAL_NODE: {'yes' if is_final_node else 'no'}\n"
         f"NODE_DEPENDENCIES: {node_dependencies}\n"
         f"NODE_REQUIRED_SKILLS: {node_required_skills}\n"
-        f"NODE_OUTPUT_KEY: {node.output_key}\n"
         "OUTPUT CONTRACT:\n"
         "- Do only the current NODE_INSTRUCTION.\n"
-        "- Use DEPENDENCY_OUTPUTS as the current working context when they are provided.\n"
+        "- Use DEPENDENCY_RESULTS as the current working context when they are provided.\n"
+        "- Treat dependency results as factual inputs from earlier nodes. If a dependency says `sin(alpha) = 1/2`, use that value directly.\n"
         "- Do not solve future nodes, repeat the full task, or add explanations unless the instruction explicitly asks for them.\n"
         "- Return exactly one <worker_result> block and nothing else.\n"
         "- Use this exact skeleton:\n"
         "<worker_result>\n"
-        f"OUTPUT_KEY: {node.output_key}\n"
-        "RESULT: concise result\n"
+        "concise result\n"
         "</worker_result>\n"
-        "- RESULT must contain only the downstream-usable result for this node.\n"
-        "- For expressions, equations, values, or short case splits, return just that content in RESULT.\n"
-        "- If the node produces the final answer, RESULT must contain only the final answer.\n"
+        "- Put only the node result inside the tags. Do not include field labels like `RESULT:` or `OUTPUT_KEY:`.\n"
+        "- For expressions, equations, values, or short case splits, return just that content inside the tags.\n"
         "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
+        f"{final_node_contract}"
         "- Forbidden output patterns: prose outside tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
         f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
-        "DEPENDENCY_OUTPUTS:\n"
+        "DEPENDENCY_RESULTS:\n"
         f"{chr(10).join(dependency_lines)}\n\n"
         "Return ONLY the <worker_result> block."
     )
