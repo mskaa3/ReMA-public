@@ -220,7 +220,7 @@ class ReMARewardManager:
             if already_print_data_sources[data_source] < self.num_examine:
                 prompt_str = data_item.non_tensor_batch['question']
                 padded_history = data_item.non_tensor_batch['history']
-                history = padded_history[:num_turns * 2]
+                history = padded_history[:num_turns * len(agent_roles)]
                 already_print_data_sources[data_source] += 1
                 print("[question]", prompt_str)
                 print("[ground_truth]", ground_truth)

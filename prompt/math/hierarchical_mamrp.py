@@ -46,7 +46,8 @@ Solve your assigned subtasks. Please reason step by step following the given ins
 
 FINALIZER_SYSTEM_PROMPT = """You are the Finalizer.
 Use the original problem and worker results to write the final solution.
-If the answer is ready, include [FINISH] and put the final answer in \\boxed{}.
+If the answer is ready, output the exact token [FINISH] and put the final answer in \\boxed{}.
+Do not write FINISH, *FINISH*, or any other variant.
 Otherwise, explain what needs to be revised.
 """
 
