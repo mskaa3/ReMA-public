@@ -268,9 +268,8 @@ def _load_model_and_tokenizer(
         torch_dtype=torch_dtype,
         trust_remote_code=config.trust_remote_code,
     )
-    model.config.use_cache = False
-
     if config.gradient_checkpointing:
+        model.config.use_cache = False
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     if torch.cuda.is_available():
@@ -948,8 +947,26 @@ def evaluate_controller_model(
 def _save_model_checkpoint(model, tokenizer, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_model = model.module if hasattr(model, "module") else model
-    base_model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+    original_use_cache = getattr(base_model.config, "use_cache", None)
+    generation_config = getattr(base_model, "generation_config", None)
+    original_generation_use_cache = (
+        getattr(generation_config, "use_cache", None) if generation_config is not None else None
+    )
+    try:
+        # Training disables KV cache for gradient checkpointing, but rollout/inference
+        # checkpoints must restore cache usage or subsequent hierarchical generation
+        # becomes dramatically slower.
+        if original_use_cache is not None:
+            base_model.config.use_cache = True
+        if generation_config is not None and original_generation_use_cache is not None:
+            generation_config.use_cache = True
+        base_model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+    finally:
+        if original_use_cache is not None:
+            base_model.config.use_cache = original_use_cache
+        if generation_config is not None and original_generation_use_cache is not None:
+            generation_config.use_cache = original_generation_use_cache
 
 
 def _parse_cli_args() -> argparse.Namespace:
