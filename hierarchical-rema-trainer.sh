@@ -99,8 +99,8 @@ fi
 # Frequently adjusted: search width and DAG complexity.
 NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-3}
 NUM_SELECTIONS=${NUM_SELECTIONS:-2}
-SOFT_MAX_HOPS=${SOFT_MAX_HOPS:-3}
-HARD_MAX_HOPS=${HARD_MAX_HOPS:-5}
+SOFT_MAX_HOPS=${SOFT_MAX_HOPS:-5}
+HARD_MAX_HOPS=${HARD_MAX_HOPS:-8}
 SOFT_HOP_PENALTY=${SOFT_HOP_PENALTY:-0.1}
 
 # Frequently adjusted: generation budget / decoding.
