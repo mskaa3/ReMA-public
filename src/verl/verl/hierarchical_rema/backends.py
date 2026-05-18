@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -567,6 +568,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
     def _controller_sampling_overrides(
         self,
         role: str,
+        *,
+        node_order: Sequence[str] | None = None,
+        worker_count: int | None = None,
     ) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
         stop_tag = "</decomposition_plan>" if role == "decomposer" else "</selection_plan>"
@@ -578,6 +582,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 regex = r"(?s)<decomposition_plan>.*?</decomposition_plan>"
             else:
                 regex = r"(?s)<selection_plan>\s*(?:\d+\s*:\s*\d+\s*)+</selection_plan>"
+                if node_order and worker_count and worker_count > 0:
+                    worker_index_pattern = "|".join(str(index) for index in range(1, worker_count + 1))
+                    assignment_lines = [
+                        rf"{re.escape(str(node_id))}\s*:\s*(?:{worker_index_pattern})\s*"
+                        for node_id in node_order
+                    ]
+                    regex = r"(?s)<selection_plan>\s*" + "".join(assignment_lines) + r"</selection_plan>"
             # Keep alias variants for vLLM versions that differ in field names.
             overrides["structured_outputs"] = {"regex": regex}
             overrides["guided_decoding"] = {"regex": regex}
@@ -651,8 +662,10 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         system_prompt: str | None = None,
         temperature: float | None = None,
         sampling_overrides: Optional[Dict[str, Any]] = None,
+        log_label: str | None = None,
     ) -> List[Tuple[str, float]]:
         del sampling_overrides
+        del log_label
         if not prompt_texts:
             return []
 
@@ -840,7 +853,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 prompt_text=repair_prompt,
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 temperature=self._controller_temperature(),
-                sampling_overrides=self._controller_sampling_overrides("selector"),
+                sampling_overrides=self._controller_sampling_overrides(
+                    "selector",
+                    node_order=[node.node_id for node in decomposition.nodes],
+                    worker_count=len(worker_pool.workers),
+                ),
             )
             try:
                 payload = extract_selection_payload(last_raw_text)
@@ -1020,6 +1037,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
                 sampling_overrides=self._controller_sampling_overrides("decomposer"),
+                log_label="decomposer",
             )
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
@@ -1079,7 +1097,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         if not requests:
             return []
 
-        grouped: Dict[str, List[Tuple[int, SelectionRequest, str]]] = {}
+        grouped: Dict[Tuple[str, Tuple[str, ...], int], List[Tuple[int, SelectionRequest, str]]] = {}
         for index, request in enumerate(requests):
             model_path = request.policy_config.model_for_role("selector")
             if not model_path:
@@ -1090,10 +1108,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 request.worker_pool,
                 request.worker_performance,
             )
-            grouped.setdefault(model_path, []).append((index, request, prompt_text))
+            node_order = tuple(node.node_id for node in request.decomposition.nodes)
+            grouped.setdefault((model_path, node_order, len(request.worker_pool.workers)), []).append((index, request, prompt_text))
 
         results: List[SelectionCandidate | None] = [None] * len(requests)
-        for model_path, grouped_requests in grouped.items():
+        for (model_path, node_order, worker_count), grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
             generated = self._generate_text_batch(
                 base_model_path=model_path,
@@ -1101,7 +1120,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
-                sampling_overrides=self._controller_sampling_overrides("selector"),
+                sampling_overrides=self._controller_sampling_overrides(
+                    "selector",
+                    node_order=node_order,
+                    worker_count=worker_count,
+                ),
+                log_label="selector",
             )
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
@@ -1206,6 +1230,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 lora_adapter_path=lora_adapter_path,
                 system_prompt=system_prompt,
                 temperature=self._worker_temperature(),
+                log_label="worker",
             )
             for (result_index, request, _), (output_text, entropy) in zip(grouped_requests, generated):
                 normalized_output = extract_worker_result_text(output_text).strip()
@@ -1267,6 +1292,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
         system_prompt: str | None = None,
         temperature: float | None = None,
         sampling_overrides: Optional[Dict[str, Any]] = None,
+        log_label: str | None = None,
     ) -> List[Tuple[str, float]]:
         if lora_adapter_path is not None:
             raise NotImplementedError("Worker LoRA adapters are not implemented for the Ray/vLLM backend yet")
@@ -1278,6 +1304,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
             system_prompt=system_prompt,
             temperature=self.config.temperature if temperature is None else temperature,
             sampling_overrides=sampling_overrides,
+            log_label=log_label,
         )
         return [(item.text, item.entropy) for item in generated]
 

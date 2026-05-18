@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -419,6 +420,7 @@ class RayVLLMGenerationManager:
         system_prompt: str | None = None,
         temperature: float | None = None,
         sampling_overrides: Optional[Dict[str, Any]] = None,
+        log_label: str | None = None,
     ) -> List[RayGenerationResult]:
         if not prompt_texts:
             return []
@@ -442,8 +444,19 @@ class RayVLLMGenerationManager:
             from protocol import pad_dataproto_to_divisor, unpad_dataproto
 
         results: List[RayGenerationResult] = []
-        for start, end in self._chunk_range(len(prompt_texts), batch_size):
+        chunk_ranges = list(self._chunk_range(len(prompt_texts), batch_size))
+        total_chunks = len(chunk_ranges)
+        generation_started_at = time.monotonic()
+        for chunk_index, (start, end) in enumerate(chunk_ranges, start=1):
             prompt_chunk = prompt_texts[start:end]
+            if log_label is not None:
+                print(
+                    f"[hierarchical-rema][generation-progress] role={log_label} "
+                    f"model={Path(model_path).name} chunk={chunk_index}/{total_chunks} "
+                    f"prompts={start + 1}-{end}/{len(prompt_texts)} "
+                    f"batch_size={len(prompt_chunk)}"
+                )
+            chunk_started_at = time.monotonic()
             prompt_proto = self._encode_prompt_batch(
                 tokenizer=tokenizer,
                 prompt_texts=prompt_chunk,
@@ -495,6 +508,14 @@ class RayVLLMGenerationManager:
                         response_length=response_length_int,
                     )
                 )
+            if log_label is not None:
+                chunk_elapsed = time.monotonic() - chunk_started_at
+                total_elapsed = time.monotonic() - generation_started_at
+                print(
+                    f"[hierarchical-rema][generation-progress] role={log_label} "
+                    f"model={Path(model_path).name} chunk_done={chunk_index}/{total_chunks} "
+                    f"elapsed_s={chunk_elapsed:.1f} total_elapsed_s={total_elapsed:.1f}"
+                )
 
         return results
 
@@ -507,6 +528,7 @@ class RayVLLMGenerationManager:
         system_prompt: str | None = None,
         temperature: float | None = None,
         sampling_overrides: Optional[Dict[str, Any]] = None,
+        log_label: str | None = None,
     ) -> RayGenerationResult:
         return self.generate_batch(
             model_path=model_path,
@@ -516,4 +538,5 @@ class RayVLLMGenerationManager:
             system_prompt=system_prompt,
             temperature=temperature,
             sampling_overrides=sampling_overrides,
+            log_label=log_label,
         )[0]
