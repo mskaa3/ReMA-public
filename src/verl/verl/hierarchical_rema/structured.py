@@ -608,49 +608,67 @@ def validate_decomposition_payload(
             )
         )
 
-    declared_node_ids = [node.node_id for node in nodes]
-    expected_node_ids = [str(index) for index in range(1, len(nodes) + 1)]
-    if declared_node_ids != expected_node_ids:
-        raise StructuredOutputError(
-            "NODE_ID values must be contiguous numeric IDs declared in order: "
-            + ", ".join(expected_node_ids)
-        )
-
-    node_position = {node.node_id: index for index, node in enumerate(nodes)}
-    for node in nodes:
-        for dependency in node.dependencies:
-            dependency_position = node_position.get(dependency)
-            if dependency_position is None:
-                continue
-            if dependency_position >= node_position[node.node_id]:
-                raise StructuredOutputError(
-                    f"Node {node.node_id} depends on '{dependency}', but dependencies must reference earlier declared NODE_ID values"
-                )
-
     if not final_node_id:
         final_node_id = nodes[-1].node_id
 
-    candidate = DecompositionCandidate(
+    raw_candidate = DecompositionCandidate(
         decomposition_id=decomposition_id,
         summary=summary,
         nodes=nodes,
         final_node_id=final_node_id,
     )
-    candidate.topological_order()
-
-    declared_final_node_id = nodes[-1].node_id
-    if candidate.final_node_id != declared_final_node_id:
-        raise StructuredOutputError(
-            f"FINAL_NODE_ID must match the last declared NODE_ID ('{declared_final_node_id}')"
-        )
+    raw_order = raw_candidate.topological_order()
 
     downstream_dependencies = {
         dependency
         for node in nodes
         for dependency in node.dependencies
     }
-    if candidate.final_node_id in downstream_dependencies:
+    if raw_candidate.final_node_id in downstream_dependencies:
         raise StructuredOutputError("FINAL_NODE_ID must be a sink node with no downstream dependents")
+
+    if raw_candidate.final_node_id not in {node.node_id for node in nodes}:
+        raise StructuredOutputError(
+            f"FINAL_NODE_ID '{raw_candidate.final_node_id}' is not part of the decomposition"
+        )
+
+    canonical_order = [node_id for node_id in raw_order if node_id != raw_candidate.final_node_id]
+    canonical_order.append(raw_candidate.final_node_id)
+
+    remapped_node_ids = {
+        original_node_id: str(index)
+        for index, original_node_id in enumerate(canonical_order, start=1)
+    }
+    original_node_map = raw_candidate.nodes_by_id()
+    canonical_nodes: List[SubtaskNode] = []
+    for original_node_id in canonical_order:
+        original_node = original_node_map[original_node_id]
+        remapped_node_id = remapped_node_ids[original_node_id]
+        output_key = original_node.output_key
+        if output_key == f"{original_node_id}_output":
+            output_key = f"{remapped_node_id}_output"
+        canonical_nodes.append(
+            SubtaskNode(
+                node_id=remapped_node_id,
+                instruction=original_node.instruction,
+                dependencies=[remapped_node_ids[dependency] for dependency in original_node.dependencies],
+                required_skills=list(original_node.required_skills),
+                output_key=output_key,
+            )
+        )
+
+    candidate = DecompositionCandidate(
+        decomposition_id=decomposition_id,
+        summary=summary,
+        nodes=canonical_nodes,
+        final_node_id=remapped_node_ids[raw_candidate.final_node_id],
+    )
+    candidate.topological_order()
+
+    if candidate.final_node_id != candidate.nodes[-1].node_id:
+        raise StructuredOutputError(
+            f"FINAL_NODE_ID must canonicalize to the last declared NODE_ID ('{candidate.nodes[-1].node_id}')"
+        )
 
     return apply_decomposition_limits(candidate, rollout_config)
 

@@ -99,6 +99,128 @@ def _canonicalize_selection_candidate(
     return candidate
 
 
+def _try_complete_partial_selection_candidate(
+    *,
+    payload: Dict[str, Any],
+    decomposition: DecompositionCandidate,
+    worker_pool: WorkerPoolConfig,
+    worker_performance: Dict[str, WorkerPerformanceSnapshot],
+    fallback_id: str,
+) -> SelectionCandidate | None:
+    assignments_payload = payload.get("assignments")
+    if not isinstance(assignments_payload, list) or not assignments_payload:
+        return None
+
+    ordered_node_ids = [node.node_id for node in decomposition.nodes]
+    valid_node_ids = set(ordered_node_ids)
+    ordered_worker_ids = [worker.worker_id for worker in worker_pool.workers]
+    valid_worker_ids = set(ordered_worker_ids)
+
+    def _normalize_numeric_token(raw_value: Any) -> str:
+        text = str(raw_value or "").strip()
+        if not text:
+            return ""
+        match = re.fullmatch(r"[nN]\s*(\d+)", text)
+        if match:
+            return str(int(match.group(1)))
+        if text.isdigit():
+            return str(int(text))
+        return text
+
+    def _extract_positive_ints(raw_value: Any) -> List[int]:
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, list):
+            values: List[int] = []
+            for item in raw_value:
+                try:
+                    parsed = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    values.append(parsed)
+            return values
+        return [int(token) for token in re.findall(r"\d+", str(raw_value)) if int(token) > 0]
+
+    normalized_assignments: List[Dict[str, Any]] = []
+    seen_node_ids = set()
+    for assignment_payload in assignments_payload:
+        if not isinstance(assignment_payload, dict):
+            return None
+        node_id = _normalize_numeric_token(assignment_payload.get("node_id"))
+        worker_id = str(assignment_payload.get("worker_id") or "").strip()
+
+        if node_id not in valid_node_ids:
+            node_index_candidates = _extract_positive_ints(assignment_payload.get("node_index"))
+            if node_id.isdigit():
+                node_index_candidates.extend(_extract_positive_ints(node_id))
+            if not node_index_candidates:
+                return None
+            node_index = node_index_candidates[0]
+            if node_index <= 0 or node_index > len(ordered_node_ids):
+                return None
+            node_id = ordered_node_ids[node_index - 1]
+
+        if worker_id not in valid_worker_ids:
+            worker_index_candidates = _extract_positive_ints(assignment_payload.get("worker_index"))
+            if worker_id.isdigit():
+                worker_index_candidates.extend(_extract_positive_ints(worker_id))
+            if not worker_index_candidates:
+                return None
+            worker_index = worker_index_candidates[0]
+            if worker_index <= 0 or worker_index > len(ordered_worker_ids):
+                return None
+            worker_id = ordered_worker_ids[worker_index - 1]
+
+        if node_id in seen_node_ids:
+            return None
+
+        seen_node_ids.add(node_id)
+        normalized_assignments.append(
+            {
+                "node_id": node_id,
+                "worker_id": worker_id,
+                "rationale": str(
+                    assignment_payload.get("rationale") or f"Selected for node {node_id}."
+                ).strip(),
+                "compatibility": assignment_payload.get("compatibility", 0.0),
+            }
+        )
+
+    missing_node_ids = [node_id for node_id in ordered_node_ids if node_id not in seen_node_ids]
+    if not missing_node_ids:
+        return None
+
+    node_map = decomposition.nodes_by_id()
+    for missing_node_id in missing_node_ids:
+        node = node_map[missing_node_id]
+        _, best_worker = max(
+            enumerate(worker_pool.workers),
+            key=lambda item: (
+                compatibility_score(node.required_skills, item[1], worker_performance),
+                -item[0],
+            ),
+        )
+        normalized_assignments.append(
+            {
+                "node_id": missing_node_id,
+                "worker_id": best_worker.worker_id,
+                "rationale": "Auto-completed missing node assignment from partial selector output.",
+                "compatibility": 0.0,
+            }
+        )
+
+    completed_payload = {
+        "selection_id": str(payload.get("selection_id") or fallback_id),
+        "assignments": normalized_assignments,
+    }
+    return validate_selection_payload(
+        payload=completed_payload,
+        decomposition=decomposition,
+        worker_pool=worker_pool,
+    )
+
+
 class HierarchicalBackend(ABC):
     @abstractmethod
     def sample_decomposition(
@@ -859,6 +981,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             len(worker_pool.workers),
         )
         for attempt in range(self.config.max_format_retries + 1):
+            payload: Dict[str, Any] | None = None
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
@@ -898,6 +1021,35 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     worker_pool=worker_pool,
                 )
             except Exception as exc:
+                if payload is not None:
+                    partial_candidate = _try_complete_partial_selection_candidate(
+                        payload=payload,
+                        decomposition=decomposition,
+                        worker_pool=worker_pool,
+                        worker_performance=worker_performance,
+                        fallback_id=fallback_id,
+                    )
+                    if partial_candidate is not None:
+                        partial_candidate = _canonicalize_selection_candidate(
+                            candidate=partial_candidate,
+                            decomposition=decomposition,
+                            worker_pool=worker_pool,
+                            worker_performance=worker_performance,
+                        )
+                        return self._set_selection_artifacts(
+                            candidate=partial_candidate,
+                            prompt_text=prompt_text,
+                            validation={
+                                "backend": self.backend_name,
+                                "attempt": attempt,
+                                "errors_before_success": list(errors),
+                                "fallback_used": False,
+                                "partial_completion_used": True,
+                                "raw_model_text": last_raw_text,
+                            },
+                            decomposition=decomposition,
+                            worker_pool=worker_pool,
+                        )
                 errors.append(str(exc))
                 repair_prompt = (
                     f"{prompt_text}\n\nYour previous answer did not match the required selection format. "
@@ -1140,6 +1292,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.decomposition.decomposition_id}-sel-{request.selection_index}"
+                payload: Dict[str, Any] | None = None
                 try:
                     payload = extract_selection_payload(raw_text)
                     payload.setdefault("selection_id", fallback_id)
@@ -1171,27 +1324,59 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     )
                 except Exception:
                     repair_count += 1
-                    candidate = self._generate_validated_selection(
-                        prompt_text=prompt_text,
-                        task=request.task,
+                    partial_candidate = _try_complete_partial_selection_candidate(
+                        payload=payload,
                         decomposition=request.decomposition,
                         worker_pool=request.worker_pool,
-                        policy_config=request.policy_config,
                         worker_performance=request.worker_performance,
                         fallback_id=fallback_id,
                     )
-                    candidate.raw_payload.setdefault("validation", {})
-                    candidate.raw_payload["validation"].update(
-                        {
-                            "batch_generated": True,
-                            "batch_repair_fallback": True,
-                        }
-                    )
-                    candidate.raw_text = self._format_selection_completion_text(
-                        candidate=candidate,
-                        decomposition=request.decomposition,
-                        worker_pool=request.worker_pool,
-                    )
+                    if partial_candidate is not None:
+                        partial_candidate = _canonicalize_selection_candidate(
+                            candidate=partial_candidate,
+                            decomposition=request.decomposition,
+                            worker_pool=request.worker_pool,
+                            worker_performance=request.worker_performance,
+                        )
+                        candidate = self._set_selection_artifacts(
+                            candidate=partial_candidate,
+                            prompt_text=prompt_text,
+                            validation={
+                                "backend": self.backend_name,
+                                "attempt": 0,
+                                "errors_before_success": [],
+                                "fallback_used": False,
+                                "partial_completion_used": True,
+                                "raw_model_text": raw_text,
+                                "batch_generated": True,
+                                "batch_repair_fallback": True,
+                                "entropy": entropy,
+                            },
+                            decomposition=request.decomposition,
+                            worker_pool=request.worker_pool,
+                        )
+                    else:
+                        candidate = self._generate_validated_selection(
+                            prompt_text=prompt_text,
+                            task=request.task,
+                            decomposition=request.decomposition,
+                            worker_pool=request.worker_pool,
+                            policy_config=request.policy_config,
+                            worker_performance=request.worker_performance,
+                            fallback_id=fallback_id,
+                        )
+                        candidate.raw_payload.setdefault("validation", {})
+                        candidate.raw_payload["validation"].update(
+                            {
+                                "batch_generated": True,
+                                "batch_repair_fallback": True,
+                            }
+                        )
+                        candidate.raw_text = self._format_selection_completion_text(
+                            candidate=candidate,
+                            decomposition=request.decomposition,
+                            worker_pool=request.worker_pool,
+                        )
                 results[result_index] = candidate
             if repair_count:
                 print(

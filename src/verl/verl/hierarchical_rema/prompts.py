@@ -44,15 +44,22 @@ OUTPUT_KEY: final_answer
 
 SELECTOR_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
 EXAMPLE_NODES_BY_ID:
-1: deps=none | skills=algebra | output=isolated_equation | instruction=rearrange the equation to isolate the variable term
-2: deps=1 | skills=arithmetic | output=final_answer | instruction=compute the value of x and return the final answer
+1: deps=none | skills=algebra | output=rewritten_equation | instruction=rewrite the equation into a simpler algebraic form
+2: deps=1 | skills=arithmetic | output=numeric_constant | instruction=simplify the numeric side exactly
+3: deps=1 | skills=analysis | output=constraint_check | instruction=check the domain or sign constraints implied by the equation
+4: deps=2,3 | skills=algebra | output=final_answer | instruction=solve for the final answer using the earlier results
 EXAMPLE_WORKERS_BY_INDEX:
 1: arithmetic_prealgebra_worker | skills=arithmetic,prealgebra,fractions,simplification | success=0.72 | avg_reward=0.44 | desc=Exact arithmetic, fractions, ratios, and simplification specialist.
 2: algebra_symbolic_worker | skills=algebra,symbolic_manipulation,equations,polynomials | success=0.81 | avg_reward=0.57 | desc=Equation solving and symbolic algebra specialist.
+3: geometry_trigonometry_worker | skills=geometry,trigonometry,coordinate_geometry | success=0.53 | avg_reward=0.31 | desc=Geometry, trigonometry, and coordinate methods specialist.
+4: calculus_analysis_worker | skills=analysis,calculus,functions,limits | success=0.69 | avg_reward=0.46 | desc=Calculus, limits, and function analysis specialist.
+5: discrete_number_theory_worker | skills=combinatorics,probability,number_theory,discrete_math | success=0.61 | avg_reward=0.37 | desc=Counting, probability, and number theory specialist.
 EXAMPLE_OUTPUT:
 <selection_plan>
 1: 2
 2: 1
+3: 4
+4: 2
 </selection_plan>"""
 
 
