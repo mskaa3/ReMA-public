@@ -1329,7 +1329,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 ),
                 log_label="selector",
             )
-            repair_count = 0
+            first_pass_failure_count = 0
+            local_completion_count = 0
+            model_repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.decomposition.decomposition_id}-sel-{request.selection_index}"
                 payload: Dict[str, Any] | None = None
@@ -1363,7 +1365,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         worker_pool=request.worker_pool,
                     )
                 except Exception:
-                    repair_count += 1
+                    first_pass_failure_count += 1
                     partial_candidate = _try_complete_partial_selection_candidate(
                         payload=payload,
                         decomposition=request.decomposition,
@@ -1395,7 +1397,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             decomposition=request.decomposition,
                             worker_pool=request.worker_pool,
                         )
+                        local_completion_count += 1
                     else:
+                        model_repair_count += 1
                         candidate = self._generate_validated_selection(
                             prompt_text=prompt_text,
                             task=request.task,
@@ -1418,10 +1422,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             worker_pool=request.worker_pool,
                         )
                 results[result_index] = candidate
-            if repair_count:
+            if first_pass_failure_count:
                 print(
                     f"[hierarchical-rema][generation] role=selector "
-                    f"model={model_path} repair_fallbacks={repair_count}/{len(grouped_requests)}"
+                    f"model={model_path} first_pass_failures={first_pass_failure_count}/{len(grouped_requests)} "
+                    f"local_completions={local_completion_count} model_repairs={model_repair_count}"
                 )
 
         if any(candidate is None for candidate in results):
