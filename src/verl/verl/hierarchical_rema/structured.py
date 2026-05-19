@@ -499,14 +499,17 @@ def apply_decomposition_limits(
     rollout_config: RolloutConfig,
 ) -> DecompositionCandidate:
     original_hops = compute_dag_hops(candidate.nodes)
+    original_node_count = len(candidate.nodes)
     candidate.num_hops = original_hops
     candidate.effective_num_hops = original_hops
+    candidate.soft_penalty = 0.0
 
-    if rollout_config.soft_max_hops is not None and original_hops > rollout_config.soft_max_hops:
-        exceedance = original_hops - rollout_config.soft_max_hops
-        candidate.soft_penalty = rollout_config.soft_hop_penalty * (
-            exceedance ** rollout_config.soft_hop_penalty_power
-        )
+    if rollout_config.soft_max_hops is not None:
+        if original_node_count > rollout_config.soft_max_hops:
+            node_exceedance = original_node_count - rollout_config.soft_max_hops
+            candidate.soft_penalty += rollout_config.soft_hop_penalty * (
+                node_exceedance ** rollout_config.soft_hop_penalty_power
+            )
 
     limited_candidate = candidate
     if len(limited_candidate.nodes) > rollout_config.max_nodes_per_decomposition:
@@ -514,16 +517,6 @@ def apply_decomposition_limits(
             limited_candidate,
             budget=rollout_config.max_nodes_per_decomposition,
             reason=f"Node count exceeded {rollout_config.max_nodes_per_decomposition}",
-        )
-
-    if (
-        rollout_config.hard_max_hops is not None
-        and limited_candidate.effective_num_hops > rollout_config.hard_max_hops
-    ):
-        limited_candidate = _truncate_to_node_budget(
-            limited_candidate,
-            budget=rollout_config.hard_max_hops,
-            reason=f"Hop count exceeded {rollout_config.hard_max_hops}",
         )
 
     limited_candidate.effective_num_hops = compute_dag_hops(limited_candidate.nodes)

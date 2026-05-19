@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .prompts import render_decomposer_prompt, render_selector_prompt, render_worker_prompt
+from .prompts import (
+    render_decomposer_prompt,
+    render_selector_output_skeleton,
+    render_selector_prompt,
+    render_worker_prompt,
+)
 from .rewarding import compatibility_score, entropy_to_confidence_reward, skill_match_score
 from .schema import (
     ControllerPolicyConfig,
@@ -847,6 +851,10 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         repair_prompt = prompt_text
         errors: List[str] = []
         last_raw_text = ""
+        selector_skeleton = render_selector_output_skeleton(
+            [node.node_id for node in decomposition.nodes],
+            len(worker_pool.workers),
+        )
         for attempt in range(self.config.max_format_retries + 1):
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
@@ -894,10 +902,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     "Do not add commentary, bullets, repeated task text, or extra sections. "
                     "Use numeric node IDs only with one `node_id: worker_index` line per node. "
                     "The simplest valid form is:\n"
-                    "<selection_plan>\n"
-                    "1: 2\n"
-                    "2: 1\n"
-                    "</selection_plan>"
+                    f"{selector_skeleton}"
+                    "\nTreat the worker indices shown above as placeholders for the required output shape; "
+                    "choose the actual best valid worker index for each node."
                 )
 
         candidate = build_fallback_selection(

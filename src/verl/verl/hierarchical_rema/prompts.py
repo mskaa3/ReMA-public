@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Sequence
 
 from .schema import (
     CANONICAL_SKILL_TAGS,
@@ -155,6 +155,16 @@ def _worker_context(
     return worker_context
 
 
+def render_selector_output_skeleton(node_ids: Sequence[str], worker_count: int) -> str:
+    safe_worker_count = max(1, int(worker_count))
+    lines = ["<selection_plan>"]
+    for line_index, node_id in enumerate(node_ids, start=1):
+        worker_index = ((line_index - 1) % safe_worker_count) + 1
+        lines.append(f"{node_id}: {worker_index}")
+    lines.append("</selection_plan>")
+    return "\n".join(lines)
+
+
 def _decomposition_context(decomposition: DecompositionCandidate) -> dict:
     return {
         "decomposition_id": decomposition.decomposition_id,
@@ -186,18 +196,15 @@ def render_decomposer_prompt(
     max_nodes = max(1, int(max_nodes_hint or 4))
     allowed_node_ids = ", ".join(str(i) for i in range(1, max_nodes + 1))
     skill_tags = ", ".join(CANONICAL_SKILL_TAGS)
-    hop_lines = []
+    node_budget_lines = []
     if soft_max_hops_hint is not None:
-        hop_lines.append(
-            f"- Prefer dependency depth no greater than {int(soft_max_hops_hint)}; deeper plans are penalized."
+        node_budget_lines.append(
+            f"- Prefer at most {int(soft_max_hops_hint)} nodes; decompositions with more nodes are penalized."
         )
-    if hard_max_hops_hint is not None:
-        hop_lines.append(
-            f"- Dependency depth above {int(hard_max_hops_hint)} may be truncated."
-        )
-    hop_contract = "\n".join(hop_lines)
-    if hop_contract:
-        hop_contract += "\n"
+    node_budget_lines.append(f"- Hard node cap: at most {max_nodes} nodes.")
+    node_budget_contract = "\n".join(node_budget_lines)
+    if node_budget_contract:
+        node_budget_contract += "\n"
     return (
         f"{DECOMPOSER_SYSTEM_PROMPT}\n\n"
         "OUTPUT CONTRACT:\n"
@@ -220,8 +227,7 @@ def render_decomposer_prompt(
         "</decomposition_plan>\n"
         "- Every NODE_ID must be followed by exactly one INSTRUCTION, one DEPENDENCIES, one REQUIRED_SKILLS, and one OUTPUT_KEY line.\n"
         f"- Allowed node IDs: {allowed_node_ids}.\n"
-        f"- Use at most {max_nodes} nodes. Prefer the shortest valid decomposition.\n"
-        f"{hop_contract}"
+        f"{node_budget_contract}"
         "- Allowed dependency tokens: `none` or comma-separated node IDs from the allowed set.\n"
         f"- REQUIRED_SKILLS must use only these abstract tags: {skill_tags}.\n"
         "- Use `none` if a node does not need a specific skill tag.\n"
@@ -262,16 +268,15 @@ def render_selector_prompt(
             f"{worker_index}: {worker.worker_id} | skills={skills} | success={success_rate:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
         )
 
+    selector_skeleton = render_selector_output_skeleton(ordered_node_ids, len(worker_pool.workers))
     allowed_worker_indices = ", ".join(str(index) for index in range(1, len(worker_pool.workers) + 1))
     return (
         f"{SELECTOR_SYSTEM_PROMPT}\n\n"
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <selection_plan> block and nothing else.\n"
         "- Use this exact skeleton:\n"
-        "<selection_plan>\n"
-        "1: 2\n"
-        "2: 1\n"
-        "</selection_plan>\n"
+        f"{selector_skeleton}\n"
+        "- Treat the worker indices shown in the skeleton as format placeholders only; choose the actual best worker index for each node.\n"
         "- Use exactly one line per node in the form: `node_id: worker_index`.\n"
         "- The left side is the numeric node ID from NODES_BY_ID.\n"
         "- The right side is the worker index from WORKERS_BY_INDEX.\n"

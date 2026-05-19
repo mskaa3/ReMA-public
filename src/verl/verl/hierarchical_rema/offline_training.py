@@ -8,7 +8,10 @@ import random
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import TYPE_CHECKING, Dict, Sequence
+
+if TYPE_CHECKING:
+    import torch
 
 from .controller_data import ControllerReplaySample, load_samples_from_jsonl
 
@@ -446,7 +449,7 @@ def _sequence_log_probs(logits, labels):
     return gathered
 
 
-def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_size: int, device) -> Dict[int, "torch.Tensor"]:
+def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_size: int, device) -> Dict[int, torch.Tensor]:
     from torch.utils.data import DataLoader
 
     dataloader = DataLoader(
@@ -455,7 +458,7 @@ def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_s
         shuffle=False,
         collate_fn=_collate_rows,
     )
-    cached: Dict[int, "torch.Tensor"] = {}
+    cached: Dict[int, torch.Tensor] = {}
     model.eval()
     with _lazy_torch().no_grad():
         for batch in dataloader:

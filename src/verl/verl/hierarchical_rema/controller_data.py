@@ -5,7 +5,7 @@ import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .schema import TaskRollout
 

@@ -101,6 +101,7 @@ NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-3}
 NUM_SELECTIONS=${NUM_SELECTIONS:-2}
 SOFT_MAX_HOPS=${SOFT_MAX_HOPS:-5}
 HARD_MAX_HOPS=${HARD_MAX_HOPS:-8}
+MAX_NODES_PER_DECOMPOSITION=${MAX_NODES_PER_DECOMPOSITION:-$HARD_MAX_HOPS}
 SOFT_HOP_PENALTY=${SOFT_HOP_PENALTY:-0.1}
 
 # Frequently adjusted: generation budget / decoding.
@@ -964,6 +965,7 @@ python3 -m hierarchical_rema.demo \
   --worker-base-model-path ${WORKER_BASE_MODEL_PATH} \
   --num-decompositions ${NUM_DECOMPOSITIONS} \
   --num-selections ${NUM_SELECTIONS} \
+  --max-nodes-per-decomposition ${MAX_NODES_PER_DECOMPOSITION} \
   --soft-max-hops ${SOFT_MAX_HOPS} \
   --hard-max-hops ${HARD_MAX_HOPS} \
   --soft-hop-penalty ${SOFT_HOP_PENALTY} \
@@ -1030,6 +1032,7 @@ python3 -m hierarchical_rema.train \
   --worker-base-model-path ${WORKER_BASE_MODEL_PATH} \
   --num-decompositions ${NUM_DECOMPOSITIONS} \
   --num-selections ${NUM_SELECTIONS} \
+  --max-nodes-per-decomposition ${MAX_NODES_PER_DECOMPOSITION} \
   --soft-max-hops ${SOFT_MAX_HOPS} \
   --hard-max-hops ${HARD_MAX_HOPS} \
   --soft-hop-penalty ${SOFT_HOP_PENALTY} \

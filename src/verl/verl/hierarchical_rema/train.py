@@ -9,7 +9,7 @@ import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 from .backends import MockHierarchicalBackend, RayVLLMHierarchicalBackend, TransformersHierarchicalBackend
 from .controller_data import controller_samples_from_task_rollouts, write_samples_to_jsonl
@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-base-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
+    parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
     parser.add_argument("--soft-hop-penalty", type=float, default=0.1)
@@ -1328,9 +1329,15 @@ def main() -> None:
             max_tasks=args.max_val_tasks,
         )
     worker_pool = make_worker_pool(base_model_path=args.worker_base_model_path)
+    max_nodes_per_decomposition = (
+        args.max_nodes_per_decomposition
+        if args.max_nodes_per_decomposition is not None
+        else (args.hard_max_hops if args.hard_max_hops is not None else 4)
+    )
     base_rollout_config = RolloutConfig(
         num_decompositions=args.num_decompositions,
         num_selections_per_decomposition=args.num_selections,
+        max_nodes_per_decomposition=max_nodes_per_decomposition,
         soft_max_hops=args.soft_max_hops,
         hard_max_hops=args.hard_max_hops,
         soft_hop_penalty=args.soft_hop_penalty,
