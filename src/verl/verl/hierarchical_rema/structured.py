@@ -163,6 +163,43 @@ def _normalize_required_skills(raw_value: Any) -> List[str]:
     return normalized
 
 
+_GENERIC_FINAL_ANSWER_PATTERNS: tuple[str, ...] = (
+    "return the final answer",
+    "provide the final answer",
+    "give the final answer",
+    "state the final answer",
+    "best final answer",
+)
+
+
+def _is_generic_final_answer_instruction(instruction: str) -> bool:
+    normalized = " ".join(str(instruction or "").strip().lower().split())
+    return any(pattern in normalized for pattern in _GENERIC_FINAL_ANSWER_PATTERNS)
+
+
+def _infer_required_skills_from_instruction(instruction: str) -> List[str]:
+    text = " ".join(str(instruction or "").strip().lower().split())
+    if not text or _is_generic_final_answer_instruction(text):
+        return []
+
+    keyword_groups: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("trigonometry", ("sin", "cos", "tan", "trig", "angle", "radian")),
+        ("geometry", ("triangle", "circle", "radius", "diameter", "polygon", "coordinate", "line segment")),
+        ("calculus", ("derivative", "integral", "differentiate", "integrate", "limit")),
+        ("analysis", ("range", "interval", "monotonic", "extrema", "check if", "verify", "identify")),
+        ("probability", ("probability", "expected value", "odds")),
+        ("combinatorics", ("count", "number of ways", "choose", "combination", "permutation", "ordered triple", "subset")),
+        ("number_theory", ("mod", "modulo", "divisible", "prime", "gcd", "lcm", "remainder", "parity")),
+        ("algebra", ("equation", "solve", "isolate", "factor", "expand", "polynomial", "variable", "substitute")),
+        ("simplification", ("simplify", "rewrite", "reduce")),
+        ("arithmetic", ("compute", "calculate", "evaluate", "ceiling", "floor", "sum", "product", "integer", "fraction", "decimal")),
+    )
+    for skill_tag, keywords in keyword_groups:
+        if any(keyword in text for keyword in keywords):
+            return [skill_tag]
+    return []
+
+
 def _extract_int_list(raw_value: Any) -> List[int]:
     if raw_value is None:
         return []
@@ -558,6 +595,8 @@ def validate_decomposition_payload(
         required_skills = _normalize_required_skills(
             node_payload.get("required_skills")
         )
+        if not required_skills:
+            required_skills = _infer_required_skills_from_instruction(instruction)
         output_key = str(node_payload.get("output_key") or f"{node_id}_output")
         nodes.append(
             SubtaskNode(
@@ -579,6 +618,21 @@ def validate_decomposition_payload(
         final_node_id=final_node_id,
     )
     candidate.topological_order()
+
+    declared_final_node_id = nodes[-1].node_id
+    if candidate.final_node_id != declared_final_node_id:
+        raise StructuredOutputError(
+            f"FINAL_NODE_ID must match the last declared NODE_ID ('{declared_final_node_id}')"
+        )
+
+    downstream_dependencies = {
+        dependency
+        for node in nodes
+        for dependency in node.dependencies
+    }
+    if candidate.final_node_id in downstream_dependencies:
+        raise StructuredOutputError("FINAL_NODE_ID must be a sink node with no downstream dependents")
+
     return apply_decomposition_limits(candidate, rollout_config)
 
 
