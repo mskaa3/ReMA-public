@@ -158,7 +158,7 @@ def _try_complete_partial_selection_candidate(
                 return None
             node_index = node_index_candidates[0]
             if node_index <= 0 or node_index > len(ordered_node_ids):
-                return None
+                continue
             node_id = ordered_node_ids[node_index - 1]
 
         if worker_id not in valid_worker_ids:
@@ -173,7 +173,7 @@ def _try_complete_partial_selection_candidate(
             worker_id = ordered_worker_ids[worker_index - 1]
 
         if node_id in seen_node_ids:
-            return None
+            continue
 
         seen_node_ids.add(node_id)
         normalized_assignments.append(
@@ -186,6 +186,9 @@ def _try_complete_partial_selection_candidate(
                 "compatibility": assignment_payload.get("compatibility", 0.0),
             }
         )
+
+    if not normalized_assignments:
+        return None
 
     missing_node_ids = [node_id for node_id in ordered_node_ids if node_id not in seen_node_ids]
     if not missing_node_ids:

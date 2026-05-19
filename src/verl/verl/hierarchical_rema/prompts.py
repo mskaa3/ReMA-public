@@ -40,27 +40,6 @@ REQUIRED_SKILLS: arithmetic
 </decomposition_plan>"""
 
 
-SELECTOR_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
-EXAMPLE_NODES_BY_ID:
-1: deps=none | skills=algebra | output=rewritten_equation | instruction=rewrite the equation into a simpler algebraic form
-2: deps=1 | skills=arithmetic | output=numeric_constant | instruction=simplify the numeric side exactly
-3: deps=1 | skills=analysis | output=constraint_check | instruction=check the domain or sign constraints implied by the equation
-4: deps=2,3 | skills=algebra | output=final_answer | instruction=solve for the final answer using the earlier results
-EXAMPLE_WORKERS_BY_INDEX:
-1: arithmetic_prealgebra_worker | skills=arithmetic,prealgebra,fractions,simplification | success=0.72 | avg_reward=0.44 | desc=Exact arithmetic, fractions, ratios, and simplification specialist.
-2: algebra_symbolic_worker | skills=algebra,symbolic_manipulation,equations,polynomials | success=0.81 | avg_reward=0.57 | desc=Equation solving and symbolic algebra specialist.
-3: geometry_trigonometry_worker | skills=geometry,trigonometry,coordinate_geometry | success=0.53 | avg_reward=0.31 | desc=Geometry, trigonometry, and coordinate methods specialist.
-4: calculus_analysis_worker | skills=analysis,calculus,functions,limits | success=0.69 | avg_reward=0.46 | desc=Calculus, limits, and function analysis specialist.
-5: discrete_number_theory_worker | skills=combinatorics,probability,number_theory,discrete_math | success=0.61 | avg_reward=0.37 | desc=Counting, probability, and number theory specialist.
-EXAMPLE_OUTPUT:
-<selection_plan>
-1: 2
-2: 1
-3: 4
-4: 2
-</selection_plan>"""
-
-
 WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
 NODE_INSTRUCTION: compute the value of x and return the final answer
 FINAL_NODE: yes
@@ -296,7 +275,6 @@ def render_selector_prompt(
         "- Prefer the worker whose skills and past performance best match each node.\n"
         "- Do not repeat the task, decomposition, or worker descriptions in the output.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
-        f"{SELECTOR_ONE_SHOT_EXAMPLE}\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         f"FINAL_NODE_ID: {decomposition.final_node_id}\n"
