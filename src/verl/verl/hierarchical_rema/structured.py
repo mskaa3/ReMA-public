@@ -624,16 +624,26 @@ def validate_decomposition_payload(
         for node in nodes
         for dependency in node.dependencies
     }
-    if raw_candidate.final_node_id in downstream_dependencies:
-        raise StructuredOutputError("FINAL_NODE_ID must be a sink node with no downstream dependents")
+    node_ids = {node.node_id for node in nodes}
+    sink_node_ids = [node.node_id for node in nodes if node.node_id not in downstream_dependencies]
+    if not sink_node_ids:
+        raise StructuredOutputError("Decomposition must contain at least one terminal sink node")
 
-    if raw_candidate.final_node_id not in {node.node_id for node in nodes}:
-        raise StructuredOutputError(
-            f"FINAL_NODE_ID '{raw_candidate.final_node_id}' is not part of the decomposition"
-        )
+    resolved_final_node_id = raw_candidate.final_node_id
+    if resolved_final_node_id not in node_ids or resolved_final_node_id in downstream_dependencies:
+        preferred_sink_ids = [
+            node.node_id
+            for node in nodes
+            if node.node_id in sink_node_ids and _is_generic_final_answer_instruction(node.instruction)
+        ]
+        if preferred_sink_ids:
+            resolved_final_node_id = preferred_sink_ids[-1]
+        else:
+            declared_sink_ids = [node.node_id for node in nodes if node.node_id in sink_node_ids]
+            resolved_final_node_id = declared_sink_ids[-1]
 
-    canonical_order = [node_id for node_id in raw_order if node_id != raw_candidate.final_node_id]
-    canonical_order.append(raw_candidate.final_node_id)
+    canonical_order = [node_id for node_id in raw_order if node_id != resolved_final_node_id]
+    canonical_order.append(resolved_final_node_id)
 
     remapped_node_ids = {
         original_node_id: str(index)
@@ -661,7 +671,7 @@ def validate_decomposition_payload(
         decomposition_id=decomposition_id,
         summary=summary,
         nodes=canonical_nodes,
-        final_node_id=remapped_node_ids[raw_candidate.final_node_id],
+        final_node_id=remapped_node_ids[resolved_final_node_id],
     )
     candidate.topological_order()
 

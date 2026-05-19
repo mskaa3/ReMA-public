@@ -966,7 +966,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             print(
                 f"[hierarchical-rema][generation-repair] role=decomposer "
                 f"model={model_path}{repair_position} "
-                "exhausted_attempts=true"
+                f"exhausted_attempts=true last_error={errors[-1] if errors else 'unknown'}"
             )
         candidate = build_fallback_decomposition(
             task_id=task.task_id,
