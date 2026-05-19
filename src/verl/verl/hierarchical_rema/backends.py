@@ -813,7 +813,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     f"Error: {exc}\nReturn ONLY the corrected <decomposition_plan> block. "
                     "Do not add commentary, bullets, or repeated task text. "
                     "Every node must include NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, and OUTPUT_KEY. "
-                    "Use only allowed numeric node IDs (1, 2, ...). "
+                    "Use only allowed numeric node IDs (1, 2, ...), declared contiguously in order. "
+                    "Dependencies may only reference earlier declared NODE_ID values. "
                     "Use `none` for REQUIRED_SKILLS only on pure routing or final-answer wrapper nodes. "
                     "FINAL_NODE_ID must match the last declared node and that node must be the terminal final-answer node."
                 )

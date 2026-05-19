@@ -608,6 +608,25 @@ def validate_decomposition_payload(
             )
         )
 
+    declared_node_ids = [node.node_id for node in nodes]
+    expected_node_ids = [str(index) for index in range(1, len(nodes) + 1)]
+    if declared_node_ids != expected_node_ids:
+        raise StructuredOutputError(
+            "NODE_ID values must be contiguous numeric IDs declared in order: "
+            + ", ".join(expected_node_ids)
+        )
+
+    node_position = {node.node_id: index for index, node in enumerate(nodes)}
+    for node in nodes:
+        for dependency in node.dependencies:
+            dependency_position = node_position.get(dependency)
+            if dependency_position is None:
+                continue
+            if dependency_position >= node_position[node.node_id]:
+                raise StructuredOutputError(
+                    f"Node {node.node_id} depends on '{dependency}', but dependencies must reference earlier declared NODE_ID values"
+                )
+
     if not final_node_id:
         final_node_id = nodes[-1].node_id
 
