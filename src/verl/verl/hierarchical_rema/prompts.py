@@ -33,12 +33,10 @@ NODE_ID: 1
 INSTRUCTION: rearrange the equation to isolate the variable term
 DEPENDENCIES: none
 REQUIRED_SKILLS: algebra
-OUTPUT_KEY: isolated_equation
 NODE_ID: 2
 INSTRUCTION: compute the value of x and return the final answer
 DEPENDENCIES: 1
 REQUIRED_SKILLS: arithmetic
-OUTPUT_KEY: final_answer
 </decomposition_plan>"""
 
 
@@ -217,7 +215,7 @@ def render_decomposer_prompt(
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <decomposition_plan> block and nothing else.\n"
         "- Allowed field keys: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
-        "- Use this exact skeleton:\n"
+        "- Use this compact skeleton:\n"
         "<decomposition_plan>\n"
         "SUMMARY: short summary\n"
         "FINAL_NODE_ID: 2\n"
@@ -225,25 +223,26 @@ def render_decomposer_prompt(
         "INSTRUCTION: short instruction\n"
         "DEPENDENCIES: none\n"
         "REQUIRED_SKILLS: algebra\n"
-        "OUTPUT_KEY: partial_result\n"
         "NODE_ID: 2\n"
         "INSTRUCTION: produce the final answer\n"
         "DEPENDENCIES: 1\n"
         "REQUIRED_SKILLS: analysis\n"
-        "OUTPUT_KEY: final_answer\n"
         "</decomposition_plan>\n"
-        "- Every NODE_ID must be followed by exactly one INSTRUCTION, one DEPENDENCIES, one REQUIRED_SKILLS, and one OUTPUT_KEY line.\n"
+        "- Every NODE_ID must be followed by exactly one INSTRUCTION line.\n"
+        "- Include one DEPENDENCIES line per node.\n"
+        "- REQUIRED_SKILLS is strongly preferred for substantive nodes, but omit it rather than inventing a bad skill tag.\n"
+        "- OUTPUT_KEY is optional and only for readability; it is not required for execution.\n"
         f"- Allowed node IDs: {allowed_node_ids}.\n"
-        "- Use contiguous numeric NODE_ID values in declaration order: 1, 2, ..., N.\n"
+        "- Prefer contiguous numeric NODE_ID values in declaration order: 1, 2, ..., N.\n"
         f"{node_budget_contract}"
         "- Allowed dependency tokens: `none` or comma-separated node IDs from the allowed set.\n"
-        "- Dependencies must reference only earlier declared NODE_ID values.\n"
-        f"- REQUIRED_SKILLS must use only these abstract tags: {skill_tags}.\n"
-        "- Use `none` only for pure routing or final-answer wrapper nodes; for substantive math steps choose at least one concrete REQUIRED_SKILLS tag.\n"
+        "- Prefer dependencies that reference earlier NODE_ID values.\n"
+        f"- When present, REQUIRED_SKILLS should use only these abstract tags: {skill_tags}.\n"
+        "- Use `none` only for pure routing or final-answer wrapper nodes; for substantive math steps prefer at least one concrete REQUIRED_SKILLS tag.\n"
         "- Do not tailor the decomposition to a particular worker roster.\n"
         "- Use a DAG, not a linear chain unless the task truly requires one.\n"
-        "- Use short node instructions, short summaries, and short snake_case OUTPUT_KEY values.\n"
-        "- The final node must produce the final answer, be the last declared NODE_ID, and have no downstream dependents.\n"
+        "- Use short node instructions and short summaries.\n"
+        "- The final node should produce the final answer and be a terminal sink node.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"{DECOMPOSER_ONE_SHOT_EXAMPLE}\n\n"
         f"TASK_ID: {task.task_id}\n"
