@@ -239,6 +239,23 @@ def _normalize_node_id_token(raw_value: Any) -> str:
     return text
 
 
+def _normalize_placeholder_token(raw_value: Any) -> str:
+    text = str(raw_value or "").strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+
+def _is_placeholder_selection_assignment(raw_node_value: Any, raw_worker_value: Any) -> bool:
+    node_token = _normalize_placeholder_token(raw_node_value)
+    worker_token = _normalize_placeholder_token(raw_worker_value)
+    return node_token in {"node_id", "node_index", "node"} and worker_token in {
+        "worker_id",
+        "worker_index",
+        "worker",
+    }
+
+
 def _next_numeric_node_id(nodes: Sequence[SubtaskNode]) -> str:
     numeric_ids = [
         int(normalized)
@@ -399,11 +416,15 @@ def _parse_selection_plan(text: str) -> Dict[str, Any]:
             compatibility = float(compatibility_raw) if compatibility_raw is not None else 0.0
         except ValueError:
             compatibility = 0.0
+        raw_node_id = match.group("node_id").strip()
+        raw_worker_id = match.group("worker_id").strip()
+        if _is_placeholder_selection_assignment(raw_node_id, raw_worker_id):
+            continue
         rationale = (match.group("rationale") or "Selected for this node.").strip()
         payload["assignments"].append(
             {
-                "node_id": match.group("node_id").strip(),
-                "worker_id": match.group("worker_id").strip(),
+                "node_id": raw_node_id,
+                "worker_id": raw_worker_id,
                 "compatibility": compatibility,
                 "rationale": rationale,
             }

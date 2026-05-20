@@ -265,6 +265,7 @@ def render_selector_prompt(
         f"{selector_skeleton}\n"
         "- Treat the worker indices shown in the skeleton as format placeholders only; choose the actual best worker index for each node.\n"
         "- Use exactly one line per node in the form: `node_id: worker_index`.\n"
+        "- Never output the literal placeholder/header row `node_id: worker_index`; every line must use a real numeric node ID and a real worker index.\n"
         "- The left side is the numeric node ID from NODES_BY_ID.\n"
         "- The right side is the worker index from WORKERS_BY_INDEX.\n"
         "- Assign exactly one worker to each node ID from the decomposition.\n"

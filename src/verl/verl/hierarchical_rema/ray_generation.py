@@ -302,6 +302,11 @@ class RayVLLMGenerationManager:
     ) -> _RayBundle:
         self._require_runtime()
         self._ensure_ray_initialized()
+        build_started_at = time.monotonic()
+        print(
+            f"[hierarchical-rema][ray-generation] event=bundle_build_start "
+            f"model={Path(key.model_path).name} response_length={key.bundle_response_length}"
+        )
 
         import ray
         from omegaconf import OmegaConf
@@ -359,7 +364,19 @@ class RayVLLMGenerationManager:
             resource_pool=resource_pool,
             ray_cls_with_init=ray_cls_with_init,
         )
+        init_started_at = time.monotonic()
+        print(
+            f"[hierarchical-rema][ray-generation] event=bundle_init_start "
+            f"model={Path(key.model_path).name} response_length={key.bundle_response_length}"
+        )
         worker_group.init_model()
+        init_elapsed = time.monotonic() - init_started_at
+        total_elapsed = time.monotonic() - build_started_at
+        print(
+            f"[hierarchical-rema][ray-generation] event=bundle_build_done "
+            f"model={Path(key.model_path).name} response_length={key.bundle_response_length} "
+            f"init_elapsed_s={init_elapsed:.1f} total_elapsed_s={total_elapsed:.1f}"
+        )
         return _RayBundle(
             key=key,
             local_model_path=local_model_path,
@@ -400,13 +417,26 @@ class RayVLLMGenerationManager:
         )
         cached = self._bundle_cache.pop(key, None)
         if cached is not None:
+            print(
+                f"[hierarchical-rema][ray-generation] event=bundle_cache_hit "
+                f"model={Path(model_path).name} response_length={key.bundle_response_length}"
+            )
             self._bundle_cache[key] = cached
             return cached
 
+        print(
+            f"[hierarchical-rema][ray-generation] event=bundle_cache_miss "
+            f"model={Path(model_path).name} response_length={key.bundle_response_length}"
+        )
         bundle = self._build_bundle(key)
         self._bundle_cache[key] = bundle
         while len(self._bundle_cache) > self._max_cached_bundles():
             _, stale_bundle = self._bundle_cache.popitem(last=False)
+            print(
+                f"[hierarchical-rema][ray-generation] event=bundle_evict "
+                f"model={Path(stale_bundle.key.model_path).name} "
+                f"response_length={stale_bundle.key.bundle_response_length}"
+            )
             self._close_bundle(stale_bundle)
         return bundle
 

@@ -367,6 +367,11 @@ class HierarchicalReMAOrchestrator:
                 break
 
             frontier_step += 1
+            print(
+                f"[hierarchical-rema][rollout] stage=workers_dispatch "
+                f"{progress_suffix.lstrip()} frontier={frontier_step}/{max_frontier_steps} "
+                f"requests={len(worker_requests)}"
+            )
             worker_executions = self.backend.execute_workers_batch(worker_requests)
             for state, execution in zip(request_states, worker_executions):
                 state.executions.append(execution)

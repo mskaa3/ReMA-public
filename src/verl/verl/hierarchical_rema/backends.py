@@ -118,6 +118,7 @@ def _try_complete_partial_selection_candidate(
     valid_node_ids = set(ordered_node_ids)
     ordered_worker_ids = [worker.worker_id for worker in worker_pool.workers]
     valid_worker_ids = set(ordered_worker_ids)
+    node_map = decomposition.nodes_by_id()
 
     def _normalize_numeric_token(raw_value: Any) -> str:
         text = str(raw_value or "").strip()
@@ -145,38 +146,72 @@ def _try_complete_partial_selection_candidate(
             return values
         return [int(token) for token in re.findall(r"\d+", str(raw_value)) if int(token) > 0]
 
+    def _normalize_placeholder_token(raw_value: Any) -> str:
+        text = str(raw_value or "").strip().lower()
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+    def _is_placeholder_assignment(raw_node_value: Any, raw_worker_value: Any) -> bool:
+        node_token = _normalize_placeholder_token(raw_node_value)
+        worker_token = _normalize_placeholder_token(raw_worker_value)
+        return node_token in {"node_id", "node_index", "node"} and worker_token in {
+            "worker_id",
+            "worker_index",
+            "worker",
+        }
+
+    def _best_worker_id_for_node(node_id: str) -> str:
+        node = node_map[node_id]
+        _, best_worker = max(
+            enumerate(worker_pool.workers),
+            key=lambda item: (
+                compatibility_score(node.required_skills, item[1], worker_performance),
+                -item[0],
+            ),
+        )
+        return best_worker.worker_id
+
     normalized_assignments: List[Dict[str, Any]] = []
     seen_node_ids = set()
     for assignment_payload in assignments_payload:
         if not isinstance(assignment_payload, dict):
-            return None
-        node_id = _normalize_numeric_token(assignment_payload.get("node_id"))
-        worker_id = str(assignment_payload.get("worker_id") or "").strip()
+            continue
+
+        raw_node_id = assignment_payload.get("node_id")
+        raw_worker_id = assignment_payload.get("worker_id")
+        if _is_placeholder_assignment(raw_node_id, raw_worker_id):
+            continue
+
+        node_id = _normalize_numeric_token(raw_node_id)
+        worker_id = str(raw_worker_id or "").strip()
 
         if node_id not in valid_node_ids:
             node_index_candidates = _extract_positive_ints(assignment_payload.get("node_index"))
             if node_id.isdigit():
                 node_index_candidates.extend(_extract_positive_ints(node_id))
             if not node_index_candidates:
-                return None
+                continue
             node_index = node_index_candidates[0]
             if node_index <= 0 or node_index > len(ordered_node_ids):
                 continue
             node_id = ordered_node_ids[node_index - 1]
 
+        if node_id in seen_node_ids:
+            continue
+
         if worker_id not in valid_worker_ids:
             worker_index_candidates = _extract_positive_ints(assignment_payload.get("worker_index"))
             if worker_id.isdigit():
                 worker_index_candidates.extend(_extract_positive_ints(worker_id))
-            if not worker_index_candidates:
-                return None
-            worker_index = worker_index_candidates[0]
-            if worker_index <= 0 or worker_index > len(ordered_worker_ids):
-                return None
-            worker_id = ordered_worker_ids[worker_index - 1]
-
-        if node_id in seen_node_ids:
-            continue
+            if worker_index_candidates:
+                worker_index = worker_index_candidates[0]
+                if 0 < worker_index <= len(ordered_worker_ids):
+                    worker_id = ordered_worker_ids[worker_index - 1]
+                else:
+                    worker_id = _best_worker_id_for_node(node_id)
+            else:
+                worker_id = _best_worker_id_for_node(node_id)
 
         seen_node_ids.add(node_id)
         normalized_assignments.append(
@@ -194,23 +229,11 @@ def _try_complete_partial_selection_candidate(
         return None
 
     missing_node_ids = [node_id for node_id in ordered_node_ids if node_id not in seen_node_ids]
-    if not missing_node_ids:
-        return None
-
-    node_map = decomposition.nodes_by_id()
     for missing_node_id in missing_node_ids:
-        node = node_map[missing_node_id]
-        _, best_worker = max(
-            enumerate(worker_pool.workers),
-            key=lambda item: (
-                compatibility_score(node.required_skills, item[1], worker_performance),
-                -item[0],
-            ),
-        )
         normalized_assignments.append(
             {
                 "node_id": missing_node_id,
-                "worker_id": best_worker.worker_id,
+                "worker_id": _best_worker_id_for_node(missing_node_id),
                 "rationale": "Auto-completed missing node assignment from partial selector output.",
                 "compatibility": 0.0,
             }
