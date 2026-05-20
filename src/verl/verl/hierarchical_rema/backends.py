@@ -101,12 +101,15 @@ def _canonicalize_selection_candidate(
 
 def _try_complete_partial_selection_candidate(
     *,
-    payload: Dict[str, Any],
+    payload: Dict[str, Any] | None,
     decomposition: DecompositionCandidate,
     worker_pool: WorkerPoolConfig,
     worker_performance: Dict[str, WorkerPerformanceSnapshot],
     fallback_id: str,
 ) -> SelectionCandidate | None:
+    if not isinstance(payload, dict):
+        return None
+
     assignments_payload = payload.get("assignments")
     if not isinstance(assignments_payload, list) or not assignments_payload:
         return None
@@ -219,6 +222,50 @@ def _try_complete_partial_selection_candidate(
     }
     return validate_selection_payload(
         payload=completed_payload,
+        decomposition=decomposition,
+        worker_pool=worker_pool,
+    )
+
+
+def _build_compatibility_fallback_selection_candidate(
+    *,
+    decomposition: DecompositionCandidate,
+    worker_pool: WorkerPoolConfig,
+    worker_performance: Dict[str, WorkerPerformanceSnapshot],
+    fallback_id: str,
+    raw_text: str,
+    error_message: str,
+) -> SelectionCandidate:
+    assignments_payload: List[Dict[str, Any]] = []
+    for node in decomposition.nodes:
+        _, best_worker = max(
+            enumerate(worker_pool.workers),
+            key=lambda item: (
+                compatibility_score(node.required_skills, item[1], worker_performance),
+                -item[0],
+            ),
+        )
+        assignments_payload.append(
+            {
+                "node_id": node.node_id,
+                "worker_id": best_worker.worker_id,
+                "rationale": "Fallback selection due to unparseable controller output.",
+                "compatibility": 0.0,
+            }
+        )
+
+    payload = {
+        "selection_id": fallback_id,
+        "assignments": assignments_payload,
+        "validation": {
+            "fallback_used": True,
+            "error": error_message,
+            "raw_text": raw_text,
+            "unparseable_batch_output": True,
+        },
+    }
+    return validate_selection_payload(
+        payload=payload,
         decomposition=decomposition,
         worker_pool=worker_pool,
     )
@@ -1366,29 +1413,30 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     )
                 except Exception:
                     first_pass_failure_count += 1
-                    partial_candidate = _try_complete_partial_selection_candidate(
-                        payload=payload,
-                        decomposition=request.decomposition,
-                        worker_pool=request.worker_pool,
-                        worker_performance=request.worker_performance,
-                        fallback_id=fallback_id,
-                    )
-                    if partial_candidate is not None:
-                        partial_candidate = _canonicalize_selection_candidate(
-                            candidate=partial_candidate,
+                    if payload is None:
+                        fallback_candidate = _build_compatibility_fallback_selection_candidate(
+                            decomposition=request.decomposition,
+                            worker_pool=request.worker_pool,
+                            worker_performance=request.worker_performance,
+                            fallback_id=fallback_id,
+                            raw_text=raw_text,
+                            error_message="Could not parse selector output",
+                        )
+                        fallback_candidate = _canonicalize_selection_candidate(
+                            candidate=fallback_candidate,
                             decomposition=request.decomposition,
                             worker_pool=request.worker_pool,
                             worker_performance=request.worker_performance,
                         )
                         candidate = self._set_selection_artifacts(
-                            candidate=partial_candidate,
+                            candidate=fallback_candidate,
                             prompt_text=prompt_text,
                             validation={
                                 "backend": self.backend_name,
                                 "attempt": 0,
                                 "errors_before_success": [],
-                                "fallback_used": False,
-                                "partial_completion_used": True,
+                                "fallback_used": True,
+                                "unparseable_batch_output": True,
                                 "raw_model_text": raw_text,
                                 "batch_generated": True,
                                 "batch_repair_fallback": True,
@@ -1399,28 +1447,61 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         )
                         local_completion_count += 1
                     else:
-                        model_repair_count += 1
-                        candidate = self._generate_validated_selection(
-                            prompt_text=prompt_text,
-                            task=request.task,
+                        partial_candidate = _try_complete_partial_selection_candidate(
+                            payload=payload,
                             decomposition=request.decomposition,
                             worker_pool=request.worker_pool,
-                            policy_config=request.policy_config,
                             worker_performance=request.worker_performance,
                             fallback_id=fallback_id,
                         )
-                        candidate.raw_payload.setdefault("validation", {})
-                        candidate.raw_payload["validation"].update(
-                            {
-                                "batch_generated": True,
-                                "batch_repair_fallback": True,
-                            }
-                        )
-                        candidate.raw_text = self._format_selection_completion_text(
-                            candidate=candidate,
-                            decomposition=request.decomposition,
-                            worker_pool=request.worker_pool,
-                        )
+                        if partial_candidate is not None:
+                            partial_candidate = _canonicalize_selection_candidate(
+                                candidate=partial_candidate,
+                                decomposition=request.decomposition,
+                                worker_pool=request.worker_pool,
+                                worker_performance=request.worker_performance,
+                            )
+                            candidate = self._set_selection_artifacts(
+                                candidate=partial_candidate,
+                                prompt_text=prompt_text,
+                                validation={
+                                    "backend": self.backend_name,
+                                    "attempt": 0,
+                                    "errors_before_success": [],
+                                    "fallback_used": False,
+                                    "partial_completion_used": True,
+                                    "raw_model_text": raw_text,
+                                    "batch_generated": True,
+                                    "batch_repair_fallback": True,
+                                    "entropy": entropy,
+                                },
+                                decomposition=request.decomposition,
+                                worker_pool=request.worker_pool,
+                            )
+                            local_completion_count += 1
+                        else:
+                            model_repair_count += 1
+                            candidate = self._generate_validated_selection(
+                                prompt_text=prompt_text,
+                                task=request.task,
+                                decomposition=request.decomposition,
+                                worker_pool=request.worker_pool,
+                                policy_config=request.policy_config,
+                                worker_performance=request.worker_performance,
+                                fallback_id=fallback_id,
+                            )
+                            candidate.raw_payload.setdefault("validation", {})
+                            candidate.raw_payload["validation"].update(
+                                {
+                                    "batch_generated": True,
+                                    "batch_repair_fallback": True,
+                                }
+                            )
+                            candidate.raw_text = self._format_selection_completion_text(
+                                candidate=candidate,
+                                decomposition=request.decomposition,
+                                worker_pool=request.worker_pool,
+                            )
                 results[result_index] = candidate
             if first_pass_failure_count:
                 print(
