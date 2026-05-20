@@ -1041,6 +1041,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         policy_config: ControllerPolicyConfig,
         worker_performance: Dict[str, WorkerPerformanceSnapshot],
         fallback_id: str,
+        repair_progress: Tuple[int, int] | None = None,
     ) -> SelectionCandidate:
         del task
         model_path = policy_config.model_for_role("selector")
@@ -1050,12 +1051,21 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         repair_prompt = prompt_text
         errors: List[str] = []
         last_raw_text = ""
+        repair_position = ""
+        if repair_progress is not None:
+            repair_position = f" item={repair_progress[0]}/{repair_progress[1]}"
         selector_skeleton = render_selector_output_skeleton(
             [node.node_id for node in decomposition.nodes],
             len(worker_pool.workers),
         )
         for attempt in range(self.config.max_format_retries + 1):
             payload: Dict[str, Any] | None = None
+            if repair_progress is not None:
+                print(
+                    f"[hierarchical-rema][generation-repair] role=selector "
+                    f"model={model_path}{repair_position} "
+                    f"attempt={attempt + 1}/{self.config.max_format_retries + 1}"
+                )
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
@@ -1136,6 +1146,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     "choose the actual best valid worker index for each node."
                 )
 
+        if repair_progress is not None:
+            print(
+                f"[hierarchical-rema][generation-repair] role=selector "
+                f"model={model_path}{repair_position} "
+                f"exhausted_attempts=true last_error={errors[-1] if errors else 'unknown'}"
+            )
         candidate = build_fallback_selection(
             decomposition=decomposition,
             worker_pool=worker_pool,
@@ -1481,6 +1497,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             local_completion_count += 1
                         else:
                             model_repair_count += 1
+                            if self._should_log_repair_progress(model_repair_count, len(grouped_requests)):
+                                print(
+                                    f"[hierarchical-rema][generation-repair] role=selector "
+                                    f"model={model_path} "
+                                    f"start_item={model_repair_count}/{len(grouped_requests)}"
+                                )
                             candidate = self._generate_validated_selection(
                                 prompt_text=prompt_text,
                                 task=request.task,
@@ -1489,7 +1511,14 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                                 policy_config=request.policy_config,
                                 worker_performance=request.worker_performance,
                                 fallback_id=fallback_id,
+                                repair_progress=(model_repair_count, len(grouped_requests)),
                             )
+                            if self._should_log_repair_progress(model_repair_count, len(grouped_requests)):
+                                print(
+                                    f"[hierarchical-rema][generation-repair] role=selector "
+                                    f"model={model_path} "
+                                    f"done_item={model_repair_count}/{len(grouped_requests)}"
+                                )
                             candidate.raw_payload.setdefault("validation", {})
                             candidate.raw_payload["validation"].update(
                                 {
