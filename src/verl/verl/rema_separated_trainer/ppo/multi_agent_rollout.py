@@ -802,7 +802,8 @@ class MultiAgentRollout:
                     current_plan[idx], selector_output_by_idx[idx], worker_results[idx],
                     output, worker_roles)
 
-                if finish_flag and finish_flag in output:
+                finalizer_has_answer = "\\boxed" in output
+                if (finish_flag and finish_flag in output) or finalizer_has_answer:
                     finish_flags[idx] = True
                     finish_reason[idx] = None
                 if self.config.stop_when_truncated and finalizer_stops[local_idx] == "length":
