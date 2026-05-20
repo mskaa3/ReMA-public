@@ -177,10 +177,14 @@ def _init_distributed_training() -> DistributedTrainingContext:
 def _destroy_distributed_training(context: DistributedTrainingContext) -> None:
     if not context.enabled:
         return
+    torch = _lazy_torch()
     import torch.distributed as dist
 
     if dist.is_initialized():
-        dist.barrier()
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
         dist.destroy_process_group()
 
 

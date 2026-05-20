@@ -72,6 +72,15 @@ def get_sharding_strategy(device_mesh):
     return sharding_strategy
 
 
+def _distributed_barrier() -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    if torch.distributed.get_backend() == "nccl" and torch.cuda.is_available():
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        torch.distributed.barrier()
+
+
 class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -249,7 +258,7 @@ class ActorRolloutRefWorker(Worker):
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={'use_reentrant': False})
-        torch.distributed.barrier()
+        _distributed_barrier()
 
         if self.rank == 0:
             print_model_size(actor_module)
@@ -780,7 +789,7 @@ class ActorRolloutRefWorker(Worker):
             global_step=global_step,
             remove_previous_ckpt=remove_previous_ckpt)
 
-        torch.distributed.barrier()
+        _distributed_barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
@@ -1108,7 +1117,7 @@ class CriticWorker(Worker):
             global_step=global_step,
             remove_previous_ckpt=remove_previous_ckpt)
 
-        torch.distributed.barrier()
+        _distributed_barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
 
@@ -1126,7 +1135,7 @@ class CriticWorker(Worker):
             hdfs_path=hdfs_path,
             del_local_after_load=del_local_after_load)
 
-        torch.distributed.barrier()
+        _distributed_barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
 
