@@ -204,6 +204,17 @@ def _all_reduce_mean(value: float, device, context: DistributedTrainingContext) 
     return float(tensor.item())
 
 
+def _all_reduce_sum(value: float, device, context: DistributedTrainingContext) -> float:
+    if not context.enabled:
+        return float(value)
+    torch = _lazy_torch()
+    import torch.distributed as dist
+
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
 def _load_scheduler_factory():
     _ensure_repo_root_on_path()
     try:
@@ -531,6 +542,54 @@ def _filter_batch_rows(batch: Dict, row_mask) -> Dict:
     return filtered
 
 
+def _selector_format_bucket(sample: ControllerReplaySample) -> str | None:
+    if sample.role != "selector":
+        return None
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    validation = metadata.get("format_validation")
+    if not isinstance(validation, dict):
+        return "clean"
+    if bool(validation.get("fallback_used")):
+        return "hard_fallback"
+
+    attempt_raw = validation.get("attempt", 0)
+    try:
+        attempt_count = max(int(attempt_raw), 0)
+    except (TypeError, ValueError):
+        attempt_count = 0
+
+    errors_before_success = validation.get("errors_before_success")
+    if isinstance(errors_before_success, list):
+        attempt_count = max(attempt_count, len(errors_before_success))
+
+    if attempt_count > 0:
+        return "model_repaired"
+    if bool(validation.get("partial_completion_used")):
+        return "locally_repaired"
+    return "clean"
+
+
+def _empty_selector_format_counts() -> Dict[str, int]:
+    return {
+        "clean": 0,
+        "locally_repaired": 0,
+        "model_repaired": 0,
+        "hard_fallback": 0,
+    }
+
+
+def _update_selector_format_counts(
+    counts: Dict[str, int],
+    *,
+    sample_indices,
+    samples: Sequence[ControllerReplaySample],
+) -> None:
+    for sample_index in sample_indices:
+        bucket = _selector_format_bucket(samples[int(sample_index)])
+        if bucket is not None:
+            counts[bucket] += 1
+
+
 def _all_finite(*tensors) -> bool:
     torch = _lazy_torch()
     return all(bool(torch.isfinite(tensor).all().item()) for tensor in tensors)
@@ -674,6 +733,7 @@ def run_offline_policy_training(
     skipped_non_finite_batches = 0
     optimizer.zero_grad(set_to_none=True)
     best_val_loss = None
+    step_selector_format_counts = _empty_selector_format_counts()
 
     for epoch in range(config.epochs):
         if train_sampler is not None:
@@ -686,6 +746,7 @@ def run_offline_policy_training(
             if not bool(valid_row_mask.any().item()):
                 skipped_empty_batches += 1
                 optimizer.zero_grad(set_to_none=True)
+                step_selector_format_counts = _empty_selector_format_counts()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping empty batch "
@@ -710,6 +771,7 @@ def run_offline_policy_training(
             if not _all_finite(outputs.logits):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
+                step_selector_format_counts = _empty_selector_format_counts()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping non-finite logits "
@@ -728,6 +790,7 @@ def run_offline_policy_training(
             if not _all_finite(token_log_probs, old_log_probs, advantages, loss_mask):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
+                step_selector_format_counts = _empty_selector_format_counts()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping non-finite batch tensors "
@@ -747,6 +810,7 @@ def run_offline_policy_training(
             if not _all_finite(pg_loss, clipfrac, approx_kl, clipfrac_lower, entropy, loss):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
+                step_selector_format_counts = _empty_selector_format_counts()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping non-finite objective "
@@ -756,6 +820,11 @@ def run_offline_policy_training(
                     )
                 continue
 
+            _update_selector_format_counts(
+                step_selector_format_counts,
+                sample_indices=batch["sample_index"],
+                samples=train_samples,
+            )
             loss = loss / max(config.grad_accum_steps, 1)
             loss.backward()
 
@@ -767,6 +836,7 @@ def run_offline_policy_training(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
+                selector_total_local = sum(step_selector_format_counts.values())
                 metrics = {
                     "step": global_step,
                     "epoch": epoch,
@@ -783,7 +853,23 @@ def run_offline_policy_training(
                     "entropy": _all_reduce_mean(float(entropy.detach().item()), device, distributed_context),
                     "clipfrac": _all_reduce_mean(float(clipfrac.detach().item()), device, distributed_context),
                     "clipfrac_lower": _all_reduce_mean(float(clipfrac_lower.detach().item()), device, distributed_context),
+                    "selector_samples_total": int(
+                        round(_all_reduce_sum(selector_total_local, device, distributed_context))
+                    ),
+                    "selector_samples_clean": int(
+                        round(_all_reduce_sum(step_selector_format_counts["clean"], device, distributed_context))
+                    ),
+                    "selector_samples_locally_repaired": int(
+                        round(_all_reduce_sum(step_selector_format_counts["locally_repaired"], device, distributed_context))
+                    ),
+                    "selector_samples_model_repaired": int(
+                        round(_all_reduce_sum(step_selector_format_counts["model_repaired"], device, distributed_context))
+                    ),
+                    "selector_samples_hard_fallback": int(
+                        round(_all_reduce_sum(step_selector_format_counts["hard_fallback"], device, distributed_context))
+                    ),
                 }
+                step_selector_format_counts = _empty_selector_format_counts()
                 if is_primary:
                     with metrics_log_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(metrics, sort_keys=True) + "\n")
@@ -800,7 +886,21 @@ def run_offline_policy_training(
                             f"{tracking_prefix}train/approx_kl": metrics["approx_kl"],
                             f"{tracking_prefix}train/entropy": metrics["entropy"],
                             f"{tracking_prefix}train/clipfrac": metrics["clipfrac"],
+                            f"{tracking_prefix}train/selector_samples_total": metrics["selector_samples_total"],
+                            f"{tracking_prefix}train/selector_samples_clean": metrics["selector_samples_clean"],
+                            f"{tracking_prefix}train/selector_samples_locally_repaired": metrics["selector_samples_locally_repaired"],
+                            f"{tracking_prefix}train/selector_samples_model_repaired": metrics["selector_samples_model_repaired"],
+                            f"{tracking_prefix}train/selector_samples_hard_fallback": metrics["selector_samples_hard_fallback"],
                         }
+                        selector_format_log = ""
+                        if metrics["selector_samples_total"] > 0:
+                            selector_format_log = (
+                                f" selector_samples={metrics['selector_samples_total']} "
+                                f"clean={metrics['selector_samples_clean']} "
+                                f"locally_repaired={metrics['selector_samples_locally_repaired']} "
+                                f"model_repaired={metrics['selector_samples_model_repaired']} "
+                                f"hard_fallback={metrics['selector_samples_hard_fallback']}"
+                            )
                         print(
                             f"[hierarchical-rema][grpo] step={global_step}/{total_update_steps} "
                             f"epoch={epoch + 1}/{config.epochs} "
@@ -808,6 +908,7 @@ def run_offline_policy_training(
                             f"mean_reward={metrics['mean_reward']:.4f} "
                             f"mean_advantage={metrics['mean_advantage']:.4f} "
                             f"approx_kl={metrics['approx_kl']:.6f}"
+                            f"{selector_format_log}"
                         )
                         if tracking is not None:
                             tracking.log(concise_metrics, step=log_step_offset + global_step)

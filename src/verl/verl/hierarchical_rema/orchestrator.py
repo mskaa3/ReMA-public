@@ -131,6 +131,15 @@ class HierarchicalReMAOrchestrator:
             penalty += self.selector_partial_completion_penalty
         return penalty
 
+    def _format_adjusted_reward(
+        self,
+        raw_reward: float,
+        payload: Dict[str, object],
+        *,
+        role: str,
+    ) -> float:
+        return raw_reward - self._controller_format_penalty(payload, role=role)
+
     def run_task(
         self,
         task: TaskExample,
@@ -249,14 +258,22 @@ class HierarchicalReMAOrchestrator:
                     selection_rollout_map[(task_index, decomposition_index, selection_index)]
                     for selection_index in range(num_selections)
                 ]
+                selection_training_rewards = [
+                    self._format_adjusted_reward(
+                        selection.reward.total_reward,
+                        selection.selection.raw_payload,
+                        role="selector",
+                    )
+                    for selection in selection_rollouts
+                ]
                 selection_advantages = group_relative_advantages(
-                    [selection.reward.total_reward for selection in selection_rollouts]
+                    selection_training_rewards
                 )
                 for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
                     selection_rollout.selector_advantage = advantage
 
                 base_decomposition_reward = sum(
-                    selection.reward.total_reward for selection in selection_rollouts
+                    selection_training_rewards
                 ) / max(len(selection_rollouts), 1)
                 decomposition_reward = base_decomposition_reward - decomposition.soft_penalty
                 decomposition_rollouts.append(
@@ -268,9 +285,15 @@ class HierarchicalReMAOrchestrator:
                     )
                 )
 
-            decomposition_advantages = group_relative_advantages(
-                [decomposition.decomposition_reward for decomposition in decomposition_rollouts]
-            )
+            decomposition_training_rewards = [
+                self._format_adjusted_reward(
+                    decomposition_rollout.decomposition_reward,
+                    decomposition_rollout.decomposition.raw_payload,
+                    role="decomposer",
+                )
+                for decomposition_rollout in decomposition_rollouts
+            ]
+            decomposition_advantages = group_relative_advantages(decomposition_training_rewards)
             for decomposition_rollout, advantage in zip(
                 decomposition_rollouts,
                 decomposition_advantages,
@@ -504,12 +527,13 @@ class HierarchicalReMAOrchestrator:
 
         if include_decomposer:
             for decomposition_rollout in decompositions:
-                format_penalty = self._controller_format_penalty(
+                adjusted_reward = self._format_adjusted_reward(
+                    decomposition_rollout.decomposition_reward,
                     decomposition_rollout.decomposition.raw_payload,
                     role="decomposer",
                 )
-                adjusted_reward = decomposition_rollout.decomposition_reward - format_penalty
-                adjusted_advantage = decomposition_rollout.decomposer_advantage - format_penalty
+                format_penalty = decomposition_rollout.decomposition_reward - adjusted_reward
+                adjusted_advantage = decomposition_rollout.decomposer_advantage
                 decomposer_samples.append(
                     ControllerTrainingSample(
                         role="decomposer",
@@ -523,7 +547,7 @@ class HierarchicalReMAOrchestrator:
                             "model_path": policy_config.model_for_role("decomposer"),
                             "parameter_sharing": policy_config.parameter_sharing,
                             "reward_before_format_penalty": decomposition_rollout.decomposition_reward,
-                            "advantage_before_format_penalty": decomposition_rollout.decomposer_advantage,
+                            "advantage_used_for_training": adjusted_advantage,
                             "format_penalty": format_penalty,
                             "format_validation": self._controller_validation_info(
                                 decomposition_rollout.decomposition.raw_payload
@@ -535,12 +559,13 @@ class HierarchicalReMAOrchestrator:
         if include_selector:
             for decomposition_rollout in decompositions:
                 for selection_rollout in decomposition_rollout.selections:
-                    format_penalty = self._controller_format_penalty(
+                    adjusted_reward = self._format_adjusted_reward(
+                        selection_rollout.reward.total_reward,
                         selection_rollout.selection.raw_payload,
                         role="selector",
                     )
-                    adjusted_reward = selection_rollout.reward.total_reward - format_penalty
-                    adjusted_advantage = selection_rollout.selector_advantage - format_penalty
+                    format_penalty = selection_rollout.reward.total_reward - adjusted_reward
+                    adjusted_advantage = selection_rollout.selector_advantage
                     selector_samples.append(
                         ControllerTrainingSample(
                             role="selector",
@@ -554,7 +579,7 @@ class HierarchicalReMAOrchestrator:
                                 "model_path": policy_config.model_for_role("selector"),
                                 "parameter_sharing": policy_config.parameter_sharing,
                                 "reward_before_format_penalty": selection_rollout.reward.total_reward,
-                                "advantage_before_format_penalty": selection_rollout.selector_advantage,
+                                "advantage_used_for_training": adjusted_advantage,
                                 "format_penalty": format_penalty,
                                 "format_validation": self._controller_validation_info(
                                     selection_rollout.selection.raw_payload
