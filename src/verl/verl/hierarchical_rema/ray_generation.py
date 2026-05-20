@@ -143,7 +143,10 @@ class RayVLLMGenerationManager:
 
     @staticmethod
     def _max_cached_bundles() -> int:
-        return 2
+        # Each Ray/vLLM rollout bundle reserves the full configured cluster
+        # (`process_on_nodes=[n_gpus_per_node] * nnodes`), so keeping more than
+        # one live bundle risks resource starvation during model swaps.
+        return 1
 
     @staticmethod
     def _require_runtime() -> None:
@@ -428,6 +431,14 @@ class RayVLLMGenerationManager:
             f"[hierarchical-rema][ray-generation] event=bundle_cache_miss "
             f"model={Path(model_path).name} response_length={key.bundle_response_length}"
         )
+        while len(self._bundle_cache) >= self._max_cached_bundles():
+            _, stale_bundle = self._bundle_cache.popitem(last=False)
+            print(
+                f"[hierarchical-rema][ray-generation] event=bundle_pre_evict "
+                f"model={Path(stale_bundle.key.model_path).name} "
+                f"response_length={stale_bundle.key.bundle_response_length}"
+            )
+            self._close_bundle(stale_bundle)
         bundle = self._build_bundle(key)
         self._bundle_cache[key] = bundle
         while len(self._bundle_cache) > self._max_cached_bundles():
