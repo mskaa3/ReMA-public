@@ -72,6 +72,8 @@ class RewardWeights:
     compatibility: float = 0.2
     entropy_cap: float = 2.0
     worker_reward_mode: WorkerRewardMode = WorkerRewardMode.CURRENT
+    worker_success_weight: float = 0.5
+    worker_final_correctness_weight: float = 0.5
 
 
 @dataclass

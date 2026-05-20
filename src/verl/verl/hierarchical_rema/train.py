@@ -106,6 +106,36 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--final-answer-reward-weight",
+        type=float,
+        default=1.5,
+        help="Weight assigned to exact final-answer correctness in selection reward",
+    )
+    parser.add_argument(
+        "--confidence-reward-weight",
+        type=float,
+        default=0.1,
+        help="Weight assigned to low-entropy worker responses in selection reward",
+    )
+    parser.add_argument(
+        "--compatibility-reward-weight",
+        type=float,
+        default=0.1,
+        help="Weight assigned to worker-node compatibility in selection reward",
+    )
+    parser.add_argument(
+        "--worker-success-weight",
+        type=float,
+        default=0.25,
+        help="Relative weight of local worker execution success in worker performance memory updates",
+    )
+    parser.add_argument(
+        "--worker-final-correctness-weight",
+        type=float,
+        default=0.75,
+        help="Relative weight of final-answer correctness in worker performance memory updates",
+    )
+    parser.add_argument(
         "--controller-constrained-decoding",
         dest="controller_constrained_decoding",
         action="store_true",
@@ -998,7 +1028,14 @@ def _build_rollout_trainer(
         else WorkerRewardMode.CURRENT
     )
     return HierarchicalGRPOTrainer(
-        reward_weights=RewardWeights(worker_reward_mode=worker_reward_mode),
+        reward_weights=RewardWeights(
+            final_answer=args.final_answer_reward_weight,
+            confidence=args.confidence_reward_weight,
+            compatibility=args.compatibility_reward_weight,
+            worker_reward_mode=worker_reward_mode,
+            worker_success_weight=args.worker_success_weight,
+            worker_final_correctness_weight=args.worker_final_correctness_weight,
+        ),
         backend_type=args.backend,
         hf_backend_config=HFBackendConfig(
             temperature=backend_temperature,

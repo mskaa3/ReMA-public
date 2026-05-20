@@ -77,7 +77,7 @@ class WorkerPerformanceMemory:
         task_id: str,
         execution: WorkerExecution,
         selection_reward: SelectionRewardBreakdown,
-        reward_mode: WorkerRewardMode = WorkerRewardMode.CURRENT,
+        reward_weights: RewardWeights,
     ) -> None:
         stats = self._stats_for(execution.worker_id)
         stats["num_assignments"] += 1
@@ -102,10 +102,23 @@ class WorkerPerformanceMemory:
         if len(stats["recent_history"]) > self.max_recent_history:
             stats["recent_history"] = stats["recent_history"][-self.max_recent_history:]
 
-        if reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
+        if reward_weights.worker_reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
             outcome = selection_reward.final_answer_correctness
         else:
-            outcome = 0.5 * float(execution.success) + 0.5 * selection_reward.final_answer_correctness
+            success_weight = max(float(reward_weights.worker_success_weight), 0.0)
+            final_correctness_weight = max(
+                float(reward_weights.worker_final_correctness_weight),
+                0.0,
+            )
+            total_weight = success_weight + final_correctness_weight
+            if total_weight <= 0.0:
+                success_weight = 0.5
+                final_correctness_weight = 0.5
+                total_weight = 1.0
+            outcome = (
+                success_weight * float(execution.success)
+                + final_correctness_weight * selection_reward.final_answer_correctness
+            ) / total_weight
         self.update(execution.worker_id, outcome)
 
     def snapshot_for(self, worker_id: str) -> WorkerPerformanceSnapshot:
