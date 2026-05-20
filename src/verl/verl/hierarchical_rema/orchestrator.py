@@ -59,12 +59,17 @@ class HierarchicalReMAOrchestrator:
         worker_memory: WorkerPerformanceMemory,
         controller_format_retry_penalty: float = 0.0,
         controller_format_fallback_penalty: float = 0.0,
+        selector_partial_completion_penalty: float = 0.0,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
         self.worker_memory = worker_memory
         self.controller_format_retry_penalty = max(float(controller_format_retry_penalty), 0.0)
         self.controller_format_fallback_penalty = max(float(controller_format_fallback_penalty), 0.0)
+        self.selector_partial_completion_penalty = max(
+            float(selector_partial_completion_penalty),
+            0.0,
+        )
 
     @staticmethod
     def _raw_controller_validation(payload: Dict[str, object]) -> Dict[str, object]:
@@ -92,11 +97,13 @@ class HierarchicalReMAOrchestrator:
             "attempt": attempt,
             "fallback_used": bool(validation.get("fallback_used")),
             "batch_repair_fallback": bool(validation.get("batch_repair_fallback")),
+            "partial_completion_used": bool(validation.get("partial_completion_used")),
+            "unparseable_batch_output": bool(validation.get("unparseable_batch_output")),
             "num_errors_before_success": len(errors_before_success) if isinstance(errors_before_success, list) else 0,
             "num_errors": len(errors) if isinstance(errors, list) else 0,
         }
 
-    def _controller_format_penalty(self, payload: Dict[str, object]) -> float:
+    def _controller_format_penalty(self, payload: Dict[str, object], *, role: str) -> float:
         validation = self._raw_controller_validation(payload)
         if not validation:
             return 0.0
@@ -117,9 +124,12 @@ class HierarchicalReMAOrchestrator:
         if validation.get("batch_repair_fallback"):
             attempt_count = max(attempt_count, 1)
 
-        if attempt_count <= 0:
-            return 0.0
-        return attempt_count * self.controller_format_retry_penalty
+        penalty = 0.0
+        if attempt_count > 0:
+            penalty += attempt_count * self.controller_format_retry_penalty
+        if role == "selector" and validation.get("partial_completion_used"):
+            penalty += self.selector_partial_completion_penalty
+        return penalty
 
     def run_task(
         self,
@@ -495,7 +505,8 @@ class HierarchicalReMAOrchestrator:
         if include_decomposer:
             for decomposition_rollout in decompositions:
                 format_penalty = self._controller_format_penalty(
-                    decomposition_rollout.decomposition.raw_payload
+                    decomposition_rollout.decomposition.raw_payload,
+                    role="decomposer",
                 )
                 adjusted_reward = decomposition_rollout.decomposition_reward - format_penalty
                 adjusted_advantage = decomposition_rollout.decomposer_advantage - format_penalty
@@ -525,7 +536,8 @@ class HierarchicalReMAOrchestrator:
             for decomposition_rollout in decompositions:
                 for selection_rollout in decomposition_rollout.selections:
                     format_penalty = self._controller_format_penalty(
-                        selection_rollout.selection.raw_payload
+                        selection_rollout.selection.raw_payload,
+                        role="selector",
                     )
                     adjusted_reward = selection_rollout.reward.total_reward - format_penalty
                     adjusted_advantage = selection_rollout.selector_advantage - format_penalty
@@ -577,6 +589,7 @@ class HierarchicalGRPOTrainer:
     backend: Optional[HierarchicalBackend] = None
     controller_format_retry_penalty: float = 0.0
     controller_format_fallback_penalty: float = 0.0
+    selector_partial_completion_penalty: float = 0.0
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -598,6 +611,7 @@ class HierarchicalGRPOTrainer:
             worker_memory=self.worker_memory,
             controller_format_retry_penalty=self.controller_format_retry_penalty,
             controller_format_fallback_penalty=self.controller_format_fallback_penalty,
+            selector_partial_completion_penalty=self.selector_partial_completion_penalty,
         )
         self._current_phase = AlternatingPhase.SELECTOR
 

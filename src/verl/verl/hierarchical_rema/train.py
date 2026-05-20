@@ -197,6 +197,15 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Penalty subtracted from controller sample reward/advantage when fallback output was used",
     )
+    parser.add_argument(
+        "--selector-partial-completion-penalty",
+        type=float,
+        default=0.10,
+        help=(
+            "Extra penalty subtracted from selector sample reward/advantage when "
+            "a malformed selector output was locally repaired into a valid assignment"
+        ),
+    )
     parser.add_argument("--save-replay-copy", action="store_true", help="Save train/val/all sample JSONL files per policy for inspection")
 
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -1036,6 +1045,7 @@ def _build_rollout_trainer(
         backend=backend,
         controller_format_retry_penalty=args.controller_format_retry_penalty,
         controller_format_fallback_penalty=args.controller_format_fallback_penalty,
+        selector_partial_completion_penalty=args.selector_partial_completion_penalty,
     )
 
 
