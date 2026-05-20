@@ -3,7 +3,7 @@
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --mem=200gb
 #SBATCH -p lem-gpu-short
 #SBATCH --gpus-per-node=hopper:4
