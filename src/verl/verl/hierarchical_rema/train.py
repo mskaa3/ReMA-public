@@ -164,6 +164,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-worker-max-new-tokens", type=int, default=0, help="0 reuses --worker-max-new-tokens")
     parser.add_argument("--controller-batch-size", type=int, default=8)
     parser.add_argument("--worker-batch-size", type=int, default=16)
+    parser.add_argument("--val-controller-batch-size", type=int, default=0, help="0 reuses --controller-batch-size during external validation")
+    parser.add_argument("--val-worker-batch-size", type=int, default=0, help="0 reuses --worker-batch-size during external validation")
     parser.add_argument("--rollout-prompt-length", type=int, default=2048)
     parser.add_argument("--ray-nnodes", type=int, default=1)
     parser.add_argument("--ray-n-gpus-per-node", type=int, default=1)
@@ -1050,8 +1052,16 @@ def _build_rollout_trainer(
     selector_max_new_tokens: int | None,
     worker_max_new_tokens: int,
     rollout_logging_config: RolloutLoggingConfig | None,
+    controller_batch_size: int | None = None,
+    worker_batch_size: int | None = None,
     backend: Any | None = None,
 ) -> HierarchicalGRPOTrainer:
+    effective_controller_batch_size = (
+        controller_batch_size if controller_batch_size is not None else args.controller_batch_size
+    )
+    effective_worker_batch_size = (
+        worker_batch_size if worker_batch_size is not None else args.worker_batch_size
+    )
     worker_reward_mode = (
         WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY
         if args.final_answer_correctness_reward_only
@@ -1077,8 +1087,8 @@ def _build_rollout_trainer(
             decomposer_max_new_tokens=decomposer_max_new_tokens,
             selector_max_new_tokens=selector_max_new_tokens,
             worker_max_new_tokens=worker_max_new_tokens,
-            controller_batch_size=args.controller_batch_size,
-            worker_batch_size=args.worker_batch_size,
+            controller_batch_size=effective_controller_batch_size,
+            worker_batch_size=effective_worker_batch_size,
             controller_constrained_decoding=args.controller_constrained_decoding,
             trust_remote_code=args.trust_remote_code,
             torch_dtype=args.torch_dtype,
@@ -1094,8 +1104,8 @@ def _build_rollout_trainer(
             decomposer_max_new_tokens=decomposer_max_new_tokens,
             selector_max_new_tokens=selector_max_new_tokens,
             worker_max_new_tokens=worker_max_new_tokens,
-            controller_batch_size=args.controller_batch_size,
-            worker_batch_size=args.worker_batch_size,
+            controller_batch_size=effective_controller_batch_size,
+            worker_batch_size=effective_worker_batch_size,
             controller_constrained_decoding=args.controller_constrained_decoding,
             nnodes=args.ray_nnodes,
             n_gpus_per_node=args.ray_n_gpus_per_node,
@@ -1127,7 +1137,15 @@ def _build_rollout_backend(
     decomposer_max_new_tokens: int | None,
     selector_max_new_tokens: int | None,
     worker_max_new_tokens: int,
+    controller_batch_size: int | None = None,
+    worker_batch_size: int | None = None,
 ):
+    effective_controller_batch_size = (
+        controller_batch_size if controller_batch_size is not None else args.controller_batch_size
+    )
+    effective_worker_batch_size = (
+        worker_batch_size if worker_batch_size is not None else args.worker_batch_size
+    )
     hf_config = HFBackendConfig(
         temperature=backend_temperature,
         controller_temperature=controller_temperature,
@@ -1138,8 +1156,8 @@ def _build_rollout_backend(
         decomposer_max_new_tokens=decomposer_max_new_tokens,
         selector_max_new_tokens=selector_max_new_tokens,
         worker_max_new_tokens=worker_max_new_tokens,
-        controller_batch_size=args.controller_batch_size,
-        worker_batch_size=args.worker_batch_size,
+        controller_batch_size=effective_controller_batch_size,
+        worker_batch_size=effective_worker_batch_size,
         controller_constrained_decoding=args.controller_constrained_decoding,
         trust_remote_code=args.trust_remote_code,
         torch_dtype=args.torch_dtype,
@@ -1160,8 +1178,8 @@ def _build_rollout_backend(
         decomposer_max_new_tokens=decomposer_max_new_tokens,
         selector_max_new_tokens=selector_max_new_tokens,
         worker_max_new_tokens=worker_max_new_tokens,
-        controller_batch_size=args.controller_batch_size,
-        worker_batch_size=args.worker_batch_size,
+        controller_batch_size=effective_controller_batch_size,
+        worker_batch_size=effective_worker_batch_size,
         controller_constrained_decoding=args.controller_constrained_decoding,
         nnodes=args.ray_nnodes,
         n_gpus_per_node=args.ray_n_gpus_per_node,
@@ -1240,6 +1258,16 @@ def run_external_validation(
         if args.val_rollout_task_batch_size > 0
         else args.rollout_task_batch_size
     )
+    controller_batch_size = (
+        args.val_controller_batch_size
+        if args.val_controller_batch_size > 0
+        else args.controller_batch_size
+    )
+    worker_batch_size = (
+        args.val_worker_batch_size
+        if args.val_worker_batch_size > 0
+        else args.worker_batch_size
+    )
 
     validation_rollout_config = RolloutConfig(
         num_decompositions=args.val_num_decompositions,
@@ -1259,7 +1287,10 @@ def run_external_validation(
     print(
         f"[hierarchical-rema][validation] epoch={epoch_number} tasks={len(val_tasks)} "
         f"controller_total={workload['controller_generations_total']} "
-        f"worker_total_upper_bound={workload['worker_generations_total_upper_bound']}"
+        f"worker_total_upper_bound={workload['worker_generations_total_upper_bound']} "
+        f"task_batch_size={rollout_task_batch_size} "
+        f"controller_batch_size={controller_batch_size} "
+        f"worker_batch_size={worker_batch_size}"
     )
 
     trainer = _build_rollout_trainer(
@@ -1272,6 +1303,8 @@ def run_external_validation(
         decomposer_max_new_tokens=decomposer_max_new_tokens,
         selector_max_new_tokens=selector_max_new_tokens,
         worker_max_new_tokens=worker_max_new_tokens,
+        controller_batch_size=controller_batch_size,
+        worker_batch_size=worker_batch_size,
         rollout_logging_config=None,
     )
 
