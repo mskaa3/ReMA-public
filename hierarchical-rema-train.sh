@@ -67,7 +67,9 @@ export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
 export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
 export MAX_LENGTH=${MAX_LENGTH:-3072}
 export GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-true}
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# Keep allocator tuning scoped to offline GRPO workers. vLLM rollout actors are
+# incompatible with expandable_segments:True.
+export OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF=${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 # Reward/training switches that are still commonly toggled in experiments.
 export CONTROLLER_FORMAT_RETRY_PENALTY=${CONTROLLER_FORMAT_RETRY_PENALTY:-0.05} # subtract from controller reward/advantage when output needed repair

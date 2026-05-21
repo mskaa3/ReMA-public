@@ -384,6 +384,9 @@ def _offline_training_ray_runtime_env() -> Dict[str, Any]:
         "PYTHONPATH": os.pathsep.join(pythonpath_entries),
         "PYTHONUNBUFFERED": "1",
     }
+    offline_alloc_conf = os.environ.get("OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF")
+    if offline_alloc_conf is not None:
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = offline_alloc_conf
     for env_name in (
         "HF_HOME",
         "TRANSFORMERS_CACHE",
@@ -399,6 +402,14 @@ def _offline_training_ray_runtime_env() -> Dict[str, Any]:
         if env_value:
             env_vars[env_name] = env_value
     return {"env_vars": env_vars}
+
+
+def _offline_training_alloc_conf() -> str | None:
+    offline_alloc_conf = os.environ.get("OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF")
+    if offline_alloc_conf is None:
+        return None
+    stripped = offline_alloc_conf.strip()
+    return stripped or None
 
 
 def _ensure_ray_initialized_for_offline_training() -> None:
@@ -1763,14 +1774,24 @@ def main() -> None:
                             master_port=args.offline_grpo_master_port,
                         )
                     else:
-                        summary = run_offline_policy_training(
-                            train_samples=split["train"],
-                            val_samples=split["val"],
-                            config=training_config,
-                            tracking=tracking,
-                            tracking_prefix=f"{policy_id}/",
-                            log_step_offset=tracking_step_offset,
-                        )
+                        previous_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+                        offline_alloc_conf = _offline_training_alloc_conf()
+                        try:
+                            if offline_alloc_conf is not None:
+                                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = offline_alloc_conf
+                            summary = run_offline_policy_training(
+                                train_samples=split["train"],
+                                val_samples=split["val"],
+                                config=training_config,
+                                tracking=tracking,
+                                tracking_prefix=f"{policy_id}/",
+                                log_step_offset=tracking_step_offset,
+                            )
+                        finally:
+                            if previous_alloc_conf is None:
+                                os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+                            else:
+                                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = previous_alloc_conf
                     tracking_step_offset += max(int(summary["steps"]), 1)
                     final_model_path = str(policy_dir / "final")
                     selected_model_path = str(summary.get("selected_model_path") or final_model_path)

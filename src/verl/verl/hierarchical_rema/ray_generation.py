@@ -193,6 +193,9 @@ class RayVLLMGenerationManager:
                     "TOKENIZERS_PARALLELISM": "true",
                     "NCCL_DEBUG": "WARN",
                     "VLLM_LOGGING_LEVEL": "WARN",
+                    # vLLM's CuMemAllocator asserts if expandable segments are
+                    # enabled globally, so rollout actors must clear it.
+                    "PYTORCH_CUDA_ALLOC_CONF": "",
                 }
             }
         }
