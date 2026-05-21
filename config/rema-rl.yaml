@@ -227,8 +227,7 @@ algorithm:
     finalizer_role: finalizer
     worker_roles: [algebra_worker, functional_analysis_worker, general_math_worker]
     agent_roles: [decomposer, selector, algebra_worker, functional_analysis_worker, general_math_worker, finalizer]
-    # train_agent_roles: [decomposer, selector, algebra_worker, functional_analysis_worker, general_math_worker, finalizer]
-    train_agent_roles: [decomposer, selector, finalizer]
+    train_agent_roles: [decomposer, selector, algebra_worker, functional_analysis_worker, general_math_worker, finalizer]
     start_agent: decomposer
     default_worker: general_math_worker
     pass_question_to_workers: True
