@@ -31,7 +31,7 @@ class OfflineTrainingConfig:
     clip_ratio_c: float = 3.0
     entropy_coeff: float = 0.0
     max_grad_norm: float = 1.0
-    warmup_ratio: float = 0.03
+    warmup_ratio: float = 0.01
     seed: int = 42
     logging_steps: int = 10
     save_steps: int = 200
@@ -590,6 +590,27 @@ def _update_selector_format_counts(
             counts[bucket] += 1
 
 
+def _empty_role_reward_stats() -> Dict[str, Dict[str, float]]:
+    return {
+        "selector": {"sum": 0.0, "count": 0.0},
+        "decomposer": {"sum": 0.0, "count": 0.0},
+    }
+
+
+def _update_role_reward_stats(
+    stats: Dict[str, Dict[str, float]],
+    *,
+    rewards,
+    roles,
+) -> None:
+    for reward, role in zip(rewards, roles):
+        bucket = stats.get(str(role))
+        if bucket is None:
+            continue
+        bucket["sum"] += float(reward.item())
+        bucket["count"] += 1.0
+
+
 def _all_finite(*tensors) -> bool:
     torch = _lazy_torch()
     return all(bool(torch.isfinite(tensor).all().item()) for tensor in tensors)
@@ -733,7 +754,9 @@ def run_offline_policy_training(
     skipped_non_finite_batches = 0
     optimizer.zero_grad(set_to_none=True)
     best_val_loss = None
+    best_val_step = 0
     step_selector_format_counts = _empty_selector_format_counts()
+    step_role_reward_stats = _empty_role_reward_stats()
 
     for epoch in range(config.epochs):
         if train_sampler is not None:
@@ -747,6 +770,7 @@ def run_offline_policy_training(
                 skipped_empty_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
+                step_role_reward_stats = _empty_role_reward_stats()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping empty batch "
@@ -772,6 +796,7 @@ def run_offline_policy_training(
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
+                step_role_reward_stats = _empty_role_reward_stats()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping non-finite logits "
@@ -791,6 +816,7 @@ def run_offline_policy_training(
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
+                step_role_reward_stats = _empty_role_reward_stats()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping non-finite batch tensors "
@@ -811,6 +837,7 @@ def run_offline_policy_training(
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
+                step_role_reward_stats = _empty_role_reward_stats()
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping non-finite objective "
@@ -825,6 +852,11 @@ def run_offline_policy_training(
                 sample_indices=batch["sample_index"],
                 samples=train_samples,
             )
+            _update_role_reward_stats(
+                step_role_reward_stats,
+                rewards=batch["reward"],
+                roles=batch["role"],
+            )
             loss = loss / max(config.grad_accum_steps, 1)
             loss.backward()
 
@@ -837,6 +869,22 @@ def run_offline_policy_training(
                 global_step += 1
 
                 selector_total_local = sum(step_selector_format_counts.values())
+                selector_reward_count = int(
+                    round(_all_reduce_sum(step_role_reward_stats["selector"]["count"], device, distributed_context))
+                )
+                selector_reward_sum = _all_reduce_sum(
+                    step_role_reward_stats["selector"]["sum"],
+                    device,
+                    distributed_context,
+                )
+                decomposer_reward_count = int(
+                    round(_all_reduce_sum(step_role_reward_stats["decomposer"]["count"], device, distributed_context))
+                )
+                decomposer_reward_sum = _all_reduce_sum(
+                    step_role_reward_stats["decomposer"]["sum"],
+                    device,
+                    distributed_context,
+                )
                 metrics = {
                     "step": global_step,
                     "epoch": epoch,
@@ -869,7 +917,14 @@ def run_offline_policy_training(
                         round(_all_reduce_sum(step_selector_format_counts["hard_fallback"], device, distributed_context))
                     ),
                 }
+                if selector_reward_count > 0:
+                    metrics["selector_mean_reward"] = selector_reward_sum / selector_reward_count
+                    metrics["selector_reward_count"] = selector_reward_count
+                if decomposer_reward_count > 0:
+                    metrics["decomposer_mean_reward"] = decomposer_reward_sum / decomposer_reward_count
+                    metrics["decomposer_reward_count"] = decomposer_reward_count
                 step_selector_format_counts = _empty_selector_format_counts()
+                step_role_reward_stats = _empty_role_reward_stats()
                 if is_primary:
                     with metrics_log_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(metrics, sort_keys=True) + "\n")
@@ -882,7 +937,9 @@ def run_offline_policy_training(
                             f"{tracking_prefix}train/loss": metrics["loss"],
                             f"{tracking_prefix}train/lr": metrics["lr"],
                             f"{tracking_prefix}train/mean_reward": metrics["mean_reward"],
+                            f"{tracking_prefix}train/overall_mean_reward": metrics["mean_reward"],
                             f"{tracking_prefix}train/mean_advantage": metrics["mean_advantage"],
+                            f"{tracking_prefix}train/overall_mean_advantage": metrics["mean_advantage"],
                             f"{tracking_prefix}train/approx_kl": metrics["approx_kl"],
                             f"{tracking_prefix}train/entropy": metrics["entropy"],
                             f"{tracking_prefix}train/clipfrac": metrics["clipfrac"],
@@ -892,6 +949,10 @@ def run_offline_policy_training(
                             f"{tracking_prefix}train/selector_samples_model_repaired": metrics["selector_samples_model_repaired"],
                             f"{tracking_prefix}train/selector_samples_hard_fallback": metrics["selector_samples_hard_fallback"],
                         }
+                        if "selector_mean_reward" in metrics:
+                            concise_metrics[f"{tracking_prefix}train/selector_mean_reward"] = metrics["selector_mean_reward"]
+                        if "decomposer_mean_reward" in metrics:
+                            concise_metrics[f"{tracking_prefix}train/decomposer_mean_reward"] = metrics["decomposer_mean_reward"]
                         selector_format_log = ""
                         if metrics["selector_samples_total"] > 0:
                             selector_format_log = (
@@ -901,6 +962,11 @@ def run_offline_policy_training(
                                 f"model_repaired={metrics['selector_samples_model_repaired']} "
                                 f"hard_fallback={metrics['selector_samples_hard_fallback']}"
                             )
+                        role_reward_log = ""
+                        if "selector_mean_reward" in metrics:
+                            role_reward_log += f" selector_mean_reward={metrics['selector_mean_reward']:.4f}"
+                        if "decomposer_mean_reward" in metrics:
+                            role_reward_log += f" decomposer_mean_reward={metrics['decomposer_mean_reward']:.4f}"
                         print(
                             f"[hierarchical-rema][grpo] step={global_step}/{total_update_steps} "
                             f"epoch={epoch + 1}/{config.epochs} "
@@ -909,6 +975,7 @@ def run_offline_policy_training(
                             f"mean_advantage={metrics['mean_advantage']:.4f} "
                             f"approx_kl={metrics['approx_kl']:.6f}"
                             f"{selector_format_log}"
+                            f"{role_reward_log}"
                         )
                         if tracking is not None:
                             tracking.log(concise_metrics, step=log_step_offset + global_step)
@@ -925,6 +992,7 @@ def run_offline_policy_training(
                         and (best_val_loss is None or val_metrics["val_loss"] < best_val_loss)
                     ):
                         best_val_loss = val_metrics["val_loss"]
+                        best_val_step = global_step
                         if is_primary:
                             _save_model_checkpoint(model, tokenizer, output_dir / "best")
                     if is_primary:
@@ -954,6 +1022,42 @@ def run_offline_policy_training(
 
     if config.save_final_checkpoint and is_primary:
         _save_model_checkpoint(model, tokenizer, output_dir / "final")
+    final_val_metrics = {}
+    if val_loader is not None:
+        final_val_metrics = evaluate_controller_model(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            distributed_context=distributed_context,
+        )
+        if (
+            config.save_best_checkpoint
+            and (best_val_loss is None or final_val_metrics["val_loss"] <= best_val_loss)
+        ):
+            best_val_loss = final_val_metrics["val_loss"]
+            best_val_step = global_step
+            if is_primary:
+                _save_model_checkpoint(model, tokenizer, output_dir / "best")
+    final_checkpoint_path = output_dir / "final"
+    best_checkpoint_path = output_dir / "best"
+    selected_model_path = (
+        str(best_checkpoint_path)
+        if config.save_best_checkpoint and best_checkpoint_path.exists()
+        else (
+            str(final_checkpoint_path)
+            if config.save_final_checkpoint and final_checkpoint_path.exists()
+            else str(output_dir)
+        )
+    )
+    selected_model_source = (
+        "best"
+        if config.save_best_checkpoint and best_checkpoint_path.exists()
+        else (
+            "final"
+            if config.save_final_checkpoint and final_checkpoint_path.exists()
+            else "output_dir"
+        )
+    )
     summary = {
         "output_dir": str(output_dir),
         "steps": global_step,
@@ -965,17 +1069,16 @@ def run_offline_policy_training(
         "save_final_checkpoint": config.save_final_checkpoint,
         "save_best_checkpoint": config.save_best_checkpoint,
         "save_intermediate_checkpoints": config.save_intermediate_checkpoints,
+        "final_checkpoint_path": str(final_checkpoint_path) if final_checkpoint_path.exists() else "",
+        "best_checkpoint_path": str(best_checkpoint_path) if best_checkpoint_path.exists() else "",
+        "selected_model_path": selected_model_path,
+        "selected_model_source": selected_model_source,
+        "best_val_loss": best_val_loss,
+        "best_val_step": best_val_step,
         **_count_parameters(model),
     }
-    if val_loader is not None:
-        summary.update(
-            evaluate_controller_model(
-                model=model,
-                dataloader=val_loader,
-                device=device,
-                distributed_context=distributed_context,
-            )
-        )
+    if final_val_metrics:
+        summary.update(final_val_metrics)
     if is_primary:
         with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
@@ -983,7 +1086,8 @@ def run_offline_policy_training(
             f"[hierarchical-rema][grpo] finished experiment={config.experiment_name} "
             f"steps={global_step} output_dir={output_dir} "
             f"skipped_empty_batches={skipped_empty_batches} "
-            f"skipped_non_finite_batches={skipped_non_finite_batches}"
+            f"skipped_non_finite_batches={skipped_non_finite_batches} "
+            f"selected_model_source={selected_model_source}"
         )
         if tracking is not None:
             final_metrics = {
@@ -995,6 +1099,8 @@ def run_offline_policy_training(
             }
             if "val_loss" in summary:
                 final_metrics[f"{tracking_prefix}val/final_loss"] = summary["val_loss"]
+            if best_val_loss is not None:
+                final_metrics[f"{tracking_prefix}val/best_loss"] = float(best_val_loss)
             tracking.log(final_metrics, step=log_step_offset + max(global_step, 1))
             if owns_tracking:
                 _finish_tracking(tracking)

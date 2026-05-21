@@ -190,10 +190,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--update-every-n-rollout-batches",
         type=int,
-        default=2,
+        default=4,
         help=(
             "How many rollout task batches to collect before running an offline GRPO update. "
-            "1 = update after every rollout batch, 2 = update every two rollout batches."
+            "1 = update after every rollout batch, 4 = update every four rollout batches."
         ),
     )
     parser.add_argument(
@@ -249,10 +249,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-ratio-c", type=float, default=3.0)
     parser.add_argument("--entropy-coeff", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--warmup-ratio", type=float, default=0.01)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=200)
-    parser.add_argument("--eval-every-steps", type=int, default=0)
+    parser.add_argument("--eval-every-steps", type=int, default=10)
     parser.add_argument("--checkpoint-mode", choices=["final", "all"], default="final")
     parser.add_argument("--prune-stale-policy-models", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -311,18 +311,35 @@ def _relay_offline_metrics_to_tracking(
                     continue
                 record = json.loads(line)
                 step = log_step_offset + int(record["step"])
-                tracking.log(
-                    {
-                        f"{tracking_prefix}train/loss": float(record["loss"]),
-                        f"{tracking_prefix}train/lr": float(record["lr"]),
-                        f"{tracking_prefix}train/mean_reward": float(record["mean_reward"]),
-                        f"{tracking_prefix}train/mean_advantage": float(record["mean_advantage"]),
-                        f"{tracking_prefix}train/approx_kl": float(record["approx_kl"]),
-                        f"{tracking_prefix}train/entropy": float(record["entropy"]),
-                        f"{tracking_prefix}train/clipfrac": float(record["clipfrac"]),
-                    },
-                    step=step,
-                )
+                metrics = {
+                    f"{tracking_prefix}train/loss": float(record["loss"]),
+                    f"{tracking_prefix}train/lr": float(record["lr"]),
+                    f"{tracking_prefix}train/mean_reward": float(record["mean_reward"]),
+                    f"{tracking_prefix}train/overall_mean_reward": float(record["mean_reward"]),
+                    f"{tracking_prefix}train/mean_advantage": float(record["mean_advantage"]),
+                    f"{tracking_prefix}train/overall_mean_advantage": float(record["mean_advantage"]),
+                    f"{tracking_prefix}train/approx_kl": float(record["approx_kl"]),
+                    f"{tracking_prefix}train/entropy": float(record["entropy"]),
+                    f"{tracking_prefix}train/clipfrac": float(record["clipfrac"]),
+                }
+                optional_float_fields = {
+                    "selector_mean_reward": "selector_mean_reward",
+                    "decomposer_mean_reward": "decomposer_mean_reward",
+                }
+                optional_int_fields = {
+                    "selector_samples_total": "selector_samples_total",
+                    "selector_samples_clean": "selector_samples_clean",
+                    "selector_samples_locally_repaired": "selector_samples_locally_repaired",
+                    "selector_samples_model_repaired": "selector_samples_model_repaired",
+                    "selector_samples_hard_fallback": "selector_samples_hard_fallback",
+                }
+                for record_key, metric_suffix in optional_float_fields.items():
+                    if record_key in record:
+                        metrics[f"{tracking_prefix}train/{metric_suffix}"] = float(record[record_key])
+                for record_key, metric_suffix in optional_int_fields.items():
+                    if record_key in record:
+                        metrics[f"{tracking_prefix}train/{metric_suffix}"] = int(record[record_key])
+                tracking.log(metrics, step=step)
 
     eval_log_path = output_dir / "eval_metrics.jsonl"
     if eval_log_path.exists():
@@ -349,6 +366,8 @@ def _relay_offline_metrics_to_tracking(
         }
         if "val_loss" in summary:
             final_metrics[f"{tracking_prefix}val/final_loss"] = float(summary["val_loss"])
+        if summary.get("best_val_loss") is not None:
+            final_metrics[f"{tracking_prefix}val/best_loss"] = float(summary["best_val_loss"])
         tracking.log(final_metrics, step=log_step_offset + max(int(summary.get("steps", 0)), 1))
 
 
@@ -1343,11 +1362,11 @@ def _replay_model_args(current_paths: Dict[str, str]) -> argparse.Namespace:
     )
 
 
-def _update_current_paths(current_paths: Dict[str, str], policy_id: str, final_path: str) -> None:
-    current_paths[policy_id] = final_path
+def _update_current_paths(current_paths: Dict[str, str], policy_id: str, model_path: str) -> None:
+    current_paths[policy_id] = model_path
     if policy_id == "shared_controller":
-        current_paths["decomposer_controller"] = final_path
-        current_paths["selector_controller"] = final_path
+        current_paths["decomposer_controller"] = model_path
+        current_paths["selector_controller"] = model_path
 
 
 def main() -> None:
@@ -1727,7 +1746,7 @@ def main() -> None:
                         experiment_name=experiment_name,
                         enable_wandb=False,
                         save_final_checkpoint=True,
-                        save_best_checkpoint=args.checkpoint_mode == "all" and args.eval_every_steps > 0,
+                        save_best_checkpoint=args.eval_every_steps > 0,
                         save_intermediate_checkpoints=args.checkpoint_mode == "all",
                     )
                     previous_model_path = current_paths.get(policy_id)
@@ -1754,14 +1773,18 @@ def main() -> None:
                         )
                     tracking_step_offset += max(int(summary["steps"]), 1)
                     final_model_path = str(policy_dir / "final")
-                    _update_current_paths(current_paths, policy_id, final_model_path)
-                    if args.prune_stale_policy_models and previous_model_path and previous_model_path != final_model_path:
+                    selected_model_path = str(summary.get("selected_model_path") or final_model_path)
+                    selected_model_source = str(summary.get("selected_model_source") or "final")
+                    _update_current_paths(current_paths, policy_id, selected_model_path)
+                    if args.prune_stale_policy_models and previous_model_path and previous_model_path != selected_model_path:
                         previous_policy_root = Path(previous_model_path).expanduser().resolve().parent
                         if previous_policy_root != policy_dir.resolve():
                             _prune_policy_artifacts(previous_policy_root)
                     summary["policy_id"] = policy_id
                     summary["model_path"] = model_path
                     summary["final_model_path"] = final_model_path
+                    summary["selected_model_path"] = selected_model_path
+                    summary["selected_model_source"] = selected_model_source
                     summary["segment"] = segment_index
                     summary["batch_start"] = batch_cursor + 1
                     summary["batch_end"] = batch_cursor + len(segment_batches)
@@ -1772,7 +1795,8 @@ def main() -> None:
                     print(
                         f"[hierarchical-rema][integrated] finished policy={policy_id} "
                         f"segment={segment_index} steps={summary['steps']} "
-                        f"final_model_path={final_model_path}"
+                        f"selected_model_source={selected_model_source} "
+                        f"selected_model_path={selected_model_path}"
                     )
                     _release_memory()
 

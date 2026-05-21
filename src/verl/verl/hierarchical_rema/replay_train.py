@@ -43,10 +43,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-ratio-c", type=float, default=3.0)
     parser.add_argument("--entropy-coeff", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--warmup-ratio", type=float, default=0.01)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=200)
-    parser.add_argument("--eval-every-steps", type=int, default=0)
+    parser.add_argument("--eval-every-steps", type=int, default=10)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--gradient-checkpointing", action="store_true")
@@ -227,6 +227,7 @@ def main() -> None:
             project_name=args.project_name,
             experiment_name=experiment_name,
             enable_wandb=args.enable_wandb,
+            save_best_checkpoint=args.eval_every_steps > 0,
         )
         summaries[policy_id] = run_offline_policy_training(
             train_samples=split["train"],
