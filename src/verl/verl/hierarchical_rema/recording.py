@@ -101,12 +101,24 @@ class RolloutRecorder:
         bucket.sort(key=lambda record: record.score, reverse=True)
         del bucket[self.config.best_k :]
 
+    @staticmethod
+    def _strip_worker_prompts(payload):
+        if isinstance(payload, dict):
+            return {
+                key: RolloutRecorder._strip_worker_prompts(value)
+                for key, value in payload.items()
+                if key != "worker_prompt"
+            }
+        if isinstance(payload, list):
+            return [RolloutRecorder._strip_worker_prompts(item) for item in payload]
+        return payload
+
     def _task_payload(self, rollout: TaskRollout, timestamp: str) -> Dict:
         if not self.config.compact_mode:
             return {
                 "timestamp": timestamp,
                 "task_id": rollout.task.task_id,
-                "rollout": rollout.to_dict(),
+                "rollout": self._strip_worker_prompts(rollout.to_dict()),
             }
         best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
         best_selection = max(
@@ -151,7 +163,7 @@ class RolloutRecorder:
                 },
                 "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
                 "score": decomposition_rollout.decomposition_reward,
-                "rollout": decomposition_rollout.to_dict(),
+                "rollout": self._strip_worker_prompts(decomposition_rollout.to_dict()),
             }
         decomposition = decomposition_rollout.decomposition
         return {
@@ -205,7 +217,7 @@ class RolloutRecorder:
                 "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
                 "selection_id": selection_rollout.selection.selection_id,
                 "score": selection_rollout.reward.total_reward,
-                "rollout": selection_rollout.to_dict(),
+                "rollout": self._strip_worker_prompts(selection_rollout.to_dict()),
             }
         return {
             "timestamp": timestamp,
@@ -237,7 +249,6 @@ class RolloutRecorder:
                 {
                     "node_id": execution.node_id,
                     "worker_id": execution.worker_id,
-                    "worker_prompt": execution.worker_prompt,
                     "raw_output_text": execution.raw_output_text,
                     "output_text": execution.output_text,
                     "dependency_outputs": execution.dependency_outputs,
