@@ -237,6 +237,8 @@ class RolloutRecorder:
                 {
                     "node_id": execution.node_id,
                     "worker_id": execution.worker_id,
+                    "worker_prompt": execution.worker_prompt,
+                    "raw_output_text": execution.raw_output_text,
                     "output_text": execution.output_text,
                     "dependency_outputs": execution.dependency_outputs,
                     "entropy": execution.entropy,

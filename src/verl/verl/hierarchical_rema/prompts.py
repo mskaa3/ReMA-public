@@ -30,13 +30,15 @@ EXAMPLE_OUTPUT:
 SUMMARY: isolate x and compute the final value
 FINAL_NODE_ID: 2
 NODE_ID: 1
-INSTRUCTION: rearrange the equation to isolate the variable term
+INSTRUCTION: rewrite 2x + 3 = 11 as an isolated variable equation and return the transformed equation 2x = 8
 DEPENDENCIES: none
 REQUIRED_SKILLS: algebra
+OUTPUT_KEY: transformed_equation
 NODE_ID: 2
-INSTRUCTION: compute the value of x and return the final answer
+INSTRUCTION: solve 2x = 8 and return the final scalar answer for x
 DEPENDENCIES: 1
 REQUIRED_SKILLS: arithmetic
+OUTPUT_KEY: final_answer
 </decomposition_plan>"""
 
 
@@ -46,6 +48,9 @@ FINAL_NODE: yes
 DEPENDENCY_RESULTS:
 - NODE 1 (rearrange the equation to isolate the variable term): 2x = 8
 EXAMPLE_OUTPUT:
+<worker_scratchpad>
+From 2x = 8, divide both sides by 2.
+</worker_scratchpad>
 <worker_result>
 4
 </worker_result>"""
@@ -149,6 +154,27 @@ def render_selector_output_skeleton(node_ids: Sequence[str], worker_count: int) 
     return "\n".join(lines)
 
 
+def _expected_worker_output_hint(
+    decomposition: DecompositionCandidate,
+    node: SubtaskNode,
+) -> str:
+    if decomposition.final_node_id == node.node_id:
+        return "final_scalar_answer"
+
+    instruction = node.instruction.lower()
+    output_key = (node.output_key or "").lower()
+
+    if "equation" in instruction or "equation" in output_key:
+        return "transformed_equation"
+    if any(token in instruction for token in ("expression", "simplify", "expand", "factor")):
+        return "simplified_expression"
+    if any(token in instruction for token in ("theorem", "method", "strategy", "approach", "choose")):
+        return "chosen_method"
+    if any(token in instruction for token in ("value", "count", "probability", "ratio")):
+        return "intermediate_numeric_result"
+    return "intermediate_mathematical_state"
+
+
 def _decomposition_context(decomposition: DecompositionCandidate) -> dict:
     return {
         "decomposition_id": decomposition.decomposition_id,
@@ -221,6 +247,11 @@ def render_decomposer_prompt(
         "- Do not tailor the decomposition to a particular worker roster.\n"
         "- Use a DAG, not a linear chain unless the task truly requires one.\n"
         "- Use short node instructions and short summaries.\n"
+        "- Every node instruction must name the concrete mathematical artifact it should output.\n"
+        "- Prefer instructions like `rewrite ... as ...`, `return the simplified expression ...`, `name the chosen method ...`, or `return the final scalar answer ...`.\n"
+        "- For root nodes with DEPENDENCIES: none, explicitly reference the equation, expression, case split, or target quantity from TASK instead of vague instructions like `simplify both sides`.\n"
+        "- For intermediate nodes, prefer symbolic state that a downstream node can reuse; avoid bare numbers unless the node explicitly asks for a numeric sub-result.\n"
+        "- When helpful, make OUTPUT_KEY describe the artifact type, for example `transformed_equation`, `simplified_expression`, `chosen_method`, or `final_answer`.\n"
         "- The final node should produce the final answer and be a terminal sink node.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"{DECOMPOSER_ONE_SHOT_EXAMPLE}\n\n"
@@ -314,6 +345,13 @@ def render_worker_prompt(
     node_dependencies = ",".join(node.dependencies) if node.dependencies else "none"
     node_required_skills = ",".join(node.required_skills) if node.required_skills else "none"
     is_final_node = decomposition.final_node_id == node.node_id
+    expected_output_hint = _expected_worker_output_hint(decomposition, node)
+    root_node_contract = ""
+    if not node.dependencies:
+        root_node_contract = (
+            "- This node has no dependencies. Ground your result directly in TASK and explicitly carry forward the relevant equation, expression, or target quantity from the problem.\n"
+            "- For root algebra or manipulation nodes, do not return a bare scalar unless NODE_INSTRUCTION explicitly asks for one.\n"
+        )
     final_node_contract = (
         "- This is the FINAL_NODE. Put only the final answer inside <worker_result>.\n"
         "- Do not include explanations, labels, sentences, or variable assignments such as `x = 4`; write only `4`.\n"
@@ -321,6 +359,7 @@ def render_worker_prompt(
     if not is_final_node:
         final_node_contract = (
             "- This is an intermediate node. Put only the minimal downstream-usable result inside <worker_result>.\n"
+            f"- Suggested output shape for this node: {expected_output_hint}.\n"
         )
 
     return (
@@ -334,23 +373,33 @@ def render_worker_prompt(
         f"FINAL_NODE: {'yes' if is_final_node else 'no'}\n"
         f"NODE_DEPENDENCIES: {node_dependencies}\n"
         f"NODE_REQUIRED_SKILLS: {node_required_skills}\n"
+        f"EXPECTED_OUTPUT_HINT: {expected_output_hint}\n"
         "OUTPUT CONTRACT:\n"
         "- Do only the current NODE_INSTRUCTION.\n"
         "- Use DEPENDENCY_RESULTS as the current working context when they are provided.\n"
         "- Treat dependency results as factual inputs from earlier nodes. If a dependency says `sin(alpha) = 1/2`, use that value directly.\n"
         "- Do not solve future nodes, repeat the full task, or add explanations unless the instruction explicitly asks for them.\n"
-        "- Return exactly one <worker_result> block and nothing else.\n"
-        "- Use this exact skeleton:\n"
+        "- You may include at most one brief <worker_scratchpad> block before the final <worker_result> block.\n"
+        "- Keep <worker_scratchpad> short, focused, and only for the reasoning needed to produce the node artifact.\n"
+        "- Only the content inside <worker_result> is passed to downstream nodes, so put the final node artifact there.\n"
+        "- Return exactly one <worker_result> block.\n"
+        "- Use one of these exact skeletons:\n"
+        "<worker_scratchpad>\n"
+        "brief derivation\n"
+        "</worker_scratchpad>\n"
         "<worker_result>\n"
         "concise result\n"
         "</worker_result>\n"
+        "- If you do not need scratch work, omit <worker_scratchpad> and return only <worker_result>.\n"
         "- Put only the node result inside the tags. Do not include field labels like `RESULT:` or `OUTPUT_KEY:`.\n"
         "- For expressions, equations, values, or short case splits, return just that content inside the tags.\n"
+        "- Do not jump to a scalar too early; preserve an equation, expression, or other reusable symbolic state unless NODE_INSTRUCTION explicitly asks for a numeric result.\n"
         "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
+        f"{root_node_contract}"
         f"{final_node_contract}"
-        "- Forbidden output patterns: prose outside tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
+        "- Forbidden output patterns: prose outside the allowed tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
         f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
         "DEPENDENCY_RESULTS:\n"
         f"{chr(10).join(dependency_lines)}\n\n"
-        "Return ONLY the <worker_result> block."
+        "Return ONLY an optional <worker_scratchpad> block followed by the required <worker_result> block."
     )

@@ -313,6 +313,8 @@ class WorkerExecution:
     entropy: float
     confidence_reward: float
     compatibility: float
+    raw_output_text: str = ""
+    worker_prompt: str = ""
     dependency_outputs: Dict[str, str] = field(default_factory=dict)
     completed: bool = True
     success: bool = True
