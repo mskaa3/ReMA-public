@@ -148,6 +148,7 @@ class HierarchicalReMAOrchestrator:
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
         progress_label: str | None = None,
+        update_worker_memory: bool = True,
     ) -> TaskRollout:
         return self.run_tasks(
             tasks=[task],
@@ -156,6 +157,7 @@ class HierarchicalReMAOrchestrator:
             rollout_config=rollout_config,
             schedule=schedule,
             progress_label=progress_label,
+            update_worker_memory=update_worker_memory,
         )[0]
 
     def run_tasks(
@@ -166,6 +168,7 @@ class HierarchicalReMAOrchestrator:
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
         progress_label: str | None = None,
+        update_worker_memory: bool = True,
     ) -> List[TaskRollout]:
         if not tasks:
             return []
@@ -300,7 +303,8 @@ class HierarchicalReMAOrchestrator:
             ):
                 decomposition_rollout.decomposer_advantage = advantage
 
-            self._update_worker_memory(task, decomposition_rollouts)
+            if update_worker_memory:
+                self._update_worker_memory(task, decomposition_rollouts)
             task_rollouts.append(
                 self._finalize_task_rollout(
                     task=task,
@@ -648,6 +652,7 @@ class HierarchicalGRPOTrainer:
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
         progress_label: str | None = None,
+        update_worker_memory: bool = True,
     ) -> TaskRollout:
         return self.run_many(
             tasks=[task],
@@ -656,6 +661,7 @@ class HierarchicalGRPOTrainer:
             rollout_config=rollout_config,
             schedule=schedule,
             progress_label=progress_label,
+            update_worker_memory=update_worker_memory,
         )[0]
 
     def run_many(
@@ -666,6 +672,7 @@ class HierarchicalGRPOTrainer:
         rollout_config: RolloutConfig,
         schedule: TrainingScheduleConfig,
         progress_label: str | None = None,
+        update_worker_memory: bool = True,
     ) -> List[TaskRollout]:
         rollouts = self.orchestrator.run_tasks(
             tasks=tasks,
@@ -674,6 +681,7 @@ class HierarchicalGRPOTrainer:
             rollout_config=rollout_config,
             schedule=schedule,
             progress_label=progress_label,
+            update_worker_memory=update_worker_memory,
         )
         if self.rollout_recorder is not None:
             for rollout in rollouts:

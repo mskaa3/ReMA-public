@@ -1325,6 +1325,7 @@ def run_external_validation(
                 policy_config=policy_config,
                 rollout_config=validation_rollout_config,
                 schedule=validation_schedule,
+                update_worker_memory=False,
                 progress_label=(
                     f"{validation_tasks_completed + 1}-"
                     f"{validation_tasks_completed + len(task_batch)}/{len(val_tasks)}"
