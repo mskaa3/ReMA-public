@@ -30,17 +30,35 @@ ASSIGNMENTS:
 
 
 ALGEBRA_WORKER_SYSTEM_PROMPT = """You are algebra_worker.
-Solve your assigned subtasks. Please reason step by step following the given instructions for your task. Follow fallback instructions if present. End each subtask answer with \\boxed{}.
+Use the original question only as context.
+Solve only your assigned subtasks. Do not solve the full original problem unless a subtask explicitly asks for the final answer.
+Do not write \\boxed{}, [FINISH], or Final Answer.
+For each assigned subtask, output:
+SUBTASK Sx:
+LOCAL_RESULT: <the local result needed by the finalizer>
+REASONING: <brief derivation>
 """
 
 
 FUNCTIONAL_ANALYSIS_WORKER_SYSTEM_PROMPT = """You are functional_analysis_worker.
-Solve your assigned subtasks. Please reason step by step following the given instructions for your task. Follow fallback instructions if present. End each subtask answer with \\boxed{}.
+Use the original question only as context.
+Solve only your assigned subtasks. Do not solve the full original problem unless a subtask explicitly asks for the final answer.
+Do not write \\boxed{}, [FINISH], or Final Answer.
+For each assigned subtask, output:
+SUBTASK Sx:
+LOCAL_RESULT: <the local result needed by the finalizer>
+REASONING: <brief derivation>
 """
 
 
 GENERAL_MATH_WORKER_SYSTEM_PROMPT = """You are general_math_worker.
-Solve your assigned subtasks. Please reason step by step following the given instructions for your task. Follow fallback instructions if present. End each subtask answer with \\boxed{}.
+Use the original question only as context.
+Solve only your assigned subtasks. Do not solve the full original problem unless a subtask explicitly asks for the final answer.
+Do not write \\boxed{}, [FINISH], or Final Answer.
+For each assigned subtask, output:
+SUBTASK Sx:
+LOCAL_RESULT: <the local result needed by the finalizer>
+REASONING: <brief derivation>
 """
 
 

@@ -1297,13 +1297,19 @@ class RayReMASeparatedTrainer(object):
                         #     "reasoning_turn_level_reward": tensor([...], device='cuda:0'),
                         # }
                         reward_tensor_map = self.reward_fn(new_batch)
-                        meta_boxed_penalty_applied = reward_tensor_map.pop('meta_boxed_penalty_applied', None)
-                        meta_boxed_penalty_value = reward_tensor_map.pop('meta_boxed_penalty_value', None)
-                        if meta_boxed_penalty_applied is not None:
-                            metrics['reward/meta_boxed_penalty_applied_count'] = meta_boxed_penalty_applied.sum().item()
-                            metrics['reward/meta_boxed_penalty_applied_rate'] = meta_boxed_penalty_applied.float().mean().item()
-                        if meta_boxed_penalty_value is not None:
-                            metrics['reward/meta_boxed_penalty_avg_value'] = meta_boxed_penalty_value.float().mean().item()
+                        for penalty_name in (
+                            'meta_boxed_penalty',
+                            'worker_boxed_penalty',
+                            'planner_repeat_penalty',
+                            'worker_duplicate_result_penalty',
+                        ):
+                            penalty_applied = reward_tensor_map.pop(f'{penalty_name}_applied', None)
+                            penalty_value = reward_tensor_map.pop(f'{penalty_name}_value', None)
+                            if penalty_applied is not None:
+                                metrics[f'reward/{penalty_name}_applied_count'] = penalty_applied.sum().item()
+                                metrics[f'reward/{penalty_name}_applied_rate'] = penalty_applied.float().mean().item()
+                            if penalty_value is not None:
+                                metrics[f'reward/{penalty_name}_avg_value'] = penalty_value.float().mean().item()
                         # batch.batch['token_level_scores'] = reward_tensor
                         new_batch.batch['acc'] = reward_tensor_map.pop('acc')
                         for key_reward, reward_tensor in reward_tensor_map.items():

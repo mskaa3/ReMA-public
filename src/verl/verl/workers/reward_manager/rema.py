@@ -14,6 +14,7 @@
 
 from functools import partial
 from typing import Dict
+import re
 
 from tqdm import tqdm
 from verl import DataProto
@@ -24,6 +25,9 @@ from concurrent.futures import TimeoutError
 from math_verify.errors import TimeoutException
 
 META_BOXED_PENALTY = 0.25
+WORKER_BOXED_PENALTY = 0.10
+PLANNER_REPEAT_PENALTY = 0.10
+WORKER_DUPLICATE_RESULT_PENALTY = 0.10
 
 
 def compute_score_fn(compute_score, params):
@@ -60,6 +64,24 @@ def compute_format_r(data_source, role, response_str):
         return _rema_laaj_format_reward_fn(role, response_str)
     else:
         raise ValueError(f'Unknown {data_source=} for format reward.')
+
+
+def _normalize_role_output(text):
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.lower().strip().split())
+
+
+def _extract_worker_local_result_signature(text):
+    """Return a comparable signature only for explicit worker LOCAL_RESULT lines."""
+    if not isinstance(text, str):
+        return ""
+
+    local_results = re.findall(r"(?im)^\s*LOCAL_RESULT\s*:\s*(.+?)\s*$", text)
+    if local_results:
+        return _normalize_role_output(" | ".join(local_results))
+
+    return ""
 
 class ReMARewardManager:
     """The reward manager.
@@ -118,11 +140,23 @@ class ReMARewardManager:
 
         
         agent_roles = data.meta_info['agent_roles']
+        hierarchy_config = data.meta_info.get('hierarchy', {})
+        worker_roles = set(hierarchy_config.get(
+            'worker_roles',
+            [role for role in agent_roles if role.endswith('_worker')],
+        ))
+        planner_roles = {'decomposer', 'selector'}
         reward_tensor_map = {
             f'{role}_turn_level_reward': torch.zeros(batch_size, max_num_turns, dtype=torch.float32) for role in agent_roles
         }
         reward_tensor_map['meta_boxed_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['meta_boxed_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_boxed_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_boxed_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['planner_repeat_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['planner_repeat_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_duplicate_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_duplicate_result_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         
         already_print_data_sources = {}
 
@@ -178,6 +212,8 @@ class ReMARewardManager:
             full_history = data_item.non_tensor_batch.get('history', [])
             valid_history = full_history[:num_turns * len(agent_roles)]
             meta_roles = {'meta_thinking', 'decomposer'}
+            role_penalties = {role: 0.0 for role in agent_roles}
+
             meta_has_boxed = any(
                 isinstance(msg, dict)
                 and msg.get('role') in meta_roles
@@ -188,6 +224,74 @@ class ReMARewardManager:
             if meta_has_boxed:
                 reward_tensor_map['meta_boxed_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['meta_boxed_penalty_value'][i_bsz] = META_BOXED_PENALTY
+
+            worker_boxed_roles = set()
+            for msg in valid_history:
+                if (
+                    isinstance(msg, dict)
+                    and msg.get('role') in worker_roles
+                    and isinstance(msg.get('content'), str)
+                    and 'boxed' in msg.get('content').lower()
+                ):
+                    worker_boxed_roles.add(msg.get('role'))
+            if worker_boxed_roles:
+                reward_tensor_map['worker_boxed_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['worker_boxed_penalty_value'][i_bsz] = WORKER_BOXED_PENALTY
+                for role in worker_boxed_roles:
+                    role_penalties[role] += WORKER_BOXED_PENALTY
+
+            repeated_planner_roles = set()
+            for role in planner_roles.intersection(agent_roles):
+                role_outputs = [
+                    _normalize_role_output(msg.get('content', ''))
+                    for msg in valid_history
+                    if isinstance(msg, dict) and msg.get('role') == role
+                ]
+                role_outputs = [output for output in role_outputs if output]
+                if len(role_outputs) > len(set(role_outputs)):
+                    repeated_planner_roles.add(role)
+            if {'decomposer', 'selector'}.issubset(set(agent_roles)):
+                for i_turn in range(num_turns):
+                    turn_history = valid_history[
+                        i_turn * len(agent_roles):(i_turn + 1) * len(agent_roles)
+                    ]
+                    planner_outputs = {
+                        msg.get('role'): _normalize_role_output(msg.get('content', ''))
+                        for msg in turn_history
+                        if isinstance(msg, dict) and msg.get('role') in {'decomposer', 'selector'}
+                    }
+                    if (
+                        planner_outputs.get('decomposer')
+                        and planner_outputs.get('decomposer') == planner_outputs.get('selector')
+                    ):
+                        repeated_planner_roles.update({'decomposer', 'selector'})
+            if repeated_planner_roles:
+                reward_tensor_map['planner_repeat_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['planner_repeat_penalty_value'][i_bsz] = PLANNER_REPEAT_PENALTY
+                for role in repeated_planner_roles:
+                    role_penalties[role] += PLANNER_REPEAT_PENALTY
+
+            duplicate_worker_roles = set()
+            for i_turn in range(num_turns):
+                turn_history = valid_history[
+                    i_turn * len(agent_roles):(i_turn + 1) * len(agent_roles)
+                ]
+                signature_to_roles = {}
+                for msg in turn_history:
+                    if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
+                        continue
+                    signature = _extract_worker_local_result_signature(msg.get('content', ''))
+                    if not signature:
+                        continue
+                    signature_to_roles.setdefault(signature, set()).add(msg.get('role'))
+                for roles_with_same_signature in signature_to_roles.values():
+                    if len(roles_with_same_signature) > 1:
+                        duplicate_worker_roles.update(roles_with_same_signature)
+            if duplicate_worker_roles:
+                reward_tensor_map['worker_duplicate_result_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['worker_duplicate_result_penalty_value'][i_bsz] = WORKER_DUPLICATE_RESULT_PENALTY
+                for role in duplicate_worker_roles:
+                    role_penalties[role] += WORKER_DUPLICATE_RESULT_PENALTY
             
             for i_role, role in enumerate(agent_roles):
                 turn_finished = data_item.batch[f'{role}_turn_finished'].item()
@@ -211,6 +315,7 @@ class ReMARewardManager:
                 role_score = score
                 if role in meta_roles and meta_has_boxed:
                     role_score -= META_BOXED_PENALTY
+                role_score -= role_penalties.get(role, 0.0)
 
                 reward_tensor_map[f'{role}_turn_level_reward'][i_bsz, num_turns - 1] = role_score
 
