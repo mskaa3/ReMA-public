@@ -42,52 +42,52 @@ OUTPUT_KEY: final_answer
 </decomposition_plan>"""
 
 
-WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
-NODE_INSTRUCTION: compute the value of x and return the final answer
-FINAL_NODE: yes
-DEPENDENCY_RESULTS:
-- NODE 1 (rearrange the equation to isolate the variable term): 2x = 8
-EXAMPLE_OUTPUT:
-<worker_scratchpad>
-From 2x = 8, divide both sides by 2.
-</worker_scratchpad>
-<worker_result>
-4
-</worker_result>"""
+# WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
+# NODE_INSTRUCTION: compute the value of x and return the final answer
+# FINAL_NODE: yes
+# DEPENDENCY_RESULTS:
+# - NODE 1 (rearrange the equation to isolate the variable term): 2x = 8
+# EXAMPLE_OUTPUT:
+# <worker_scratchpad>
+# From 2x = 8, divide both sides by 2.
+# </worker_scratchpad>
+# <worker_result>
+# 4
+# </worker_result>"""
 
 
 DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT = """You are an arithmetic and prealgebra worker.
 You are strongest at exact numeric computation, fractions, ratios, percentages, signs, simplification, and straightforward expression cleanup.
 Prefer exact forms over decimals unless the task explicitly asks for approximation.
-Be concise and return the subtask result directly.
+
 """
 
 
 DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT = """You are an algebra and symbolic manipulation worker.
 You are strongest at solving equations, substitutions, polynomial manipulation, factoring, expanding, and symbolic simplification.
 Keep expressions exact and transform them carefully step by step when needed.
-Be concise and return the subtask result directly.
+
 """
 
 
 DEFAULT_GEOMETRY_TRIGONOMETRY_WORKER_PROMPT = """You are a geometry and trigonometry worker.
 You are strongest at Euclidean geometry, coordinate geometry, angle and length relations, standard formulas, and trigonometric identities.
 Use the relevant geometric constraints precisely and keep notation clean.
-Be concise and return the subtask result directly.
+
 """
 
 
 DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT = """You are a calculus and analysis worker.
 You are strongest at limits, derivatives, integrals, continuity, monotonicity, extrema, and function behavior.
 Apply standard theorems and derivative or integral rules carefully, keeping the result mathematically exact.
-Be concise and return the subtask result directly.
+
 """
 
 
 DEFAULT_DISCRETE_NUMBER_THEORY_WORKER_PROMPT = """You are a discrete mathematics and number theory worker.
 You are strongest at divisibility, modular arithmetic, parity, counting, combinatorics, invariants, and elementary probability.
 Break the problem into precise cases or arithmetic constraints when helpful.
-Be concise and return the subtask result directly.
+
 """
 
 
@@ -358,11 +358,35 @@ def render_worker_prompt(
     )
     if not is_final_node:
         final_node_contract = (
-            "- This is an intermediate node. Put only the minimal downstream-usable result inside <worker_result>.\n"
+            "- This is an intermediate node. Put only the downstream-usable result inside <worker_result>.\n"
             f"- Suggested output shape for this node: {expected_output_hint}.\n"
         )
 
     return (
+        "- Do only the current NODE_INSTRUCTION. Do not solve future nodes, repeat the full task, or add explanations unless the instruction explicitly asks for them.\n"
+        "- Use DEPENDENCY_RESULTS as the current working context when they are provided.\n"
+        "- Treat dependency results as factual inputs from earlier nodes. If a dependency says `sin(alpha) = 1/2`, use that value directly.\n"
+        "- You may include at most one <worker_scratchpad> block before the final <worker_result> block.\n"
+        "- If you use <worker_scratchpad>, make it a short but logically connected piece of reasoning that helps solve the current node.\n"
+        "- The scratchpad should show useful mathematical thinking such as a transformation, substitution, case split, geometric fact, or intermediate deduction that moves from TASK and DEPENDENCY_RESULTS toward the required node artifact.\n"
+        "- Do not use the scratchpad as filler, a paraphrase of NODE_INSTRUCTION, or a copied template; it should contain reasoning that is genuinely helpful for solving this task.\n"
+        "- Return exactly one <worker_result> block. Only the content inside <worker_result> is passed to downstream nodes, so put the final node artifact there.\n"
+        "- Use one of these exact skeletons:\n"
+        "<worker_scratchpad>\n"
+        "Logical derivation of the solution\n"
+        "</worker_scratchpad>\n"
+        "<worker_result>\n"
+        "concise result\n"
+        "</worker_result>\n"
+        "- Put only the node result inside the tags <worker_result>. Do not include field labels like `RESULT:` or `OUTPUT_KEY:`.\n"
+        "- For expressions, equations, values, or short case splits, return just that content inside the tags.\n"
+        "- Do not jump to a scalar too early; preserve an equation, expression, or other reusable symbolic state unless NODE_INSTRUCTION explicitly asks for a numeric result.\n"
+        "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
+        f"{root_node_contract}"
+        f"{final_node_contract}"
+        "- Forbidden output patterns: prose outside the allowed tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
+        # f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
+        "Task details:\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         f"WORKER_ID: {worker.worker_id}\n"
@@ -370,36 +394,12 @@ def render_worker_prompt(
         f"WORKER_DESCRIPTION: {worker.description}\n"
         f"NODE_ID: {node.node_id}\n"
         f"NODE_INSTRUCTION: {node.instruction}\n"
+        f"NODE_REQUIRED_SKILLS: {node_required_skills}\n"
         f"FINAL_NODE: {'yes' if is_final_node else 'no'}\n"
         f"NODE_DEPENDENCIES: {node_dependencies}\n"
-        f"NODE_REQUIRED_SKILLS: {node_required_skills}\n"
-        f"EXPECTED_OUTPUT_HINT: {expected_output_hint}\n"
-        "OUTPUT CONTRACT:\n"
-        "- Do only the current NODE_INSTRUCTION.\n"
-        "- Use DEPENDENCY_RESULTS as the current working context when they are provided.\n"
-        "- Treat dependency results as factual inputs from earlier nodes. If a dependency says `sin(alpha) = 1/2`, use that value directly.\n"
-        "- Do not solve future nodes, repeat the full task, or add explanations unless the instruction explicitly asks for them.\n"
-        "- You may include at most one brief <worker_scratchpad> block before the final <worker_result> block.\n"
-        "- Keep <worker_scratchpad> short, focused, and only for the reasoning needed to produce the node artifact.\n"
-        "- Only the content inside <worker_result> is passed to downstream nodes, so put the final node artifact there.\n"
-        "- Return exactly one <worker_result> block.\n"
-        "- Use one of these exact skeletons:\n"
-        "<worker_scratchpad>\n"
-        "brief derivation\n"
-        "</worker_scratchpad>\n"
-        "<worker_result>\n"
-        "concise result\n"
-        "</worker_result>\n"
-        "- If you do not need scratch work, omit <worker_scratchpad> and return only <worker_result>.\n"
-        "- Put only the node result inside the tags. Do not include field labels like `RESULT:` or `OUTPUT_KEY:`.\n"
-        "- For expressions, equations, values, or short case splits, return just that content inside the tags.\n"
-        "- Do not jump to a scalar too early; preserve an equation, expression, or other reusable symbolic state unless NODE_INSTRUCTION explicitly asks for a numeric result.\n"
-        "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
-        f"{root_node_contract}"
-        f"{final_node_contract}"
-        "- Forbidden output patterns: prose outside the allowed tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
-        f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
-        "DEPENDENCY_RESULTS:\n"
+        f"DEPENDENCY_RESULTS:\n"
         f"{chr(10).join(dependency_lines)}\n\n"
+        f"EXPECTED_OUTPUT_HINT: {expected_output_hint}\n"
         "Return ONLY an optional <worker_scratchpad> block followed by the required <worker_result> block."
+        "OUTPUT:\n"
     )
