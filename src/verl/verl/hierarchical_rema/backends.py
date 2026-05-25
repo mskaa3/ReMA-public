@@ -37,6 +37,7 @@ from .structured import (
     extract_selection_payload,
     format_decomposition_plan,
     format_selection_plan,
+    salvage_decomposition_payload,
     validate_decomposition_payload,
     validate_selection_payload,
 )
@@ -250,6 +251,26 @@ def _try_complete_partial_selection_candidate(
     )
 
 
+def _try_salvage_decomposition_candidate(
+    *,
+    raw_text: str,
+    payload: Dict[str, Any] | None,
+    rollout_config: RolloutConfig,
+    fallback_id: str,
+) -> DecompositionCandidate | None:
+    salvaged_payload = salvage_decomposition_payload(raw_text, payload)
+    if salvaged_payload is None:
+        return None
+    try:
+        return validate_decomposition_payload(
+            payload=salvaged_payload,
+            rollout_config=rollout_config,
+            fallback_id=fallback_id,
+        )
+    except Exception:
+        return None
+
+
 def _build_compatibility_fallback_selection_candidate(
     *,
     decomposition: DecompositionCandidate,
@@ -295,6 +316,39 @@ def _build_compatibility_fallback_selection_candidate(
 
 
 class HierarchicalBackend(ABC):
+    @staticmethod
+    def _apply_sampling_stop_text(
+        text: str,
+        sampling_overrides: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if not isinstance(sampling_overrides, dict):
+            return str(text).strip()
+        raw_stops = sampling_overrides.get("stop")
+        if isinstance(raw_stops, str):
+            stops = [raw_stops]
+        elif isinstance(raw_stops, (list, tuple)):
+            stops = [str(item) for item in raw_stops if item]
+        else:
+            stops = []
+        if not stops:
+            return str(text).strip()
+
+        rendered_text = str(text)
+        include_stop = bool(sampling_overrides.get("include_stop_str_in_output", False))
+        earliest_index: int | None = None
+        earliest_stop = ""
+        for stop in stops:
+            index = rendered_text.find(stop)
+            if index < 0:
+                continue
+            if earliest_index is None or index < earliest_index:
+                earliest_index = index
+                earliest_stop = stop
+        if earliest_index is None:
+            return rendered_text.strip()
+        end_index = earliest_index + len(earliest_stop) if include_stop else earliest_index
+        return rendered_text[:end_index].strip()
+
     @abstractmethod
     def sample_decomposition(
         self,
@@ -823,7 +877,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         temperature: float | None = None,
         sampling_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, float]:
-        del sampling_overrides
         tokenizer, model = self._load_bundle(base_model_path, lora_adapter_path=lora_adapter_path)
         full_prompt = self._build_prompt(tokenizer, prompt_text, system_prompt=system_prompt)
         resolved_temperature = self.config.temperature if temperature is None else temperature
@@ -849,7 +902,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             )
 
         generated_ids = outputs.sequences[0, input_length:]
-        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        generated_text = self._apply_sampling_stop_text(generated_text, sampling_overrides)
         entropy = self._estimate_entropy(list(outputs.scores))
         return generated_text, entropy
 
@@ -865,7 +919,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         sampling_overrides: Optional[Dict[str, Any]] = None,
         log_label: str | None = None,
     ) -> List[Tuple[str, float]]:
-        del sampling_overrides
         del log_label
         if not prompt_texts:
             return []
@@ -902,7 +955,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             entropies = self._estimate_batch_entropy(list(outputs.scores))
             for row_idx in range(outputs.sequences.shape[0]):
                 generated_ids = outputs.sequences[row_idx, int(input_lengths[row_idx].item()):]
-                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                generated_text = self._apply_sampling_stop_text(generated_text, sampling_overrides)
                 entropy = entropies[row_idx] if row_idx < len(entropies) else 0.0
                 results.append((generated_text, float(entropy)))
 
@@ -991,6 +1045,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         if repair_progress is not None:
             repair_position = f" item={repair_progress[0]}/{repair_progress[1]}"
         for attempt in range(self.config.max_format_retries + 1):
+            payload: Dict[str, Any] | None = None
             if repair_progress is not None:
                 print(
                     f"[hierarchical-rema][generation-repair] role=decomposer "
@@ -1023,6 +1078,25 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     },
                 )
             except Exception as exc:
+                salvaged_candidate = _try_salvage_decomposition_candidate(
+                    raw_text=last_raw_text,
+                    payload=payload,
+                    rollout_config=rollout_config,
+                    fallback_id=fallback_id,
+                )
+                if salvaged_candidate is not None:
+                    return self._set_decomposition_artifacts(
+                        candidate=salvaged_candidate,
+                        prompt_text=prompt_text,
+                        validation={
+                            "backend": self.backend_name,
+                            "attempt": attempt,
+                            "errors_before_success": list(errors),
+                            "fallback_used": False,
+                            "local_salvage_used": True,
+                            "raw_model_text": last_raw_text,
+                        },
+                    )
                 errors.append(str(exc))
                 repair_prompt = (
                     f"{prompt_text}\n\nYour previous answer did not match the required decomposition format. "
@@ -1321,6 +1395,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             repair_count = 0
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.task.task_id}-decomp-{request.decomposition_index}"
+                payload: Dict[str, Any] | None = None
                 try:
                     payload = extract_decomposition_payload(raw_text)
                     candidate = validate_decomposition_payload(
@@ -1342,35 +1417,57 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         },
                     )
                 except Exception:
-                    repair_count += 1
-                    if self._should_log_repair_progress(repair_count, len(grouped_requests)):
-                        print(
-                            f"[hierarchical-rema][generation-repair] role=decomposer "
-                            f"model={model_path} "
-                            f"start_item={repair_count}/{len(grouped_requests)}"
-                        )
-                    candidate = self._generate_validated_decomposition(
-                        prompt_text=prompt_text,
-                        task=request.task,
-                        policy_config=request.policy_config,
+                    salvaged_candidate = _try_salvage_decomposition_candidate(
+                        raw_text=raw_text,
+                        payload=payload,
                         rollout_config=request.rollout_config,
                         fallback_id=fallback_id,
-                        repair_progress=(repair_count, len(grouped_requests)),
                     )
-                    if self._should_log_repair_progress(repair_count, len(grouped_requests)):
-                        print(
-                            f"[hierarchical-rema][generation-repair] role=decomposer "
-                            f"model={model_path} "
-                            f"done_item={repair_count}/{len(grouped_requests)}"
+                    if salvaged_candidate is not None:
+                        candidate = self._set_decomposition_artifacts(
+                            candidate=salvaged_candidate,
+                            prompt_text=prompt_text,
+                            validation={
+                                "backend": self.backend_name,
+                                "attempt": 0,
+                                "errors_before_success": [],
+                                "fallback_used": False,
+                                "local_salvage_used": True,
+                                "raw_model_text": raw_text,
+                                "batch_generated": True,
+                                "entropy": entropy,
+                            },
                         )
-                    candidate.raw_payload.setdefault("validation", {})
-                    candidate.raw_payload["validation"].update(
-                        {
-                            "batch_generated": True,
-                            "batch_repair_fallback": True,
-                        }
-                    )
-                    candidate.raw_text = format_decomposition_plan(candidate)
+                    else:
+                        repair_count += 1
+                        if self._should_log_repair_progress(repair_count, len(grouped_requests)):
+                            print(
+                                f"[hierarchical-rema][generation-repair] role=decomposer "
+                                f"model={model_path} "
+                                f"start_item={repair_count}/{len(grouped_requests)}"
+                            )
+                        candidate = self._generate_validated_decomposition(
+                            prompt_text=prompt_text,
+                            task=request.task,
+                            policy_config=request.policy_config,
+                            rollout_config=request.rollout_config,
+                            fallback_id=fallback_id,
+                            repair_progress=(repair_count, len(grouped_requests)),
+                        )
+                        if self._should_log_repair_progress(repair_count, len(grouped_requests)):
+                            print(
+                                f"[hierarchical-rema][generation-repair] role=decomposer "
+                                f"model={model_path} "
+                                f"done_item={repair_count}/{len(grouped_requests)}"
+                            )
+                        candidate.raw_payload.setdefault("validation", {})
+                        candidate.raw_payload["validation"].update(
+                            {
+                                "batch_generated": True,
+                                "batch_repair_fallback": True,
+                            }
+                        )
+                        candidate.raw_text = format_decomposition_plan(candidate)
                 results[result_index] = candidate
             if repair_count:
                 print(
@@ -1659,7 +1756,7 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
             temperature=self.config.temperature if temperature is None else temperature,
             sampling_overrides=sampling_overrides,
         )
-        return result.text, result.entropy
+        return self._apply_sampling_stop_text(result.text, sampling_overrides), result.entropy
 
     def _generate_text_batch(
         self,
@@ -1685,7 +1782,10 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
             sampling_overrides=sampling_overrides,
             log_label=log_label,
         )
-        return [(item.text, item.entropy) for item in generated]
+        return [
+            (self._apply_sampling_stop_text(item.text, sampling_overrides), item.entropy)
+            for item in generated
+        ]
 
     def close(self) -> None:
         self._manager.close()

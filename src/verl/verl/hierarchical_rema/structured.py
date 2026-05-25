@@ -370,6 +370,95 @@ def _parse_decomposition_plan(text: str) -> Dict[str, Any]:
     raise StructuredOutputError("Could not parse a decomposition plan from controller output")
 
 
+def _coerce_decomposition_nodes(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _normalize_node_like(raw_key: Any, raw_value: Any) -> Dict[str, Any] | None:
+        if isinstance(raw_value, dict):
+            node_payload = dict(raw_value)
+            node_payload.setdefault("node_id", str(raw_key).strip())
+            alt_instruction = node_payload.get("text") or node_payload.get("description")
+            if alt_instruction and not node_payload.get("instruction"):
+                node_payload["instruction"] = str(alt_instruction).strip()
+            return node_payload
+        if isinstance(raw_value, str) and raw_value.strip():
+            return {
+                "node_id": str(raw_key).strip(),
+                "instruction": raw_value.strip(),
+            }
+        return None
+
+    def _coerce_from_container(raw_value: Any) -> List[Dict[str, Any]]:
+        nodes: List[Dict[str, Any]] = []
+        if isinstance(raw_value, list):
+            for idx, item in enumerate(raw_value, start=1):
+                normalized = _normalize_node_like(idx, item)
+                if normalized is not None:
+                    nodes.append(normalized)
+        elif isinstance(raw_value, dict):
+            sortable_items = list(raw_value.items())
+            sortable_items.sort(
+                key=lambda item: (
+                    0 if _normalize_node_id_token(item[0]) else 1,
+                    int(_normalize_node_id_token(item[0])) if _normalize_node_id_token(item[0]) else str(item[0]),
+                )
+            )
+            for raw_key, raw_item in sortable_items:
+                normalized = _normalize_node_like(raw_key, raw_item)
+                if normalized is not None:
+                    nodes.append(normalized)
+        return nodes
+
+    for key in ("nodes", "steps", "subtasks"):
+        nodes = _coerce_from_container(payload.get(key))
+        if nodes:
+            return nodes
+
+    top_level_nodes = _coerce_from_container(
+        {
+            key: value
+            for key, value in payload.items()
+            if _normalize_node_id_token(key)
+        }
+    )
+    return top_level_nodes
+
+
+def salvage_decomposition_payload(
+    text: str,
+    payload: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    merged_payload: Dict[str, Any] = {}
+    if isinstance(payload, dict):
+        for key in ("decomposition_id", "summary"):
+            value = payload.get(key)
+            if value:
+                merged_payload[key] = value
+        final_node_value = payload.get("final_node_id") or payload.get("final_node")
+        if final_node_value:
+            merged_payload["final_node_id"] = final_node_value
+        coerced_nodes = _coerce_decomposition_nodes(payload)
+        if coerced_nodes:
+            merged_payload["nodes"] = coerced_nodes
+
+    line_payload = _extract_key_value_payload(
+        _normalize_structured_text(text, tags=KNOWN_DECOMPOSITION_TAGS)
+    )
+    if line_payload.get("summary") and not merged_payload.get("summary"):
+        merged_payload["summary"] = line_payload["summary"]
+    if line_payload.get("decomposition_id") and not merged_payload.get("decomposition_id"):
+        merged_payload["decomposition_id"] = line_payload["decomposition_id"]
+    if line_payload.get("final_node_id") and not merged_payload.get("final_node_id"):
+        merged_payload["final_node_id"] = line_payload["final_node_id"]
+    if line_payload.get("nodes"):
+        merged_payload["nodes"] = line_payload["nodes"]
+
+    if merged_payload.get("nodes"):
+        merged_payload.setdefault("summary", "Compact decomposition.")
+        if not merged_payload.get("final_node_id"):
+            merged_payload["final_node_id"] = merged_payload["nodes"][-1].get("node_id")
+        return merged_payload
+    return None
+
+
 def _parse_selection_plan(text: str) -> Dict[str, Any]:
     normalized = _normalize_structured_text(text, tags=KNOWN_SELECTION_TAGS)
     lines = [line.strip() for line in normalized.splitlines() if line.strip()]
