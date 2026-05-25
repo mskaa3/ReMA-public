@@ -149,7 +149,8 @@ def render_selector_output_skeleton(node_ids: Sequence[str], worker_count: int) 
     lines = ["<selection_plan>"]
     for line_index, node_id in enumerate(node_ids, start=1):
         worker_index = ((line_index - 1) % safe_worker_count) + 1
-        lines.append(f"{node_id}: {worker_index}")
+        # lines.append(f"{node_id}: most_feasible_worker_{worker_index}")
+        lines.append(f"{node_id}: most_feasible_worker_idx")
     lines.append("</selection_plan>")
     return "\n".join(lines)
 
