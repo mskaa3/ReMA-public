@@ -397,8 +397,12 @@ def _coerce_decomposition_nodes(payload: Dict[str, Any]) -> List[Dict[str, Any]]
             sortable_items = list(raw_value.items())
             sortable_items.sort(
                 key=lambda item: (
-                    0 if _normalize_node_id_token(item[0]) else 1,
-                    int(_normalize_node_id_token(item[0])) if _normalize_node_id_token(item[0]) else str(item[0]),
+                    0
+                    if (_normalize_node_id_token(item[0]) and _normalize_node_id_token(item[0]).isdigit())
+                    else 1,
+                    int(_normalize_node_id_token(item[0]))
+                    if (_normalize_node_id_token(item[0]) and _normalize_node_id_token(item[0]).isdigit())
+                    else str(item[0]),
                 )
             )
             for raw_key, raw_item in sortable_items:
@@ -416,7 +420,7 @@ def _coerce_decomposition_nodes(payload: Dict[str, Any]) -> List[Dict[str, Any]]
         {
             key: value
             for key, value in payload.items()
-            if _normalize_node_id_token(key)
+            if (_normalize_node_id_token(key) and _normalize_node_id_token(key).isdigit())
         }
     )
     return top_level_nodes
@@ -702,6 +706,13 @@ def validate_decomposition_payload(
         ]
         if not isinstance(dependencies, list) or not all(isinstance(dep, str) for dep in dependencies):
             raise StructuredOutputError(f"Node {node_id} has invalid 'dependencies'")
+        normalized_dependencies: List[str] = []
+        seen_dependencies = set()
+        for dependency in dependencies:
+            if not dependency or dependency == node_id or dependency in seen_dependencies:
+                continue
+            seen_dependencies.add(dependency)
+            normalized_dependencies.append(dependency)
         required_skills = _normalize_required_skills(
             node_payload.get("required_skills")
         )
@@ -712,7 +723,7 @@ def validate_decomposition_payload(
             SubtaskNode(
                 node_id=node_id,
                 instruction=instruction,
-                dependencies=list(dependencies),
+                dependencies=normalized_dependencies,
                 required_skills=list(required_skills),
                 output_key=output_key,
             )
@@ -882,18 +893,20 @@ def validate_selection_payload(
 
 def build_fallback_decomposition(
     task_id: str,
+    task_prompt: str,
     raw_text: str,
     error_message: str,
     rollout_config: RolloutConfig,
 ) -> DecompositionCandidate:
+    resolved_instruction = str(task_prompt or "").strip() or "Solve the full original task directly and return the final answer."
     payload = {
         "decomposition_id": f"{task_id}-fallback-decomposition",
-        "summary": "Fallback decomposition due to invalid controller output.",
+        "summary": "Fallback decomposition: solve the full task directly.",
         "final_node_id": "1",
         "nodes": [
             {
                 "node_id": "1",
-                "instruction": "Provide the best final answer directly.",
+                "instruction": resolved_instruction,
                 "dependencies": [],
                 "required_skills": [],
                 "output_key": "final_answer",

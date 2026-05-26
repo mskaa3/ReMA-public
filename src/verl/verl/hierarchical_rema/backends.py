@@ -258,7 +258,10 @@ def _try_salvage_decomposition_candidate(
     rollout_config: RolloutConfig,
     fallback_id: str,
 ) -> DecompositionCandidate | None:
-    salvaged_payload = salvage_decomposition_payload(raw_text, payload)
+    try:
+        salvaged_payload = salvage_decomposition_payload(raw_text, payload)
+    except Exception:
+        return None
     if salvaged_payload is None:
         return None
     try:
@@ -1116,6 +1119,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             )
         candidate = build_fallback_decomposition(
             task_id=task.task_id,
+            task_prompt=task.prompt,
             raw_text=last_raw_text,
             error_message=" | ".join(errors) if errors else "Unknown decomposition format error",
             rollout_config=rollout_config,
