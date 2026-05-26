@@ -14,32 +14,13 @@ from .schema import (
 
 
 DECOMPOSER_SYSTEM_PROMPT = """You are the Decomposer controller.
-Break the task into a compact DAG of atomic reasoning steps.
+Break each task into a compact DAG of concrete mathematical steps whose outputs are reusable by downstream nodes and end at the final answer.
 """
 
 
 SELECTOR_SYSTEM_PROMPT = """You are the Selector controller.
-Assign workers to the DAG nodes.
+Assign the most suitable worker to each decomposition node using the node requirements and the workers' capabilities and track record.
 """
-
-
-DECOMPOSER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
-EXAMPLE_TASK: Solve for x: 2x + 3 = 11
-EXAMPLE_OUTPUT:
-<decomposition_plan>
-SUMMARY: isolate x and compute the final value
-FINAL_NODE_ID: 2
-NODE_ID: 1
-INSTRUCTION: rewrite 2x + 3 = 11 as an isolated variable equation and return the transformed equation 2x = 8
-DEPENDENCIES: none
-REQUIRED_SKILLS: algebra
-OUTPUT_KEY: transformed_equation
-NODE_ID: 2
-INSTRUCTION: solve 2x = 8 and return the final scalar answer for x
-DEPENDENCIES: 1
-REQUIRED_SKILLS: arithmetic
-OUTPUT_KEY: final_answer
-</decomposition_plan>"""
 
 
 # WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
@@ -57,36 +38,31 @@ OUTPUT_KEY: final_answer
 
 
 DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT = """You are an arithmetic and prealgebra worker.
-You are strongest at exact numeric computation, fractions, ratios, percentages, signs, simplification, and straightforward expression cleanup.
-Prefer exact forms over decimals unless the task explicitly asks for approximation.
+Be exact with fractions, ratios, signs, and straightforward simplifications, and prefer exact forms over decimals unless the task asks for approximation.
 
 """
 
 
 DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT = """You are an algebra and symbolic manipulation worker.
-You are strongest at solving equations, substitutions, polynomial manipulation, factoring, expanding, and symbolic simplification.
-Keep expressions exact and transform them carefully step by step when needed.
+Solve equations and carry out substitutions, factoring, expanding, and symbolic simplification carefully while keeping expressions exact.
 
 """
 
 
 DEFAULT_GEOMETRY_TRIGONOMETRY_WORKER_PROMPT = """You are a geometry and trigonometry worker.
-You are strongest at Euclidean geometry, coordinate geometry, angle and length relations, standard formulas, and trigonometric identities.
-Use the relevant geometric constraints precisely and keep notation clean.
+Use Euclidean or coordinate geometry, angle and length relations, and trigonometric identities precisely, keeping notation clean and exact.
 
 """
 
 
 DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT = """You are a calculus and analysis worker.
-You are strongest at limits, derivatives, integrals, continuity, monotonicity, extrema, and function behavior.
-Apply standard theorems and derivative or integral rules carefully, keeping the result mathematically exact.
+Reason carefully about limits, derivatives, integrals, continuity, extrema, and function behavior, and keep the result mathematically exact.
 
 """
 
 
 DEFAULT_DISCRETE_NUMBER_THEORY_WORKER_PROMPT = """You are a discrete mathematics and number theory worker.
-You are strongest at divisibility, modular arithmetic, parity, counting, combinatorics, invariants, and elementary probability.
-Break the problem into precise cases or arithmetic constraints when helpful.
+Use divisibility, modular arithmetic, parity, counting, combinatorics, invariants, and elementary probability with precise case splits or arithmetic constraints when helpful.
 
 """
 
@@ -217,11 +193,10 @@ def render_decomposer_prompt(
     if node_budget_contract:
         node_budget_contract += "\n"
     return (
-        f"{DECOMPOSER_SYSTEM_PROMPT}\n\n"
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <decomposition_plan> block and nothing else.\n"
-        "- Allowed field keys: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
-        "- Use this compact skeleton:\n"
+        "- Use only these keys: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
+        "- Use this skeleton:\n"
         "<decomposition_plan>\n"
         "SUMMARY: short summary\n"
         "FINAL_NODE_ID: 2\n"
@@ -234,16 +209,15 @@ def render_decomposer_prompt(
         "DEPENDENCIES: 1\n"
         "REQUIRED_SKILLS: analysis\n"
         "</decomposition_plan>\n"
-        f"- Allowed node IDs: {allowed_node_ids}; use contiguous numeric NODE_ID values in declaration order: 1, 2, ..., N.\n"
-        "- Each node must have exactly one INSTRUCTION line and one DEPENDENCIES line.\n"
+        f"- Allowed node IDs: {allowed_node_ids}. Use contiguous numeric NODE_ID values in declaration order: 1, 2, ..., N.\n"
+        "- Each node must contain exactly one INSTRUCTION line and one DEPENDENCIES line.\n"
         f"{node_budget_contract}"
         "- DEPENDENCIES must be `none` or comma-separated earlier node IDs from the allowed set.\n"
-        f"- REQUIRED_SKILLS is preferred for substantive nodes; when present, use only these abstract tags: {skill_tags}.\n"
+        f"- REQUIRED_SKILLS is preferred for substantive nodes; when present, use only these tags: {skill_tags}.\n"
         "- OUTPUT_KEY is optional and only for readability.\n"
         "- Do not tailor the decomposition to a particular worker roster.\n"
-        "- Use a DAG, not a linear chain unless needed.\n"
-        "- Prefer splitting the task into a few smaller meaningful steps instead of collapsing everything into one node.\n"
-        "- Use a single-node decomposition only when the task is genuinely atomic or cannot be usefully divided.\n"
+        "- Return a DAG, not a chain unless the task truly needs one.\n"
+        "- Prefer a few smaller meaningful steps over a single node; use one node only when the task is genuinely atomic or cannot be usefully divided.\n"
         "- Keep the summary and node instructions short.\n"
         "- Every node instruction must name the concrete mathematical artifact it should output.\n"
         "- Prefer grounded instructions like `rewrite ... as ...`, `return the simplified expression ...`, `name the chosen method ...`, or `return the final scalar answer ...`.\n"
@@ -251,7 +225,6 @@ def render_decomposer_prompt(
         "- For intermediate nodes, preserve reusable symbolic state; avoid bare numbers unless the node explicitly asks for a numeric sub-result.\n"
         "- The final node must be a terminal sink node that produces the final answer.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
-        f"{DECOMPOSER_ONE_SHOT_EXAMPLE}\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         "Return ONLY the <decomposition_plan> block."
@@ -286,23 +259,18 @@ def render_selector_prompt(
     selector_skeleton = render_selector_output_skeleton(ordered_node_ids, len(worker_pool.workers))
     allowed_worker_indices = ", ".join(str(index) for index in range(1, len(worker_pool.workers) + 1))
     return (
-        f"{SELECTOR_SYSTEM_PROMPT}\n\n"
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <selection_plan> block and nothing else.\n"
-        "- Use this exact skeleton:\n"
+        "- Use this skeleton:\n"
         f"{selector_skeleton}\n"
-        "- Treat the worker indices shown in the skeleton as format placeholders only; choose the actual best worker index for each node.\n"
         "- Use exactly one line per node in the form: `node_id: worker_index`.\n"
-        "- Never output the literal placeholder/header row `node_id: worker_index`; every line must use a real numeric node ID and a real worker index.\n"
-        "- The left side is the numeric node ID from NODES_BY_ID.\n"
-        "- The right side is the worker index from WORKERS_BY_INDEX.\n"
-        "- Assign exactly one worker to each node ID from the decomposition.\n"
-        f"- Number of mapping lines must equal number of nodes ({len(ordered_node_ids)}).\n"
+        "- Replace the skeleton placeholder indices with the actual best worker indices.\n"
+        "- Assign exactly one worker to every node from NODES_BY_ID.\n"
+        f"- The number of mapping lines must equal the number of nodes ({len(ordered_node_ids)}).\n"
         f"- Allowed node IDs: {', '.join(ordered_node_ids)}.\n"
         f"- Allowed worker indices: {allowed_worker_indices}.\n"
-        "- Do not skip nodes, do not add extra assignments, and do not assign multiple workers to one node.\n"
+        "- Do not skip nodes, add extra mappings, repeat a node, or assign multiple workers to one node.\n"
         "- Prefer the worker whose skills and past performance best match each node.\n"
-        "- Do not repeat the task, decomposition, or worker descriptions in the output.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
@@ -397,6 +365,6 @@ def render_worker_prompt(
         f"DEPENDENCY_RESULTS:\n"
         f"{chr(10).join(dependency_lines)}\n\n"
         f"EXPECTED_OUTPUT_HINT: {expected_output_hint}\n"
-        "Return ONLY an optional <worker_scratchpad> block followed by the required <worker_result> block."
+        "Return ONLY an optional <worker_scratchpad> block followed by the required <worker_result> block.\n"
         "OUTPUT:\n"
     )

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .prompts import (
+    DECOMPOSER_SYSTEM_PROMPT,
+    SELECTOR_SYSTEM_PROMPT,
     render_decomposer_prompt,
     render_selector_output_skeleton,
     render_selector_prompt,
@@ -1058,6 +1060,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
+                system_prompt=DECOMPOSER_SYSTEM_PROMPT,
                 max_new_tokens=self._controller_max_new_tokens("decomposer"),
                 temperature=self._controller_temperature(),
                 sampling_overrides=self._controller_sampling_overrides("decomposer"),
@@ -1172,6 +1175,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
+                system_prompt=SELECTOR_SYSTEM_PROMPT,
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 temperature=self._controller_temperature(),
                 sampling_overrides=self._controller_sampling_overrides(
@@ -1390,6 +1394,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
+                system_prompt=DECOMPOSER_SYSTEM_PROMPT,
                 max_new_tokens=self._controller_max_new_tokens("decomposer"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
@@ -1510,6 +1515,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
+                system_prompt=SELECTOR_SYSTEM_PROMPT,
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),
