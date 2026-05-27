@@ -170,6 +170,8 @@ class ReMARewardManager:
         reward_tensor_map['meta_boxed_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_boxed_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_boxed_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_finish_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_finish_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_repeat_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_repeat_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
