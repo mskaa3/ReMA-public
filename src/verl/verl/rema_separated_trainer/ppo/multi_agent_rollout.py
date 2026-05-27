@@ -934,6 +934,7 @@ class MultiAgentRollout:
                             output,
                             tokens[local_idx],
                             stops[local_idx],
+                            [subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]],
                         )
                         subtask_ids = ", ".join([subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]])
                         completed_results_by_idx[idx].append((stage_role, worker_type_by_idx[idx], subtask_ids, output))
@@ -957,8 +958,10 @@ class MultiAgentRollout:
                         chat = build_prompt(stage_role, idx, "No subtasks were assigned to this worker stage.")
                         record_prompt_and_output(idx, stage_role, chat, "", 0, "stop")
                     else:
-                        chat, output, num_gen_tokens, stop_reason = record
+                        chat, output, num_gen_tokens, stop_reason, assigned_subtask_ids = record
                         record_prompt_and_output(idx, stage_role, chat, output, num_gen_tokens, stop_reason)
+                        if history[idx] and history[idx][-1].get("role") == stage_role:
+                            history[idx][-1]["assigned_subtasks"] = assigned_subtask_ids
 
             for idx in unfinished_indices:
                 previous_feedback[idx] = self._format_hierarchical_feedback(
@@ -1123,6 +1126,21 @@ class MultiAgentRollout:
         """Prepare final output"""
 
         non_tensor_batch = prompts.non_tensor_batch
+        hierarchy_config = prompts.meta_info.get("hierarchy", {})
+        if hierarchy_config.get("enable", False):
+            score_role = hierarchy_config.get("score_role")
+            if score_role:
+                latest_outputs = [
+                    next(
+                        (
+                            msg.get("content", "")
+                            for msg in reversed(sample_history)
+                            if isinstance(msg, dict) and msg.get("role") == score_role
+                        ),
+                        output,
+                    )
+                    for sample_history, output in zip(history, latest_outputs)
+                ]
         non_tensor_batch["finish_reason"] = finish_reason
         non_tensor_batch["num_turns"] = [
             len(h) // len(agent_roles) for h in history

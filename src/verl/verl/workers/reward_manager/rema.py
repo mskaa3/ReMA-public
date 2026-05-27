@@ -29,6 +29,8 @@ WORKER_BOXED_PENALTY = 0.10
 WORKER_FINISH_PENALTY = 0.10
 PLANNER_REPEAT_PENALTY = 0.10
 PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
+WORKER_EMPTY_ASSIGNED_PENALTY = 0.10
+WORKER_SUBTASK_OVERREACH_PENALTY = 0.10
 WORKER_DUPLICATE_RESULT_PENALTY = 0.10
 
 
@@ -177,6 +179,10 @@ class ReMARewardManager:
         reward_tensor_map['planner_repeat_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_excess_subtask_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_excess_subtask_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_empty_assigned_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_empty_assigned_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_subtask_overreach_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_subtask_overreach_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         
@@ -336,6 +342,34 @@ class ReMARewardManager:
                 reward_tensor_map['planner_excess_subtask_penalty_value'][i_bsz] = PLANNER_EXCESS_SUBTASK_PENALTY
                 for role in excess_subtask_roles:
                     role_penalties[role] += PLANNER_EXCESS_SUBTASK_PENALTY
+
+            empty_assigned_roles = set()
+            overreach_roles = set()
+            for msg in valid_history:
+                if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
+                    continue
+                assigned_subtasks = msg.get('assigned_subtasks') or []
+                content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+                if assigned_subtasks and not content.strip():
+                    empty_assigned_roles.add(msg.get('role'))
+                if assigned_subtasks:
+                    mentioned_subtasks = {
+                        subtask.upper()
+                        for subtask in re.findall(r"\bS\d+\b", content, re.IGNORECASE)
+                    }
+                    allowed_subtasks = {subtask.upper() for subtask in assigned_subtasks}
+                    if mentioned_subtasks - allowed_subtasks:
+                        overreach_roles.add(msg.get('role'))
+            if empty_assigned_roles:
+                reward_tensor_map['worker_empty_assigned_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['worker_empty_assigned_penalty_value'][i_bsz] = WORKER_EMPTY_ASSIGNED_PENALTY
+                for role in empty_assigned_roles:
+                    role_penalties[role] += WORKER_EMPTY_ASSIGNED_PENALTY
+            if overreach_roles:
+                reward_tensor_map['worker_subtask_overreach_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['worker_subtask_overreach_penalty_value'][i_bsz] = WORKER_SUBTASK_OVERREACH_PENALTY
+                for role in overreach_roles:
+                    role_penalties[role] += WORKER_SUBTASK_OVERREACH_PENALTY
 
             duplicate_worker_roles = set()
             for i_turn in range(num_turns):

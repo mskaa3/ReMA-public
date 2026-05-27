@@ -1319,12 +1319,16 @@ class RayReMASeparatedTrainer(object):
                         #     "reasoning_turn_level_reward": tensor([...], device='cuda:0'),
                         # }
                         reward_tensor_map = self.reward_fn(new_batch)
-                        for penalty_name in (
-                            'meta_boxed_penalty',
-                            'worker_boxed_penalty',
-                            'planner_repeat_penalty',
-                            'worker_duplicate_result_penalty',
-                        ):
+                        penalty_names = sorted({
+                            key[:-len('_applied')]
+                            for key in reward_tensor_map
+                            if key.endswith('_penalty_applied')
+                        } | {
+                            key[:-len('_value')]
+                            for key in reward_tensor_map
+                            if key.endswith('_penalty_value')
+                        })
+                        for penalty_name in penalty_names:
                             penalty_applied = reward_tensor_map.pop(f'{penalty_name}_applied', None)
                             penalty_value = reward_tensor_map.pop(f'{penalty_name}_value', None)
                             if penalty_applied is not None:
