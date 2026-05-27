@@ -24,7 +24,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--val-ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--min-reward", type=float, default=None)
+    parser.add_argument(
+        "--min-reward",
+        type=float,
+        default=0.21,
+        help=(
+            "Minimum replay reward required for a controller sample to enter training. "
+            "The default filters out most incorrect-but-confident selector samples."
+        ),
+    )
     parser.add_argument("--min-advantage", type=float, default=None)
     parser.add_argument("--save-replay-copy", action="store_true", help="Save train/val/all sample JSONL files per policy for inspection")
 

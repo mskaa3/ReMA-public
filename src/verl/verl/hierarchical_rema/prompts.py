@@ -76,8 +76,6 @@ def _compact_performance_summary(snapshot: WorkerPerformanceSnapshot) -> dict:
     return {
         "ema_outcome": snapshot.ema_outcome,
         "num_assignments": snapshot.num_assignments,
-        "completion_rate": snapshot.completion_rate,
-        "success_rate": snapshot.success_rate,
         "average_reward": snapshot.average_reward,
         "average_confidence_reward": snapshot.average_confidence_reward,
         "average_compatibility": snapshot.average_compatibility,
@@ -106,10 +104,6 @@ def _worker_context(
                         worker_id=worker.worker_id,
                         ema_outcome=0.5,
                         num_assignments=0,
-                        num_completed=0,
-                        completion_rate=0.0,
-                        num_successes=0,
-                        success_rate=0.0,
                         average_reward=0.0,
                         average_confidence_reward=0.0,
                         average_compatibility=0.0,
@@ -249,11 +243,11 @@ def render_selector_prompt(
     worker_lines = []
     for worker_index, worker in enumerate(worker_pool.workers, start=1):
         snapshot = worker_performance.get(worker.worker_id)
-        success_rate = snapshot.success_rate if snapshot is not None else 0.0
+        ema_outcome = snapshot.ema_outcome if snapshot is not None else 0.5
         avg_reward = snapshot.average_reward if snapshot is not None else 0.0
         skills = ",".join(worker.skills) if worker.skills else "none"
         worker_lines.append(
-            f"{worker_index}: {worker.worker_id} | skills={skills} | success={success_rate:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
+            f"{worker_index}: {worker.worker_id} | skills={skills} | ema={ema_outcome:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
         )
 
     selector_skeleton = render_selector_output_skeleton(ordered_node_ids, len(worker_pool.workers))

@@ -676,7 +676,6 @@ class MockHierarchicalBackend(HierarchicalBackend):
             raw_output_text=output_text,
             worker_prompt=prompt_text,
             dependency_outputs=dict(dependency_outputs),
-            completed=bool(output_text.strip()),
             success=success,
         )
 
@@ -1352,8 +1351,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             temperature=self._worker_temperature(),
         )
         normalized_output = extract_worker_result_text(output_text).strip()
-        completed = bool(normalized_output)
-        success = completed and "i don't know" not in output_text.lower()
+        success = bool(normalized_output) and "i don't know" not in output_text.lower()
         return WorkerExecution(
             node_id=node.node_id,
             worker_id=worker.worker_id,
@@ -1364,7 +1362,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             raw_output_text=output_text,
             worker_prompt=prompt_text,
             dependency_outputs=dict(dependency_outputs),
-            completed=completed,
             success=success,
         )
 
@@ -1718,8 +1715,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             )
             for (result_index, request, _), (output_text, entropy) in zip(grouped_requests, generated):
                 normalized_output = extract_worker_result_text(output_text).strip()
-                completed = bool(normalized_output)
-                success = completed and "i don't know" not in output_text.lower()
+                success = bool(normalized_output) and "i don't know" not in output_text.lower()
                 results[result_index] = WorkerExecution(
                     node_id=request.node.node_id,
                     worker_id=request.worker.worker_id,
@@ -1730,7 +1726,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     raw_output_text=output_text,
                     worker_prompt=prompt_text,
                     dependency_outputs=dict(request.dependency_outputs),
-                    completed=completed,
                     success=success,
                 )
 

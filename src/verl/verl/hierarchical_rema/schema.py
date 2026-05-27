@@ -72,7 +72,7 @@ class RewardWeights:
     compatibility: float = 0.2
     entropy_cap: float = 2.0
     worker_reward_mode: WorkerRewardMode = WorkerRewardMode.CURRENT
-    worker_success_weight: float = 0.5
+    worker_success_weight: float = 0.0
     worker_final_correctness_weight: float = 0.5
 
 
@@ -199,10 +199,6 @@ class WorkerPerformanceSnapshot:
     worker_id: str
     ema_outcome: float
     num_assignments: int
-    num_completed: int
-    completion_rate: float
-    num_successes: int
-    success_rate: float
     average_reward: float
     average_confidence_reward: float
     average_compatibility: float
@@ -316,11 +312,12 @@ class WorkerExecution:
     raw_output_text: str = ""
     worker_prompt: str = ""
     dependency_outputs: Dict[str, str] = field(default_factory=dict)
-    completed: bool = True
     success: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("success", None)
+        return payload
 
 
 @dataclass

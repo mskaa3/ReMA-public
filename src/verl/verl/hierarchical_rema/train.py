@@ -114,21 +114,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--confidence-reward-weight",
         type=float,
-        default=0.1,
+        default=0.05,
         help="Weight assigned to low-entropy worker responses in selection reward",
     )
     parser.add_argument(
         "--compatibility-reward-weight",
         type=float,
-        default=0.1,
+        default=0.05,
         help="Weight assigned to worker-node compatibility in selection reward",
     )
-    parser.add_argument(
-        "--worker-success-weight",
-        type=float,
-        default=0.25,
-        help="Relative weight of local worker execution success in worker performance memory updates",
-    )
+    # parser.add_argument(
+    #     "--worker-success-weight",
+    #     type=float,
+    #     default=0.25,
+    #     help="Relative weight of local worker execution success in worker performance memory updates",
+    # )
     parser.add_argument(
         "--worker-final-correctness-weight",
         type=float,
@@ -215,8 +215,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role", choices=["decomposer", "selector", "both"], default="both", help="Only train these controller roles after rollout generation")
     parser.add_argument("--val-ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--min-reward", type=float, default=None)
+    parser.add_argument(
+        "--min-reward",
+        type=float,
+        default=0.21,
+        help=(
+            "Minimum replay reward required for a controller sample to enter training. "
+            "The default filters out most incorrect-but-confident selector samples."
+        ),
+    )
     parser.add_argument("--min-advantage", type=float, default=None)
+    parser.add_argument(
+        "--decomposer-reward-aggregation",
+        choices=["mean", "best"],
+        default="best",
+        help=(
+            "How to aggregate selection rewards into a decomposer reward. "
+            "`best` uses the strongest selection under a decomposition; `mean` averages all selections."
+        ),
+    )
+    parser.add_argument(
+        "--decomposer-no-correct-selection-scale",
+        type=float,
+        default=0.25,
+        help=(
+            "Scale applied to the positive part of a decomposition reward when none of its "
+            "selections reach the correct final answer. 0.0 zeros positive spillover; 1.0 disables the gate."
+        ),
+    )
     parser.add_argument(
         "--controller-format-retry-penalty",
         type=float,
@@ -1073,7 +1099,7 @@ def _build_rollout_trainer(
             confidence=args.confidence_reward_weight,
             compatibility=args.compatibility_reward_weight,
             worker_reward_mode=worker_reward_mode,
-            worker_success_weight=args.worker_success_weight,
+            worker_success_weight=getattr(args, "worker_success_weight", 0.0),
             worker_final_correctness_weight=args.worker_final_correctness_weight,
         ),
         backend_type=args.backend,
@@ -1123,6 +1149,8 @@ def _build_rollout_trainer(
         controller_format_retry_penalty=args.controller_format_retry_penalty,
         controller_format_fallback_penalty=args.controller_format_fallback_penalty,
         selector_partial_completion_penalty=args.selector_partial_completion_penalty,
+        decomposer_reward_aggregation=args.decomposer_reward_aggregation,
+        decomposer_no_correct_selection_scale=args.decomposer_no_correct_selection_scale,
     )
 
 

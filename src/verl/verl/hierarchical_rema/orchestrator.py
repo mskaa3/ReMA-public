@@ -60,6 +60,8 @@ class HierarchicalReMAOrchestrator:
         controller_format_retry_penalty: float = 0.0,
         controller_format_fallback_penalty: float = 0.0,
         selector_partial_completion_penalty: float = 0.0,
+        decomposer_reward_aggregation: str = "best",
+        decomposer_no_correct_selection_scale: float = 0.25,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
@@ -70,6 +72,43 @@ class HierarchicalReMAOrchestrator:
             float(selector_partial_completion_penalty),
             0.0,
         )
+        normalized_aggregation = str(decomposer_reward_aggregation).strip().lower()
+        if normalized_aggregation not in {"mean", "best"}:
+            raise ValueError(
+                "decomposer_reward_aggregation must be one of: mean, best"
+            )
+        self.decomposer_reward_aggregation = normalized_aggregation
+        self.decomposer_no_correct_selection_scale = min(
+            max(float(decomposer_no_correct_selection_scale), 0.0),
+            1.0,
+        )
+
+    def _aggregate_decomposition_selection_reward(
+        self,
+        selection_rollouts: Sequence[SelectionRollout],
+        selection_training_rewards: Sequence[float],
+    ) -> float:
+        if not selection_training_rewards:
+            return 0.0
+        if self.decomposer_reward_aggregation == "best":
+            aggregated_reward = max(selection_training_rewards)
+        else:
+            aggregated_reward = sum(selection_training_rewards) / max(
+                len(selection_training_rewards), 1
+            )
+
+        has_correct_selection = any(
+            selection.reward.final_answer_correctness > 0.0
+            for selection in selection_rollouts
+        )
+        if not has_correct_selection:
+            positive_reward = max(aggregated_reward, 0.0)
+            negative_reward = min(aggregated_reward, 0.0)
+            aggregated_reward = (
+                negative_reward
+                + positive_reward * self.decomposer_no_correct_selection_scale
+            )
+        return aggregated_reward
 
     @staticmethod
     def _raw_controller_validation(payload: Dict[str, object]) -> Dict[str, object]:
@@ -275,9 +314,10 @@ class HierarchicalReMAOrchestrator:
                 for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
                     selection_rollout.selector_advantage = advantage
 
-                base_decomposition_reward = sum(
-                    selection_training_rewards
-                ) / max(len(selection_rollouts), 1)
+                base_decomposition_reward = self._aggregate_decomposition_selection_reward(
+                    selection_rollouts=selection_rollouts,
+                    selection_training_rewards=selection_training_rewards,
+                )
                 decomposition_reward = base_decomposition_reward - decomposition.soft_penalty
                 decomposition_rollouts.append(
                     DecompositionRollout(
@@ -619,6 +659,8 @@ class HierarchicalGRPOTrainer:
     controller_format_retry_penalty: float = 0.0
     controller_format_fallback_penalty: float = 0.0
     selector_partial_completion_penalty: float = 0.0
+    decomposer_reward_aggregation: str = "best"
+    decomposer_no_correct_selection_scale: float = 0.25
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -641,6 +683,8 @@ class HierarchicalGRPOTrainer:
             controller_format_retry_penalty=self.controller_format_retry_penalty,
             controller_format_fallback_penalty=self.controller_format_fallback_penalty,
             selector_partial_completion_penalty=self.selector_partial_completion_penalty,
+            decomposer_reward_aggregation=self.decomposer_reward_aggregation,
+            decomposer_no_correct_selection_scale=self.decomposer_no_correct_selection_scale,
         )
         self._current_phase = AlternatingPhase.SELECTOR
 

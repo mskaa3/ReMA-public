@@ -255,8 +255,6 @@ class RolloutRecorder:
                     "entropy": execution.entropy,
                     "confidence_reward": execution.confidence_reward,
                     "compatibility": execution.compatibility,
-                    "completed": execution.completed,
-                    "success": execution.success,
                 }
                 for execution in selection_rollout.executions
             ],

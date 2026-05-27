@@ -45,18 +45,16 @@ class WorkerPerformanceMemory:
     smoothing: float = 0.2
     initial_prior: float = 0.5
     max_recent_history: int = 5
-    _worker_success_rate: Dict[str, float] = field(default_factory=dict)
+    _worker_outcome_ema: Dict[str, float] = field(default_factory=dict)
     _worker_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def prior_for(self, worker_id: str) -> float:
-        return self._worker_success_rate.get(worker_id, self.initial_prior)
+        return self._worker_outcome_ema.get(worker_id, self.initial_prior)
 
     def _stats_for(self, worker_id: str) -> Dict[str, Any]:
         if worker_id not in self._worker_stats:
             self._worker_stats[worker_id] = {
                 "num_assignments": 0,
-                "num_completed": 0,
-                "num_successes": 0,
                 "total_reward": 0.0,
                 "total_confidence_reward": 0.0,
                 "total_compatibility": 0.0,
@@ -66,7 +64,7 @@ class WorkerPerformanceMemory:
 
     def update(self, worker_id: str, outcome: float) -> None:
         previous = self.prior_for(worker_id)
-        self._worker_success_rate[worker_id] = (1.0 - self.smoothing) * previous + self.smoothing * outcome
+        self._worker_outcome_ema[worker_id] = (1.0 - self.smoothing) * previous + self.smoothing * outcome
 
     def update_many(self, worker_ids: Iterable[str], outcome: float) -> None:
         for worker_id in worker_ids:
@@ -81,8 +79,6 @@ class WorkerPerformanceMemory:
     ) -> None:
         stats = self._stats_for(execution.worker_id)
         stats["num_assignments"] += 1
-        stats["num_completed"] += int(execution.completed)
-        stats["num_successes"] += int(execution.success)
         stats["total_reward"] += selection_reward.total_reward
         stats["total_confidence_reward"] += execution.confidence_reward
         stats["total_compatibility"] += execution.compatibility
@@ -90,8 +86,6 @@ class WorkerPerformanceMemory:
             {
                 "task_id": task_id,
                 "node_id": execution.node_id,
-                "completed": execution.completed,
-                "success": execution.success,
                 "selection_reward": selection_reward.total_reward,
                 "final_answer_correctness": selection_reward.final_answer_correctness,
                 "confidence_reward": execution.confidence_reward,
@@ -102,39 +96,17 @@ class WorkerPerformanceMemory:
         if len(stats["recent_history"]) > self.max_recent_history:
             stats["recent_history"] = stats["recent_history"][-self.max_recent_history:]
 
-        if reward_weights.worker_reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
-            outcome = selection_reward.final_answer_correctness
-        else:
-            success_weight = max(float(reward_weights.worker_success_weight), 0.0)
-            final_correctness_weight = max(
-                float(reward_weights.worker_final_correctness_weight),
-                0.0,
-            )
-            total_weight = success_weight + final_correctness_weight
-            if total_weight <= 0.0:
-                success_weight = 0.5
-                final_correctness_weight = 0.5
-                total_weight = 1.0
-            outcome = (
-                success_weight * float(execution.success)
-                + final_correctness_weight * selection_reward.final_answer_correctness
-            ) / total_weight
+        outcome = selection_reward.final_answer_correctness
         self.update(execution.worker_id, outcome)
 
     def snapshot_for(self, worker_id: str) -> WorkerPerformanceSnapshot:
         stats = self._stats_for(worker_id)
         num_assignments = int(stats["num_assignments"])
-        num_completed = int(stats["num_completed"])
-        num_successes = int(stats["num_successes"])
         denom = max(num_assignments, 1)
         return WorkerPerformanceSnapshot(
             worker_id=worker_id,
             ema_outcome=self.prior_for(worker_id),
             num_assignments=num_assignments,
-            num_completed=num_completed,
-            completion_rate=num_completed / denom if num_assignments else 0.0,
-            num_successes=num_successes,
-            success_rate=num_successes / denom if num_assignments else 0.0,
             average_reward=stats["total_reward"] / denom if num_assignments else 0.0,
             average_confidence_reward=(
                 stats["total_confidence_reward"] / denom if num_assignments else 0.0
@@ -152,7 +124,7 @@ class WorkerPerformanceMemory:
         }
 
     def to_dict(self) -> Dict[str, float]:
-        return dict(self._worker_success_rate)
+        return dict(self._worker_outcome_ema)
 
 
 def skill_match_score(required_skills: Sequence[str], worker: WorkerSpec) -> float:
@@ -172,7 +144,7 @@ def compatibility_score(
     skill_score = skill_match_score(required_skills, worker)
     performance_snapshot = worker_performance.get(worker.worker_id)
     performance_prior = performance_snapshot.ema_outcome if performance_snapshot else 0.5
-    return 0.5 * skill_score + 0.5 * performance_prior
+    return 0.8 * skill_score + 0.2 * performance_prior
 
 
 def build_selection_reward(
