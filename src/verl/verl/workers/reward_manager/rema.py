@@ -28,6 +28,7 @@ META_BOXED_PENALTY = 0.25
 WORKER_BOXED_PENALTY = 0.10
 WORKER_FINISH_PENALTY = 0.10
 PLANNER_REPEAT_PENALTY = 0.10
+PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
 WORKER_DUPLICATE_RESULT_PENALTY = 0.10
 
 
@@ -174,6 +175,8 @@ class ReMARewardManager:
         reward_tensor_map['worker_finish_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_repeat_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_repeat_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['planner_excess_subtask_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['planner_excess_subtask_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         
@@ -310,6 +313,29 @@ class ReMARewardManager:
                 reward_tensor_map['planner_repeat_penalty_value'][i_bsz] = PLANNER_REPEAT_PENALTY
                 for role in repeated_planner_roles:
                     role_penalties[role] += PLANNER_REPEAT_PENALTY
+
+            excess_subtask_roles = set()
+            if 'decomposer' in agent_roles:
+                max_worker_subtasks = max(
+                    len(stage_roles or []) - 1,
+                    1,
+                )
+                for msg in valid_history:
+                    if not (
+                        isinstance(msg, dict)
+                        and msg.get('role') == 'decomposer'
+                        and isinstance(msg.get('content'), str)
+                    ):
+                        continue
+                    subtask_ids = set(re.findall(r"\bS\d+\b", msg.get('content'), re.IGNORECASE))
+                    if len(subtask_ids) > max_worker_subtasks:
+                        excess_subtask_roles.add('decomposer')
+                        break
+            if excess_subtask_roles:
+                reward_tensor_map['planner_excess_subtask_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['planner_excess_subtask_penalty_value'][i_bsz] = PLANNER_EXCESS_SUBTASK_PENALTY
+                for role in excess_subtask_roles:
+                    role_penalties[role] += PLANNER_EXCESS_SUBTASK_PENALTY
 
             duplicate_worker_roles = set()
             for i_turn in range(num_turns):

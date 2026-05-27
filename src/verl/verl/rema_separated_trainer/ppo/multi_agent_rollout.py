@@ -624,6 +624,8 @@ class MultiAgentRollout:
         stage_items = []
         seen_subtasks = set()
         next_stage_idx = 0
+        worker_stage_roles = stage_roles[:-1] if len(stage_roles) > 1 else stage_roles
+        final_stage_role = stage_roles[-1] if stage_roles else None
 
         for line in selector_text.splitlines():
             worker = None
@@ -645,14 +647,16 @@ class MultiAgentRollout:
             if stage_role is None and not subtask_ids and not is_final_line:
                 continue
 
-            if stage_role is None and is_final_line and stage_roles:
-                stage_role = stage_roles[-1]
+            if stage_role is None and is_final_line and final_stage_role:
+                stage_role = final_stage_role
             elif stage_role is None:
-                if next_stage_idx >= len(stage_roles):
-                    stage_role = stage_roles[-1]
+                if next_stage_idx >= len(worker_stage_roles):
+                    stage_role = worker_stage_roles[-1]
                 else:
-                    stage_role = stage_roles[next_stage_idx]
+                    stage_role = worker_stage_roles[next_stage_idx]
                     next_stage_idx += 1
+            elif subtask_ids and stage_role == final_stage_role and worker_stage_roles and not is_final_line:
+                stage_role = worker_stage_roles[-1]
 
             stage_subtasks = []
             for subtask_id in subtask_ids:
@@ -661,20 +665,20 @@ class MultiAgentRollout:
                     seen_subtasks.add(subtask_id)
             if stage_subtasks:
                 stage_items.append((stage_role, worker, stage_subtasks))
-            elif stage_roles and stage_role == stage_roles[-1] and is_final_line:
+            elif final_stage_role and stage_role == final_stage_role and is_final_line:
                 stage_items.append((stage_role, worker, []))
 
         if not stage_items:
             seen_subtasks = set()
             for i, (subtask_id, description) in enumerate(subtasks):
-                stage_role = stage_roles[min(i, len(stage_roles) - 1)]
+                stage_role = worker_stage_roles[min(i, len(worker_stage_roles) - 1)]
                 worker = default_worker
                 stage_items.append((stage_role, worker, [(subtask_id, description)]))
                 seen_subtasks.add(subtask_id)
 
         for subtask_id, _ in subtasks:
             if subtask_id not in seen_subtasks:
-                stage_role = stage_roles[min(len(stage_items), len(stage_roles) - 1)]
+                stage_role = worker_stage_roles[min(len(stage_items), len(worker_stage_roles) - 1)]
                 stage_items.append((stage_role, default_worker, [(subtask_id, subtask_map[subtask_id])]))
                 seen_subtasks.add(subtask_id)
 
@@ -895,7 +899,8 @@ class MultiAgentRollout:
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
                             "FINAL STAGE: Use previous worker results and your assigned subtasks to provide the final answer. "
-                            "Output the exact token [FINISH] and put the final answer in \\boxed{}."
+                            "Output the exact token [FINISH] and put the final answer in \\boxed{}. "
+                            "Do not output [FINISH] unless the final answer is present in \\boxed{}."
                             if is_final_stage else
                             "INTERMEDIATE STAGE: Solve only these subtasks. Do not write [FINISH], \\boxed{}, or Final Answer. "
                             "Return LOCAL_RESULT and REASONING for later workers."
@@ -937,7 +942,7 @@ class MultiAgentRollout:
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
                             final_worker_has_answer = "\\boxed" in output
-                            if (finish_flag and finish_flag in output) or final_worker_has_answer:
+                            if final_worker_has_answer:
                                 finish_flags[idx] = True
                                 finish_reason[idx] = None
                             if self.config.stop_when_truncated and stops[local_idx] == "length":
