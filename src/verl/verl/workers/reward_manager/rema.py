@@ -26,6 +26,7 @@ from math_verify.errors import TimeoutException
 
 META_BOXED_PENALTY = 0.25
 WORKER_BOXED_PENALTY = 0.10
+WORKER_FINISH_PENALTY = 0.10
 PLANNER_REPEAT_PENALTY = 0.10
 WORKER_DUPLICATE_RESULT_PENALTY = 0.10
 
@@ -257,6 +258,25 @@ class ReMARewardManager:
                 reward_tensor_map['worker_boxed_penalty_value'][i_bsz] = WORKER_BOXED_PENALTY
                 for role in worker_boxed_roles:
                     role_penalties[role] += WORKER_BOXED_PENALTY
+
+            finish_flag = data.meta_info.get('finish_flag')
+            worker_finish_roles = set()
+            if finish_flag:
+                for msg in valid_history:
+                    content = msg.get('content') if isinstance(msg, dict) else None
+                    if (
+                        isinstance(msg, dict)
+                        and msg.get('role') in worker_roles
+                        and isinstance(content, str)
+                        and finish_flag in content
+                        and content != response_str
+                    ):
+                        worker_finish_roles.add(msg.get('role'))
+            if worker_finish_roles:
+                reward_tensor_map['worker_finish_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['worker_finish_penalty_value'][i_bsz] = WORKER_FINISH_PENALTY
+                for role in worker_finish_roles:
+                    role_penalties[role] += WORKER_FINISH_PENALTY
 
             repeated_planner_roles = set()
             for role in planner_roles.intersection(agent_roles):

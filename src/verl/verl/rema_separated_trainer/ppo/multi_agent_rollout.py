@@ -563,10 +563,15 @@ class MultiAgentRollout:
     @staticmethod
     def _extract_subtasks(plan_text: str) -> List[Tuple[str, str]]:
         subtasks = []
+        seen_subtasks = set()
         for line in plan_text.splitlines():
             match = re.match(r"\s*-?\s*(S\d+)\s*[:.)-]\s*(.+?)\s*$", line, re.IGNORECASE)
             if match:
-                subtasks.append((match.group(1).upper(), match.group(2).strip()))
+                subtask_id = match.group(1).upper()
+                if subtask_id in seen_subtasks:
+                    continue
+                subtasks.append((subtask_id, match.group(2).strip()))
+                seen_subtasks.add(subtask_id)
         if not subtasks and plan_text.strip():
             subtasks.append(("S1", plan_text.strip()))
         return subtasks
@@ -610,7 +615,11 @@ class MultiAgentRollout:
         worker_stage_3 as algebra again without repeating a role in history.
         """
         subtask_map = {subtask_id: description for subtask_id, description in subtasks}
-        lowered_workers = {worker.lower(): worker for worker in worker_types}
+        lowered_workers = {}
+        for worker in worker_types:
+            lowered_workers[worker.lower()] = worker
+            if worker.endswith("_worker"):
+                lowered_workers[worker[:-len("_worker")].lower()] = worker
         lowered_stages = {stage.lower(): stage for stage in stage_roles}
         stage_items = []
         seen_subtasks = set()
@@ -878,7 +887,10 @@ class MultiAgentRollout:
                         stage_subtasks_by_idx[idx] = assigned_subtasks
                         worker_type_by_idx[idx] = worker_type
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
-                        question_block = f"Question:\n{questions[idx]}\n\n" if pass_question_to_workers else ""
+                        question_block = (
+                            f"Question (complete original problem):\n{questions[idx]}\n\n"
+                            if pass_question_to_workers else ""
+                        )
                         completed_text = self._format_completed_worker_results(completed_results_by_idx[idx])
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
@@ -900,7 +912,6 @@ class MultiAgentRollout:
                                 f"{question_block}"
                                 f"Worker type for this stage: {worker_type}\n\n"
                                 f"Worker specialization: {worker_specs.get(worker_type, '')}\n\n"
-                                f"Plan:\n{current_plan[idx]}\n\n"
                                 f"Previous worker results:\n{completed_text}\n\n"
                                 f"{stage_instruction}\n\n"
                                 f"Your assigned subtasks:\n{assigned_subtasks_text}"
