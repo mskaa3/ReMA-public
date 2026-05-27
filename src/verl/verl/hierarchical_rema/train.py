@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compatibility-reward-weight",
         type=float,
-        default=0.05,
+        default=0.1,
         help="Weight assigned to worker-node compatibility in selection reward",
     )
     # parser.add_argument(

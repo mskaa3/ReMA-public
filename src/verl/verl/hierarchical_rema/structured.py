@@ -253,6 +253,10 @@ def _is_placeholder_selection_assignment(raw_node_value: Any, raw_worker_value: 
         "worker_id",
         "worker_index",
         "worker",
+        "best_worker_id_here",
+        "actual_worker_id",
+        "exact_worker_id",
+        "exact_worker_id_here",
     }
 
 
@@ -291,20 +295,15 @@ def format_selection_plan(
     candidate: SelectionCandidate,
     *,
     node_order: Sequence[str] | None = None,
-    worker_index_by_id: Dict[str, int] | None = None,
 ) -> str:
     lines = ["<selection_plan>"]
-    if node_order is not None and worker_index_by_id is not None:
+    if node_order is not None:
         assignment_by_node = {assignment.node_id: assignment for assignment in candidate.assignments}
         for node_id in node_order:
             assignment = assignment_by_node.get(node_id)
             if assignment is None:
                 continue
-            worker_index = worker_index_by_id.get(assignment.worker_id)
-            if worker_index is None:
-                lines.append(f"{node_id}: {assignment.worker_id}")
-                continue
-            lines.append(f"{node_id}: {worker_index}")
+            lines.append(f"{node_id}: {assignment.worker_id}")
     else:
         for assignment in candidate.assignments:
             lines.append(f"{assignment.node_id}: {assignment.worker_id}")

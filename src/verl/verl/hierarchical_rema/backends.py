@@ -162,6 +162,10 @@ def _try_complete_partial_selection_candidate(
             "worker_id",
             "worker_index",
             "worker",
+            "best_worker_id_here",
+            "actual_worker_id",
+            "exact_worker_id",
+            "exact_worker_id_here",
         }
 
     def _best_worker_id_for_node(node_id: str) -> str:
@@ -616,15 +620,9 @@ class MockHierarchicalBackend(HierarchicalBackend):
             "fallback_used": False,
         }
         candidate.raw_payload = raw_payload
-        node_order = [node.node_id for node in decomposition.nodes]
-        worker_index_by_id = {
-            worker.worker_id: idx
-            for idx, worker in enumerate(worker_pool.workers, start=1)
-        }
         candidate.raw_text = format_selection_plan(
             candidate,
-            node_order=node_order,
-            worker_index_by_id=worker_index_by_id,
+            node_order=[node.node_id for node in decomposition.nodes],
         )
         return candidate
 
@@ -796,32 +794,23 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         return int(self.config.controller_max_new_tokens)
 
     @staticmethod
-    def _selection_index_context(
+    def _selection_node_order(
         decomposition: DecompositionCandidate,
-        worker_pool: WorkerPoolConfig,
-    ) -> tuple[List[str], Dict[str, int]]:
-        node_order = [node.node_id for node in decomposition.nodes]
-        worker_index_by_id = {
-            worker.worker_id: index
-            for index, worker in enumerate(worker_pool.workers, start=1)
-        }
-        return node_order, worker_index_by_id
+    ) -> List[str]:
+        return [node.node_id for node in decomposition.nodes]
 
     def _format_selection_completion_text(
         self,
         *,
         candidate: SelectionCandidate,
         decomposition: DecompositionCandidate,
-        worker_pool: WorkerPoolConfig,
     ) -> str:
-        node_order, worker_index_by_id = self._selection_index_context(
+        node_order = self._selection_node_order(
             decomposition=decomposition,
-            worker_pool=worker_pool,
         )
         return format_selection_plan(
             candidate,
             node_order=node_order,
-            worker_index_by_id=worker_index_by_id,
         )
 
     def _controller_sampling_overrides(
@@ -829,7 +818,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         role: str,
         *,
         node_order: Sequence[str] | None = None,
-        worker_count: int | None = None,
+        worker_ids: Sequence[str] | None = None,
     ) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
         stop_tag = "</decomposition_plan>" if role == "decomposer" else "</selection_plan>"
@@ -840,11 +829,14 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             if role == "decomposer":
                 regex = r"(?s)<decomposition_plan>.*?</decomposition_plan>"
             else:
-                regex = r"(?s)<selection_plan>\s*(?:\d+\s*:\s*\d+\s*)+</selection_plan>"
-                if node_order and worker_count and worker_count > 0:
-                    worker_index_pattern = "|".join(str(index) for index in range(1, worker_count + 1))
+                regex = r"(?s)<selection_plan>\s*(?:\d+\s*:\s*[A-Za-z0-9_.-]+\s*)+</selection_plan>"
+                if node_order and worker_ids:
+                    worker_id_pattern = "|".join(
+                        re.escape(str(worker_id))
+                        for worker_id in worker_ids
+                    )
                     assignment_lines = [
-                        rf"{re.escape(str(node_id))}\s*:\s*(?:{worker_index_pattern})\s*"
+                        rf"{re.escape(str(node_id))}\s*:\s*(?:{worker_id_pattern})\s*"
                         for node_id in node_order
                     ]
                     regex = r"(?s)<selection_plan>\s*" + "".join(assignment_lines) + r"</selection_plan>"
@@ -1006,15 +998,9 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             "validation": dict(validation),
         }
         if decomposition is not None and worker_pool is not None:
-            node_order = [node.node_id for node in decomposition.nodes]
-            worker_index_by_id = {
-                worker.worker_id: idx
-                for idx, worker in enumerate(worker_pool.workers, start=1)
-            }
             candidate.raw_text = format_selection_plan(
                 candidate,
-                node_order=node_order,
-                worker_index_by_id=worker_index_by_id,
+                node_order=[node.node_id for node in decomposition.nodes],
             )
         else:
             candidate.raw_text = format_selection_plan(candidate)
@@ -1161,7 +1147,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             repair_position = f" item={repair_progress[0]}/{repair_progress[1]}"
         selector_skeleton = render_selector_output_skeleton(
             [node.node_id for node in decomposition.nodes],
-            len(worker_pool.workers),
         )
         for attempt in range(self.config.max_format_retries + 1):
             payload: Dict[str, Any] | None = None
@@ -1180,7 +1165,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 sampling_overrides=self._controller_sampling_overrides(
                     "selector",
                     node_order=[node.node_id for node in decomposition.nodes],
-                    worker_count=len(worker_pool.workers),
+                    worker_ids=[worker.worker_id for worker in worker_pool.workers],
                 ),
             )
             try:
@@ -1245,11 +1230,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     f"{prompt_text}\n\nYour previous answer did not match the required selection format. "
                     f"Error: {exc}\nReturn ONLY the corrected <selection_plan> block. "
                     "Do not add commentary, bullets, repeated task text, or extra sections. "
-                    "Use numeric node IDs only with one `node_id: worker_index` line per node. "
+                    "Use numeric node IDs only with one `node_id: worker_id` line per node. "
                     "The simplest valid form is:\n"
                     f"{selector_skeleton}"
-                    "\nTreat the worker indices shown above as placeholders for the required output shape; "
-                    "choose the actual best valid worker index for each node."
+                    "\nTreat the worker IDs shown above as placeholders for the required output shape; "
+                    "choose the actual best valid worker_id for each node."
                 )
 
         if repair_progress is not None:
@@ -1281,7 +1266,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         candidate.raw_text = self._format_selection_completion_text(
             candidate=candidate,
             decomposition=decomposition,
-            worker_pool=worker_pool,
         )
         return candidate
 
@@ -1492,7 +1476,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         if not requests:
             return []
 
-        grouped: Dict[Tuple[str, Tuple[str, ...], int], List[Tuple[int, SelectionRequest, str]]] = {}
+        grouped: Dict[Tuple[str, Tuple[str, ...], Tuple[str, ...]], List[Tuple[int, SelectionRequest, str]]] = {}
         for index, request in enumerate(requests):
             model_path = request.policy_config.model_for_role("selector")
             if not model_path:
@@ -1504,10 +1488,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 request.worker_performance,
             )
             node_order = tuple(node.node_id for node in request.decomposition.nodes)
-            grouped.setdefault((model_path, node_order, len(request.worker_pool.workers)), []).append((index, request, prompt_text))
+            worker_ids = tuple(worker.worker_id for worker in request.worker_pool.workers)
+            grouped.setdefault((model_path, node_order, worker_ids), []).append((index, request, prompt_text))
 
         results: List[SelectionCandidate | None] = [None] * len(requests)
-        for (model_path, node_order, worker_count), grouped_requests in grouped.items():
+        for (model_path, node_order, worker_ids), grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
             generated = self._generate_text_batch(
                 base_model_path=model_path,
@@ -1519,7 +1504,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 sampling_overrides=self._controller_sampling_overrides(
                     "selector",
                     node_order=node_order,
-                    worker_count=worker_count,
+                    worker_ids=worker_ids,
                 ),
                 log_label="selector",
             )
@@ -1660,7 +1645,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             candidate.raw_text = self._format_selection_completion_text(
                                 candidate=candidate,
                                 decomposition=request.decomposition,
-                                worker_pool=request.worker_pool,
                             )
                 results[result_index] = candidate
             if first_pass_failure_count:

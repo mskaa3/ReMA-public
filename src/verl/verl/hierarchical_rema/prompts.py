@@ -114,13 +114,10 @@ def _worker_context(
     return worker_context
 
 
-def render_selector_output_skeleton(node_ids: Sequence[str], worker_count: int) -> str:
-    safe_worker_count = max(1, int(worker_count))
+def render_selector_output_skeleton(node_ids: Sequence[str]) -> str:
     lines = ["<selection_plan>"]
-    for line_index, node_id in enumerate(node_ids, start=1):
-        worker_index = ((line_index - 1) % safe_worker_count) + 1
-        # lines.append(f"{node_id}: most_feasible_worker_{worker_index}")
-        lines.append(f"{node_id}: most_feasible_worker_idx")
+    for node_id in node_ids:
+        lines.append(f"{node_id}: best_worker_id_here")
     lines.append("</selection_plan>")
     return "\n".join(lines)
 
@@ -208,6 +205,8 @@ def render_decomposer_prompt(
         f"{node_budget_contract}"
         "- DEPENDENCIES must be `none` or comma-separated earlier node IDs from the allowed set.\n"
         f"- REQUIRED_SKILLS is preferred for substantive nodes; when present, use only these tags: {skill_tags}.\n"
+        "- Use at most 3 REQUIRED_SKILLS tags per node, and prefer 1-2 when possible.\n"
+        "- Do not list every possible skill or repeat broad generic tags across all nodes; include only the tags truly needed for that node.\n"
         "- OUTPUT_KEY is optional and only for readability.\n"
         "- Do not tailor the decomposition to a particular worker roster.\n"
         "- Return a DAG, not a chain unless the task truly needs one.\n"
@@ -241,37 +240,38 @@ def render_selector_prompt(
         )
 
     worker_lines = []
-    for worker_index, worker in enumerate(worker_pool.workers, start=1):
+    for worker in worker_pool.workers:
         snapshot = worker_performance.get(worker.worker_id)
         ema_outcome = snapshot.ema_outcome if snapshot is not None else 0.5
         avg_reward = snapshot.average_reward if snapshot is not None else 0.0
         skills = ",".join(worker.skills) if worker.skills else "none"
         worker_lines.append(
-            f"{worker_index}: {worker.worker_id} | skills={skills} | ema={ema_outcome:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
+            f"- {worker.worker_id} | skills={skills} | ema={ema_outcome:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
         )
 
-    selector_skeleton = render_selector_output_skeleton(ordered_node_ids, len(worker_pool.workers))
-    allowed_worker_indices = ", ".join(str(index) for index in range(1, len(worker_pool.workers) + 1))
+    selector_skeleton = render_selector_output_skeleton(ordered_node_ids)
+    allowed_worker_ids = ", ".join(worker.worker_id for worker in worker_pool.workers)
     return (
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <selection_plan> block and nothing else.\n"
         "- Use this skeleton:\n"
         f"{selector_skeleton}\n"
-        "- Use exactly one line per node in the form: `node_id: worker_index`.\n"
-        "- Replace the skeleton placeholder indices with the actual best worker indices.\n"
+        "- Use exactly one line per node in the form: `node_id: worker_id`.\n"
+        "- Replace the placeholder worker ID with the actual best worker_id from WORKERS_BY_ID.\n"
         "- Assign exactly one worker to every node from NODES_BY_ID.\n"
         f"- The number of mapping lines must equal the number of nodes ({len(ordered_node_ids)}).\n"
         f"- Allowed node IDs: {', '.join(ordered_node_ids)}.\n"
-        f"- Allowed worker indices: {allowed_worker_indices}.\n"
+        f"- Allowed worker IDs: {allowed_worker_ids}.\n"
         "- Do not skip nodes, add extra mappings, repeat a node, or assign multiple workers to one node.\n"
         "- Prefer the worker whose skills and past performance best match each node.\n"
+        "- Do not assign workers by list position or by a repeated numeric pattern like `1->1, 2->2, 3->3`; choose based on node requirements and worker fit.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         f"FINAL_NODE_ID: {decomposition.final_node_id}\n"
         "NODES_BY_ID:\n"
         f"{chr(10).join(node_lines)}\n"
-        "WORKERS_BY_INDEX:\n"
+        "WORKERS_BY_ID:\n"
         f"{chr(10).join(worker_lines)}\n\n"
         "Return ONLY the <selection_plan> block."
     )
