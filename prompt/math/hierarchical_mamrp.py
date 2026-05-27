@@ -9,6 +9,7 @@ You are a meta-think agent that represents human high-level think process, when 
 For this hierarchical setup, express your meta-thinking as an executable worker plan.
 Do not solve the problem or provide the final answer.
 
+Prefer a compact plan with at most 6 subtasks unless the problem truly requires more.
 Break down the solution into clear plan in the following format:
 
 PLAN:
@@ -18,47 +19,37 @@ PLAN:
 """
 
 
-SELECTOR_SYSTEM_PROMPT = """You are the Selector.
-Assign every subtask to one available worker. Do not change the plan.
+SELECTOR_SYSTEM_PROMPT = """You are the subtask assigner.
+Assign each planned subtask to a worker type.
+Do not change the plan.
+Keep the subtask order exactly as written by the Decomposer.
+Choose one worker type for each subtask from: algebra_worker, functional_analysis_worker, general_math_worker.
+Also choose one worker type for the final synthesis step.
 
 Output only:
 ASSIGNMENTS:
-- S1 -> <worker_name>
-- S2 -> <worker_name>
+- S1 -> <worker_type>
+- S2 -> <worker_type>
 ...
+- FINAL -> <worker_type>
 """
 
 
 ALGEBRA_WORKER_SYSTEM_PROMPT = """You are algebra_worker.
 Use the original question only as context.
-Solve only your assigned subtasks. Do not solve the full original problem unless a subtask explicitly asks for the final answer.
-Do not write \\boxed{}, [FINISH], or Final Answer.
-For each assigned subtask, output:
-SUBTASK Sx:
-LOCAL_RESULT: <the local result needed by the finalizer>
-REASONING: <brief derivation>
+Solve only your assigned subtasks using previous worker results when provided.
 """
 
 
 FUNCTIONAL_ANALYSIS_WORKER_SYSTEM_PROMPT = """You are functional_analysis_worker.
 Use the original question only as context.
-Solve only your assigned subtasks. Do not solve the full original problem unless a subtask explicitly asks for the final answer.
-Do not write \\boxed{}, [FINISH], or Final Answer.
-For each assigned subtask, output:
-SUBTASK Sx:
-LOCAL_RESULT: <the local result needed by the finalizer>
-REASONING: <brief derivation>
+Solve only your assigned subtasks using previous worker results when provided.
 """
 
 
 GENERAL_MATH_WORKER_SYSTEM_PROMPT = """You are general_math_worker.
 Use the original question only as context.
-Solve only your assigned subtasks. Do not solve the full original problem unless a subtask explicitly asks for the final answer.
-Do not write \\boxed{}, [FINISH], or Final Answer.
-For each assigned subtask, output:
-SUBTASK Sx:
-LOCAL_RESULT: <the local result needed by the finalizer>
-REASONING: <brief derivation>
+Solve only your assigned subtasks using previous worker results when provided.
 """
 
 
@@ -68,11 +59,44 @@ If the answer is ready, output the exact token [FINISH] and put the final answer
 """
 
 
-HIERARCHICAL_SYSTEM_PROMPTS = {
+ORCHESTRATION_SYSTEM_PROMPTS = {
     "decomposer": DECOMPOSER_SYSTEM_PROMPT,
     "selector": SELECTOR_SYSTEM_PROMPT,
+    "finalizer": FINALIZER_SYSTEM_PROMPT,
+}
+
+
+WORKER_TYPE_SYSTEM_PROMPTS = {
     "algebra_worker": ALGEBRA_WORKER_SYSTEM_PROMPT,
     "functional_analysis_worker": FUNCTIONAL_ANALYSIS_WORKER_SYSTEM_PROMPT,
     "general_math_worker": GENERAL_MATH_WORKER_SYSTEM_PROMPT,
-    "finalizer": FINALIZER_SYSTEM_PROMPT,
 }
+
+
+DEFAULT_STAGE_ROLES = [
+    "worker_stage_1",
+    "worker_stage_2",
+    "worker_stage_3",
+    "worker_stage_4",
+    "worker_stage_5",
+    "worker_stage_6",
+]
+
+
+def build_hierarchical_system_prompts(stage_roles=None):
+    """Build prompts for control roles, worker types, and stage slots.
+
+    worker_stage_* are tensor/history slots. During hierarchical rollout, each
+    stage uses the system prompt of the worker type chosen by the selector.
+    The stage prompt below is only a fallback required by the role map.
+    """
+    prompts = {
+        **ORCHESTRATION_SYSTEM_PROMPTS,
+        **WORKER_TYPE_SYSTEM_PROMPTS,
+    }
+    for stage_role in stage_roles or DEFAULT_STAGE_ROLES:
+        prompts[stage_role] = GENERAL_MATH_WORKER_SYSTEM_PROMPT
+    return prompts
+
+
+HIERARCHICAL_SYSTEM_PROMPTS = build_hierarchical_system_prompts()

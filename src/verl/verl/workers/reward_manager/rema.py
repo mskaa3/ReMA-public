@@ -141,10 +141,26 @@ class ReMARewardManager:
         
         agent_roles = data.meta_info['agent_roles']
         hierarchy_config = data.meta_info.get('hierarchy', {})
-        worker_roles = set(hierarchy_config.get(
+        stage_roles = hierarchy_config.get('stage_roles')
+        if stage_roles is None and hierarchy_config.get('num_worker_stages'):
+            stage_roles = [
+                f'worker_stage_{idx}'
+                for idx in range(1, int(hierarchy_config.get('num_worker_stages')) + 1)
+            ]
+        if stage_roles is not None:
+            worker_roles = set(stage_roles)
+        else:
+            worker_roles = set(hierarchy_config.get(
+                'worker_roles',
+                [role for role in agent_roles if role.endswith('_worker')],
+            ))
+        worker_type_roles = set(hierarchy_config.get(
             'worker_roles',
             [role for role in agent_roles if role.endswith('_worker')],
         ))
+        # Backward compatibility for older hierarchical configs where worker
+        # types themselves were the rollout roles.
+        worker_roles.update(worker_type_roles.intersection(agent_roles))
         planner_roles = {'decomposer', 'selector'}
         reward_tensor_map = {
             f'{role}_turn_level_reward': torch.zeros(batch_size, max_num_turns, dtype=torch.float32) for role in agent_roles
@@ -227,11 +243,13 @@ class ReMARewardManager:
 
             worker_boxed_roles = set()
             for msg in valid_history:
+                content = msg.get('content') if isinstance(msg, dict) else None
                 if (
                     isinstance(msg, dict)
                     and msg.get('role') in worker_roles
-                    and isinstance(msg.get('content'), str)
-                    and 'boxed' in msg.get('content').lower()
+                    and isinstance(content, str)
+                    and 'boxed' in content.lower()
+                    and content != response_str
                 ):
                     worker_boxed_roles.add(msg.get('role'))
             if worker_boxed_roles:

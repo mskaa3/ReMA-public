@@ -595,6 +595,93 @@ class MultiAgentRollout:
         return assignments
 
     @staticmethod
+    def _parse_ordered_worker_stages(
+        selector_text: str,
+        subtasks: List[Tuple[str, str]],
+        stage_roles: List[str],
+        worker_types: List[str],
+        default_worker: str,
+    ) -> List[Tuple[str, str, List[Tuple[str, str]]]]:
+        """Parse selector output into ordered worker stages.
+
+        Stage roles provide fixed tensor slots. Worker types provide the skill
+        specialization used inside a stage. This lets the selector route:
+        worker_stage_1 as algebra, worker_stage_2 as general math,
+        worker_stage_3 as algebra again without repeating a role in history.
+        """
+        subtask_map = {subtask_id: description for subtask_id, description in subtasks}
+        lowered_workers = {worker.lower(): worker for worker in worker_types}
+        lowered_stages = {stage.lower(): stage for stage in stage_roles}
+        stage_items = []
+        seen_subtasks = set()
+        next_stage_idx = 0
+
+        for line in selector_text.splitlines():
+            worker = None
+            stage_role = None
+            line_lower = line.lower()
+            subtask_ids = [match.upper() for match in re.findall(r"\bS\d+\b", line, re.IGNORECASE)]
+            is_final_line = "final" in line_lower
+            for stage_lower, stage_name in lowered_stages.items():
+                if stage_lower in line_lower:
+                    stage_role = stage_name
+                    break
+            for worker_lower, worker_name in lowered_workers.items():
+                if worker_lower in line_lower:
+                    worker = worker_name
+                    break
+            if worker is None:
+                worker = default_worker
+
+            if stage_role is None and not subtask_ids and not is_final_line:
+                continue
+
+            if stage_role is None and is_final_line and stage_roles:
+                stage_role = stage_roles[-1]
+            elif stage_role is None:
+                if next_stage_idx >= len(stage_roles):
+                    stage_role = stage_roles[-1]
+                else:
+                    stage_role = stage_roles[next_stage_idx]
+                    next_stage_idx += 1
+
+            stage_subtasks = []
+            for subtask_id in subtask_ids:
+                if subtask_id in subtask_map and subtask_id not in seen_subtasks:
+                    stage_subtasks.append((subtask_id, subtask_map[subtask_id]))
+                    seen_subtasks.add(subtask_id)
+            if stage_subtasks:
+                stage_items.append((stage_role, worker, stage_subtasks))
+            elif stage_roles and stage_role == stage_roles[-1] and is_final_line:
+                stage_items.append((stage_role, worker, []))
+
+        if not stage_items:
+            seen_subtasks = set()
+            for i, (subtask_id, description) in enumerate(subtasks):
+                stage_role = stage_roles[min(i, len(stage_roles) - 1)]
+                worker = default_worker
+                stage_items.append((stage_role, worker, [(subtask_id, description)]))
+                seen_subtasks.add(subtask_id)
+
+        for subtask_id, _ in subtasks:
+            if subtask_id not in seen_subtasks:
+                stage_role = stage_roles[min(len(stage_items), len(stage_roles) - 1)]
+                stage_items.append((stage_role, default_worker, [(subtask_id, subtask_map[subtask_id])]))
+                seen_subtasks.add(subtask_id)
+
+        merged_by_stage = {}
+        for stage_role, worker, stage_subtasks in stage_items:
+            if stage_role not in merged_by_stage:
+                merged_by_stage[stage_role] = [worker, []]
+            merged_by_stage[stage_role][1].extend(stage_subtasks)
+
+        return [
+            (stage_role, merged_by_stage[stage_role][0], merged_by_stage[stage_role][1])
+            for stage_role in stage_roles
+            if stage_role in merged_by_stage
+        ]
+
+    @staticmethod
     def _format_worker_specs(worker_specs: Dict[str, str], worker_roles: List[str]) -> str:
         return "\n".join([
             f"- {role}: {worker_specs.get(role, '')}"
@@ -605,12 +692,21 @@ class MultiAgentRollout:
     def _format_subtasks(subtasks: List[Tuple[str, str]]) -> str:
         return "\n".join([f"- {subtask_id}: {description}" for subtask_id, description in subtasks])
 
+    @staticmethod
+    def _format_completed_worker_results(completed_results: List[Tuple[str, str, str, str]]) -> str:
+        if not completed_results:
+            return "- None yet."
+        return "\n\n".join([
+            f"{stage_role} as {worker_type} ({subtask_ids}):\n{output}"
+            for stage_role, worker_type, subtask_ids, output in completed_results
+        ])
+
     def _format_hierarchical_feedback(
         self,
         plan: str,
         assignments: str,
         worker_results: Dict[str, str],
-        finalizer_output: str,
+        last_worker_output: str,
         worker_roles: List[str],
     ) -> str:
         worker_result_text = "\n\n".join([
@@ -622,7 +718,7 @@ class MultiAgentRollout:
             f"Plan:\n{plan}\n\n"
             f"Assignments:\n{assignments}\n\n"
             f"Worker results:\n{worker_result_text}\n\n"
-            f"Finalizer output:\n{finalizer_output}\n\n"
+            f"Last worker output:\n{last_worker_output}\n\n"
             "If the answer was not finalized, revise the plan and backtrack where needed."
         )
 
@@ -644,12 +740,17 @@ class MultiAgentRollout:
         batch_size = len(questions)
         decomposer_role = hierarchy_config.get("decomposer_role", "decomposer")
         selector_role = hierarchy_config.get("selector_role", "selector")
-        finalizer_role = hierarchy_config.get("finalizer_role", "finalizer")
-        worker_roles = hierarchy_config.get("worker_roles", [])
-        default_worker = hierarchy_config.get("default_worker", worker_roles[-1] if worker_roles else selector_role)
+        worker_types = hierarchy_config.get("worker_roles", [])
+        stage_roles = hierarchy_config.get("stage_roles")
+        if stage_roles is None:
+            stage_roles = [
+                f"worker_stage_{idx}"
+                for idx in range(1, int(hierarchy_config.get("num_worker_stages", 0)) + 1)
+            ] or worker_types
+        default_worker = hierarchy_config.get("default_worker", worker_types[-1] if worker_types else selector_role)
         worker_specs = hierarchy_config.get("worker_specs", {})
         pass_question_to_workers = hierarchy_config.get("pass_question_to_workers", False)
-        worker_spec_text = self._format_worker_specs(worker_specs, worker_roles)
+        worker_spec_text = self._format_worker_specs(worker_specs, worker_types)
 
         conversation_history = {
             role: [None for _ in range(batch_size)]
@@ -673,6 +774,10 @@ class MultiAgentRollout:
 
         def build_prompt(role, idx, content):
             return running_conversation[role][idx] + [{"role": "user", "content": content}]
+
+        def build_selected_worker_prompt(stage_role, worker_type, idx, content):
+            system_prompt = system_prompts.get(worker_type, system_prompts[stage_role])
+            return [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
 
         def record_prompt_and_output(idx, role, chat, output, num_gen_tokens, stop_reason):
             conversation_history[role][idx] = chat
@@ -720,7 +825,7 @@ class MultiAgentRollout:
                 ))
             selector_outputs, selector_tokens, selector_stops, _ = self._generate_from_chat_list(
                 selector_role, selector_chats, tokenizers, prompts.meta_info, response_length)
-            parsed_assignments = {}
+            ordered_stages_by_idx = {}
             selector_output_by_idx = {}
             for local_idx, idx in enumerate(unfinished_indices):
                 output = selector_outputs[local_idx]
@@ -728,87 +833,121 @@ class MultiAgentRollout:
                 record_prompt_and_output(
                     idx, selector_role, selector_chats[local_idx], output,
                     selector_tokens[local_idx], selector_stops[local_idx])
-                parsed_assignments[idx] = self._parse_assignments(
-                    output, parsed_subtasks[idx], worker_roles, default_worker)
+                ordered_stages_by_idx[idx] = self._parse_ordered_worker_stages(
+                    output, parsed_subtasks[idx], stage_roles, worker_types, default_worker)
+                if stage_roles:
+                    final_stage_role = stage_roles[-1]
+                    if all(stage_role != final_stage_role
+                           for stage_role, _, _ in ordered_stages_by_idx[idx]):
+                        ordered_stages_by_idx[idx].append(
+                            (final_stage_role, default_worker, []))
 
-            # 3. Execute selected workers. Non-selected workers get empty steps so
-            # every role keeps one history slot per hierarchical turn.
-            worker_results = {idx: {role: "" for role in worker_roles} for idx in unfinished_indices}
-            for worker_role in worker_roles:
-                assigned_indices = [
-                    idx for idx in unfinished_indices
-                    if worker_role in parsed_assignments[idx].values()
-                ]
-                worker_chats_by_idx = {}
-                if assigned_indices:
+            # 3. Execute selected worker stages sequentially. Stage roles encode
+            # the order; each later worker sees previous results.
+            worker_results = {idx: {role: "" for role in stage_roles} for idx in unfinished_indices}
+            worker_records = {
+                idx: {
+                    role: None
+                    for role in stage_roles
+                }
+                for idx in unfinished_indices
+            }
+            completed_results_by_idx = {idx: [] for idx in unfinished_indices}
+            max_stage_count = max(
+                [len(ordered_stages_by_idx[idx]) for idx in unfinished_indices],
+                default=0,
+            )
+            for stage_idx in range(max_stage_count):
+                for stage_role in stage_roles:
+                    stage_indices = [
+                        idx for idx in unfinished_indices
+                        if (
+                            stage_idx < len(ordered_stages_by_idx[idx])
+                            and ordered_stages_by_idx[idx][stage_idx][0] == stage_role
+                        )
+                    ]
+                    if not stage_indices:
+                        continue
+
                     worker_chats = []
-                    for idx in assigned_indices:
-                        assigned_subtasks = [
-                            (subtask_id, description)
-                            for subtask_id, description in parsed_subtasks[idx]
-                            if parsed_assignments[idx].get(subtask_id) == worker_role
-                        ]
+                    worker_chats_by_idx = {}
+                    stage_subtasks_by_idx = {}
+                    worker_type_by_idx = {}
+                    for idx in stage_indices:
+                        _, worker_type, assigned_subtasks = ordered_stages_by_idx[idx][stage_idx]
+                        stage_subtasks_by_idx[idx] = assigned_subtasks
+                        worker_type_by_idx[idx] = worker_type
+                        is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         question_block = f"Question:\n{questions[idx]}\n\n" if pass_question_to_workers else ""
-                        chat = build_prompt(
-                            worker_role,
+                        completed_text = self._format_completed_worker_results(completed_results_by_idx[idx])
+                        assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
+                        stage_instruction = (
+                            "FINAL STAGE: Use previous worker results and your assigned subtasks to provide the final answer. "
+                            "Output the exact token [FINISH] and put the final answer in \\boxed{}."
+                            if is_final_stage else
+                            "INTERMEDIATE STAGE: Solve only these subtasks. Do not write [FINISH], \\boxed{}, or Final Answer. "
+                            "Return LOCAL_RESULT and REASONING for later workers."
+                        )
+                        if is_final_stage and not assigned_subtasks_text:
+                            assigned_subtasks_text = (
+                                "- FINAL: Synthesize previous worker results and answer the original question."
+                            )
+                        chat = build_selected_worker_prompt(
+                            stage_role,
+                            worker_type,
                             idx,
                             (
                                 f"{question_block}"
-                                f"Your assigned subtasks:\n{self._format_subtasks(assigned_subtasks)}"
+                                f"Worker type for this stage: {worker_type}\n\n"
+                                f"Worker specialization: {worker_specs.get(worker_type, '')}\n\n"
+                                f"Plan:\n{current_plan[idx]}\n\n"
+                                f"Previous worker results:\n{completed_text}\n\n"
+                                f"{stage_instruction}\n\n"
+                                f"Your assigned subtasks:\n{assigned_subtasks_text}"
                             ),
                         )
                         worker_chats.append(chat)
                         worker_chats_by_idx[idx] = chat
                     outputs, tokens, stops, _ = self._generate_from_chat_list(
-                        worker_role, worker_chats, tokenizers, prompts.meta_info, response_length)
-                    for local_idx, idx in enumerate(assigned_indices):
+                        stage_role, worker_chats, tokenizers, prompts.meta_info, response_length)
+                    for local_idx, idx in enumerate(stage_indices):
                         output = outputs[local_idx]
-                        worker_results[idx][worker_role] = output
-                        record_prompt_and_output(
-                            idx, worker_role, worker_chats_by_idx[idx], output,
-                            tokens[local_idx], stops[local_idx])
+                        worker_results[idx][stage_role] = output
+                        worker_records[idx][stage_role] = (
+                            worker_chats_by_idx[idx],
+                            output,
+                            tokens[local_idx],
+                            stops[local_idx],
+                        )
+                        subtask_ids = ", ".join([subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]])
+                        completed_results_by_idx[idx].append((stage_role, worker_type_by_idx[idx], subtask_ids, output))
 
-                for idx in unfinished_indices:
-                    if idx not in assigned_indices:
-                        chat = build_prompt(worker_role, idx, "No subtasks were assigned to this worker.")
-                        record_prompt_and_output(idx, worker_role, chat, "", 0, "stop")
+                        latest_outputs[idx] = output
+                        is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
+                        if is_final_stage:
+                            final_worker_has_answer = "\\boxed" in output
+                            if (finish_flag and finish_flag in output) or final_worker_has_answer:
+                                finish_flags[idx] = True
+                                finish_reason[idx] = None
+                            if self.config.stop_when_truncated and stops[local_idx] == "length":
+                                finish_flags[idx] = True
+                                finish_reason[idx] = "stop_when_truncated"
 
-            # 4. Finalize, or provide feedback for the next hierarchical turn.
-            finalizer_chats = []
+            # Keep exactly one history slot per role per hierarchical turn.
             for idx in unfinished_indices:
-                worker_result_text = "\n\n".join([
-                    f"{worker_role}:\n{worker_results[idx].get(worker_role, '')}"
-                    for worker_role in worker_roles
-                ])
-                finalizer_chats.append(build_prompt(
-                    finalizer_role,
-                    idx,
-                    (
-                        f"Question:\n{questions[idx]}\n\n"
-                        f"Plan:\n{current_plan[idx]}\n\n"
-                        f"Assignments:\n{selector_output_by_idx[idx]}\n\n"
-                        f"Worker results:\n{worker_result_text}"
-                    ),
-                ))
-            finalizer_outputs, finalizer_tokens, finalizer_stops, _ = self._generate_from_chat_list(
-                finalizer_role, finalizer_chats, tokenizers, prompts.meta_info, response_length)
-            for local_idx, idx in enumerate(unfinished_indices):
-                output = finalizer_outputs[local_idx]
-                latest_outputs[idx] = output
-                record_prompt_and_output(
-                    idx, finalizer_role, finalizer_chats[local_idx], output,
-                    finalizer_tokens[local_idx], finalizer_stops[local_idx])
+                for stage_role in stage_roles:
+                    record = worker_records[idx].get(stage_role)
+                    if record is None:
+                        chat = build_prompt(stage_role, idx, "No subtasks were assigned to this worker stage.")
+                        record_prompt_and_output(idx, stage_role, chat, "", 0, "stop")
+                    else:
+                        chat, output, num_gen_tokens, stop_reason = record
+                        record_prompt_and_output(idx, stage_role, chat, output, num_gen_tokens, stop_reason)
+
+            for idx in unfinished_indices:
                 previous_feedback[idx] = self._format_hierarchical_feedback(
                     current_plan[idx], selector_output_by_idx[idx], worker_results[idx],
-                    output, worker_roles)
-
-                finalizer_has_answer = "\\boxed" in output
-                if (finish_flag and finish_flag in output) or finalizer_has_answer:
-                    finish_flags[idx] = True
-                    finish_reason[idx] = None
-                if self.config.stop_when_truncated and finalizer_stops[local_idx] == "length":
-                    finish_flags[idx] = True
-                    finish_reason[idx] = "stop_when_truncated"
+                    latest_outputs[idx], stage_roles)
 
         return latest_outputs, conversation_history
 

@@ -433,7 +433,27 @@ class RayReMASeparatedTrainer(object):
 
     def _get_hierarchy_config(self) -> Dict:
         hierarchy_config = self.config.algorithm.get('hierarchy', {})
-        return OmegaConf.to_container(hierarchy_config, resolve=True) if hierarchy_config else {}
+        hierarchy_config = OmegaConf.to_container(hierarchy_config, resolve=True) if hierarchy_config else {}
+        if not hierarchy_config:
+            return {}
+
+        decomposer_role = hierarchy_config.get('decomposer_role', 'decomposer')
+        selector_role = hierarchy_config.get('selector_role', 'selector')
+        if 'stage_roles' not in hierarchy_config:
+            num_worker_stages = int(hierarchy_config.get('num_worker_stages', 0))
+            hierarchy_config['stage_roles'] = [
+                f'worker_stage_{idx}'
+                for idx in range(1, num_worker_stages + 1)
+            ]
+        stage_roles = hierarchy_config.get('stage_roles', [])
+        hierarchy_config.setdefault(
+            'agent_roles',
+            [decomposer_role, selector_role] + stage_roles,
+        )
+        hierarchy_config.setdefault('train_agent_roles', hierarchy_config['agent_roles'])
+        if stage_roles:
+            hierarchy_config.setdefault('score_role', stage_roles[-1])
+        return hierarchy_config
 
     def _get_rollout_agent_roles(self):
         if self._hierarchy_enabled():
@@ -454,18 +474,20 @@ class RayReMASeparatedTrainer(object):
 
     def _get_score_role(self):
         if self._hierarchy_enabled():
-            return self._get_hierarchy_config().get('finalizer_role', 'finalizer')
+            hierarchy_config = self._get_hierarchy_config()
+            return hierarchy_config.get('score_role', hierarchy_config['agent_roles'][-1])
         return 'reasoning'
 
     def _build_rollout_meta_info(self, max_num_turns: int) -> Dict:
         if self._hierarchy_enabled():
-            from prompt.math.hierarchical_mamrp import HIERARCHICAL_SYSTEM_PROMPTS
+            from prompt.math.hierarchical_mamrp import build_hierarchical_system_prompts
             from prompt import FINISH_FLAG
             hierarchy_config = self._get_hierarchy_config()
             return {
                 'agent_roles': hierarchy_config['agent_roles'],
                 'finish_flag': FINISH_FLAG,
-                'system_prompts': HIERARCHICAL_SYSTEM_PROMPTS,
+                'system_prompts': build_hierarchical_system_prompts(
+                    hierarchy_config.get('stage_roles')),
                 'max_num_turns': max_num_turns,
                 'hierarchy': hierarchy_config,
             }
