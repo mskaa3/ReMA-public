@@ -32,6 +32,7 @@ PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
 WORKER_EMPTY_ASSIGNED_PENALTY = 0.10
 WORKER_SUBTASK_OVERREACH_PENALTY = 0.10
 WORKER_DUPLICATE_RESULT_PENALTY = 0.10
+MIN_NEGATIVE_SHAPED_REWARD = 1e-6
 
 
 def compute_score_fn(compute_score, params):
@@ -165,6 +166,10 @@ class ReMARewardManager:
         # Backward compatibility for older hierarchical configs where worker
         # types themselves were the rollout roles.
         worker_roles.update(worker_type_roles.intersection(agent_roles))
+        score_role = hierarchy_config.get(
+            'score_role',
+            agent_roles[-1] if agent_roles else None,
+        )
         planner_roles = {'decomposer', 'selector'}
         reward_tensor_map = {
             f'{role}_turn_level_reward': torch.zeros(batch_size, max_num_turns, dtype=torch.float32) for role in agent_roles
@@ -234,13 +239,14 @@ class ReMARewardManager:
             #     ground_truth=ground_truth,
             #     extra_info=extra_info,
             # )
-            score = scores[i_bsz]
+            raw_score = scores[i_bsz]
             
             num_turns = data_item.non_tensor_batch['num_turns']
             full_history = data_item.non_tensor_batch.get('history', [])
             valid_history = full_history[:num_turns * len(agent_roles)]
             meta_roles = {'meta_thinking', 'decomposer'}
             role_penalties = {role: 0.0 for role in agent_roles}
+            active_penalties = []
 
             meta_has_boxed = any(
                 isinstance(msg, dict)
@@ -252,6 +258,7 @@ class ReMARewardManager:
             if meta_has_boxed:
                 reward_tensor_map['meta_boxed_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['meta_boxed_penalty_value'][i_bsz] = META_BOXED_PENALTY
+                active_penalties.append(('meta_boxed', META_BOXED_PENALTY, sorted(meta_roles.intersection(agent_roles))))
 
             worker_boxed_roles = set()
             for msg in valid_history:
@@ -267,6 +274,7 @@ class ReMARewardManager:
             if worker_boxed_roles:
                 reward_tensor_map['worker_boxed_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_boxed_penalty_value'][i_bsz] = WORKER_BOXED_PENALTY
+                active_penalties.append(('worker_boxed', WORKER_BOXED_PENALTY, sorted(worker_boxed_roles)))
                 for role in worker_boxed_roles:
                     role_penalties[role] += WORKER_BOXED_PENALTY
 
@@ -286,6 +294,7 @@ class ReMARewardManager:
             if worker_finish_roles:
                 reward_tensor_map['worker_finish_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_finish_penalty_value'][i_bsz] = WORKER_FINISH_PENALTY
+                active_penalties.append(('worker_finish', WORKER_FINISH_PENALTY, sorted(worker_finish_roles)))
                 for role in worker_finish_roles:
                     role_penalties[role] += WORKER_FINISH_PENALTY
 
@@ -317,6 +326,7 @@ class ReMARewardManager:
             if repeated_planner_roles:
                 reward_tensor_map['planner_repeat_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['planner_repeat_penalty_value'][i_bsz] = PLANNER_REPEAT_PENALTY
+                active_penalties.append(('planner_repeat', PLANNER_REPEAT_PENALTY, sorted(repeated_planner_roles)))
                 for role in repeated_planner_roles:
                     role_penalties[role] += PLANNER_REPEAT_PENALTY
 
@@ -340,6 +350,7 @@ class ReMARewardManager:
             if excess_subtask_roles:
                 reward_tensor_map['planner_excess_subtask_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['planner_excess_subtask_penalty_value'][i_bsz] = PLANNER_EXCESS_SUBTASK_PENALTY
+                active_penalties.append(('planner_excess_subtask', PLANNER_EXCESS_SUBTASK_PENALTY, sorted(excess_subtask_roles)))
                 for role in excess_subtask_roles:
                     role_penalties[role] += PLANNER_EXCESS_SUBTASK_PENALTY
 
@@ -363,11 +374,13 @@ class ReMARewardManager:
             if empty_assigned_roles:
                 reward_tensor_map['worker_empty_assigned_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_empty_assigned_penalty_value'][i_bsz] = WORKER_EMPTY_ASSIGNED_PENALTY
+                active_penalties.append(('worker_empty_assigned', WORKER_EMPTY_ASSIGNED_PENALTY, sorted(empty_assigned_roles)))
                 for role in empty_assigned_roles:
                     role_penalties[role] += WORKER_EMPTY_ASSIGNED_PENALTY
             if overreach_roles:
                 reward_tensor_map['worker_subtask_overreach_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_subtask_overreach_penalty_value'][i_bsz] = WORKER_SUBTASK_OVERREACH_PENALTY
+                active_penalties.append(('worker_subtask_overreach', WORKER_SUBTASK_OVERREACH_PENALTY, sorted(overreach_roles)))
                 for role in overreach_roles:
                     role_penalties[role] += WORKER_SUBTASK_OVERREACH_PENALTY
 
@@ -390,16 +403,21 @@ class ReMARewardManager:
             if duplicate_worker_roles:
                 reward_tensor_map['worker_duplicate_result_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_duplicate_result_penalty_value'][i_bsz] = WORKER_DUPLICATE_RESULT_PENALTY
+                active_penalties.append(('worker_duplicate_result', WORKER_DUPLICATE_RESULT_PENALTY, sorted(duplicate_worker_roles)))
                 for role in duplicate_worker_roles:
                     role_penalties[role] += WORKER_DUPLICATE_RESULT_PENALTY
+
+            global_penalty_value = sum(penalty_value for _, penalty_value, _ in active_penalties)
+            role_shaped_scores = {}
             
             for i_role, role in enumerate(agent_roles):
                 turn_finished = data_item.batch[f'{role}_turn_finished'].item()
+                effective_score = raw_score
                 if data_item.meta_info['mask_unfinished_reward']:
                     # if conversation is not finised normally, i.e. with ['FINISH']
                     #  the reward should be zero.
                     # `turn_finished` is 0 means finished normally.
-                    score = score if turn_finished == 0 else 0.0
+                    effective_score = effective_score if turn_finished == 0 else 0.0
 
                 # Legacy format reward path disabled for cleaner experiments.
                 # We now use explicit role-level penalties/bonuses (e.g. META_BOXED_PENALTY)
@@ -412,12 +430,24 @@ class ReMARewardManager:
                 #     format_r = compute_format_r(data_source, role, last_round_msg['content'])
                 #     score += format_r
 
-                role_score = score
+                role_penalty = role_penalties.get(role, 0.0)
                 if role in meta_roles and meta_has_boxed:
-                    role_score -= META_BOXED_PENALTY
-                role_score -= role_penalties.get(role, 0.0)
+                    role_penalty += META_BOXED_PENALTY
+
+                if global_penalty_value > 0.0:
+                    # A correct final answer should not hide protocol failures in
+                    # the trajectory. Make every role's shaped reward negative
+                    # when any structured penalty fired, so switching the trained
+                    # agent cannot still positively reinforce a bad trajectory.
+                    role_penalty = max(role_penalty, global_penalty_value)
+
+                if role_penalty > 0.0:
+                    role_score = -max(role_penalty, MIN_NEGATIVE_SHAPED_REWARD)
+                else:
+                    role_score = effective_score
 
                 reward_tensor_map[f'{role}_turn_level_reward'][i_bsz, num_turns - 1] = role_score
+                role_shaped_scores[role] = float(role_score)
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -430,7 +460,23 @@ class ReMARewardManager:
                 print("[question]", prompt_str)
                 print("[ground_truth]", ground_truth)
                 print("[answer]", response_str)
-                print("[score]", score)
+                print("[score]", raw_score)
+                print("[raw_score]", raw_score)
+                if score_role is not None and score_role in role_shaped_scores:
+                    print("[shaped_score]", role_shaped_scores[score_role])
+                    print("[score_role]", score_role)
+                if active_penalties:
+                    print("[penalties]", [
+                        {
+                            'name': penalty_name,
+                            'value': penalty_value,
+                            'roles': roles,
+                        }
+                        for penalty_name, penalty_value, roles in active_penalties
+                    ])
+                    print("[role_shaped_scores]", role_shaped_scores)
+                else:
+                    print("[penalties]", [])
                 print("[history]", history)
 
         # Return both reward tensors in a dictionary
