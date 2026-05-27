@@ -565,7 +565,7 @@ class MultiAgentRollout:
         subtasks = []
         seen_subtasks = set()
         for line in plan_text.splitlines():
-            match = re.match(r"\s*-?\s*(S\d+)\s*[:.)-]\s*(.+?)\s*$", line, re.IGNORECASE)
+            match = re.match(r"\s*-\s*(S\d+)\s*[:.)-]\s*(.+?)\s*$", line, re.IGNORECASE)
             if match:
                 subtask_id = match.group(1).upper()
                 if subtask_id in seen_subtasks:
@@ -714,6 +714,41 @@ class MultiAgentRollout:
             for stage_role, worker_type, subtask_ids, output in completed_results
         ])
 
+    @staticmethod
+    def _format_work_so_far(completed_results: List[Tuple[str, str, str, str]]) -> str:
+        return "\n\n".join([
+            output.strip()
+            for _, _, _, output in completed_results
+            if output and output.strip()
+        ])
+
+    @staticmethod
+    def _extract_local_result(output: str) -> str:
+        if not output:
+            return ""
+        match = re.search(
+            r"local[_ ]result\s*:\s*(.*?)(?:\n\s*reasoning\s*:|\n\s*subtask\b|\Z)",
+            output,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+        first_line = output.strip().splitlines()[0] if output.strip() else ""
+        return first_line[:240]
+
+    @staticmethod
+    def _extract_reasoning(output: str) -> str:
+        if not output:
+            return ""
+        match = re.search(
+            r"reasoning\s*:\s*(.*?)(?:\n\s*local[_ ]result\s*:|\n\s*subtask\b|\n\s*final\b|\Z)",
+            output,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+        return output.strip()
+
     def _format_hierarchical_feedback(
         self,
         plan: str,
@@ -722,18 +757,18 @@ class MultiAgentRollout:
         last_worker_output: str,
         worker_roles: List[str],
     ) -> str:
-        worker_result_text = "\n\n".join([
-            f"{worker_role}:\n{worker_results.get(worker_role, '')}"
-            for worker_role in worker_roles
-        ])
-        return (
-            "Previous round feedback:\n"
-            f"Plan:\n{plan}\n\n"
-            f"Assignments:\n{assignments}\n\n"
-            f"Worker results:\n{worker_result_text}\n\n"
-            f"Last worker output:\n{last_worker_output}\n\n"
-            "If the answer was not finalized, revise the plan and backtrack where needed."
-        )
+        fragments = []
+        for worker_role in worker_roles:
+            output = worker_results.get(worker_role, "")
+            reasoning = self._extract_reasoning(output)
+            local_result = self._extract_local_result(output)
+            if reasoning:
+                fragments.append(reasoning)
+            if local_result and local_result not in reasoning:
+                fragments.append(local_result)
+        if last_worker_output and last_worker_output not in "\n\n".join(fragments):
+            fragments.append(last_worker_output)
+        return "\n\n".join(fragment for fragment in fragments if fragment.strip())
 
     def _run_hierarchical_conversation(
         self,
@@ -892,34 +927,34 @@ class MultiAgentRollout:
                         worker_type_by_idx[idx] = worker_type
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         question_block = (
-                            f"Question (complete original problem):\n{questions[idx]}\n\n"
+                            f"{questions[idx]}\n\n"
                             if pass_question_to_workers else ""
                         )
-                        completed_text = self._format_completed_worker_results(completed_results_by_idx[idx])
+                        work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
-                            "FINAL STAGE: Use previous worker results and your assigned subtasks to provide the final answer. "
-                            "Output the exact token [FINISH] and put the final answer in \\boxed{}. "
-                            "Do not output [FINISH] unless the final answer is present in \\boxed{}."
+                            "Write the final answer using the work above. "
+                            "Include the exact token [FINISH] and put the final answer in \\boxed{}. "
+                            "Do not write [FINISH] unless the final answer is present in \\boxed{}."
                             if is_final_stage else
-                            "INTERMEDIATE STAGE: Solve only these subtasks. Do not write [FINISH], \\boxed{}, or Final Answer. "
-                            "Return LOCAL_RESULT and REASONING for later workers."
+                            "Solve only the step above. "
+                            "Do not write [FINISH], \\boxed{}, or Final Answer. "
+                            "Return LOCAL_RESULT and REASONING."
                         )
                         if is_final_stage and not assigned_subtasks_text:
                             assigned_subtasks_text = (
-                                "- FINAL: Synthesize previous worker results and answer the original question."
+                                "- Use the work above to answer the original question."
                             )
+                        work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ""
                         chat = build_selected_worker_prompt(
                             stage_role,
                             worker_type,
                             idx,
                             (
                                 f"{question_block}"
-                                f"Worker type for this stage: {worker_type}\n\n"
-                                f"Worker specialization: {worker_specs.get(worker_type, '')}\n\n"
-                                f"Previous worker results:\n{completed_text}\n\n"
+                                f"{work_so_far_block}"
+                                f"{assigned_subtasks_text}\n\n"
                                 f"{stage_instruction}\n\n"
-                                f"Your assigned subtasks:\n{assigned_subtasks_text}"
                             ),
                         )
                         worker_chats.append(chat)
