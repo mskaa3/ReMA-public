@@ -318,12 +318,18 @@ def render_worker_prompt(
     node_dependencies = ",".join(node.dependencies) if node.dependencies else "none"
     node_required_skills = ",".join(node.required_skills) if node.required_skills else "none"
     is_final_node = decomposition.final_node_id == node.node_id
+    is_root_node = not node.dependencies
     expected_output_hint = _expected_worker_output_hint(decomposition, node)
-    root_node_contract = ""
-    if not node.dependencies:
-        root_node_contract = (
-            "- This node has no dependencies. Ground your result directly in TASK and explicitly carry forward the relevant equation, expression, or target quantity from the problem.\n"
+    node_context_contract = ""
+    if is_root_node:
+        node_context_contract = (
+            "- This node has no dependencies. The full TASK is provided below. Ground your result directly in TASK and explicitly carry forward the relevant equation, expression, or target quantity from the problem.\n"
             "- For root algebra or manipulation nodes, do not return a bare scalar unless NODE_INSTRUCTION explicitly asks for one.\n"
+        )
+    else:
+        node_context_contract = (
+            "- This node has dependencies. The full TASK is intentionally omitted.\n"
+            "- Solve only the current NODE_INSTRUCTION using DEPENDENCY_RESULTS. Do not reconstruct or re-solve the entire task on your own.\n"
         )
     final_node_contract = (
         "- This is the FINAL_NODE. Put only the final answer inside <worker_result>.\n"
@@ -341,7 +347,7 @@ def render_worker_prompt(
         "- Treat dependency results as factual inputs from earlier nodes. If a dependency says `sin(alpha) = 1/2`, use that value directly.\n"
         "- You may include at most one <worker_scratchpad> block before the final <worker_result> block.\n"
         "- If you use <worker_scratchpad>, make it a short but logically connected piece of reasoning that helps solve the current node.\n"
-        "- The scratchpad should show useful mathematical thinking such as a transformation, substitution, case split, geometric fact, or intermediate deduction that moves from TASK and DEPENDENCY_RESULTS toward the required node artifact.\n"
+        "- The scratchpad should show useful mathematical thinking such as a transformation, substitution, case split, geometric fact, or intermediate deduction that moves from the available context toward the required node artifact.\n"
         "- Do not use the scratchpad as filler, a paraphrase of NODE_INSTRUCTION, or a copied template; it should contain reasoning that is genuinely helpful for solving this task.\n"
         "- Return exactly one <worker_result> block. Only the content inside <worker_result> is passed to downstream nodes, so put the final node artifact there.\n"
         "- Use one of these exact skeletons:\n"
@@ -355,13 +361,13 @@ def render_worker_prompt(
         "- For expressions, equations, values, or short case splits, return just that content inside the tags.\n"
         "- Do not jump to a scalar too early; preserve an equation, expression, or other reusable symbolic state unless NODE_INSTRUCTION explicitly asks for a numeric result.\n"
         "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
-        f"{root_node_contract}"
+        f"{node_context_contract}"
         f"{final_node_contract}"
         "- Forbidden output patterns: prose outside the allowed tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
         # f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
         "Task details:\n"
         f"TASK_ID: {task.task_id}\n"
-        f"TASK: {task.prompt}\n"
+        f"{f'TASK: {task.prompt}\\n' if is_root_node else ''}"
         f"WORKER_ID: {worker.worker_id}\n"
         f"WORKER_SKILLS: {skills}\n"
         f"WORKER_DESCRIPTION: {worker.description}\n"

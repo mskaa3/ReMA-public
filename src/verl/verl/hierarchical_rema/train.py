@@ -884,16 +884,21 @@ def select_epoch_tasks_by_subset(
     selected: List[TaskExample] = []
     for subset_name in sorted(tasks_by_subset):
         subset_tasks = tasks_by_subset[subset_name]
-        subset_seed = seed + epoch_index + sum(ord(ch) for ch in subset_name)
-        selected.extend(
-            select_epoch_tasks(
-                tasks=subset_tasks,
-                epoch_index=epoch_index,
-                tasks_per_epoch=tasks_per_subset,
-                shuffle_tasks=shuffle_tasks,
-                seed=subset_seed,
-            )
-        )
+        if tasks_per_subset >= len(subset_tasks):
+            if shuffle_tasks:
+                rng = random.Random(seed + sum(ord(ch) for ch in subset_name))
+                shuffled_subset_tasks = list(subset_tasks)
+                rng.shuffle(shuffled_subset_tasks)
+                selected.extend(shuffled_subset_tasks)
+            else:
+                selected.extend(subset_tasks)
+            continue
+
+        if shuffle_tasks:
+            rng = random.Random(seed + sum(ord(ch) for ch in subset_name))
+            selected.extend(rng.sample(subset_tasks, tasks_per_subset))
+        else:
+            selected.extend(subset_tasks[:tasks_per_subset])
     return selected
 
 
