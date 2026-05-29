@@ -340,6 +340,7 @@ def render_worker_prompt(
             "- This is an intermediate node. Put only the downstream-usable result inside <worker_result>.\n"
             f"- Suggested output shape for this node: {expected_output_hint}.\n"
         )
+    task_line = f"TASK: {task.prompt}\n" if is_root_node else ""
 
     return (
         "- Do only the current NODE_INSTRUCTION. Do not solve future nodes, repeat the full task, or add explanations unless the instruction explicitly asks for them.\n"
@@ -367,7 +368,7 @@ def render_worker_prompt(
         # f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
         "Task details:\n"
         f"TASK_ID: {task.task_id}\n"
-        f"{f'TASK: {task.prompt}\\n' if is_root_node else ''}"
+        f"{task_line}"
         f"WORKER_ID: {worker.worker_id}\n"
         f"WORKER_SKILLS: {skills}\n"
         f"WORKER_DESCRIPTION: {worker.description}\n"
