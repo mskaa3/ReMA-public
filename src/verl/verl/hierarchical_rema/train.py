@@ -66,6 +66,15 @@ def parse_args() -> argparse.Namespace:
         help="How many validation tasks to run per epoch; 0 means all loaded validation tasks",
     )
     parser.add_argument(
+        "--val-tasks-per-subset",
+        type=int,
+        default=0,
+        help=(
+            "How many validation tasks to run per subset/dataset when external validation is triggered; "
+            "0 disables subset-stratified capping."
+        ),
+    )
+    parser.add_argument(
         "--external-validation-every-n-epochs",
         type=int,
         default=10,
@@ -846,6 +855,36 @@ def select_epoch_tasks(
 
     start = (epoch_index * tasks_per_epoch) % len(task_list)
     selected = [task_list[(start + offset) % len(task_list)] for offset in range(tasks_per_epoch)]
+    return selected
+
+
+def select_epoch_tasks_by_subset(
+    tasks: Sequence[TaskExample],
+    epoch_index: int,
+    tasks_per_subset: int,
+    shuffle_tasks: bool,
+    seed: int,
+) -> List[TaskExample]:
+    if tasks_per_subset <= 0:
+        return list(tasks)
+
+    tasks_by_subset: Dict[str, List[TaskExample]] = {}
+    for task in tasks:
+        tasks_by_subset.setdefault(_task_subset_name(task), []).append(task)
+
+    selected: List[TaskExample] = []
+    for subset_name in sorted(tasks_by_subset):
+        subset_tasks = tasks_by_subset[subset_name]
+        subset_seed = seed + epoch_index + sum(ord(ch) for ch in subset_name)
+        selected.extend(
+            select_epoch_tasks(
+                tasks=subset_tasks,
+                epoch_index=epoch_index,
+                tasks_per_epoch=tasks_per_subset,
+                shuffle_tasks=shuffle_tasks,
+                seed=subset_seed,
+            )
+        )
     return selected
 
 
@@ -1928,8 +1967,17 @@ def main() -> None:
             elif validation_interval > 0 and epoch_number % validation_interval == 0:
                 should_run_external_validation = True
         if should_run_external_validation:
+            epoch_val_tasks = val_tasks
+            if args.val_tasks_per_subset > 0:
+                epoch_val_tasks = select_epoch_tasks_by_subset(
+                    tasks=epoch_val_tasks,
+                    epoch_index=epoch_index,
+                    tasks_per_subset=args.val_tasks_per_subset,
+                    shuffle_tasks=False,
+                    seed=args.seed,
+                )
             epoch_val_tasks = select_epoch_tasks(
-                tasks=val_tasks,
+                tasks=epoch_val_tasks,
                 epoch_index=epoch_index,
                 tasks_per_epoch=args.val_tasks_per_epoch,
                 shuffle_tasks=False,

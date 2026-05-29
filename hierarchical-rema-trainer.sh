@@ -175,6 +175,8 @@ VAL_TASK_ID_KEY=${VAL_TASK_ID_KEY:-idx}
 MAX_VAL_TASKS=${MAX_VAL_TASKS:-0}
 # How many validation tasks to run when validation is triggered.
 VAL_TASKS_PER_EPOCH=${VAL_TASKS_PER_EPOCH:-128}
+# How many validation tasks to take per subset/dataset before any global cap.
+VAL_TASKS_PER_SUBSET=${VAL_TASKS_PER_SUBSET:-128}
 # Run external validation periodically instead of every outer round.
 EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS:-10}
 VAL_TASK_SOURCE_STAGE=${VAL_TASK_SOURCE_STAGE:-$RUN_ROOT/val_task_source}
@@ -1030,6 +1032,7 @@ python3 -m hierarchical_rema.train \
   --val-task-id-key ${VAL_TASK_ID_KEY} \
   --max-val-tasks ${MAX_VAL_TASKS} \
   --val-tasks-per-epoch ${VAL_TASKS_PER_EPOCH} \
+  --val-tasks-per-subset ${VAL_TASKS_PER_SUBSET} \
   --external-validation-every-n-epochs ${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS} \
   ${DISABLE_EXTERNAL_VALIDATION_FLAG} \
   --backend ${BACKEND} \
