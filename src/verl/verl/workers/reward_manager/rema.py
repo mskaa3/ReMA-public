@@ -29,7 +29,12 @@ WORKER_BOXED_PENALTY = 0.10
 WORKER_FINISH_PENALTY = 0.10
 PLANNER_REPEAT_PENALTY = 0.10
 PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
+PLANNER_SUBTASK_TARGET_MIN = 4
+PLANNER_SUBTASK_TARGET_MAX = 5
+PLANNER_SUBTASK_COUNT_PENALTY_PER_TASK = 0.20
+PLANNER_SUBTASK_COUNT_MAX_PENALTY = 0.80
 WORKER_EMPTY_ASSIGNED_PENALTY = 0.10
+WORKER_MISSING_LOCAL_RESULT_PENALTY = 0.20
 WORKER_SUBTASK_OVERREACH_PENALTY = 0.10
 WORKER_DUPLICATE_RESULT_PENALTY = 0.10
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
@@ -77,12 +82,26 @@ def _normalize_role_output(text):
     return " ".join(text.lower().strip().split())
 
 
+def _extract_worker_local_results(text):
+    """Return explicit worker LOCAL_RESULT values, accepting minor formatting variants."""
+    if not isinstance(text, str):
+        return []
+
+    local_results = re.findall(r"(?im)^\s*LOCAL[_ ]RESULT\s*:\s*(.+?)\s*$", text)
+    return [result.strip() for result in local_results if result.strip()]
+
+
+def _is_valid_worker_local_result(text):
+    normalized = _normalize_role_output(text)
+    return normalized not in {"", "none", "n/a", "na", "null", "unknown"}
+
+
 def _extract_worker_local_result_signature(text):
     """Return a comparable signature only for explicit worker LOCAL_RESULT lines."""
-    if not isinstance(text, str):
-        return ""
-
-    local_results = re.findall(r"(?im)^\s*LOCAL_RESULT\s*:\s*(.+?)\s*$", text)
+    local_results = [
+        result for result in _extract_worker_local_results(text)
+        if _is_valid_worker_local_result(result)
+    ]
     if local_results:
         return _normalize_role_output(" | ".join(local_results))
 
@@ -184,8 +203,12 @@ class ReMARewardManager:
         reward_tensor_map['planner_repeat_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_excess_subtask_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_excess_subtask_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['planner_subtask_count_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['planner_subtask_count_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_empty_assigned_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_empty_assigned_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_missing_local_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_missing_local_result_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_subtask_overreach_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_subtask_overreach_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -354,7 +377,42 @@ class ReMARewardManager:
                 for role in excess_subtask_roles:
                     role_penalties[role] += PLANNER_EXCESS_SUBTASK_PENALTY
 
+            subtask_count_penalty = 0.0
+            if 'decomposer' in agent_roles:
+                for msg in valid_history:
+                    if not (
+                        isinstance(msg, dict)
+                        and msg.get('role') == 'decomposer'
+                        and isinstance(msg.get('content'), str)
+                    ):
+                        continue
+                    subtask_ids = {
+                        subtask.upper()
+                        for subtask in re.findall(r"\bS\d+\b", msg.get('content'), re.IGNORECASE)
+                    }
+                    subtask_count = len(subtask_ids)
+                    if subtask_count < PLANNER_SUBTASK_TARGET_MIN:
+                        distance = PLANNER_SUBTASK_TARGET_MIN - subtask_count
+                    elif subtask_count > PLANNER_SUBTASK_TARGET_MAX:
+                        distance = subtask_count - PLANNER_SUBTASK_TARGET_MAX
+                    else:
+                        distance = 0
+                    if distance:
+                        subtask_count_penalty = max(
+                            subtask_count_penalty,
+                            min(
+                                PLANNER_SUBTASK_COUNT_MAX_PENALTY,
+                                distance * PLANNER_SUBTASK_COUNT_PENALTY_PER_TASK,
+                            ),
+                        )
+            if subtask_count_penalty > 0.0:
+                reward_tensor_map['planner_subtask_count_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['planner_subtask_count_penalty_value'][i_bsz] = subtask_count_penalty
+                active_penalties.append(('planner_subtask_count', subtask_count_penalty, ['decomposer']))
+                role_penalties['decomposer'] += subtask_count_penalty
+
             empty_assigned_roles = set()
+            missing_local_result_roles = set()
             overreach_roles = set()
             for msg in valid_history:
                 if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
@@ -363,6 +421,8 @@ class ReMARewardManager:
                 content = msg.get('content') if isinstance(msg.get('content'), str) else ''
                 if assigned_subtasks and not content.strip():
                     empty_assigned_roles.add(msg.get('role'))
+                if assigned_subtasks and not _extract_worker_local_result_signature(content):
+                    missing_local_result_roles.add(msg.get('role'))
                 if assigned_subtasks:
                     mentioned_subtasks = {
                         subtask.upper()
@@ -377,6 +437,12 @@ class ReMARewardManager:
                 active_penalties.append(('worker_empty_assigned', WORKER_EMPTY_ASSIGNED_PENALTY, sorted(empty_assigned_roles)))
                 for role in empty_assigned_roles:
                     role_penalties[role] += WORKER_EMPTY_ASSIGNED_PENALTY
+            if missing_local_result_roles:
+                reward_tensor_map['worker_missing_local_result_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['worker_missing_local_result_penalty_value'][i_bsz] = WORKER_MISSING_LOCAL_RESULT_PENALTY
+                active_penalties.append(('worker_missing_local_result', WORKER_MISSING_LOCAL_RESULT_PENALTY, sorted(missing_local_result_roles)))
+                for role in missing_local_result_roles:
+                    role_penalties[role] += WORKER_MISSING_LOCAL_RESULT_PENALTY
             if overreach_roles:
                 reward_tensor_map['worker_subtask_overreach_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_subtask_overreach_penalty_value'][i_bsz] = WORKER_SUBTASK_OVERREACH_PENALTY
