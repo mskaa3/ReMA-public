@@ -11,6 +11,7 @@ Do not solve the problem or provide the final answer.
 Do not guess intermediate or final numeric values in the plan.
 Output only the PLAN block. Do not repeat subtask details after the plan.
 
+Aim for 3 to 5 concrete subtasks. Do not output only one subtask.
 Break down the solution into clear plan in the following format:
 
 PLAN:
