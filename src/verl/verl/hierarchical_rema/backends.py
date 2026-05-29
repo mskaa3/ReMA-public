@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .prompts import (
     DECOMPOSER_SYSTEM_PROMPT,
     SELECTOR_SYSTEM_PROMPT,
+    SELECTOR_SYSTEM_PROMPT_NO_HISTORY,
     render_decomposer_prompt,
     render_selector_output_skeleton,
     render_selector_prompt,
@@ -570,7 +571,13 @@ class MockHierarchicalBackend(HierarchicalBackend):
     ) -> SelectionCandidate:
         del policy_config
         worker_map = worker_pool.workers_by_id()
-        prompt_text = render_selector_prompt(task, decomposition, worker_pool, worker_performance)
+        prompt_text = render_selector_prompt(
+            task,
+            decomposition,
+            worker_pool,
+            worker_performance,
+            track_workers_history=bool(worker_performance),
+        )
         assignments: List[WorkerAssignment] = []
         all_workers = list(worker_map.values())
         for node_position, node in enumerate(decomposition.nodes):
@@ -1159,7 +1166,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
-                system_prompt=SELECTOR_SYSTEM_PROMPT,
+                system_prompt=(
+                    SELECTOR_SYSTEM_PROMPT
+                    if worker_performance
+                    else SELECTOR_SYSTEM_PROMPT_NO_HISTORY
+                ),
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 temperature=self._controller_temperature(),
                 sampling_overrides=self._controller_sampling_overrides(
@@ -1301,7 +1312,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         selection_index: int,
         worker_performance: Dict[str, WorkerPerformanceSnapshot],
     ) -> SelectionCandidate:
-        prompt_text = render_selector_prompt(task, decomposition, worker_pool, worker_performance)
+        prompt_text = render_selector_prompt(
+            task,
+            decomposition,
+            worker_pool,
+            worker_performance,
+            track_workers_history=bool(worker_performance),
+        )
         return self._generate_validated_selection(
             prompt_text=prompt_text,
             task=task,
@@ -1486,6 +1503,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 request.decomposition,
                 request.worker_pool,
                 request.worker_performance,
+                track_workers_history=bool(request.worker_performance),
             )
             node_order = tuple(node.node_id for node in request.decomposition.nodes)
             worker_ids = tuple(worker.worker_id for worker in request.worker_pool.workers)
@@ -1497,7 +1515,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
-                system_prompt=SELECTOR_SYSTEM_PROMPT,
+                system_prompt=(
+                    SELECTOR_SYSTEM_PROMPT
+                    if request.worker_performance
+                    else SELECTOR_SYSTEM_PROMPT_NO_HISTORY
+                ),
                 max_new_tokens=self._controller_max_new_tokens("selector"),
                 batch_size=self.config.controller_batch_size,
                 temperature=self._controller_temperature(),

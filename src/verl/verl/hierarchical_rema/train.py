@@ -85,6 +85,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--disable-external-validation", action="store_true")
+    parser.add_argument(
+        "--track-workers-history",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Whether to expose worker history/statistics to the selector and update/use "
+            "worker memory during rollouts and fallback selection."
+        ),
+    )
 
     parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--mode", choices=["joint", "alternating"], default="joint")
@@ -1190,6 +1199,7 @@ def _build_rollout_trainer(
         selector_partial_completion_penalty=args.selector_partial_completion_penalty,
         decomposer_reward_aggregation=args.decomposer_reward_aggregation,
         decomposer_no_correct_selection_scale=args.decomposer_no_correct_selection_scale,
+        track_workers_history=args.track_workers_history,
     )
 
 

@@ -62,6 +62,7 @@ class HierarchicalReMAOrchestrator:
         selector_partial_completion_penalty: float = 0.0,
         decomposer_reward_aggregation: str = "best",
         decomposer_no_correct_selection_scale: float = 0.25,
+        track_workers_history: bool = True,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
@@ -82,6 +83,7 @@ class HierarchicalReMAOrchestrator:
             max(float(decomposer_no_correct_selection_scale), 0.0),
             1.0,
         )
+        self.track_workers_history = bool(track_workers_history)
 
     def _aggregate_decomposition_selection_reward(
         self,
@@ -212,7 +214,11 @@ class HierarchicalReMAOrchestrator:
         if not tasks:
             return []
 
-        frozen_worker_performance = self.worker_memory.snapshot(worker_pool)
+        frozen_worker_performance = (
+            self.worker_memory.snapshot(worker_pool)
+            if self.track_workers_history
+            else {}
+        )
         num_decompositions, num_selections = self._effective_rollout_counts(
             rollout_config=rollout_config,
             schedule=schedule,
@@ -343,7 +349,7 @@ class HierarchicalReMAOrchestrator:
             ):
                 decomposition_rollout.decomposer_advantage = advantage
 
-            if update_worker_memory:
+            if update_worker_memory and self.track_workers_history:
                 self._update_worker_memory(task, decomposition_rollouts)
             task_rollouts.append(
                 self._finalize_task_rollout(
@@ -661,6 +667,7 @@ class HierarchicalGRPOTrainer:
     selector_partial_completion_penalty: float = 0.0
     decomposer_reward_aggregation: str = "best"
     decomposer_no_correct_selection_scale: float = 0.25
+    track_workers_history: bool = True
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -685,6 +692,7 @@ class HierarchicalGRPOTrainer:
             selector_partial_completion_penalty=self.selector_partial_completion_penalty,
             decomposer_reward_aggregation=self.decomposer_reward_aggregation,
             decomposer_no_correct_selection_scale=self.decomposer_no_correct_selection_scale,
+            track_workers_history=self.track_workers_history,
         )
         self._current_phase = AlternatingPhase.SELECTOR
 

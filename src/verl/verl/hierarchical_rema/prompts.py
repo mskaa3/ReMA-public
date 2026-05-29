@@ -23,6 +23,11 @@ Assign the most suitable worker to each decomposition node using the node requir
 """
 
 
+SELECTOR_SYSTEM_PROMPT_NO_HISTORY = """You are the Selector controller.
+Assign the most suitable worker to each decomposition node using the node requirements and the workers' capabilities.
+"""
+
+
 # WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
 # NODE_INSTRUCTION: compute the value of x and return the final answer
 # FINAL_NODE: yes
@@ -228,6 +233,7 @@ def render_selector_prompt(
     decomposition: DecompositionCandidate,
     worker_pool: WorkerPoolConfig,
     worker_performance: Dict[str, WorkerPerformanceSnapshot],
+    track_workers_history: bool = True,
 ) -> str:
     node_lines = []
     ordered_node_ids = [node.node_id for node in decomposition.nodes]
@@ -241,14 +247,24 @@ def render_selector_prompt(
     worker_lines = []
     for worker in worker_pool.workers:
         snapshot = worker_performance.get(worker.worker_id)
-        avg_reward = snapshot.average_reward if snapshot is not None else 0.0
         skills = ",".join(worker.skills) if worker.skills else "none"
-        worker_lines.append(
-            f"- {worker.worker_id} | skills={skills} | avg_reward={avg_reward:.2f} | desc={worker.description}"
-        )
+        if track_workers_history:
+            avg_reward = snapshot.average_reward if snapshot is not None else 0.0
+            worker_lines.append(
+                f"- {worker.worker_id} | skills={skills} | avg_reward={avg_reward:.2f} | desc={worker.description}"
+            )
+        else:
+            worker_lines.append(
+                f"- {worker.worker_id} | skills={skills} | desc={worker.description}"
+            )
 
     selector_skeleton = render_selector_output_skeleton(ordered_node_ids)
     allowed_worker_ids = ", ".join(worker.worker_id for worker in worker_pool.workers)
+    worker_preference_line = (
+        "- Prefer the worker whose skills and past performance best match each node.\n"
+        if track_workers_history
+        else "- Prefer the worker whose skills best match each node.\n"
+    )
     return (
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <selection_plan> block and nothing else.\n"
@@ -261,7 +277,7 @@ def render_selector_prompt(
         f"- Allowed node IDs: {', '.join(ordered_node_ids)}.\n"
         f"- Allowed worker IDs: {allowed_worker_ids}.\n"
         "- Do not skip nodes, add extra mappings, repeat a node, or assign multiple workers to one node.\n"
-        "- Prefer the worker whose skills and past performance best match each node.\n"
+        f"{worker_preference_line}"
         "- Do not assign workers by list position or by a repeated numeric pattern like `1->1, 2->2, 3->3`; choose based on node requirements and worker fit.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"TASK_ID: {task.task_id}\n"
