@@ -37,6 +37,9 @@ WORKER_EMPTY_ASSIGNED_PENALTY = 0.10
 WORKER_MISSING_LOCAL_RESULT_PENALTY = 0.20
 WORKER_SUBTASK_OVERREACH_PENALTY = 0.10
 WORKER_DUPLICATE_RESULT_PENALTY = 0.10
+FINAL_IGNORES_WORKER_RESULTS_PENALTY = 0.20
+FINAL_IGNORES_MIN_LOCAL_RESULTS = 2
+FINAL_IGNORES_MIN_WORDS = 80
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
 
 
@@ -106,6 +109,12 @@ def _extract_worker_local_result_signature(text):
         return _normalize_role_output(" | ".join(local_results))
 
     return ""
+
+
+def _word_count(text):
+    if not isinstance(text, str):
+        return 0
+    return len(re.findall(r"\b\w+\b", text))
 
 class ReMARewardManager:
     """The reward manager.
@@ -213,6 +222,8 @@ class ReMARewardManager:
         reward_tensor_map['worker_subtask_overreach_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_duplicate_result_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_ignores_worker_results_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_ignores_worker_results_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         
         already_print_data_sources = {}
 
@@ -472,6 +483,42 @@ class ReMARewardManager:
                 active_penalties.append(('worker_duplicate_result', WORKER_DUPLICATE_RESULT_PENALTY, sorted(duplicate_worker_roles)))
                 for role in duplicate_worker_roles:
                     role_penalties[role] += WORKER_DUPLICATE_RESULT_PENALTY
+
+            final_ignores_worker_results = False
+            if score_role in worker_roles:
+                previous_local_results = []
+                final_output = ""
+                for msg in valid_history:
+                    if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
+                        continue
+                    content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+                    if msg.get('role') == score_role:
+                        final_output = content
+                        continue
+                    assigned_subtasks = msg.get('assigned_subtasks') or []
+                    if not assigned_subtasks:
+                        continue
+                    previous_local_results.extend([
+                        result for result in _extract_worker_local_results(content)
+                        if _is_valid_worker_local_result(result)
+                    ])
+
+                if (
+                    len(previous_local_results) >= FINAL_IGNORES_MIN_LOCAL_RESULTS
+                    and _word_count(final_output) >= FINAL_IGNORES_MIN_WORDS
+                ):
+                    normalized_final_output = _normalize_role_output(final_output)
+                    uses_any_local_result = any(
+                        _normalize_role_output(local_result) in normalized_final_output
+                        for local_result in previous_local_results
+                    )
+                    final_ignores_worker_results = not uses_any_local_result
+            if final_ignores_worker_results:
+                reward_tensor_map['final_ignores_worker_results_penalty_applied'][i_bsz] = 1.0
+                reward_tensor_map['final_ignores_worker_results_penalty_value'][i_bsz] = FINAL_IGNORES_WORKER_RESULTS_PENALTY
+                active_penalties.append(('final_ignores_worker_results', FINAL_IGNORES_WORKER_RESULTS_PENALTY, [score_role]))
+                if score_role in role_penalties:
+                    role_penalties[score_role] += FINAL_IGNORES_WORKER_RESULTS_PENALTY
 
             global_penalty_value = sum(penalty_value for _, penalty_value, _ in active_penalties)
             role_shaped_scores = {}
