@@ -141,10 +141,7 @@ def compatibility_score(
     worker: WorkerSpec,
     worker_performance: Dict[str, WorkerPerformanceSnapshot],
 ) -> float:
-    skill_score = skill_match_score(required_skills, worker)
-    performance_snapshot = worker_performance.get(worker.worker_id)
-    performance_prior = performance_snapshot.ema_outcome if performance_snapshot else 0.5
-    return 0.8 * skill_score + 0.2 * performance_prior
+    return skill_match_score(required_skills, worker)
 
 
 def build_selection_reward(

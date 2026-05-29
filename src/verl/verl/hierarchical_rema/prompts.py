@@ -74,7 +74,6 @@ DEFAULT_ANALYSIS_WORKER_PROMPT = DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT
 
 def _compact_performance_summary(snapshot: WorkerPerformanceSnapshot) -> dict:
     return {
-        "ema_outcome": snapshot.ema_outcome,
         "num_assignments": snapshot.num_assignments,
         "average_reward": snapshot.average_reward,
         "average_confidence_reward": snapshot.average_confidence_reward,
@@ -242,11 +241,10 @@ def render_selector_prompt(
     worker_lines = []
     for worker in worker_pool.workers:
         snapshot = worker_performance.get(worker.worker_id)
-        ema_outcome = snapshot.ema_outcome if snapshot is not None else 0.5
         avg_reward = snapshot.average_reward if snapshot is not None else 0.0
         skills = ",".join(worker.skills) if worker.skills else "none"
         worker_lines.append(
-            f"- {worker.worker_id} | skills={skills} | ema={ema_outcome:.2f} | avg_reward={avg_reward:.2f} | desc={worker.description}"
+            f"- {worker.worker_id} | skills={skills} | avg_reward={avg_reward:.2f} | desc={worker.description}"
         )
 
     selector_skeleton = render_selector_output_skeleton(ordered_node_ids)
