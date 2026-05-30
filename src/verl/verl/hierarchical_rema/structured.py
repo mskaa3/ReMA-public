@@ -54,6 +54,9 @@ KNOWN_WORKER_TAGS = (
     "result",
 )
 
+_WORKER_ALLOWED_TAGS = frozenset(("worker_scratchpad",) + KNOWN_WORKER_TAGS)
+_WORKER_TAG_PATTERN = re.compile(r"</?\s*([a-zA-Z_][a-zA-Z0-9_\-]*)\s*>")
+
 def _extract_tagged_content(text: str, tags: tuple[str, ...] = KNOWN_CONTROLLER_TAGS) -> str:
     for tag in tags:
         pattern = re.compile(rf"<{tag}>\s*(.*?)\s*</{tag}>", flags=re.DOTALL | re.IGNORECASE)
@@ -77,6 +80,10 @@ def _normalize_structured_text(text: str, tags: tuple[str, ...]) -> str:
 def extract_worker_result_payload(text: str) -> Dict[str, str] | None:
     stripped = text.strip()
     if not stripped:
+        return None
+
+    tag_names = {match.group(1).lower() for match in _WORKER_TAG_PATTERN.finditer(stripped)}
+    if tag_names and not tag_names.issubset(_WORKER_ALLOWED_TAGS):
         return None
 
     normalized = _normalize_structured_text(stripped, tags=KNOWN_WORKER_TAGS)
@@ -109,11 +116,11 @@ def extract_worker_result_payload(text: str) -> Dict[str, str] | None:
 def extract_worker_result_text(text: str) -> str:
     payload = extract_worker_result_payload(text)
     if payload is None:
-        return text.strip()
+        return ""
 
     result_text = payload["result_text"].strip()
     if not result_text:
-        return text.strip()
+        return ""
     return result_text
 
 

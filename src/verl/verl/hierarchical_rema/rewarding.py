@@ -13,6 +13,11 @@ from .schema import (
     WorkerSpec,
 )
 
+WORKER_INVALID_RESULT_PENALTY = 0.10
+INTERMEDIATE_FINAL_ANSWER_PENALTY = 0.25
+_DEFAULT_COMPUTE_SCORE = None
+_DEFAULT_COMPUTE_SCORE_LOADED = False
+
 
 def normalize_answer(text: str) -> str:
     return " ".join(text.strip().lower().split())
@@ -20,6 +25,49 @@ def normalize_answer(text: str) -> str:
 
 def exact_match(prediction: str, reference: str) -> float:
     return 1.0 if normalize_answer(prediction) == normalize_answer(reference) else 0.0
+
+
+def _load_default_compute_score():
+    global _DEFAULT_COMPUTE_SCORE, _DEFAULT_COMPUTE_SCORE_LOADED
+    if _DEFAULT_COMPUTE_SCORE_LOADED:
+        return _DEFAULT_COMPUTE_SCORE
+    try:
+        from ..utils.reward_score import _default_compute_score
+
+        _DEFAULT_COMPUTE_SCORE = _default_compute_score
+    except Exception:
+        _DEFAULT_COMPUTE_SCORE = None
+    _DEFAULT_COMPUTE_SCORE_LOADED = True
+    return _DEFAULT_COMPUTE_SCORE
+
+
+def compute_final_answer_correctness(
+    prediction: str,
+    reference: str,
+    task_metadata: Dict[str, Any] | None = None,
+) -> float:
+    if not str(prediction or "").strip() or not str(reference or "").strip():
+        return 0.0
+
+    compute_score = _load_default_compute_score()
+    metadata = task_metadata if isinstance(task_metadata, dict) else {}
+    data_source = str(metadata.get("data_source") or "ReMA-math")
+    extra_info = metadata.get("extra_info")
+    if compute_score is not None:
+        try:
+            score = float(
+                compute_score(
+                    data_source=data_source,
+                    solution_str=str(prediction),
+                    ground_truth=str(reference),
+                    extra_info=extra_info,
+                )
+            )
+            return min(max(score, 0.0), 1.0)
+        except Exception:
+            pass
+
+    return exact_match(prediction, reference)
 
 
 def entropy_to_confidence_reward(entropy: float, entropy_cap: float) -> float:
@@ -149,8 +197,13 @@ def build_selection_reward(
     ground_truth: str,
     executions: Sequence[WorkerExecution],
     weights: RewardWeights,
+    task_metadata: Dict[str, Any] | None = None,
 ) -> SelectionRewardBreakdown:
-    final_correct = exact_match(final_answer, ground_truth)
+    final_correct = compute_final_answer_correctness(
+        final_answer,
+        ground_truth,
+        task_metadata=task_metadata,
+    )
     confidence_reward = (
         sum(
             entropy_to_confidence_reward(execution.entropy, weights.entropy_cap)
@@ -165,17 +218,43 @@ def build_selection_reward(
         if executions
         else 0.0
     )
+    worker_format_penalty = (
+        WORKER_INVALID_RESULT_PENALTY
+        * (
+            sum(1 for execution in executions if execution.invalid_reason)
+            / len(executions)
+        )
+        if executions
+        else 0.0
+    )
+    intermediate_final_answer_penalty = (
+        INTERMEDIATE_FINAL_ANSWER_PENALTY
+        * (
+            sum(1 for execution in executions if execution.final_answer_leak)
+            / len(executions)
+        )
+        if executions
+        else 0.0
+    )
     if weights.worker_reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
-        total_reward = final_correct
+        total_reward = (
+            final_correct
+            - worker_format_penalty
+            - intermediate_final_answer_penalty
+        )
     else:
         total_reward = (
             weights.final_answer * final_correct
             + weights.confidence * confidence_reward
             + weights.compatibility * compatibility_reward
+            - worker_format_penalty
+            - intermediate_final_answer_penalty
         )
     return SelectionRewardBreakdown(
         final_answer_correctness=final_correct,
         confidence_reward=confidence_reward,
         compatibility_reward=compatibility_reward,
         total_reward=total_reward,
+        worker_format_penalty=worker_format_penalty,
+        intermediate_final_answer_penalty=intermediate_final_answer_penalty,
     )

@@ -487,6 +487,7 @@ class HierarchicalReMAOrchestrator:
                 ground_truth=state.task.ground_truth,
                 executions=state.executions,
                 weights=self.reward_weights,
+                task_metadata=state.task.metadata,
             )
             selection_rollout_map[
                 (state.task_index, state.decomposition_index, state.selection_index)
@@ -532,6 +533,7 @@ class HierarchicalReMAOrchestrator:
             ground_truth=task.ground_truth,
             executions=executions,
             weights=self.reward_weights,
+            task_metadata=task.metadata,
         )
         return SelectionRollout(
             selection=selection,

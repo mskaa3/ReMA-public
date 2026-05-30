@@ -15,7 +15,12 @@ from .prompts import (
     render_selector_prompt,
     render_worker_prompt,
 )
-from .rewarding import compatibility_score, entropy_to_confidence_reward, skill_match_score
+from .rewarding import (
+    compatibility_score,
+    compute_final_answer_correctness,
+    entropy_to_confidence_reward,
+    skill_match_score,
+)
 from .schema import (
     ControllerPolicyConfig,
     DecompositionCandidate,
@@ -74,6 +79,40 @@ class WorkerExecutionRequest:
     worker: WorkerSpec
     dependency_outputs: Dict[str, str]
     compatibility: float
+
+
+def _postprocess_worker_output(
+    task: TaskExample,
+    decomposition: DecompositionCandidate,
+    node: SubtaskNode,
+    raw_output_text: str,
+) -> tuple[str, str, bool, bool]:
+    normalized_output = extract_worker_result_text(raw_output_text).strip()
+    invalid_reason = ""
+    final_answer_leak = False
+
+    if not normalized_output:
+        invalid_reason = "missing_worker_result"
+        return "", invalid_reason, final_answer_leak, False
+
+    if "i don't know" in raw_output_text.lower():
+        invalid_reason = "explicit_unknown"
+        return "", invalid_reason, final_answer_leak, False
+
+    if (
+        node.node_id != decomposition.final_node_id
+        and compute_final_answer_correctness(
+            normalized_output,
+            task.ground_truth,
+            task_metadata=task.metadata,
+        )
+        > 0.0
+    ):
+        final_answer_leak = True
+        invalid_reason = "non_final_matches_final_answer"
+        return "", invalid_reason, final_answer_leak, False
+
+    return normalized_output, invalid_reason, final_answer_leak, True
 
 
 def _canonicalize_selection_candidate(
@@ -682,6 +721,8 @@ class MockHierarchicalBackend(HierarchicalBackend):
             worker_prompt=prompt_text,
             dependency_outputs=dict(dependency_outputs),
             success=success,
+            final_answer_leak=False,
+            invalid_reason="",
         )
 
 
@@ -1351,8 +1392,12 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             max_new_tokens=self.config.worker_max_new_tokens,
             temperature=self._worker_temperature(),
         )
-        normalized_output = extract_worker_result_text(output_text).strip()
-        success = bool(normalized_output) and "i don't know" not in output_text.lower()
+        normalized_output, invalid_reason, final_answer_leak, success = _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=node,
+            raw_output_text=output_text,
+        )
         return WorkerExecution(
             node_id=node.node_id,
             worker_id=worker.worker_id,
@@ -1364,6 +1409,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             worker_prompt=prompt_text,
             dependency_outputs=dict(dependency_outputs),
             success=success,
+            final_answer_leak=final_answer_leak,
+            invalid_reason=invalid_reason,
         )
 
     def sample_decompositions_batch(
@@ -1512,12 +1559,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         results: List[SelectionCandidate | None] = [None] * len(requests)
         for (model_path, node_order, worker_ids), grouped_requests in grouped.items():
             prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
+            first_request = grouped_requests[0][1]
             generated = self._generate_text_batch(
                 base_model_path=model_path,
                 prompt_texts=prompt_texts,
                 system_prompt=(
                     SELECTOR_SYSTEM_PROMPT
-                    if request.worker_performance
+                    if first_request.worker_performance
                     else SELECTOR_SYSTEM_PROMPT_NO_HISTORY
                 ),
                 max_new_tokens=self._controller_max_new_tokens("selector"),
@@ -1719,9 +1767,13 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 temperature=self._worker_temperature(),
                 log_label="worker",
             )
-            for (result_index, request, _), (output_text, entropy) in zip(grouped_requests, generated):
-                normalized_output = extract_worker_result_text(output_text).strip()
-                success = bool(normalized_output) and "i don't know" not in output_text.lower()
+            for (result_index, request, prompt_text), (output_text, entropy) in zip(grouped_requests, generated):
+                normalized_output, invalid_reason, final_answer_leak, success = _postprocess_worker_output(
+                    task=request.task,
+                    decomposition=request.decomposition,
+                    node=request.node,
+                    raw_output_text=output_text,
+                )
                 results[result_index] = WorkerExecution(
                     node_id=request.node.node_id,
                     worker_id=request.worker.worker_id,
@@ -1733,6 +1785,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     worker_prompt=prompt_text,
                     dependency_outputs=dict(request.dependency_outputs),
                     success=success,
+                    final_answer_leak=final_answer_leak,
+                    invalid_reason=invalid_reason,
                 )
 
         if any(execution is None for execution in results):
