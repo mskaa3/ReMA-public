@@ -12,7 +12,7 @@ Aim for 3 to 5 concrete subtasks. Do not output only one subtask.
 Write down the reasoning and break down the question into clear plan in the following format:
 
 REASONING:
-- <brief reflection on the question and its current solution, errors, or checks needed>
+- <brief reflection on the question and its current solution, errors, or checks and backtracking needed>
 
 PLAN:
 - S1: <instruction>; skill=<algebra|functional_analysis|general_math>
