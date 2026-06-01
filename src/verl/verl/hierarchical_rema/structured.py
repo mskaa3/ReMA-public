@@ -136,16 +136,31 @@ def _parse_csv_field(raw_value: Any) -> List[str]:
 
 
 _SKILL_TAG_ALIASES = {
-    "pre_algebra": "prealgebra",
-    "symbolic": "symbolic_manipulation",
-    "symbolic_algebra": "symbolic_manipulation",
-    "equation_solving": "equations",
-    "coordinate_geometry": "coordinate_geometry",
-    "coordinategeo": "coordinate_geometry",
-    "number_theory": "number_theory",
-    "numbertheory": "number_theory",
-    "discrete_math": "discrete_math",
-    "discretemath": "discrete_math",
+    "pre_algebra": "arithmetic",
+    "prealgebra": "arithmetic",
+    "fractions": "arithmetic",
+    "fraction": "arithmetic",
+    "simplification": "algebra",
+    "symbolic": "algebra",
+    "symbolic_algebra": "algebra",
+    "symbolic_manipulation": "algebra",
+    "equation_solving": "algebra",
+    "equations": "algebra",
+    "polynomials": "algebra",
+    "geometry": "geometry_trigonometry",
+    "trigonometry": "geometry_trigonometry",
+    "coordinate_geometry": "geometry_trigonometry",
+    "coordinategeo": "geometry_trigonometry",
+    "analysis": "calculus_analysis",
+    "calculus": "calculus_analysis",
+    "functions": "calculus_analysis",
+    "limits": "calculus_analysis",
+    "combinatorics": "combinatorics_probability",
+    "probability": "combinatorics_probability",
+    "number_theory": "number_theory_discrete",
+    "numbertheory": "number_theory_discrete",
+    "discrete_math": "number_theory_discrete",
+    "discretemath": "number_theory_discrete",
 }
 
 
@@ -170,6 +185,13 @@ def _normalize_required_skills(raw_value: Any) -> List[str]:
     return normalized
 
 
+def _normalize_required_skills_note(raw_value: Any) -> str:
+    text = " ".join(str(raw_value or "").strip().split())
+    if not text or text.lower() in {"none", "null", "n/a"}:
+        return ""
+    return text[:160]
+
+
 _GENERIC_FINAL_ANSWER_PATTERNS: tuple[str, ...] = (
     "return the final answer",
     "provide the final answer",
@@ -190,15 +212,11 @@ def _infer_required_skills_from_instruction(instruction: str) -> List[str]:
         return []
 
     keyword_groups: tuple[tuple[str, tuple[str, ...]], ...] = (
-        ("trigonometry", ("sin", "cos", "tan", "trig", "angle", "radian")),
-        ("geometry", ("triangle", "circle", "radius", "diameter", "polygon", "coordinate", "line segment")),
-        ("calculus", ("derivative", "integral", "differentiate", "integrate", "limit")),
-        ("analysis", ("range", "interval", "monotonic", "extrema", "check if", "verify", "identify")),
-        ("probability", ("probability", "expected value", "odds")),
-        ("combinatorics", ("count", "number of ways", "choose", "combination", "permutation", "ordered triple", "subset")),
-        ("number_theory", ("mod", "modulo", "divisible", "prime", "gcd", "lcm", "remainder", "parity")),
-        ("algebra", ("equation", "solve", "isolate", "factor", "expand", "polynomial", "variable", "substitute")),
-        ("simplification", ("simplify", "rewrite", "reduce")),
+        ("geometry_trigonometry", ("sin", "cos", "tan", "trig", "angle", "radian", "triangle", "circle", "radius", "diameter", "polygon", "coordinate", "line segment")),
+        ("calculus_analysis", ("derivative", "integral", "differentiate", "integrate", "limit", "range", "interval", "monotonic", "extrema", "check if", "verify", "identify", "function behavior")),
+        ("combinatorics_probability", ("probability", "expected value", "odds", "count", "number of ways", "choose", "combination", "permutation", "ordered triple", "subset")),
+        ("number_theory_discrete", ("mod", "modulo", "divisible", "prime", "gcd", "lcm", "remainder", "parity", "invariant", "graph", "recurrence")),
+        ("algebra", ("equation", "solve", "isolate", "factor", "expand", "polynomial", "variable", "substitute", "simplify", "rewrite", "reduce")),
         ("arithmetic", ("compute", "calculate", "evaluate", "ceiling", "floor", "sum", "product", "integer", "fraction", "decimal")),
     )
     for skill_tag, keywords in keyword_groups:
@@ -291,6 +309,7 @@ def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
                 f"INSTRUCTION: {node.instruction}",
                 f"DEPENDENCIES: {', '.join(node.dependencies) if node.dependencies else 'none'}",
                 f"REQUIRED_SKILLS: {', '.join(node.required_skills) if node.required_skills else 'none'}",
+                *([f"REQUIRED_SKILLS_NOTE: {node.required_skills_note}"] if node.required_skills_note else []),
                 f"OUTPUT_KEY: {node.output_key}",
             ]
         )
@@ -342,11 +361,13 @@ def _extract_key_value_payload(text: str) -> Dict[str, Any]:
             finalize_node()
             current_node = {"node_id": raw_value}
             continue
-        if current_node is not None and key in {"INSTRUCTION", "DEPENDENCIES", "REQUIRED_SKILLS", "SKILLS", "OUTPUT_KEY"}:
+        if current_node is not None and key in {"INSTRUCTION", "DEPENDENCIES", "REQUIRED_SKILLS", "SKILLS", "REQUIRED_SKILLS_NOTE", "SKILL_NOTE", "SKILL_HINT", "OUTPUT_KEY"}:
             if key == "INSTRUCTION":
                 current_node["instruction"] = raw_value
             elif key in {"REQUIRED_SKILLS", "SKILLS"}:
                 current_node["required_skills"] = _parse_csv_field(raw_value)
+            elif key in {"REQUIRED_SKILLS_NOTE", "SKILL_NOTE", "SKILL_HINT"}:
+                current_node["required_skills_note"] = raw_value
             elif key == "DEPENDENCIES":
                 current_node["dependencies"] = _parse_csv_field(raw_value)
             elif key == "OUTPUT_KEY":
@@ -724,6 +745,11 @@ def validate_decomposition_payload(
         )
         if not required_skills:
             required_skills = _infer_required_skills_from_instruction(instruction)
+        required_skills_note = _normalize_required_skills_note(
+            node_payload.get("required_skills_note")
+            or node_payload.get("skill_note")
+            or node_payload.get("skill_hint")
+        )
         output_key = str(node_payload.get("output_key") or f"{node_id}_output")
         nodes.append(
             SubtaskNode(
@@ -731,6 +757,7 @@ def validate_decomposition_payload(
                 instruction=instruction,
                 dependencies=normalized_dependencies,
                 required_skills=list(required_skills),
+                required_skills_note=required_skills_note,
                 output_key=output_key,
             )
         )
@@ -790,6 +817,7 @@ def validate_decomposition_payload(
                 instruction=original_node.instruction,
                 dependencies=[remapped_node_ids[dependency] for dependency in original_node.dependencies],
                 required_skills=list(original_node.required_skills),
+                required_skills_note=original_node.required_skills_note,
                 output_key=output_key,
             )
         )
@@ -915,6 +943,7 @@ def build_fallback_decomposition(
                 "instruction": resolved_instruction,
                 "dependencies": [],
                 "required_skills": [],
+                "required_skills_note": "",
                 "output_key": "final_answer",
             }
         ],

@@ -191,6 +191,7 @@ class RolloutRecorder:
                     "instruction": node.instruction,
                     "dependencies": list(node.dependencies),
                     "required_skills": list(node.required_skills),
+                    "required_skills_note": node.required_skills_note,
                     "output_key": node.output_key,
                 }
                 for node in decomposition.nodes

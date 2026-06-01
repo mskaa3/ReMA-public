@@ -508,7 +508,7 @@ class MockHierarchicalBackend(HierarchicalBackend):
     ) -> DecompositionCandidate:
         del policy_config
         skill_focus = task.metadata.get("skill_focus", "algebra")
-        secondary_skill = "analysis" if skill_focus == "algebra" else "algebra"
+        secondary_skill = "calculus_analysis" if skill_focus == "algebra" else "algebra"
         prompt_text = render_decomposer_prompt(
             task,
             max_nodes_hint=rollout_config.max_nodes_per_decomposition,
@@ -1143,7 +1143,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     "Do not add commentary, bullets, or repeated task text. "
                     "Every node must include NODE_ID and INSTRUCTION, and should include DEPENDENCIES. "
                     "Use allowed numeric node IDs and keep the dependency structure as a valid DAG. "
-                    "Use `none` for REQUIRED_SKILLS only on pure routing or final-answer wrapper nodes. "
+                    "Use coarse REQUIRED_SKILLS families, with `none` only on pure routing or final-answer wrapper nodes. "
+                    "REQUIRED_SKILLS_NOTE is optional and should stay short when present. "
                     "Make FINAL_NODE_ID point to the terminal final-answer node."
                 )
 

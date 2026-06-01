@@ -7,24 +7,11 @@ from typing import Any, Dict, List, Optional, Sequence
 
 CANONICAL_SKILL_TAGS: tuple[str, ...] = (
     "arithmetic",
-    "prealgebra",
-    "fractions",
-    "simplification",
     "algebra",
-    "symbolic_manipulation",
-    "equations",
-    "polynomials",
-    "geometry",
-    "trigonometry",
-    "coordinate_geometry",
-    "analysis",
-    "calculus",
-    "functions",
-    "limits",
-    "combinatorics",
-    "probability",
-    "number_theory",
-    "discrete_math",
+    "geometry_trigonometry",
+    "calculus_analysis",
+    "combinatorics_probability",
+    "number_theory_discrete",
 )
 
 
@@ -214,6 +201,7 @@ class SubtaskNode:
     instruction: str
     dependencies: List[str] = field(default_factory=list)
     required_skills: List[str] = field(default_factory=list)
+    required_skills_note: str = ""
     output_key: str = ""
 
     def to_dict(self) -> Dict[str, Any]:

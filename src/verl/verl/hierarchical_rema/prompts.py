@@ -162,6 +162,7 @@ def _decomposition_context(decomposition: DecompositionCandidate) -> dict:
                 "instruction": node.instruction,
                 "dependencies": list(node.dependencies),
                 "required_skills": list(node.required_skills),
+                "required_skills_note": node.required_skills_note,
                 "output_key": node.output_key,
             }
             for node in decomposition.nodes
@@ -190,7 +191,7 @@ def render_decomposer_prompt(
     return (
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <decomposition_plan> block and nothing else.\n"
-        "- Use only these keys: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY.\n"
+        "- Use only these keys: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE, OUTPUT_KEY.\n"
         "- Use this skeleton:\n"
         "<decomposition_plan>\n"
         "SUMMARY: short summary\n"
@@ -199,18 +200,20 @@ def render_decomposer_prompt(
         "INSTRUCTION: short instruction\n"
         "DEPENDENCIES: none\n"
         "REQUIRED_SKILLS: algebra\n"
+        "REQUIRED_SKILLS_NOTE: equation manipulation\n"
         "NODE_ID: 2\n"
         "INSTRUCTION: produce the final answer\n"
         "DEPENDENCIES: 1\n"
-        "REQUIRED_SKILLS: analysis\n"
+        "REQUIRED_SKILLS: calculus_analysis\n"
         "</decomposition_plan>\n"
         f"- Allowed node IDs: {allowed_node_ids}. Use contiguous numeric NODE_ID values in declaration order: 1, 2, ..., N.\n"
         "- Each node must contain exactly one INSTRUCTION line and one DEPENDENCIES line.\n"
         f"{node_budget_contract}"
         "- DEPENDENCIES must be `none` or comma-separated earlier node IDs from the allowed set.\n"
-        f"- REQUIRED_SKILLS is preferred for substantive nodes; when present, use only these tags: {skill_tags}.\n"
-        "- Use at most 3 REQUIRED_SKILLS tags per node, and prefer 1-2 when possible.\n"
-        "- Do not list every possible skill or repeat broad generic tags across all nodes; include only the tags truly needed for that node.\n"
+        f"- REQUIRED_SKILLS is preferred for substantive nodes; when present, use only these coarse skill families: {skill_tags}.\n"
+        "- Use at most 2 REQUIRED_SKILLS tags per node, and prefer 1 when possible.\n"
+        "- REQUIRED_SKILLS_NOTE is optional. When used, keep it very short and specific, such as `equation manipulation`, `counting argument`, or `coordinate setup`.\n"
+        "- Do not list every possible skill or repeat the same broad tag across all nodes unless the task genuinely requires it.\n"
         "- OUTPUT_KEY is optional and only for readability.\n"
         "- Do not tailor the decomposition to a particular worker roster.\n"
         "- Return a DAG, not a chain unless the task truly needs one.\n"
@@ -240,8 +243,9 @@ def render_selector_prompt(
     for node in decomposition.nodes:
         dependencies = ",".join(node.dependencies) if node.dependencies else "none"
         skills = ",".join(node.required_skills) if node.required_skills else "none"
+        skill_note = f" | skill_note={node.required_skills_note}" if node.required_skills_note else ""
         node_lines.append(
-            f"{node.node_id}: deps={dependencies} | skills={skills} | output={node.output_key} | instruction={node.instruction}"
+            f"{node.node_id}: deps={dependencies} | skills={skills}{skill_note} | output={node.output_key} | instruction={node.instruction}"
         )
 
     worker_lines = []
@@ -317,6 +321,7 @@ def render_worker_prompt(
     skills = ",".join(worker.skills) if worker.skills else "none"
     node_dependencies = ",".join(node.dependencies) if node.dependencies else "none"
     node_required_skills = ",".join(node.required_skills) if node.required_skills else "none"
+    node_required_skills_note = node.required_skills_note or "none"
     is_final_node = decomposition.final_node_id == node.node_id
     is_root_node = not node.dependencies
     expected_output_hint = _expected_worker_output_hint(decomposition, node)
@@ -375,6 +380,7 @@ def render_worker_prompt(
         f"NODE_ID: {node.node_id}\n"
         f"NODE_INSTRUCTION: {node.instruction}\n"
         f"NODE_REQUIRED_SKILLS: {node_required_skills}\n"
+        f"NODE_REQUIRED_SKILLS_NOTE: {node_required_skills_note}\n"
         f"FINAL_NODE: {'yes' if is_final_node else 'no'}\n"
         f"NODE_DEPENDENCIES: {node_dependencies}\n"
         f"DEPENDENCY_RESULTS:\n"
