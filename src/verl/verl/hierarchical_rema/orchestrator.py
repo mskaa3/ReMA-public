@@ -488,6 +488,7 @@ class HierarchicalReMAOrchestrator:
                 executions=state.executions,
                 weights=self.reward_weights,
                 task_metadata=state.task.metadata,
+                final_node_id=state.decomposition.final_node_id,
             )
             selection_rollout_map[
                 (state.task_index, state.decomposition_index, state.selection_index)
@@ -534,6 +535,7 @@ class HierarchicalReMAOrchestrator:
             executions=executions,
             weights=self.reward_weights,
             task_metadata=task.metadata,
+            final_node_id=decomposition.final_node_id,
         )
         return SelectionRollout(
             selection=selection,

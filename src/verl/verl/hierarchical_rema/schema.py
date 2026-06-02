@@ -302,6 +302,7 @@ class WorkerExecution:
     dependency_outputs: Dict[str, str] = field(default_factory=dict)
     success: bool = True
     final_answer_leak: bool = False
+    answer_containment: bool = False
     invalid_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -318,6 +319,7 @@ class SelectionRewardBreakdown:
     total_reward: float
     worker_format_penalty: float = 0.0
     intermediate_final_answer_penalty: float = 0.0
+    non_final_answer_containment_penalty: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

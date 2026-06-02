@@ -17,6 +17,7 @@ from .prompts import (
 )
 from .rewarding import (
     compatibility_score,
+    contains_answer_like_content,
     compute_final_answer_correctness,
     entropy_to_confidence_reward,
     skill_match_score,
@@ -86,33 +87,39 @@ def _postprocess_worker_output(
     decomposition: DecompositionCandidate,
     node: SubtaskNode,
     raw_output_text: str,
-) -> tuple[str, str, bool, bool]:
+) -> tuple[str, str, bool, bool, bool]:
     normalized_output = extract_worker_result_text(raw_output_text).strip()
     invalid_reason = ""
     final_answer_leak = False
+    answer_containment = False
 
     if not normalized_output:
         invalid_reason = "missing_worker_result"
-        return "", invalid_reason, final_answer_leak, False
+        return "", invalid_reason, final_answer_leak, answer_containment, False
 
     if "i don't know" in raw_output_text.lower():
         invalid_reason = "explicit_unknown"
-        return "", invalid_reason, final_answer_leak, False
+        return "", invalid_reason, final_answer_leak, answer_containment, False
 
-    if (
-        node.node_id != decomposition.final_node_id
-        and compute_final_answer_correctness(
-            normalized_output,
-            task.ground_truth,
-            task_metadata=task.metadata,
-        )
-        > 0.0
-    ):
-        final_answer_leak = True
-        invalid_reason = "non_final_matches_final_answer"
-        return "", invalid_reason, final_answer_leak, False
+    if node.node_id != decomposition.final_node_id:
+        if (
+            compute_final_answer_correctness(
+                normalized_output,
+                task.ground_truth,
+                task_metadata=task.metadata,
+            )
+            > 0.0
+            or contains_answer_like_content(
+                normalized_output,
+                task.ground_truth,
+                task_metadata=task.metadata,
+            )
+        ):
+            final_answer_leak = True
+            invalid_reason = "non_final_contains_ground_truth"
+            return "", invalid_reason, final_answer_leak, answer_containment, False
 
-    return normalized_output, invalid_reason, final_answer_leak, True
+    return normalized_output, invalid_reason, final_answer_leak, answer_containment, True
 
 
 def _canonicalize_selection_candidate(
@@ -1393,7 +1400,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             max_new_tokens=self.config.worker_max_new_tokens,
             temperature=self._worker_temperature(),
         )
-        normalized_output, invalid_reason, final_answer_leak, success = _postprocess_worker_output(
+        normalized_output, invalid_reason, final_answer_leak, answer_containment, success = _postprocess_worker_output(
             task=task,
             decomposition=decomposition,
             node=node,
@@ -1411,6 +1418,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             dependency_outputs=dict(dependency_outputs),
             success=success,
             final_answer_leak=final_answer_leak,
+            answer_containment=answer_containment,
             invalid_reason=invalid_reason,
         )
 
@@ -1769,7 +1777,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 log_label="worker",
             )
             for (result_index, request, prompt_text), (output_text, entropy) in zip(grouped_requests, generated):
-                normalized_output, invalid_reason, final_answer_leak, success = _postprocess_worker_output(
+                normalized_output, invalid_reason, final_answer_leak, answer_containment, success = _postprocess_worker_output(
                     task=request.task,
                     decomposition=request.decomposition,
                     node=request.node,
@@ -1787,6 +1795,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                     dependency_outputs=dict(request.dependency_outputs),
                     success=success,
                     final_answer_leak=final_answer_leak,
+                    answer_containment=answer_containment,
                     invalid_reason=invalid_reason,
                 )
 

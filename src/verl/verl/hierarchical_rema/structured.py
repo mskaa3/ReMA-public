@@ -199,11 +199,72 @@ _GENERIC_FINAL_ANSWER_PATTERNS: tuple[str, ...] = (
     "state the final answer",
     "best final answer",
 )
+_GENERIC_NODE1_PREFIXES: tuple[str, ...] = (
+    "identify",
+    "determine",
+    "simplify",
+    "compute",
+    "calculate",
+    "find",
+)
+_GENERIC_FINAL_PREFIXES: tuple[str, ...] = (
+    "return",
+    "calculate",
+    "compute",
+    "give",
+    "provide",
+    "find",
+    "determine",
+)
+_GENERIC_FINAL_MARKERS: tuple[str, ...] = (
+    "final answer",
+    "final value",
+    "total",
+    "result",
+    "value",
+    "number",
+    "sum",
+)
 
 
 def _is_generic_final_answer_instruction(instruction: str) -> bool:
     normalized = " ".join(str(instruction or "").strip().lower().split())
     return any(pattern in normalized for pattern in _GENERIC_FINAL_ANSWER_PATTERNS)
+
+
+def _looks_generic_instruction(instruction: str, prefixes: Sequence[str]) -> bool:
+    normalized = " ".join(str(instruction or "").strip().lower().split())
+    return bool(normalized) and normalized.startswith(prefixes)
+
+
+def _is_shallow_two_node_plan(candidate: DecompositionCandidate) -> bool:
+    if len(candidate.nodes) != 2:
+        return False
+
+    node_map = candidate.nodes_by_id()
+    final_node = node_map.get(candidate.final_node_id)
+    if final_node is None:
+        return False
+
+    non_final_nodes = [node for node in candidate.nodes if node.node_id != candidate.final_node_id]
+    if len(non_final_nodes) != 1:
+        return False
+
+    first_node = non_final_nodes[0]
+    if first_node.dependencies:
+        return False
+    if final_node.dependencies != [first_node.node_id]:
+        return False
+
+    first_instruction = " ".join(first_node.instruction.strip().lower().split())
+    final_instruction = " ".join(final_node.instruction.strip().lower().split())
+    if not (
+        _looks_generic_instruction(first_instruction, _GENERIC_NODE1_PREFIXES)
+        and _looks_generic_instruction(final_instruction, _GENERIC_FINAL_PREFIXES)
+    ):
+        return False
+
+    return any(marker in final_instruction for marker in _GENERIC_FINAL_MARKERS)
 
 
 def _infer_required_skills_from_instruction(instruction: str) -> List[str]:
@@ -688,6 +749,9 @@ def apply_decomposition_limits(
             candidate.soft_penalty += rollout_config.soft_hop_penalty * (
                 node_exceedance ** rollout_config.soft_hop_penalty_power
             )
+
+    if original_node_count == 2 and _is_shallow_two_node_plan(candidate):
+        candidate.soft_penalty += rollout_config.soft_hop_penalty
 
     limited_candidate = candidate
     if len(limited_candidate.nodes) > rollout_config.max_nodes_per_decomposition:

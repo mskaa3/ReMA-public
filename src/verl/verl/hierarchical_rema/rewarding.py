@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, Iterable, List, Sequence
 
 from .schema import (
@@ -15,8 +16,15 @@ from .schema import (
 
 WORKER_INVALID_RESULT_PENALTY = 0.10
 INTERMEDIATE_FINAL_ANSWER_PENALTY = 0.25
+NON_FINAL_ANSWER_CONTAINMENT_PENALTY = 0.125
 _DEFAULT_COMPUTE_SCORE = None
 _DEFAULT_COMPUTE_SCORE_LOADED = False
+_BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\s*\{([^{}]+)\}")
+_FINAL_CLAUSE_PATTERN = re.compile(
+    r"(?:the\s+answer\s+is|the\s+value\s+is|therefore|thus|so|hence|must\s+be|equals?)\s*[:=]?\s*(.+)",
+    flags=re.IGNORECASE,
+)
+_BOUNDARY_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
 
 
 def normalize_answer(text: str) -> str:
@@ -25,6 +33,73 @@ def normalize_answer(text: str) -> str:
 
 def exact_match(prediction: str, reference: str) -> float:
     return 1.0 if normalize_answer(prediction) == normalize_answer(reference) else 0.0
+
+
+def _contains_normalized_reference(text: str, reference: str) -> bool:
+    normalized_text = normalize_answer(text)
+    normalized_reference = normalize_answer(reference)
+    if not normalized_text or not normalized_reference:
+        return False
+    if normalized_reference not in normalized_text:
+        return False
+    if all(ch in _BOUNDARY_SAFE_CHARS for ch in normalized_reference):
+        pattern = rf"(?<![a-z0-9]){re.escape(normalized_reference)}(?![a-z0-9])"
+        return re.search(pattern, normalized_text) is not None
+    return True
+
+
+def _extract_answer_like_candidates(text: str) -> List[str]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return []
+
+    candidates: List[str] = [stripped]
+    seen = {stripped}
+
+    def _add(candidate: str) -> None:
+        cleaned = candidate.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            candidates.append(cleaned)
+
+    for match in _BOXED_ANSWER_PATTERN.finditer(stripped):
+        _add(match.group(1))
+
+    lines = [line.strip(" -*\t") for line in stripped.splitlines() if line.strip()]
+    if lines:
+        _add(lines[-1])
+    for line in lines[-3:]:
+        match = _FINAL_CLAUSE_PATTERN.search(line)
+        if match:
+            _add(match.group(1))
+        if ":" in line:
+            _add(line.rsplit(":", 1)[-1])
+        if "=" in line:
+            _add(line.rsplit("=", 1)[-1])
+
+    for segment in re.split(r"[;\n]", stripped):
+        candidate = segment.strip()
+        if 0 < len(candidate) <= 64:
+            _add(candidate)
+
+    return candidates
+
+
+def contains_answer_like_content(
+    text: str,
+    reference: str,
+    task_metadata: Dict[str, Any] | None = None,
+) -> bool:
+    if _contains_normalized_reference(text, reference):
+        return True
+    for candidate in _extract_answer_like_candidates(text):
+        if compute_final_answer_correctness(
+            candidate,
+            reference,
+            task_metadata=task_metadata,
+        ) > 0.0:
+            return True
+    return False
 
 
 def _load_default_compute_score():
@@ -198,6 +273,7 @@ def build_selection_reward(
     executions: Sequence[WorkerExecution],
     weights: RewardWeights,
     task_metadata: Dict[str, Any] | None = None,
+    final_node_id: str | None = None,
 ) -> SelectionRewardBreakdown:
     final_correct = compute_final_answer_correctness(
         final_answer,
@@ -236,11 +312,37 @@ def build_selection_reward(
         if executions
         else 0.0
     )
+    non_final_answer_containment_count = 0
+    if executions:
+        for execution in executions:
+            if execution.node_id == final_node_id or execution.final_answer_leak or not execution.output_text.strip():
+                execution.answer_containment = False
+                continue
+            execution.answer_containment = (
+                contains_answer_like_content(
+                    execution.output_text,
+                    final_answer,
+                    task_metadata=task_metadata,
+                )
+                or contains_answer_like_content(
+                    execution.output_text,
+                    ground_truth,
+                    task_metadata=task_metadata,
+                )
+            )
+            if execution.answer_containment:
+                non_final_answer_containment_count += 1
+    non_final_answer_containment_penalty = (
+        NON_FINAL_ANSWER_CONTAINMENT_PENALTY * (non_final_answer_containment_count / len(executions))
+        if executions
+        else 0.0
+    )
     if weights.worker_reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
         total_reward = (
             final_correct
             - worker_format_penalty
             - intermediate_final_answer_penalty
+            - non_final_answer_containment_penalty
         )
     else:
         total_reward = (
@@ -249,6 +351,7 @@ def build_selection_reward(
             + weights.compatibility * compatibility_reward
             - worker_format_penalty
             - intermediate_final_answer_penalty
+            - non_final_answer_containment_penalty
         )
     return SelectionRewardBreakdown(
         final_answer_correctness=final_correct,
@@ -257,4 +360,5 @@ def build_selection_reward(
         total_reward=total_reward,
         worker_format_penalty=worker_format_penalty,
         intermediate_final_answer_penalty=intermediate_final_answer_penalty,
+        non_final_answer_containment_penalty=non_final_answer_containment_penalty,
     )
