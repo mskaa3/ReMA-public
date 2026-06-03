@@ -89,15 +89,9 @@ export RAY_ADDRESS=${IP_HEAD}; \
 python3 -m verl.rema_separated_trainer.main_ppo \
   --config-path=/home/ajanz/projects/ReMA-public/config \
   --config-name=rema-rl.yaml \
+  actor_rollout_ref.model.path=${MODEL_PATH} \
   trainer.nnodes=${SLURM_NNODES} \
-  trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
-  algorithm.hierarchy.enable=True \
-  +algorithm.switch_agent.enable=True \
-  +algorithm.switch_agent.level=step \
-  +algorithm.switch_agent.freq=1 \
-  +algorithm.switch_agent.agent_roles=[decomposer,selector,algebra_worker,functional_analysis_worker,general_math_worker,finalizer] \
-  +algorithm.switch_agent.start_agent=decomposer \
-  +algorithm.switch_agent.model_paths=[${MODEL_PATH},${MODEL_PATH}]"
+  trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE}"
 
 echo "Submitting trainer on Ray head"
 PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \

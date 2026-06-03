@@ -36,10 +36,20 @@ PLANNER_SUBTASK_COUNT_MAX_PENALTY = 0.80
 WORKER_EMPTY_ASSIGNED_PENALTY = 0.10
 WORKER_MISSING_LOCAL_RESULT_PENALTY = 0.20
 WORKER_SUBTASK_OVERREACH_PENALTY = 0.10
-WORKER_DUPLICATE_RESULT_PENALTY = 0.10
+WORKER_DUPLICATE_RESULT_PENALTY = 0.03
 FINAL_IGNORES_WORKER_RESULTS_PENALTY = 0.20
 FINAL_IGNORES_MIN_LOCAL_RESULTS = 2
 FINAL_IGNORES_MIN_WORDS = 80
+DECOMPOSER_UNIQUE_LOCAL_RESULT_BONUS = 0.05
+DECOMPOSER_DEPENDENCY_USAGE_BONUS = 0.05
+DECOMPOSER_REPAIR_SUCCESS_BONUS = 0.10
+SELECTOR_ASSIGNMENT_COMPLETENESS_BONUS = 0.05
+SELECTOR_WORKER_VALID_LOCAL_RESULT_BONUS = 0.05
+WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
+WORKER_DOWNSTREAM_USED_BONUS = 0.03
+FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
+FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
+POSITIVE_ROLE_BONUS_MIN_GATE = 0.30
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
 
 
@@ -115,6 +125,231 @@ def _word_count(text):
     if not isinstance(text, str):
         return 0
     return len(re.findall(r"\b\w+\b", text))
+
+
+def _compute_turn_worker_metrics(turn_history, worker_roles):
+    active_workers = []
+    for msg in turn_history:
+        if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
+            continue
+        assigned_subtasks = msg.get('assigned_subtasks') or []
+        if not assigned_subtasks:
+            continue
+        content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+        signature = _extract_worker_local_result_signature(content)
+        active_workers.append({
+            'role': msg.get('role'),
+            'content': content,
+            'signature': signature,
+        })
+
+    valid_signatures = [worker['signature'] for worker in active_workers if worker['signature']]
+    unique_signatures = set(valid_signatures)
+    unique_local_result_rate = (
+        len(unique_signatures) / len(valid_signatures)
+        if valid_signatures else 0.0
+    )
+
+    dependency_hits = 0
+    dependency_checks = 0
+    previous_signatures = []
+    for worker in active_workers:
+        normalized_content = _normalize_role_output(worker['content'])
+        if previous_signatures:
+            dependency_checks += 1
+            if any(signature in normalized_content for signature in previous_signatures):
+                dependency_hits += 1
+        if worker['signature']:
+            previous_signatures.append(worker['signature'])
+
+    dependency_usage_rate = (
+        dependency_hits / dependency_checks
+        if dependency_checks else 0.0
+    )
+
+    return {
+        'active_worker_count': len(active_workers),
+        'valid_local_result_count': len(valid_signatures),
+        'unique_local_result_rate': unique_local_result_rate,
+        'dependency_usage_rate': dependency_usage_rate,
+        'duplicate_result_count': max(len(valid_signatures) - len(unique_signatures), 0),
+        'missing_local_result_count': sum(1 for worker in active_workers if not worker['signature']),
+        'empty_assigned_count': sum(1 for worker in active_workers if not worker['content'].strip()),
+    }
+
+
+def _compute_repair_success(previous_turn_metrics, current_turn_metrics):
+    if not previous_turn_metrics:
+        return 0.0
+
+    previous_issue_count = (
+        previous_turn_metrics['duplicate_result_count']
+        + previous_turn_metrics['missing_local_result_count']
+        + previous_turn_metrics['empty_assigned_count']
+    )
+    current_issue_count = (
+        current_turn_metrics['duplicate_result_count']
+        + current_turn_metrics['missing_local_result_count']
+        + current_turn_metrics['empty_assigned_count']
+    )
+
+    if previous_issue_count <= 0:
+        return 0.0
+
+    return max(previous_issue_count - current_issue_count, 0) / previous_issue_count
+
+
+def _compute_final_stage_bonus_stats(turn_history, worker_roles, score_role):
+    previous_signatures = []
+    final_output = ""
+    for msg in turn_history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get('role')
+        content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+        if role == score_role:
+            final_output = content
+            continue
+        if role not in worker_roles:
+            continue
+        assigned_subtasks = msg.get('assigned_subtasks') or []
+        if not assigned_subtasks:
+            continue
+        signature = _extract_worker_local_result_signature(content)
+        if signature:
+            previous_signatures.append(signature)
+
+    if not previous_signatures:
+        return {
+            'worker_result_usage_rate': 0.0,
+            'consistency_with_worker_results': 0.0,
+        }
+
+    unique_signatures = []
+    seen = set()
+    for signature in previous_signatures:
+        if signature not in seen:
+            unique_signatures.append(signature)
+            seen.add(signature)
+
+    normalized_final_output = _normalize_role_output(final_output)
+    used_count = sum(1 for signature in unique_signatures if signature in normalized_final_output)
+    usage_rate = used_count / len(unique_signatures)
+    if usage_rate == 1.0:
+        consistency = 1.0
+    elif usage_rate > 0.0:
+        consistency = 0.5
+    else:
+        consistency = 0.0
+
+    return {
+        'worker_result_usage_rate': usage_rate,
+        'consistency_with_worker_results': consistency,
+    }
+
+
+def _compute_selector_turn_bonus_stats(turn_history, worker_roles):
+    decomposer_output = ""
+    selector_output = ""
+    for msg in turn_history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get('role')
+        content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+        if role == 'decomposer':
+            decomposer_output = content
+        elif role == 'selector':
+            selector_output = content
+
+    planned_subtasks = {
+        subtask.upper()
+        for subtask in re.findall(r"\bS\d+\b", decomposer_output, re.IGNORECASE)
+    }
+    assigned_subtasks = [
+        subtask.upper()
+        for subtask in re.findall(r"\bS\d+\b", selector_output, re.IGNORECASE)
+    ]
+    if planned_subtasks:
+        assigned_counts = {subtask: assigned_subtasks.count(subtask) for subtask in planned_subtasks}
+        matched_once = sum(1 for count in assigned_counts.values() if count == 1)
+        assignment_completeness = matched_once / len(planned_subtasks)
+    else:
+        assignment_completeness = 0.0
+
+    worker_metrics = _compute_turn_worker_metrics(turn_history, worker_roles)
+    active_worker_count = worker_metrics['active_worker_count']
+    worker_valid_local_result_rate = (
+        worker_metrics['valid_local_result_count'] / active_worker_count
+        if active_worker_count > 0 else 0.0
+    )
+
+    return {
+        'assignment_completeness': assignment_completeness,
+        'worker_valid_local_result_rate': worker_valid_local_result_rate,
+    }
+
+
+def _compute_turn_worker_role_bonus_stats(turn_history, worker_roles, score_role):
+    active_workers = []
+    final_output = ""
+    for msg in turn_history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get('role')
+        content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+        if role == score_role:
+            final_output = content
+        if role not in worker_roles or role == score_role:
+            continue
+        assigned_subtasks = msg.get('assigned_subtasks') or []
+        if not assigned_subtasks:
+            continue
+        signature = _extract_worker_local_result_signature(content)
+        active_workers.append({
+            'role': role,
+            'content': content,
+            'signature': signature,
+        })
+
+    signature_counts = {}
+    for worker in active_workers:
+        if worker['signature']:
+            signature_counts[worker['signature']] = signature_counts.get(worker['signature'], 0) + 1
+
+    per_role = {}
+    unique_hits = 0
+    downstream_hits = 0
+    final_output_norm = _normalize_role_output(final_output)
+    valid_worker_count = 0
+    for idx, worker in enumerate(active_workers):
+        signature = worker['signature']
+        unique_local_result = 0.0
+        downstream_used = 0.0
+        if signature:
+            valid_worker_count += 1
+            if signature_counts.get(signature, 0) == 1:
+                unique_local_result = 1.0
+                unique_hits += 1
+            later_contents = [
+                _normalize_role_output(later_worker['content'])
+                for later_worker in active_workers[idx + 1:]
+            ]
+            if final_output_norm:
+                later_contents.append(final_output_norm)
+            if any(signature in later_content for later_content in later_contents):
+                downstream_used = 1.0
+                downstream_hits += 1
+        per_role[worker['role']] = {
+            'unique_local_result': unique_local_result,
+            'downstream_used': downstream_used,
+        }
+
+    denom = valid_worker_count if valid_worker_count > 0 else 1
+    return {
+        'per_role': per_role,
+        'unique_local_result_rate': unique_hits / denom if valid_worker_count > 0 else 0.0,
+        'downstream_used_rate': downstream_hits / denom if valid_worker_count > 0 else 0.0,
+    }
 
 class ReMARewardManager:
     """The reward manager.
@@ -224,6 +459,23 @@ class ReMARewardManager:
         reward_tensor_map['worker_duplicate_result_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_ignores_worker_results_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_ignores_worker_results_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['decomposer_unique_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['decomposer_dependency_usage_rate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['decomposer_repair_success'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['positive_role_bonus_gate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['decomposer_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['decomposer_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_assignment_completeness'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_worker_valid_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_unique_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_downstream_used_rate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_local_bonus_mean'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_worker_result_usage_rate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_consistency_with_worker_results'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
         
         already_print_data_sources = {}
 
@@ -278,9 +530,96 @@ class ReMARewardManager:
             num_turns = data_item.non_tensor_batch['num_turns']
             full_history = data_item.non_tensor_batch.get('history', [])
             valid_history = full_history[:num_turns * len(agent_roles)]
+            turn_histories = [
+                valid_history[i_turn * len(agent_roles):(i_turn + 1) * len(agent_roles)]
+                for i_turn in range(num_turns)
+            ]
             meta_roles = {'meta_thinking', 'decomposer'}
             role_penalties = {role: 0.0 for role in agent_roles}
+            role_bonuses = {role: 0.0 for role in agent_roles}
             active_penalties = []
+            positive_role_bonus_gate = (
+                POSITIVE_ROLE_BONUS_MIN_GATE
+                + (1.0 - POSITIVE_ROLE_BONUS_MIN_GATE) * max(0.0, min(1.0, float(raw_score)))
+            )
+            reward_tensor_map['positive_role_bonus_gate'][i_bsz] = positive_role_bonus_gate
+
+            if 'decomposer' in agent_roles and turn_histories:
+                current_turn_metrics = _compute_turn_worker_metrics(turn_histories[-1], worker_roles)
+                previous_turn_metrics = (
+                    _compute_turn_worker_metrics(turn_histories[-2], worker_roles)
+                    if len(turn_histories) >= 2 else None
+                )
+                decomposer_unique_local_result_rate = current_turn_metrics['unique_local_result_rate']
+                decomposer_dependency_usage_rate = current_turn_metrics['dependency_usage_rate']
+                decomposer_repair_success = _compute_repair_success(
+                    previous_turn_metrics,
+                    current_turn_metrics,
+                )
+                decomposer_local_bonus = (
+                    DECOMPOSER_UNIQUE_LOCAL_RESULT_BONUS * decomposer_unique_local_result_rate
+                    + DECOMPOSER_DEPENDENCY_USAGE_BONUS * decomposer_dependency_usage_rate
+                    + DECOMPOSER_REPAIR_SUCCESS_BONUS * decomposer_repair_success
+                )
+                decomposer_local_bonus *= positive_role_bonus_gate
+                reward_tensor_map['decomposer_unique_local_result_rate'][i_bsz] = decomposer_unique_local_result_rate
+                reward_tensor_map['decomposer_dependency_usage_rate'][i_bsz] = decomposer_dependency_usage_rate
+                reward_tensor_map['decomposer_repair_success'][i_bsz] = decomposer_repair_success
+                reward_tensor_map['decomposer_local_bonus_raw'][i_bsz] = (
+                    DECOMPOSER_UNIQUE_LOCAL_RESULT_BONUS * decomposer_unique_local_result_rate
+                    + DECOMPOSER_DEPENDENCY_USAGE_BONUS * decomposer_dependency_usage_rate
+                    + DECOMPOSER_REPAIR_SUCCESS_BONUS * decomposer_repair_success
+                )
+                reward_tensor_map['decomposer_local_bonus'][i_bsz] = decomposer_local_bonus
+                role_bonuses['decomposer'] += decomposer_local_bonus
+
+            if 'selector' in agent_roles and turn_histories:
+                selector_stats = _compute_selector_turn_bonus_stats(
+                    turn_histories[-1], worker_roles
+                )
+                selector_local_bonus_raw = (
+                    SELECTOR_ASSIGNMENT_COMPLETENESS_BONUS * selector_stats['assignment_completeness']
+                    + SELECTOR_WORKER_VALID_LOCAL_RESULT_BONUS * selector_stats['worker_valid_local_result_rate']
+                )
+                selector_local_bonus = selector_local_bonus_raw * positive_role_bonus_gate
+                reward_tensor_map['selector_assignment_completeness'][i_bsz] = selector_stats['assignment_completeness']
+                reward_tensor_map['selector_worker_valid_local_result_rate'][i_bsz] = selector_stats['worker_valid_local_result_rate']
+                reward_tensor_map['selector_local_bonus_raw'][i_bsz] = selector_local_bonus_raw
+                reward_tensor_map['selector_local_bonus'][i_bsz] = selector_local_bonus
+                role_bonuses['selector'] += selector_local_bonus
+
+            if turn_histories:
+                worker_bonus_stats = _compute_turn_worker_role_bonus_stats(
+                    turn_histories[-1], worker_roles, score_role
+                )
+                reward_tensor_map['worker_unique_local_result_rate'][i_bsz] = worker_bonus_stats['unique_local_result_rate']
+                reward_tensor_map['worker_downstream_used_rate'][i_bsz] = worker_bonus_stats['downstream_used_rate']
+                worker_bonus_values = []
+                for role, stats in worker_bonus_stats['per_role'].items():
+                    worker_bonus = (
+                        WORKER_UNIQUE_LOCAL_RESULT_BONUS * stats['unique_local_result']
+                        + WORKER_DOWNSTREAM_USED_BONUS * stats['downstream_used']
+                    )
+                    worker_bonus *= positive_role_bonus_gate
+                    role_bonuses[role] += worker_bonus
+                    worker_bonus_values.append(worker_bonus)
+                if worker_bonus_values:
+                    reward_tensor_map['worker_local_bonus_mean'][i_bsz] = sum(worker_bonus_values) / len(worker_bonus_values)
+
+            if score_role in agent_roles and turn_histories:
+                final_bonus_stats = _compute_final_stage_bonus_stats(
+                    turn_histories[-1], worker_roles, score_role
+                )
+                final_local_bonus_raw = (
+                    FINAL_WORKER_RESULT_USAGE_BONUS * final_bonus_stats['worker_result_usage_rate']
+                    + FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS * final_bonus_stats['consistency_with_worker_results']
+                )
+                final_local_bonus = final_local_bonus_raw * positive_role_bonus_gate
+                reward_tensor_map['final_worker_result_usage_rate'][i_bsz] = final_bonus_stats['worker_result_usage_rate']
+                reward_tensor_map['final_consistency_with_worker_results'][i_bsz] = final_bonus_stats['consistency_with_worker_results']
+                reward_tensor_map['final_local_bonus_raw'][i_bsz] = final_local_bonus_raw
+                reward_tensor_map['final_local_bonus'][i_bsz] = final_local_bonus
+                role_bonuses[score_role] += final_local_bonus
 
             meta_has_boxed = any(
                 isinstance(msg, dict)
@@ -361,8 +700,6 @@ class ReMARewardManager:
                 reward_tensor_map['planner_repeat_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['planner_repeat_penalty_value'][i_bsz] = PLANNER_REPEAT_PENALTY
                 active_penalties.append(('planner_repeat', PLANNER_REPEAT_PENALTY, sorted(repeated_planner_roles)))
-                for role in repeated_planner_roles:
-                    role_penalties[role] += PLANNER_REPEAT_PENALTY
 
             excess_subtask_roles = set()
             if 'decomposer' in agent_roles:
@@ -385,8 +722,6 @@ class ReMARewardManager:
                 reward_tensor_map['planner_excess_subtask_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['planner_excess_subtask_penalty_value'][i_bsz] = PLANNER_EXCESS_SUBTASK_PENALTY
                 active_penalties.append(('planner_excess_subtask', PLANNER_EXCESS_SUBTASK_PENALTY, sorted(excess_subtask_roles)))
-                for role in excess_subtask_roles:
-                    role_penalties[role] += PLANNER_EXCESS_SUBTASK_PENALTY
 
             subtask_count_penalty = 0.0
             if 'decomposer' in agent_roles:
@@ -420,7 +755,6 @@ class ReMARewardManager:
                 reward_tensor_map['planner_subtask_count_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['planner_subtask_count_penalty_value'][i_bsz] = subtask_count_penalty
                 active_penalties.append(('planner_subtask_count', subtask_count_penalty, ['decomposer']))
-                role_penalties['decomposer'] += subtask_count_penalty
 
             empty_assigned_roles = set()
             missing_local_result_roles = set()
@@ -458,8 +792,6 @@ class ReMARewardManager:
                 reward_tensor_map['worker_subtask_overreach_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_subtask_overreach_penalty_value'][i_bsz] = WORKER_SUBTASK_OVERREACH_PENALTY
                 active_penalties.append(('worker_subtask_overreach', WORKER_SUBTASK_OVERREACH_PENALTY, sorted(overreach_roles)))
-                for role in overreach_roles:
-                    role_penalties[role] += WORKER_SUBTASK_OVERREACH_PENALTY
 
             duplicate_worker_roles = set()
             for i_turn in range(num_turns):
@@ -520,13 +852,16 @@ class ReMARewardManager:
                 if score_role in role_penalties:
                     role_penalties[score_role] += FINAL_IGNORES_WORKER_RESULTS_PENALTY
 
-            global_penalty_value = sum(penalty_value for _, penalty_value, _ in active_penalties)
             role_shaped_scores = {}
             
             for i_role, role in enumerate(agent_roles):
                 turn_finished = data_item.batch[f'{role}_turn_finished'].item()
-                effective_score = raw_score
-                if data_item.meta_info['mask_unfinished_reward']:
+                # Only the final scoring role receives the global task reward.
+                # Other roles are shaped only by their own penalties or future
+                # local credit mechanisms.
+                effective_score = raw_score if role == score_role else 0.0
+                effective_score += role_bonuses.get(role, 0.0)
+                if role == score_role and data_item.meta_info['mask_unfinished_reward']:
                     # if conversation is not finised normally, i.e. with ['FINISH']
                     #  the reward should be zero.
                     # `turn_finished` is 0 means finished normally.
@@ -546,13 +881,6 @@ class ReMARewardManager:
                 role_penalty = role_penalties.get(role, 0.0)
                 if role in meta_roles and meta_has_boxed:
                     role_penalty += META_BOXED_PENALTY
-
-                if global_penalty_value > 0.0:
-                    # A correct final answer should not hide protocol failures in
-                    # the trajectory. Make every role's shaped reward negative
-                    # when any structured penalty fired, so switching the trained
-                    # agent cannot still positively reinforce a bad trajectory.
-                    role_penalty = max(role_penalty, global_penalty_value)
 
                 if role_penalty > 0.0:
                     role_score = -max(role_penalty, MIN_NEGATIVE_SHAPED_REWARD)
@@ -578,6 +906,38 @@ class ReMARewardManager:
                 if score_role is not None and score_role in role_shaped_scores:
                     print("[shaped_score]", role_shaped_scores[score_role])
                     print("[score_role]", score_role)
+                if 'decomposer' in agent_roles:
+                    print("[decomposer_metrics]", {
+                        'unique_local_result_rate': float(reward_tensor_map['decomposer_unique_local_result_rate'][i_bsz]),
+                        'dependency_usage_rate': float(reward_tensor_map['decomposer_dependency_usage_rate'][i_bsz]),
+                        'repair_success': float(reward_tensor_map['decomposer_repair_success'][i_bsz]),
+                        'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'local_bonus_raw': float(reward_tensor_map['decomposer_local_bonus_raw'][i_bsz]),
+                        'local_bonus': float(reward_tensor_map['decomposer_local_bonus'][i_bsz]),
+                    })
+                if 'selector' in agent_roles:
+                    print("[selector_metrics]", {
+                        'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'assignment_completeness': float(reward_tensor_map['selector_assignment_completeness'][i_bsz]),
+                        'worker_valid_local_result_rate': float(reward_tensor_map['selector_worker_valid_local_result_rate'][i_bsz]),
+                        'local_bonus_raw': float(reward_tensor_map['selector_local_bonus_raw'][i_bsz]),
+                        'local_bonus': float(reward_tensor_map['selector_local_bonus'][i_bsz]),
+                    })
+                if worker_roles:
+                    print("[worker_bonus_metrics]", {
+                        'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'unique_local_result_rate': float(reward_tensor_map['worker_unique_local_result_rate'][i_bsz]),
+                        'downstream_used_rate': float(reward_tensor_map['worker_downstream_used_rate'][i_bsz]),
+                        'local_bonus_mean': float(reward_tensor_map['worker_local_bonus_mean'][i_bsz]),
+                    })
+                if score_role in agent_roles:
+                    print("[final_stage_metrics]", {
+                        'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'worker_result_usage_rate': float(reward_tensor_map['final_worker_result_usage_rate'][i_bsz]),
+                        'consistency_with_worker_results': float(reward_tensor_map['final_consistency_with_worker_results'][i_bsz]),
+                        'local_bonus_raw': float(reward_tensor_map['final_local_bonus_raw'][i_bsz]),
+                        'local_bonus': float(reward_tensor_map['final_local_bonus'][i_bsz]),
+                    })
                 if active_penalties:
                     print("[penalties]", [
                         {

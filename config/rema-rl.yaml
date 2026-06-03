@@ -226,8 +226,15 @@ algorithm:
   filter_groups:
     enable: False
     max_num_gen_batches: 0
+  switch_agent:
+    enable: True
+    level: step
+    freq: 10
+    model_paths:
+      - ${actor_rollout_ref.model.path}
+      - ${actor_rollout_ref.model.path}
   hierarchy:
-    enable: False
+    enable: True
     decomposer_role: decomposer
     selector_role: selector
     worker_roles: [algebra_worker, functional_analysis_worker, general_math_worker]
@@ -239,6 +246,7 @@ algorithm:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning
       general_math_worker: fallback mathematical reasoning and synthesis support
+    train_agent_roles: [decomposer, selector, worker_stage_1, worker_stage_2, worker_stage_3, worker_stage_4, worker_stage_5, worker_stage_6]
 
 trainer:
   debug_mode: False

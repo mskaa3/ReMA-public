@@ -977,7 +977,7 @@ class MultiAgentRollout:
                         latest_outputs[idx] = output
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
-                            final_worker_has_answer = "\\boxed" in output
+                            final_worker_has_answer = "[FINISH]" in output and "\\boxed" in output
                             if final_worker_has_answer:
                                 finish_flags[idx] = True
                                 finish_reason[idx] = None
