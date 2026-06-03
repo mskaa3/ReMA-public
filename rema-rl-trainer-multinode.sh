@@ -2,11 +2,12 @@
 #SBATCH --job-name=verl-trainer-mn
 #SBATCH --nodes=6
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-gpu=4
 #SBATCH --time=72:00:00
 #SBATCH --mem=200gb
 #SBATCH -p lem-gpu-short
 #SBATCH --gpus-per-node=hopper:4
+#SBATCH --gres=storage:local:200G
 #SBATCH --verbose
 
 set -euo pipefail
