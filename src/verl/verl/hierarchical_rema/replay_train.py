@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train hierarchical controller policies from rollout JSONL logs with offline GRPO")
     parser.add_argument("--input", nargs="+", required=True, help="Rollout JSONL files or directories containing all_rollouts.jsonl")
     parser.add_argument("--policy-id", action="append", default=None, help="Only train these policy ids")
-    parser.add_argument("--role", choices=["decomposer", "selector", "both"], default="both")
+    parser.add_argument("--role", choices=["decomposer", "selector", "worker", "both", "all"], default="both")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--val-ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--decomposer-model-path", default=None)
     parser.add_argument("--selector-model-path", default=None)
+    parser.add_argument("--worker-model-path", default=None)
 
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -66,8 +67,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _selected_roles(role: str) -> List[str] | None:
-    if role == "both":
+    if role == "all":
         return None
+    if role == "both":
+        return ["decomposer", "selector"]
     return [role]
 
 
@@ -92,6 +95,8 @@ def model_path_for_policy(policy_id: str, samples: List[ControllerReplaySample],
         return args.decomposer_model_path
     if sample_role == "selector" and args.selector_model_path:
         return args.selector_model_path
+    if sample_role == "worker" and args.worker_model_path:
+        return args.worker_model_path
 
     model_paths = {sample.metadata.get("model_path") for sample in samples if sample.metadata.get("model_path")}
     model_paths.discard(None)

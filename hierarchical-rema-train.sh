@@ -82,6 +82,7 @@ export CONFIDENCE_REWARD_WEIGHT=${CONFIDENCE_REWARD_WEIGHT:-0.1}
 export COMPATIBILITY_REWARD_WEIGHT=${COMPATIBILITY_REWARD_WEIGHT:-0.0}
 
 export TRACK_WORKERS_HISTORY=${TRACK_WORKERS_HISTORY:-true}
+export TRAIN_WORKER_MODEL=${TRAIN_WORKER_MODEL:-true}
 
 
 # External validation: keep it narrower and less frequent than training rollout.

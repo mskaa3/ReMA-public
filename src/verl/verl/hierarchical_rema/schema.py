@@ -380,12 +380,14 @@ class ControllerTrainingSample:
 class HierarchicalTrainingBatch:
     decomposer_samples: List[ControllerTrainingSample] = field(default_factory=list)
     selector_samples: List[ControllerTrainingSample] = field(default_factory=list)
+    worker_samples: List[ControllerTrainingSample] = field(default_factory=list)
     frozen_roles: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "decomposer_samples": [sample.to_dict() for sample in self.decomposer_samples],
             "selector_samples": [sample.to_dict() for sample in self.selector_samples],
+            "worker_samples": [sample.to_dict() for sample in self.worker_samples],
             "frozen_roles": list(self.frozen_roles),
         }
 

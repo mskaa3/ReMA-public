@@ -13,7 +13,14 @@ from .backends import (
     WorkerExecutionRequest,
 )
 from .recording import RolloutRecorder
-from .rewarding import WorkerPerformanceMemory, build_selection_reward, group_relative_advantages
+from .rewarding import (
+    INTERMEDIATE_FINAL_ANSWER_PENALTY,
+    NON_FINAL_ANSWER_CONTAINMENT_PENALTY,
+    WORKER_INVALID_RESULT_PENALTY,
+    WorkerPerformanceMemory,
+    build_selection_reward,
+    group_relative_advantages,
+)
 from .schema import (
     AlternatingPhase,
     ControllerPolicyConfig,
@@ -63,6 +70,7 @@ class HierarchicalReMAOrchestrator:
         decomposer_reward_aggregation: str = "best",
         decomposer_no_correct_selection_scale: float = 0.25,
         track_workers_history: bool = True,
+        train_worker_model: bool = False,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
@@ -84,6 +92,18 @@ class HierarchicalReMAOrchestrator:
             1.0,
         )
         self.track_workers_history = bool(track_workers_history)
+        self.train_worker_model = bool(train_worker_model)
+
+    @staticmethod
+    def _worker_training_reward(selection: SelectionRollout, execution: WorkerExecution) -> float:
+        reward = float(selection.reward.total_reward)
+        if execution.invalid_reason:
+            reward -= WORKER_INVALID_RESULT_PENALTY
+        if execution.final_answer_leak:
+            reward -= INTERMEDIATE_FINAL_ANSWER_PENALTY
+        elif execution.answer_containment:
+            reward -= NON_FINAL_ANSWER_CONTAINMENT_PENALTY
+        return reward
 
     def _aggregate_decomposition_selection_reward(
         self,
@@ -569,6 +589,7 @@ class HierarchicalReMAOrchestrator:
     ) -> HierarchicalTrainingBatch:
         decomposer_samples: List[ControllerTrainingSample] = []
         selector_samples: List[ControllerTrainingSample] = []
+        worker_samples: List[ControllerTrainingSample] = []
 
         include_decomposer = schedule.mode == TrainingMode.JOINT or (
             schedule.mode == TrainingMode.ALTERNATING
@@ -642,6 +663,63 @@ class HierarchicalReMAOrchestrator:
                         )
                     )
 
+        if self.train_worker_model:
+            worker_lookup = worker_pool.workers_by_id()
+            worker_rewards: List[float] = []
+            worker_payloads: List[tuple[SelectionRollout, WorkerExecution, str]] = []
+            for decomposition_rollout in decompositions:
+                for selection_rollout in decomposition_rollout.selections:
+                    for execution in selection_rollout.executions:
+                        prompt_text = str(execution.worker_prompt or "").strip()
+                        completion_text = str(execution.raw_output_text or "").strip()
+                        if not prompt_text or not completion_text:
+                            continue
+                        worker_spec = worker_lookup.get(execution.worker_id)
+                        model_path = (
+                            worker_spec.base_model_path
+                            if worker_spec is not None and worker_spec.base_model_path
+                            else worker_pool.base_model_path
+                        )
+                        worker_rewards.append(
+                            self._worker_training_reward(selection_rollout, execution)
+                        )
+                        worker_payloads.append((selection_rollout, execution, model_path or ""))
+
+            worker_advantages = group_relative_advantages(worker_rewards)
+            for advantage, reward, payload in zip(worker_advantages, worker_rewards, worker_payloads):
+                selection_rollout, execution, model_path = payload
+                worker_samples.append(
+                    ControllerTrainingSample(
+                        role="worker",
+                        policy_id="shared_worker",
+                        group_id=task.task_id,
+                        prompt_text=execution.worker_prompt,
+                        completion_text=execution.raw_output_text,
+                        reward=reward,
+                        advantage=advantage,
+                        metadata={
+                            "model_path": model_path,
+                            "worker_id": execution.worker_id,
+                            "node_id": execution.node_id,
+                            "selection_id": selection_rollout.selection.selection_id,
+                            "invalid_reason": execution.invalid_reason,
+                            "final_answer_leak": execution.final_answer_leak,
+                            "answer_containment": execution.answer_containment,
+                            "reward_before_local_penalties": selection_rollout.reward.total_reward,
+                            "final_answer_correctness": selection_rollout.reward.final_answer_correctness,
+                            "worker_format_penalty": WORKER_INVALID_RESULT_PENALTY if execution.invalid_reason else 0.0,
+                            "intermediate_final_answer_penalty": (
+                                INTERMEDIATE_FINAL_ANSWER_PENALTY if execution.final_answer_leak else 0.0
+                            ),
+                            "non_final_answer_containment_penalty": (
+                                NON_FINAL_ANSWER_CONTAINMENT_PENALTY
+                                if execution.answer_containment and not execution.final_answer_leak
+                                else 0.0
+                            ),
+                        },
+                    )
+                )
+
         frozen_roles: List[str] = []
         if schedule.mode == TrainingMode.ALTERNATING:
             if schedule.alternating_phase == AlternatingPhase.SELECTOR:
@@ -652,6 +730,7 @@ class HierarchicalReMAOrchestrator:
         return HierarchicalTrainingBatch(
             decomposer_samples=decomposer_samples,
             selector_samples=selector_samples,
+            worker_samples=worker_samples,
             frozen_roles=frozen_roles,
         )
 
@@ -672,6 +751,7 @@ class HierarchicalGRPOTrainer:
     decomposer_reward_aggregation: str = "best"
     decomposer_no_correct_selection_scale: float = 0.25
     track_workers_history: bool = True
+    train_worker_model: bool = False
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -697,6 +777,7 @@ class HierarchicalGRPOTrainer:
             decomposer_reward_aggregation=self.decomposer_reward_aggregation,
             decomposer_no_correct_selection_scale=self.decomposer_no_correct_selection_scale,
             track_workers_history=self.track_workers_history,
+            train_worker_model=self.train_worker_model,
         )
         self._current_phase = AlternatingPhase.SELECTOR
 

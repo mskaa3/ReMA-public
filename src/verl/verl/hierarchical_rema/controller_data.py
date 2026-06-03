@@ -87,7 +87,7 @@ def load_controller_samples_from_rollouts(
                 training_batch = rollout["training_batch"]
                 task_id = rollout["task"]["task_id"]
                 timestamp = record.get("timestamp")
-                for batch_key in ("decomposer_samples", "selector_samples"):
+                for batch_key in ("decomposer_samples", "selector_samples", "worker_samples"):
                     for sample in training_batch.get(batch_key, []):
                         role = sample["role"]
                         reward = float(sample["reward"])
@@ -129,7 +129,7 @@ def controller_samples_from_task_rollouts(
     samples: List[ControllerReplaySample] = []
     for rollout in task_rollouts:
         training_batch = rollout.training_batch
-        for batch_key in ("decomposer_samples", "selector_samples"):
+        for batch_key in ("decomposer_samples", "selector_samples", "worker_samples"):
             for sample in getattr(training_batch, batch_key):
                 role = sample.role
                 reward = float(sample.reward)

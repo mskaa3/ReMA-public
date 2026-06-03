@@ -94,6 +94,15 @@ def parse_args() -> argparse.Namespace:
             "worker memory during rollouts and fallback selection."
         ),
     )
+    parser.add_argument(
+        "--train-worker-model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Train a single shared worker policy from worker rollouts in addition to "
+            "the controller policies."
+        ),
+    )
 
     parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--mode", choices=["joint", "alternating"], default="joint")
@@ -316,6 +325,15 @@ def _selected_roles(role: str) -> List[str] | None:
     if role == "both":
         return None
     return [role]
+
+
+def _selected_sample_roles(role: str, train_worker_model: bool) -> List[str] | None:
+    controller_roles = _selected_roles(role)
+    if not train_worker_model:
+        return controller_roles
+    if controller_roles is None:
+        return None
+    return [*controller_roles, "worker"]
 
 
 def _release_memory() -> None:
@@ -1205,6 +1223,7 @@ def _build_rollout_trainer(
         decomposer_reward_aggregation=args.decomposer_reward_aggregation,
         decomposer_no_correct_selection_scale=args.decomposer_no_correct_selection_scale,
         track_workers_history=args.track_workers_history,
+        train_worker_model=args.train_worker_model,
     )
 
 
@@ -1486,6 +1505,7 @@ def _replay_model_args(current_paths: Dict[str, str]) -> argparse.Namespace:
         model_path=None,
         decomposer_model_path=current_paths["decomposer_controller"],
         selector_model_path=current_paths["selector_controller"],
+        worker_model_path=current_paths["shared_worker"],
     )
 
 
@@ -1494,6 +1514,15 @@ def _update_current_paths(current_paths: Dict[str, str], policy_id: str, model_p
     if policy_id == "shared_controller":
         current_paths["decomposer_controller"] = model_path
         current_paths["selector_controller"] = model_path
+
+
+def _sync_worker_pool_model_path(worker_pool, current_paths: Dict[str, str]) -> None:
+    shared_worker_path = current_paths.get("shared_worker")
+    if not shared_worker_path:
+        return
+    worker_pool.base_model_path = shared_worker_path
+    for worker in worker_pool.workers:
+        worker.base_model_path = shared_worker_path
 
 
 def main() -> None:
@@ -1540,6 +1569,7 @@ def main() -> None:
         "shared_controller": args.model_path or args.shared_model_path,
         "decomposer_controller": args.model_path or args.decomposer_model_path,
         "selector_controller": args.model_path or args.selector_model_path,
+        "shared_worker": args.worker_base_model_path,
     }
     current_phase = AlternatingPhase(args.phase)
     tracking = _tracking(args, config_payload=vars(args))
@@ -1628,6 +1658,7 @@ def main() -> None:
         segment_index = 0
         while batch_cursor < len(task_batches):
             segment_index += 1
+            _sync_worker_pool_model_path(worker_pool, current_paths)
             policy_config = _current_policy_config(args, current_paths)
             replay_like_args = _replay_model_args(current_paths)
             segment_batches = task_batches[batch_cursor:batch_cursor + update_every_n_rollout_batches]
@@ -1809,7 +1840,7 @@ def main() -> None:
             try:
                 samples = controller_samples_from_task_rollouts(
                     task_rollouts=segment_rollouts,
-                    roles=_selected_roles(args.role),
+                    roles=_selected_sample_roles(args.role, args.train_worker_model),
                     min_reward=args.min_reward,
                     min_advantage=args.min_advantage,
                     source_path=str(segment_rollout_dir),
@@ -1982,6 +2013,7 @@ def main() -> None:
             elif validation_interval > 0 and epoch_number % validation_interval == 0:
                 should_run_external_validation = True
         if should_run_external_validation:
+            _sync_worker_pool_model_path(worker_pool, current_paths)
             epoch_val_tasks = val_tasks
             if args.val_tasks_per_subset > 0:
                 epoch_val_tasks = select_epoch_tasks_by_subset(
