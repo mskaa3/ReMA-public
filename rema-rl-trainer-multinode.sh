@@ -6,8 +6,7 @@
 #SBATCH --time=72:00:00
 #SBATCH --mem=200gb
 #SBATCH -p lem-gpu-short
-#SBATCH --gres=gpu:hopper:4
-#SBATCH --gres=storage:local:200G
+#SBATCH --gres=gpu:hopper:4,storage:local:200G
 #SBATCH --verbose
 
 set -euo pipefail
