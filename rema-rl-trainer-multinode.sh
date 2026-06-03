@@ -6,7 +6,7 @@
 #SBATCH --time=72:00:00
 #SBATCH --mem=200gb
 #SBATCH -p lem-gpu-short
-#SBATCH --gpus-per-node=hopper:4
+#SBATCH --gres=gpu:hopper:24
 #SBATCH --gres=storage:local:200G
 #SBATCH --verbose
 
