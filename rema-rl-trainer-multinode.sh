@@ -13,16 +13,16 @@ set -euo pipefail
 
 source ./env.sh
 
-GPUS_PER_NODE=${GPUS_PER_NODE:-4}
+export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 # This trainer creates two GPU pools, so this is GPUs per node per pool.
-POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
-RAY_PORT=${RAY_PORT:-6379}
-RAY_NODE_TMP=${RAY_NODE_TMP:-/tmp/ray-${USER}-${SLURM_JOB_ID}}
+export POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
+export RAY_PORT=${RAY_PORT:-6379}
+export RAY_NODE_TMP=${RAY_NODE_TMP:-/tmp/ray-${USER}-${SLURM_JOB_ID}}
 
-SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
-SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/${SIF_NAME}}
+export SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
+export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/${SIF_NAME}}
 
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/rema}
 
