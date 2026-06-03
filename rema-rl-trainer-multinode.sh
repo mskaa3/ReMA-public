@@ -81,6 +81,37 @@ for ((i = 1; i <= WORKER_COUNT; i++)); do
     sleep 5
 done
 
+EXPECTED_GPUS=$((SLURM_NNODES * GPUS_PER_NODE))
+RAY_WAIT_TIMEOUT=${RAY_WAIT_TIMEOUT:-300}
+RAY_WAIT_INTERVAL=${RAY_WAIT_INTERVAL:-10}
+RAY_WAIT_ELAPSED=0
+
+echo "Waiting for Ray cluster to register ${EXPECTED_GPUS} GPUs"
+while true; do
+    AVAILABLE_GPUS=$(srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 -c "import ray; ray.init(address='${IP_HEAD}', ignore_reinit_error=True, logging_level=40); print(int(ray.cluster_resources().get('GPU', 0)))" \
+        2>/dev/null || echo 0)
+    AVAILABLE_GPUS=$(echo "$AVAILABLE_GPUS" | tail -n 1 | tr -d '[:space:]')
+
+    if [[ "$AVAILABLE_GPUS" =~ ^[0-9]+$ ]] && (( AVAILABLE_GPUS >= EXPECTED_GPUS )); then
+        echo "Ray cluster ready: ${AVAILABLE_GPUS}/${EXPECTED_GPUS} GPUs available"
+        break
+    fi
+
+    if (( RAY_WAIT_ELAPSED >= RAY_WAIT_TIMEOUT )); then
+        echo "Timed out waiting for Ray cluster: ${AVAILABLE_GPUS:-0}/${EXPECTED_GPUS} GPUs available"
+        srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+            apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+            ray status --address "$IP_HEAD" || true
+        exit 1
+    fi
+
+    echo "Ray cluster not ready yet: ${AVAILABLE_GPUS:-0}/${EXPECTED_GPUS} GPUs available; waiting ${RAY_WAIT_INTERVAL}s"
+    sleep "$RAY_WAIT_INTERVAL"
+    RAY_WAIT_ELAPSED=$((RAY_WAIT_ELAPSED + RAY_WAIT_INTERVAL))
+done
+
 COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export TMPDIR=${RAY_NODE_TMP}; \
 export HF_HOME=/root/tmpdir/hf_home; \
