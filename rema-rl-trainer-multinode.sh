@@ -24,8 +24,7 @@ SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_im
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 
-SHARED_ROOT=${SHARED_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}
-export JOB_TMP=${JOB_TMP:-${SHARED_ROOT}/.slurm/${SLURM_JOB_ID}}
+export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/rema}
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}
@@ -40,13 +39,16 @@ if [[ "$HEAD_NODE_IP" == *" "* ]]; then
 fi
 IP_HEAD=${HEAD_NODE_IP}:${RAY_PORT}
 
-echo "Preparing shared JOB_TMP at ${JOB_TMP}"
-mkdir -p "$JOB_TMP"
-rm -rf "$JOB_TMP/overall_math" "$JOB_TMP/MATH" "$JOB_TMP/verl"
-cp -r ./data/overall_math "$JOB_TMP/overall_math"
-cp -r ./data/MATH "$JOB_TMP/MATH"
-cp -r ./src/verl "$JOB_TMP/verl"
-rclone copy "$SIF_REMOTE" "$JOB_TMP/"
+echo "Preparing node-local JOB_TMP at ${JOB_TMP} on all nodes"
+srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+    set -euo pipefail
+    mkdir -p "$JOB_TMP"
+    rm -rf "$JOB_TMP/overall_math" "$JOB_TMP/MATH" "$JOB_TMP/verl"
+    cp -r "$SLURM_SUBMIT_DIR/data/overall_math" "$JOB_TMP/overall_math"
+    cp -r "$SLURM_SUBMIT_DIR/data/MATH" "$JOB_TMP/MATH"
+    cp -r "$SLURM_SUBMIT_DIR/src/verl" "$JOB_TMP/verl"
+    rclone copy "$SIF_REMOTE" "$JOB_TMP/"
+'
 
 echo "Preparing node-local Ray temp dir at ${RAY_NODE_TMP}"
 srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
@@ -131,7 +133,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
     bash -c "$COMMAND"
 
 if [[ -n ${JOB_TMP:-} ]]; then
-    rm -rf "$JOB_TMP"/*
+    srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc 'rm -rf "$JOB_TMP"/*'
 fi
 if [[ -n ${RAY_NODE_TMP:-} ]]; then
     srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc 'rm -rf "'"${RAY_NODE_TMP}"'"'
