@@ -24,7 +24,8 @@ SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_im
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 
-export JOB_TMP=${JOB_TMP:-${TMPDIR:-/tmp/${USER}/rema-${SLURM_JOB_ID}}}
+SHARED_ROOT=${SHARED_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}
+export JOB_TMP=${JOB_TMP:-${SHARED_ROOT}/.slurm/${SLURM_JOB_ID}}
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}
