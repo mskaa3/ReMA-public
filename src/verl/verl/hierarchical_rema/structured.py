@@ -136,31 +136,23 @@ def _parse_csv_field(raw_value: Any) -> List[str]:
 
 
 _SKILL_TAG_ALIASES = {
-    "pre_algebra": "arithmetic",
-    "prealgebra": "arithmetic",
+    "pre_algebra": "prealgebra",
+    "arithmetic_prealgebra": "prealgebra",
     "fractions": "arithmetic",
     "fraction": "arithmetic",
-    "simplification": "algebra",
-    "symbolic": "algebra",
-    "symbolic_algebra": "algebra",
-    "symbolic_manipulation": "algebra",
-    "equation_solving": "algebra",
-    "equations": "algebra",
-    "polynomials": "algebra",
-    "geometry": "geometry_trigonometry",
-    "trigonometry": "geometry_trigonometry",
-    "coordinate_geometry": "geometry_trigonometry",
-    "coordinategeo": "geometry_trigonometry",
-    "analysis": "calculus_analysis",
-    "calculus": "calculus_analysis",
-    "functions": "calculus_analysis",
-    "limits": "calculus_analysis",
-    "combinatorics": "combinatorics_probability",
-    "probability": "combinatorics_probability",
-    "number_theory": "number_theory_discrete",
-    "numbertheory": "number_theory_discrete",
-    "discrete_math": "number_theory_discrete",
-    "discretemath": "number_theory_discrete",
+    "symbolic": "symbolic_manipulation",
+    "symbolic_algebra": "symbolic_manipulation",
+    "equation_solving": "equations",
+    "geometry_trigonometry": "geometry",
+    "calculus_analysis": "analysis",
+    "combinatorics_probability": "combinatorics",
+    "number_theory_discrete": "number_theory",
+    "coordinategeo": "coordinate_geometry",
+    "numbertheory": "number_theory",
+    "discretemath": "discrete_math",
+    "coordinate": "coordinate_geometry",
+    "trig": "trigonometry",
+    "mods": "number_theory",
 }
 
 
@@ -272,17 +264,24 @@ def _infer_required_skills_from_instruction(instruction: str) -> List[str]:
     if not text or _is_generic_final_answer_instruction(text):
         return []
 
-    keyword_groups: tuple[tuple[str, tuple[str, ...]], ...] = (
-        ("geometry_trigonometry", ("sin", "cos", "tan", "trig", "angle", "radian", "triangle", "circle", "radius", "diameter", "polygon", "coordinate", "line segment")),
-        ("calculus_analysis", ("derivative", "integral", "differentiate", "integrate", "limit", "range", "interval", "monotonic", "extrema", "check if", "verify", "identify", "function behavior")),
-        ("combinatorics_probability", ("probability", "expected value", "odds", "count", "number of ways", "choose", "combination", "permutation", "ordered triple", "subset")),
-        ("number_theory_discrete", ("mod", "modulo", "divisible", "prime", "gcd", "lcm", "remainder", "parity", "invariant", "graph", "recurrence")),
-        ("algebra", ("equation", "solve", "isolate", "factor", "expand", "polynomial", "variable", "substitute", "simplify", "rewrite", "reduce")),
-        ("arithmetic", ("compute", "calculate", "evaluate", "ceiling", "floor", "sum", "product", "integer", "fraction", "decimal")),
+    keyword_groups: tuple[tuple[List[str], tuple[str, ...]], ...] = (
+        (["coordinate_geometry", "geometry"], ("coordinate", "midpoint", "slope", "line segment", "distance formula")),
+        (["trigonometry", "geometry"], ("sin", "cos", "tan", "trig", "radian", "angle", "triangle", "circle", "radius", "diameter", "polygon")),
+        (["calculus"], ("derivative", "integral", "differentiate", "integrate")),
+        (["limits", "analysis"], ("limit", "approaches", "converges", "continuity")),
+        (["functions", "algebra"], ("domain", "range", "function behavior", "compose", "composition", "inverse function", "monotonic", "extrema")),
+        (["probability"], ("probability", "expected value", "odds", "random", "conditional probability")),
+        (["combinatorics"], ("count", "number of ways", "choose", "combination", "permutation", "ordered triple", "subset", "arrangement")),
+        (["number_theory"], ("mod", "modulo", "divisible", "prime", "gcd", "lcm", "remainder", "modular inverse")),
+        (["discrete_math"], ("parity", "invariant", "graph", "recurrence", "state transition")),
+        (["polynomials", "algebra"], ("polynomial", "root", "roots", "degree", "quadratic", "cubic")),
+        (["equations", "algebra"], ("equation", "solve", "isolate", "variable", "system of equations")),
+        (["symbolic_manipulation", "simplification"], ("factor", "expand", "substitute", "simplify", "rewrite", "reduce", "rationalize")),
+        (["arithmetic", "prealgebra"], ("compute", "calculate", "evaluate", "ceiling", "floor", "sum", "product", "integer", "fraction", "decimal", "ratio")),
     )
-    for skill_tag, keywords in keyword_groups:
+    for skill_tags, keywords in keyword_groups:
         if any(keyword in text for keyword in keywords):
-            return [skill_tag]
+            return skill_tags
     return []
 
 

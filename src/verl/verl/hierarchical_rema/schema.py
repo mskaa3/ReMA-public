@@ -7,11 +7,23 @@ from typing import Any, Dict, List, Optional, Sequence
 
 CANONICAL_SKILL_TAGS: tuple[str, ...] = (
     "arithmetic",
+    "prealgebra",
     "algebra",
-    "geometry_trigonometry",
-    "calculus_analysis",
-    "combinatorics_probability",
-    "number_theory_discrete",
+    "equations",
+    "polynomials",
+    "symbolic_manipulation",
+    "simplification",
+    "geometry",
+    "trigonometry",
+    "coordinate_geometry",
+    "calculus",
+    "analysis",
+    "functions",
+    "limits",
+    "combinatorics",
+    "probability",
+    "number_theory",
+    "discrete_math",
 )
 
 

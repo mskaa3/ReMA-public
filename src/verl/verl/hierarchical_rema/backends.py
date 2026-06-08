@@ -515,7 +515,7 @@ class MockHierarchicalBackend(HierarchicalBackend):
     ) -> DecompositionCandidate:
         del policy_config
         skill_focus = task.metadata.get("skill_focus", "algebra")
-        secondary_skill = "calculus_analysis" if skill_focus == "algebra" else "algebra"
+        secondary_skill = "calculus" if skill_focus == "algebra" else "algebra"
         prompt_text = render_decomposer_prompt(
             task,
             max_nodes_hint=rollout_config.max_nodes_per_decomposition,

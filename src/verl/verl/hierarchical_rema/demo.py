@@ -44,7 +44,7 @@ def make_demo_tasks() -> list[TaskExample]:
             prompt="Differentiate sin(x).",
             ground_truth="cos(x)",
             metadata={
-                "skill_focus": "calculus_analysis",
+                "skill_focus": "calculus",
                 "distractor_answer": "sin(x)",
             },
         ),
@@ -59,35 +59,35 @@ def make_worker_pool(base_model_path: str | None) -> WorkerPoolConfig:
             WorkerSpec(
                 worker_id="arithmetic_prealgebra_worker",
                 description="Exact arithmetic, fractions, ratios, and simplification specialist.",
-                skills=["arithmetic"],
+                skills=["arithmetic", "prealgebra"],
                 system_prompt=DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
             WorkerSpec(
                 worker_id="algebra_symbolic_worker",
                 description="Equation solving and symbolic algebra specialist.",
-                skills=["algebra"],
+                skills=["algebra", "equations", "polynomials", "symbolic_manipulation", "simplification"],
                 system_prompt=DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
             WorkerSpec(
                 worker_id="geometry_trigonometry_worker",
                 description="Geometry, trigonometry, and coordinate methods specialist.",
-                skills=["geometry_trigonometry"],
+                skills=["geometry", "trigonometry", "coordinate_geometry"],
                 system_prompt=DEFAULT_GEOMETRY_TRIGONOMETRY_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
             WorkerSpec(
                 worker_id="calculus_analysis_worker",
                 description="Calculus, limits, and function analysis specialist.",
-                skills=["calculus_analysis"],
+                skills=["calculus", "analysis", "functions", "limits"],
                 system_prompt=DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
             WorkerSpec(
                 worker_id="discrete_number_theory_worker",
                 description="Counting, probability, and number theory specialist.",
-                skills=["combinatorics_probability", "number_theory_discrete"],
+                skills=["combinatorics", "probability", "number_theory", "discrete_math"],
                 system_prompt=DEFAULT_DISCRETE_NUMBER_THEORY_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
@@ -164,7 +164,7 @@ def main() -> None:
     if args.task == "algebra":
         tasks = [task for task in tasks if task.metadata["skill_focus"] == "algebra"]
     elif args.task in {"analysis", "calculus_analysis"}:
-        tasks = [task for task in tasks if task.metadata["skill_focus"] == "calculus_analysis"]
+        tasks = [task for task in tasks if task.metadata["skill_focus"] == "calculus"]
 
     schedule = TrainingScheduleConfig(
         mode=TrainingMode(args.mode),
