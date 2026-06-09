@@ -71,6 +71,7 @@ class HierarchicalReMAOrchestrator:
         decomposer_no_correct_selection_scale: float = 0.25,
         track_workers_history: bool = True,
         train_worker_model: bool = False,
+        min_worker_grpo_group_size: int = 3,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
@@ -93,6 +94,7 @@ class HierarchicalReMAOrchestrator:
         )
         self.track_workers_history = bool(track_workers_history)
         self.train_worker_model = bool(train_worker_model)
+        self.min_worker_grpo_group_size = max(int(min_worker_grpo_group_size), 1)
 
     @staticmethod
     def _worker_training_reward(selection: SelectionRollout, execution: WorkerExecution) -> float:
@@ -590,6 +592,16 @@ class HierarchicalReMAOrchestrator:
         decomposer_samples: List[ControllerTrainingSample] = []
         selector_samples: List[ControllerTrainingSample] = []
         worker_samples: List[ControllerTrainingSample] = []
+        worker_grpo_stats: Dict[str, float | int] = {
+            "min_group_size": self.min_worker_grpo_group_size,
+            "num_groups_total": 0,
+            "num_groups_used": 0,
+            "num_groups_skipped": 0,
+            "num_samples_total": 0,
+            "num_samples_used": 0,
+            "num_samples_skipped": 0,
+            "mean_group_size_used": 0.0,
+        }
 
         include_decomposer = schedule.mode == TrainingMode.JOINT or (
             schedule.mode == TrainingMode.ALTERNATING
@@ -665,8 +677,7 @@ class HierarchicalReMAOrchestrator:
 
         if self.train_worker_model:
             worker_lookup = worker_pool.workers_by_id()
-            worker_rewards: List[float] = []
-            worker_payloads: List[tuple[SelectionRollout, WorkerExecution, str]] = []
+            worker_groups: Dict[str, List[tuple[SelectionRollout, WorkerExecution, str, float]]] = {}
             for decomposition_rollout in decompositions:
                 for selection_rollout in decomposition_rollout.selections:
                     for execution in selection_rollout.executions:
@@ -680,44 +691,64 @@ class HierarchicalReMAOrchestrator:
                             if worker_spec is not None and worker_spec.base_model_path
                             else worker_pool.base_model_path
                         )
-                        worker_rewards.append(
-                            self._worker_training_reward(selection_rollout, execution)
+                        reward = self._worker_training_reward(selection_rollout, execution)
+                        worker_groups.setdefault(execution.worker_id, []).append(
+                            (selection_rollout, execution, model_path or "", reward)
                         )
-                        worker_payloads.append((selection_rollout, execution, model_path or ""))
 
-            worker_advantages = group_relative_advantages(worker_rewards)
-            for advantage, reward, payload in zip(worker_advantages, worker_rewards, worker_payloads):
-                selection_rollout, execution, model_path = payload
-                worker_samples.append(
-                    ControllerTrainingSample(
-                        role="worker",
-                        policy_id="shared_worker",
-                        group_id=task.task_id,
-                        prompt_text=execution.worker_prompt,
-                        completion_text=execution.raw_output_text,
-                        reward=reward,
-                        advantage=advantage,
-                        metadata={
-                            "model_path": model_path,
-                            "worker_id": execution.worker_id,
-                            "node_id": execution.node_id,
-                            "selection_id": selection_rollout.selection.selection_id,
-                            "invalid_reason": execution.invalid_reason,
-                            "final_answer_leak": execution.final_answer_leak,
-                            "answer_containment": execution.answer_containment,
-                            "reward_before_local_penalties": selection_rollout.reward.total_reward,
-                            "final_answer_correctness": selection_rollout.reward.final_answer_correctness,
-                            "worker_format_penalty": WORKER_INVALID_RESULT_PENALTY if execution.invalid_reason else 0.0,
-                            "intermediate_final_answer_penalty": (
-                                INTERMEDIATE_FINAL_ANSWER_PENALTY if execution.final_answer_leak else 0.0
-                            ),
-                            "non_final_answer_containment_penalty": (
-                                NON_FINAL_ANSWER_CONTAINMENT_PENALTY
-                                if execution.answer_containment and not execution.final_answer_leak
-                                else 0.0
-                            ),
-                        },
+            used_group_sizes: List[int] = []
+            for worker_id, grouped_payloads in worker_groups.items():
+                group_size = len(grouped_payloads)
+                worker_grpo_stats["num_groups_total"] += 1
+                worker_grpo_stats["num_samples_total"] += group_size
+                if group_size < self.min_worker_grpo_group_size:
+                    worker_grpo_stats["num_groups_skipped"] += 1
+                    worker_grpo_stats["num_samples_skipped"] += group_size
+                    continue
+                worker_grpo_stats["num_groups_used"] += 1
+                worker_grpo_stats["num_samples_used"] += group_size
+                used_group_sizes.append(group_size)
+                grouped_rewards = [payload[3] for payload in grouped_payloads]
+                grouped_advantages = group_relative_advantages(grouped_rewards)
+                group_id = f"task:{task.task_id}:worker:{worker_id}"
+                for advantage, payload in zip(grouped_advantages, grouped_payloads):
+                    selection_rollout, execution, model_path, reward = payload
+                    worker_samples.append(
+                        ControllerTrainingSample(
+                            role="worker",
+                            policy_id="shared_worker",
+                            group_id=group_id,
+                            prompt_text=execution.worker_prompt,
+                            completion_text=execution.raw_output_text,
+                            reward=reward,
+                            advantage=advantage,
+                            metadata={
+                                "model_path": model_path,
+                                "worker_id": execution.worker_id,
+                                "node_id": execution.node_id,
+                                "selection_id": selection_rollout.selection.selection_id,
+                                "advantage_group_size": group_size,
+                                "advantage_group_kind": "worker_id_within_task",
+                                "invalid_reason": execution.invalid_reason,
+                                "final_answer_leak": execution.final_answer_leak,
+                                "answer_containment": execution.answer_containment,
+                                "reward_before_local_penalties": selection_rollout.reward.total_reward,
+                                "final_answer_correctness": selection_rollout.reward.final_answer_correctness,
+                                "worker_format_penalty": WORKER_INVALID_RESULT_PENALTY if execution.invalid_reason else 0.0,
+                                "intermediate_final_answer_penalty": (
+                                    INTERMEDIATE_FINAL_ANSWER_PENALTY if execution.final_answer_leak else 0.0
+                                ),
+                                "non_final_answer_containment_penalty": (
+                                    NON_FINAL_ANSWER_CONTAINMENT_PENALTY
+                                    if execution.answer_containment and not execution.final_answer_leak
+                                    else 0.0
+                                ),
+                            },
+                        )
                     )
+            if used_group_sizes:
+                worker_grpo_stats["mean_group_size_used"] = (
+                    sum(used_group_sizes) / len(used_group_sizes)
                 )
 
         frozen_roles: List[str] = []
@@ -732,6 +763,7 @@ class HierarchicalReMAOrchestrator:
             selector_samples=selector_samples,
             worker_samples=worker_samples,
             frozen_roles=frozen_roles,
+            worker_grpo_stats=worker_grpo_stats,
         )
 
 
@@ -752,6 +784,7 @@ class HierarchicalGRPOTrainer:
     decomposer_no_correct_selection_scale: float = 0.25
     track_workers_history: bool = True
     train_worker_model: bool = False
+    min_worker_grpo_group_size: int = 3
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -778,6 +811,7 @@ class HierarchicalGRPOTrainer:
             decomposer_no_correct_selection_scale=self.decomposer_no_correct_selection_scale,
             track_workers_history=self.track_workers_history,
             train_worker_model=self.train_worker_model,
+            min_worker_grpo_group_size=self.min_worker_grpo_group_size,
         )
         self._current_phase = AlternatingPhase.SELECTOR
 

@@ -245,13 +245,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-reward",
         type=float,
-        default=0.21,
+        default=None,
         help=(
-            "Minimum replay reward required for a controller sample to enter training. "
-            "The default filters out most incorrect-but-confident selector samples."
+            "Optional minimum replay reward required for a training sample to enter training. "
+            "Disabled by default."
         ),
     )
     parser.add_argument("--min-advantage", type=float, default=None)
+    parser.add_argument(
+        "--min-worker-grpo-group-size",
+        type=int,
+        default=3,
+        help=(
+            "Minimum number of executions of the same worker_id within one task rollout "
+            "required to compute worker GRPO advantages. Smaller groups are skipped."
+        ),
+    )
     parser.add_argument(
         "--decomposer-reward-aggregation",
         choices=["mean", "best"],
@@ -1002,12 +1011,36 @@ def epoch_rollout_summary(
     mean_selection_rewards = []
     best_correctness = []
     subset_metrics: Dict[str, Dict[str, Any]] = {}
+    worker_grpo_group_total = 0
+    worker_grpo_group_used = 0
+    worker_grpo_group_skipped = 0
+    worker_grpo_sample_total = 0
+    worker_grpo_sample_used = 0
+    worker_grpo_sample_skipped = 0
+    worker_grpo_used_group_sizes: List[float] = []
+    worker_grpo_min_group_size = 0
     for rollout in rollouts:
         metrics = _best_rollout_metrics(rollout)
         best_decomposition_rewards.append(metrics["best_decomposition_reward"])
         best_selection_rewards.append(metrics["best_selection_reward"])
         mean_selection_rewards.append(metrics["mean_selection_reward"])
         best_correctness.append(metrics["best_final_correctness"])
+        worker_stats = rollout.training_batch.worker_grpo_stats or {}
+        worker_grpo_group_total += int(worker_stats.get("num_groups_total", 0))
+        worker_grpo_group_used += int(worker_stats.get("num_groups_used", 0))
+        worker_grpo_group_skipped += int(worker_stats.get("num_groups_skipped", 0))
+        worker_grpo_sample_total += int(worker_stats.get("num_samples_total", 0))
+        worker_grpo_sample_used += int(worker_stats.get("num_samples_used", 0))
+        worker_grpo_sample_skipped += int(worker_stats.get("num_samples_skipped", 0))
+        used_groups = int(worker_stats.get("num_groups_used", 0))
+        if used_groups > 0:
+            worker_grpo_used_group_sizes.extend(
+                [float(worker_stats.get("mean_group_size_used", 0.0))] * used_groups
+            )
+        worker_grpo_min_group_size = max(
+            worker_grpo_min_group_size,
+            int(worker_stats.get("min_group_size", 0)),
+        )
         subset_name = _task_subset_name(rollout.task)
         if include_tasks:
             task_summaries.append(
@@ -1042,6 +1075,18 @@ def epoch_rollout_summary(
         "mean_best_selection_reward": sum(best_selection_rewards) / max(len(best_selection_rewards), 1),
         "mean_selection_reward": sum(mean_selection_rewards) / max(len(mean_selection_rewards), 1),
         "mean_best_final_correctness": sum(best_correctness) / max(len(best_correctness), 1),
+        "worker_grpo_min_group_size": worker_grpo_min_group_size,
+        "worker_grpo_num_groups_total": worker_grpo_group_total,
+        "worker_grpo_num_groups_used": worker_grpo_group_used,
+        "worker_grpo_num_groups_skipped": worker_grpo_group_skipped,
+        "worker_grpo_num_samples_total": worker_grpo_sample_total,
+        "worker_grpo_num_samples_used": worker_grpo_sample_used,
+        "worker_grpo_num_samples_skipped": worker_grpo_sample_skipped,
+        "worker_grpo_mean_group_size_used": (
+            sum(worker_grpo_used_group_sizes) / len(worker_grpo_used_group_sizes)
+            if worker_grpo_used_group_sizes
+            else 0.0
+        ),
         "tasks": task_summaries if include_tasks else [],
     }
     if include_subsets:
@@ -1224,6 +1269,7 @@ def _build_rollout_trainer(
         decomposer_no_correct_selection_scale=args.decomposer_no_correct_selection_scale,
         track_workers_history=args.track_workers_history,
         train_worker_model=args.train_worker_model,
+        min_worker_grpo_group_size=args.min_worker_grpo_group_size,
     )
 
 
@@ -1830,6 +1876,20 @@ def main() -> None:
                 segment_rollout_summary = epoch_rollout_summary(segment_rollouts)
                 with (segment_train_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
                     json.dump(segment_rollout_summary, handle, indent=2, sort_keys=True)
+                if tracking is not None:
+                    tracking.log(
+                        {
+                            "rollout_segment/worker_grpo_min_group_size": segment_rollout_summary["worker_grpo_min_group_size"],
+                            "rollout_segment/worker_grpo_num_groups_total": segment_rollout_summary["worker_grpo_num_groups_total"],
+                            "rollout_segment/worker_grpo_num_groups_used": segment_rollout_summary["worker_grpo_num_groups_used"],
+                            "rollout_segment/worker_grpo_num_groups_skipped": segment_rollout_summary["worker_grpo_num_groups_skipped"],
+                            "rollout_segment/worker_grpo_num_samples_total": segment_rollout_summary["worker_grpo_num_samples_total"],
+                            "rollout_segment/worker_grpo_num_samples_used": segment_rollout_summary["worker_grpo_num_samples_used"],
+                            "rollout_segment/worker_grpo_num_samples_skipped": segment_rollout_summary["worker_grpo_num_samples_skipped"],
+                            "rollout_segment/worker_grpo_mean_group_size_used": segment_rollout_summary["worker_grpo_mean_group_size_used"],
+                        },
+                        step=rollout_tracking_step,
+                    )
             finally:
                 rollout_trainer.close()
                 del rollout_trainer
@@ -1996,6 +2056,14 @@ def main() -> None:
                     "rollout/mean_best_decomposition_reward": rollout_summary["mean_best_decomposition_reward"],
                     "rollout/mean_best_final_correctness": rollout_summary["mean_best_final_correctness"],
                     "rollout/num_tasks": rollout_summary["num_tasks"],
+                    "rollout/worker_grpo_min_group_size": rollout_summary["worker_grpo_min_group_size"],
+                    "rollout/worker_grpo_num_groups_total": rollout_summary["worker_grpo_num_groups_total"],
+                    "rollout/worker_grpo_num_groups_used": rollout_summary["worker_grpo_num_groups_used"],
+                    "rollout/worker_grpo_num_groups_skipped": rollout_summary["worker_grpo_num_groups_skipped"],
+                    "rollout/worker_grpo_num_samples_total": rollout_summary["worker_grpo_num_samples_total"],
+                    "rollout/worker_grpo_num_samples_used": rollout_summary["worker_grpo_num_samples_used"],
+                    "rollout/worker_grpo_num_samples_skipped": rollout_summary["worker_grpo_num_samples_skipped"],
+                    "rollout/worker_grpo_mean_group_size_used": rollout_summary["worker_grpo_mean_group_size_used"],
                 },
                 step=tracking_step_offset,
             )

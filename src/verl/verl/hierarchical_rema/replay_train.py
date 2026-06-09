@@ -27,10 +27,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-reward",
         type=float,
-        default=0.21,
+        default=None,
         help=(
-            "Minimum replay reward required for a controller sample to enter training. "
-            "The default filters out most incorrect-but-confident selector samples."
+            "Optional minimum replay reward required for a replay sample to enter training. "
+            "Disabled by default."
         ),
     )
     parser.add_argument("--min-advantage", type=float, default=None)
