@@ -1340,6 +1340,8 @@ class RayReMASeparatedTrainer(object):
                         new_batch.batch['acc'] = reward_tensor_map.pop('acc')
                         for key_reward, reward_tensor in reward_tensor_map.items():
                             new_batch.batch[key_reward] = reward_tensor
+                            if not key_reward.endswith('_turn_level_reward'):
+                                continue
                             # get_turn_mask, shape (bsz, max_num_turns), 1 for valid turn, 0 for invalid turn
                             turn_mask = verl_F.get_turn_mask(reward_tensor, new_batch.non_tensor_batch['num_turns'])
                             key_return = key_reward.replace('reward', 'return')
