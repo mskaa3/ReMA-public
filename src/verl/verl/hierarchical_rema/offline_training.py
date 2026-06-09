@@ -261,7 +261,11 @@ def _finish_tracking(tracking) -> None:
     if tracking is None:
         return
     try:
-        tracking.__del__()
+        finish_fn = getattr(tracking, "finish", None)
+        if callable(finish_fn):
+            finish_fn()
+        else:
+            tracking.__del__()
     except Exception:
         pass
 

@@ -14,6 +14,7 @@
 """
 A unified tracking interface that supports logging data to different backend
 """
+import atexit
 import dataclasses
 from enum import Enum
 from functools import partial
@@ -24,9 +25,10 @@ from typing import List, Union, Dict, Any
 class Tracking(object):
     supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console"]
 
-    def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None, wandb_kwargs={}):
+    def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None, wandb_kwargs=None):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
+        wandb_kwargs = dict(wandb_kwargs or {})
         for backend in default_backend:
             if backend == 'tracking':
                 import warnings
@@ -35,11 +37,23 @@ class Tracking(object):
                 assert backend in self.supported_backend, f'{backend} is not supported'
 
         self.logger = {}
+        self._finished = False
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
-            wandb.init(project=project_name, name=experiment_name, config=config, **wandb_kwargs)
-            self.logger['wandb'] = wandb
+            wandb_settings = wandb_kwargs.pop("settings", None)
+            if wandb_settings is None:
+                # Keep the W&B service in-process to avoid fragile subprocess
+                # lifecycles around Ray-heavy training jobs on clusters.
+                wandb_settings = wandb.Settings(start_method="thread")
+            wandb_run = wandb.init(
+                project=project_name,
+                name=experiment_name,
+                config=config,
+                settings=wandb_settings,
+                **wandb_kwargs,
+            )
+            self.logger['wandb'] = _WandbAdapter(wandb_run)
 
         if 'mlflow' in default_backend:
             import mlflow
@@ -92,20 +106,40 @@ class Tracking(object):
             self.console_logger = LocalLogger(print_to_console=True)
             self.logger['console'] = self.console_logger
 
+        atexit.register(self.finish)
+
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
     def __del__(self):
+        self.finish()
+
+    def finish(self):
+        if self._finished:
+            return
+        self._finished = True
         if 'wandb' in self.logger:
-            self.logger['wandb'].finish(exit_code=0)
+            self.logger['wandb'].finish()
         if 'swanlab' in self.logger:
             self.logger['swanlab'].finish()
         if 'vemlp_wandb' in self.logger:
             self.logger['vemlp_wandb'].finish(exit_code=0)
         if 'tensorboard' in self.logger:
             self.logger['tensorboard'].finish()
+
+
+class _WandbAdapter:
+
+    def __init__(self, run):
+        self.run = run
+
+    def log(self, data, step):
+        self.run.log(data, step=step)
+
+    def finish(self):
+        self.run.finish(exit_code=0)
 
 
 class _TensorboardAdapter:

@@ -680,7 +680,19 @@ def _finish_tracking(tracking) -> None:
     if tracking is None:
         return
     try:
-        tracking.__del__()
+        finish_fn = getattr(tracking, "finish", None)
+        if callable(finish_fn):
+            finish_fn()
+            return
+        logger_map = getattr(tracking, "logger", {})
+        if "wandb" in logger_map:
+            logger_map["wandb"].finish()
+        if "swanlab" in logger_map:
+            logger_map["swanlab"].finish()
+        if "vemlp_wandb" in logger_map:
+            logger_map["vemlp_wandb"].finish(exit_code=0)
+        if "tensorboard" in logger_map:
+            logger_map["tensorboard"].finish()
     except Exception:
         pass
 
@@ -1515,6 +1527,16 @@ def run_external_validation(
         f"mean_best_decomposition_reward={summary['mean_best_decomposition_reward']:.4f} "
         f"mean_best_final_correctness={summary['mean_best_final_correctness']:.4f}"
     )
+    for subset_name in sorted(summary.get("subsets", {})):
+        subset_summary = summary["subsets"][subset_name]
+        print(
+            f"[hierarchical-rema][validation][subset] epoch={epoch_number} "
+            f"name={subset_name} "
+            f"acc={subset_summary['mean_best_final_correctness']:.4f} "
+            f"test_score={subset_summary['mean_best_selection_reward']:.4f} "
+            f"tasks={int(subset_summary.get('num_tasks', 0))} "
+            f"correct={int(subset_summary.get('num_correct', 0))}"
+        )
     if tracking is not None:
         metrics = {
             "val/mean_best_selection_reward": summary["mean_best_selection_reward"],
@@ -1897,6 +1919,7 @@ def main() -> None:
 
             segment_training_updates: List[Dict[str, Any]] = []
             segment_training_skipped = None
+            tracking_step_offset = max(tracking_step_offset, rollout_tracking_step)
             try:
                 samples = controller_samples_from_task_rollouts(
                     task_rollouts=segment_rollouts,
@@ -2039,6 +2062,7 @@ def main() -> None:
                     "training_skipped": segment_training_skipped,
                 }
             )
+            rollout_tracking_step = max(rollout_tracking_step, tracking_step_offset)
             batch_cursor += len(segment_batches)
 
         rollout_summary = epoch_rollout_summary(rollouts)
