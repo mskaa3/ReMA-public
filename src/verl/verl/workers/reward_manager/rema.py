@@ -639,6 +639,7 @@ class ReMARewardManager:
                 if (
                     isinstance(msg, dict)
                     and msg.get('role') in worker_roles
+                    and msg.get('role') != score_role
                     and isinstance(content, str)
                     and 'boxed' in content.lower()
                     and content != response_str
@@ -862,10 +863,12 @@ class ReMARewardManager:
                 effective_score = raw_score if role == score_role else 0.0
                 effective_score += role_bonuses.get(role, 0.0)
                 if role == score_role and data_item.meta_info['mask_unfinished_reward']:
-                    # if conversation is not finised normally, i.e. with ['FINISH']
-                    #  the reward should be zero.
-                    # `turn_finished` is 0 means finished normally.
-                    effective_score = effective_score if turn_finished == 0 else 0.0
+                    # For the final scoring role, zero the global correctness reward
+                    # only when generation was actually interrupted/truncated.
+                    # Reaching max turns can still contain a correct final answer and
+                    # should not automatically wipe out the reward.
+                    if turn_finished in {2, 3}:  # completion_token_exceeded / stop_when_truncated
+                        effective_score = 0.0
 
                 # Legacy format reward path disabled for cleaner experiments.
                 # We now use explicit role-level penalties/bonuses (e.g. META_BOXED_PENALTY)
