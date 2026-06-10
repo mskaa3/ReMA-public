@@ -62,25 +62,46 @@ def _extract_answer_like_candidates(text: str) -> List[str]:
             seen.add(cleaned)
             candidates.append(cleaned)
 
+    def _strip_outer_math_delimiters(candidate: str) -> str:
+        cleaned = candidate.strip()
+        if len(cleaned) >= 2 and cleaned.startswith("$") and cleaned.endswith("$"):
+            cleaned = cleaned[1:-1].strip()
+        if cleaned.startswith("\\(") and cleaned.endswith("\\)"):
+            cleaned = cleaned[2:-2].strip()
+        if cleaned.startswith("\\[") and cleaned.endswith("\\]"):
+            cleaned = cleaned[2:-2].strip()
+        if cleaned.startswith("$"):
+            cleaned = cleaned[1:].strip()
+        if cleaned.endswith("$"):
+            cleaned = cleaned[:-1].strip()
+        cleaned = cleaned.rstrip(".,;:")
+        return cleaned
+
+    def _add_with_variants(candidate: str) -> None:
+        _add(candidate)
+        stripped_candidate = _strip_outer_math_delimiters(candidate)
+        if stripped_candidate != candidate.strip():
+            _add(stripped_candidate)
+
     for match in _BOXED_ANSWER_PATTERN.finditer(stripped):
-        _add(match.group(1))
+        _add_with_variants(match.group(1))
 
     lines = [line.strip(" -*\t") for line in stripped.splitlines() if line.strip()]
     if lines:
-        _add(lines[-1])
+        _add_with_variants(lines[-1])
     for line in lines[-3:]:
         match = _FINAL_CLAUSE_PATTERN.search(line)
         if match:
-            _add(match.group(1))
+            _add_with_variants(match.group(1))
         if ":" in line:
-            _add(line.rsplit(":", 1)[-1])
+            _add_with_variants(line.rsplit(":", 1)[-1])
         if "=" in line:
-            _add(line.rsplit("=", 1)[-1])
+            _add_with_variants(line.rsplit("=", 1)[-1])
 
     for segment in re.split(r"[;\n]", stripped):
         candidate = segment.strip()
         if 0 < len(candidate) <= 64:
-            _add(candidate)
+            _add_with_variants(candidate)
 
     return candidates
 
@@ -116,7 +137,7 @@ def _load_default_compute_score():
     return _DEFAULT_COMPUTE_SCORE
 
 
-def compute_final_answer_correctness(
+def _score_single_prediction_candidate(
     prediction: str,
     reference: str,
     task_metadata: Dict[str, Any] | None = None,
@@ -143,6 +164,31 @@ def compute_final_answer_correctness(
             pass
 
     return exact_match(prediction, reference)
+
+
+def compute_final_answer_correctness(
+    prediction: str,
+    reference: str,
+    task_metadata: Dict[str, Any] | None = None,
+) -> float:
+    prediction_text = str(prediction or "").strip()
+    reference_text = str(reference or "").strip()
+    if not prediction_text or not reference_text:
+        return 0.0
+
+    best_score = 0.0
+    for candidate in _extract_answer_like_candidates(prediction_text):
+        best_score = max(
+            best_score,
+            _score_single_prediction_candidate(
+                candidate,
+                reference_text,
+                task_metadata=task_metadata,
+            ),
+        )
+        if best_score >= 1.0:
+            return 1.0
+    return best_score
 
 
 def entropy_to_confidence_reward(entropy: float, entropy_cap: float) -> float:

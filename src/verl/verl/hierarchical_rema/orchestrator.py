@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import re
 from typing import Dict, List, Optional, Sequence
 
 from .backends import (
@@ -42,6 +44,7 @@ from .schema import (
     WorkerExecution,
     WorkerPoolConfig,
 )
+from .structured import format_decomposition_plan, format_selection_plan
 
 
 @dataclass
@@ -95,6 +98,25 @@ class HierarchicalReMAOrchestrator:
         self.track_workers_history = bool(track_workers_history)
         self.train_worker_model = bool(train_worker_model)
         self.min_worker_grpo_group_size = max(int(min_worker_grpo_group_size), 1)
+
+    @staticmethod
+    def _canonical_decomposition_completion(candidate: DecompositionCandidate) -> str:
+        return format_decomposition_plan(candidate)
+
+    @staticmethod
+    def _canonical_selection_completion(
+        candidate: SelectionCandidate,
+        decomposition: DecompositionCandidate,
+    ) -> str:
+        return format_selection_plan(
+            candidate,
+            node_order=[node.node_id for node in decomposition.nodes],
+        )
+
+    @staticmethod
+    def _normalized_instruction_key(instruction: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(instruction or "").strip().lower())
+        return normalized or "unknown_instruction"
 
     @staticmethod
     def _worker_training_reward(selection: SelectionRollout, execution: WorkerExecution) -> float:
@@ -627,7 +649,9 @@ class HierarchicalReMAOrchestrator:
                         policy_id=policy_config.policy_id("decomposer"),
                         group_id=task.task_id,
                         prompt_text=decomposition_rollout.decomposition.raw_payload["controller_prompt"],
-                        completion_text=decomposition_rollout.decomposition.raw_text,
+                        completion_text=self._canonical_decomposition_completion(
+                            decomposition_rollout.decomposition
+                        ),
                         reward=adjusted_reward,
                         advantage=adjusted_advantage,
                         metadata={
@@ -639,6 +663,7 @@ class HierarchicalReMAOrchestrator:
                             "format_validation": self._controller_validation_info(
                                 decomposition_rollout.decomposition.raw_payload
                             ),
+                            "training_target_source": "canonical_decomposition_plan",
                         },
                     )
                 )
@@ -659,7 +684,10 @@ class HierarchicalReMAOrchestrator:
                             policy_id=policy_config.policy_id("selector"),
                             group_id=decomposition_rollout.decomposition.decomposition_id,
                             prompt_text=selection_rollout.selection.raw_payload["controller_prompt"],
-                            completion_text=selection_rollout.selection.raw_text,
+                            completion_text=self._canonical_selection_completion(
+                                selection_rollout.selection,
+                                decomposition_rollout.decomposition,
+                            ),
                             reward=adjusted_reward,
                             advantage=adjusted_advantage,
                             metadata={
@@ -671,14 +699,16 @@ class HierarchicalReMAOrchestrator:
                                 "format_validation": self._controller_validation_info(
                                     selection_rollout.selection.raw_payload
                                 ),
+                                "training_target_source": "canonical_selection_plan",
                             },
                         )
                     )
 
         if self.train_worker_model:
             worker_lookup = worker_pool.workers_by_id()
-            worker_groups: Dict[str, List[tuple[SelectionRollout, WorkerExecution, str, float]]] = {}
+            worker_groups: Dict[str, List[tuple[SelectionRollout, WorkerExecution, str, float, str]]] = {}
             for decomposition_rollout in decompositions:
+                node_map = decomposition_rollout.decomposition.nodes_by_id()
                 for selection_rollout in decomposition_rollout.selections:
                     for execution in selection_rollout.executions:
                         prompt_text = str(execution.worker_prompt or "").strip()
@@ -692,12 +722,23 @@ class HierarchicalReMAOrchestrator:
                             else worker_pool.base_model_path
                         )
                         reward = self._worker_training_reward(selection_rollout, execution)
-                        worker_groups.setdefault(execution.worker_id, []).append(
-                            (selection_rollout, execution, model_path or "", reward)
+                        node = node_map.get(execution.node_id)
+                        normalized_instruction = self._normalized_instruction_key(
+                            node.instruction if node is not None else execution.node_id
+                        )
+                        worker_group_key = f"{execution.worker_id}::{normalized_instruction}"
+                        worker_groups.setdefault(worker_group_key, []).append(
+                            (
+                                selection_rollout,
+                                execution,
+                                model_path or "",
+                                reward,
+                                normalized_instruction,
+                            )
                         )
 
             used_group_sizes: List[int] = []
-            for worker_id, grouped_payloads in worker_groups.items():
+            for worker_group_key, grouped_payloads in worker_groups.items():
                 group_size = len(grouped_payloads)
                 worker_grpo_stats["num_groups_total"] += 1
                 worker_grpo_stats["num_samples_total"] += group_size
@@ -710,9 +751,17 @@ class HierarchicalReMAOrchestrator:
                 used_group_sizes.append(group_size)
                 grouped_rewards = [payload[3] for payload in grouped_payloads]
                 grouped_advantages = group_relative_advantages(grouped_rewards)
-                group_id = f"task:{task.task_id}:worker:{worker_id}"
+                worker_id = grouped_payloads[0][1].worker_id
+                normalized_instruction = grouped_payloads[0][4]
+                instruction_hash = hashlib.sha1(
+                    normalized_instruction.encode("utf-8")
+                ).hexdigest()[:12]
+                group_id = (
+                    f"task:{task.task_id}:worker:{worker_id}:"
+                    f"instr:{instruction_hash}"
+                )
                 for advantage, payload in zip(grouped_advantages, grouped_payloads):
-                    selection_rollout, execution, model_path, reward = payload
+                    selection_rollout, execution, model_path, reward, normalized_instruction = payload
                     worker_samples.append(
                         ControllerTrainingSample(
                             role="worker",
@@ -728,7 +777,8 @@ class HierarchicalReMAOrchestrator:
                                 "node_id": execution.node_id,
                                 "selection_id": selection_rollout.selection.selection_id,
                                 "advantage_group_size": group_size,
-                                "advantage_group_kind": "worker_id_within_task",
+                                "advantage_group_kind": "worker_id_and_normalized_instruction_within_task",
+                                "normalized_node_instruction": normalized_instruction,
                                 "invalid_reason": execution.invalid_reason,
                                 "final_answer_leak": execution.final_answer_leak,
                                 "answer_containment": execution.answer_containment,

@@ -42,13 +42,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-model-path", default=None)
 
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--worker-learning-rate",
+        type=float,
+        default=None,
+        help=(
+            "Optional learning rate override for shared worker training. "
+            "Defaults to half of --learning-rate when omitted."
+        ),
+    )
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--grad-accum-steps", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--worker-epochs",
+        type=int,
+        default=None,
+        help=(
+            "Optional epoch-count override for shared worker training. "
+            "Defaults to --epochs when omitted."
+        ),
+    )
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--truncation", choices=["left", "right", "error"], default="left")
     parser.add_argument("--clip-range", type=float, default=0.2)
+    parser.add_argument(
+        "--worker-clip-range",
+        type=float,
+        default=None,
+        help=(
+            "Optional clip-range override for shared worker training. "
+            "Defaults to min(--clip-range, 0.1) when omitted."
+        ),
+    )
     parser.add_argument("--clip-ratio-c", type=float, default=3.0)
     parser.add_argument("--entropy-coeff", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -108,6 +135,31 @@ def model_path_for_policy(policy_id: str, samples: List[ControllerReplaySample],
         f"Could not infer a single model path for policy '{policy_id}'. "
         "Pass --model-path or role-specific model path overrides."
     )
+
+
+def policy_training_hparams(policy_id: str, args: argparse.Namespace) -> Dict[str, float | int]:
+    if policy_id != "shared_worker":
+        return {
+            "learning_rate": float(args.learning_rate),
+            "epochs": int(args.epochs),
+            "clip_range": float(args.clip_range),
+        }
+    worker_learning_rate = (
+        float(args.worker_learning_rate)
+        if args.worker_learning_rate is not None
+        else float(args.learning_rate) * 0.5
+    )
+    worker_epochs = int(args.worker_epochs) if args.worker_epochs is not None else int(args.epochs)
+    worker_clip_range = (
+        float(args.worker_clip_range)
+        if args.worker_clip_range is not None
+        else min(float(args.clip_range), 0.1)
+    )
+    return {
+        "learning_rate": worker_learning_rate,
+        "epochs": worker_epochs,
+        "clip_range": worker_clip_range,
+    }
 
 
 def prepare_policy_splits(
@@ -206,25 +258,29 @@ def main() -> None:
         replay_exports = maybe_save_replay_copy(policy_dir, split, enabled=args.save_replay_copy)
 
         model_path = model_path_for_policy(policy_id, split["train"] or split["all"], args)
+        policy_hparams = policy_training_hparams(policy_id, args)
         experiment_name = args.experiment_name or output_dir.name
         if len(policy_splits) > 1:
             experiment_name = f"{experiment_name}-{policy_id}"
         print(
             f"[hierarchical-rema][replay-train] policy={policy_id} "
             f"train_samples={len(split['train'])} val_samples={len(split['val'])} "
-            f"model={model_path}"
+            f"model={model_path} "
+            f"lr={policy_hparams['learning_rate']:.6g} "
+            f"epochs={policy_hparams['epochs']} "
+            f"clip_range={policy_hparams['clip_range']:.6g}"
         )
         training_config = OfflineTrainingConfig(
             model_name_or_path=model_path,
             output_dir=str(policy_dir),
-            learning_rate=args.learning_rate,
+            learning_rate=float(policy_hparams["learning_rate"]),
             weight_decay=args.weight_decay,
             train_batch_size=args.train_batch_size,
             grad_accum_steps=args.grad_accum_steps,
-            epochs=args.epochs,
+            epochs=int(policy_hparams["epochs"]),
             max_length=args.max_length,
             truncation=args.truncation,
-            clip_range=args.clip_range,
+            clip_range=float(policy_hparams["clip_range"]),
             clip_ratio_c=args.clip_ratio_c,
             entropy_coeff=args.entropy_coeff,
             max_grad_norm=args.max_grad_norm,
