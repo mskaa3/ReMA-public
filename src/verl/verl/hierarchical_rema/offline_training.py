@@ -632,6 +632,9 @@ def run_offline_policy_training(
     from torch.utils.data import DataLoader
 
     torch = _lazy_torch()
+    tracking_last_step = getattr(tracking, "last_step", None)
+    if tracking_last_step is not None:
+        log_step_offset = max(int(log_step_offset), int(tracking_last_step))
     distributed_context = _init_distributed_training()
     is_primary = _is_primary_process(distributed_context)
     try:

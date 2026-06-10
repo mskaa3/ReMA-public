@@ -38,6 +38,7 @@ class Tracking(object):
 
         self.logger = {}
         self._finished = False
+        self.last_step = None
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
@@ -109,6 +110,10 @@ class Tracking(object):
         atexit.register(self.finish)
 
     def log(self, data, step, backend=None):
+        if step is not None:
+            step = int(step)
+            if self.last_step is None or step > self.last_step:
+                self.last_step = step
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)

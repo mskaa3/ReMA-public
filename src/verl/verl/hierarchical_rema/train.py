@@ -366,6 +366,9 @@ def _relay_offline_metrics_to_tracking(
 ) -> None:
     if tracking is None:
         return
+    tracking_last_step = getattr(tracking, "last_step", None)
+    if tracking_last_step is not None:
+        log_step_offset = max(int(log_step_offset), int(tracking_last_step))
 
     tracking.log(
         {
