@@ -248,6 +248,7 @@ DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}
 EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-false}
 EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-300}
 OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF=${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+RAY_STOP_TIMEOUT_SECONDS=${RAY_STOP_TIMEOUT_SECONDS:-60}
 
 # Usually leave alone: runtime paths / artifact plumbing.
 LOCAL_VERL_DIR=${LOCAL_VERL_DIR:-$TMPDIR/verl}
@@ -574,14 +575,24 @@ stop_ray_cluster() {
         return
     fi
 
-    srun --nodes="${RAY_NNODES}" --ntasks="${RAY_NNODES}" \
-        apptainer exec --nv --writable-tmpfs \
-        --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
-        --mount type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR \
-        --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
-        --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
-        "$LOCAL_SIF_IMAGE_PATH" \
-        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    echo "[hierarchical-rema][cleanup] stopping ray cluster"
+    local -a ray_stop_cmd=(
+        srun
+        --nodes="${RAY_NNODES}"
+        --ntasks="${RAY_NNODES}"
+        apptainer exec --nv --writable-tmpfs
+        --mount "type=bind,src=$TMPDIR,dst=$TMPDIR"
+        --mount "type=bind,src=$RAY_LOCAL_TMPDIR,dst=$RAY_LOCAL_TMPDIR"
+        --mount "type=bind,src=$TMPDIR,dst=/root/tmpdir"
+        --mount "type=bind,src=$LOCAL_VERL_DIR,dst=/verl"
+        "$LOCAL_SIF_IMAGE_PATH"
+        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true"
+    )
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --signal=TERM "${RAY_STOP_TIMEOUT_SECONDS}s" "${ray_stop_cmd[@]}" >/dev/null 2>&1 || true
+    else
+        "${ray_stop_cmd[@]}" >/dev/null 2>&1 || true
+    fi
 
     local pid=""
     for pid in "${RAY_CLUSTER_PIDS[@]}"; do
@@ -913,6 +924,7 @@ stop_epoch_s3_sync_watcher() {
 
 persist_outputs() {
     set +e
+    echo "[hierarchical-rema][cleanup] persisting outputs"
 
     if [[ -d "$LOCAL_OUTPUT_DIR" ]]; then
         local s3_upload_succeeded=0
@@ -936,7 +948,27 @@ persist_outputs() {
     if [[ -n "${TMPDIR:-}" && -d "${TMPDIR:-}" ]]; then
         rm -rf "$TMPDIR"/*
     fi
+    echo "[hierarchical-rema][cleanup] finished persisting outputs"
 }
+
+CLEANUP_DONE=0
+cleanup_launcher() {
+    local exit_code=$?
+    if [[ "$CLEANUP_DONE" == "1" ]]; then
+        return "$exit_code"
+    fi
+    CLEANUP_DONE=1
+    echo "[hierarchical-rema][cleanup] start exit_code=${exit_code}"
+    stop_epoch_s3_sync_watcher
+    stop_ray_cluster
+    persist_outputs
+    echo "[hierarchical-rema][cleanup] done exit_code=${exit_code}"
+    return "$exit_code"
+}
+
+trap cleanup_launcher EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ "$RUN_KIND" == "train" ]]; then
     stage_task_source
@@ -1169,8 +1201,4 @@ srun --overlap --nodes=1 --ntasks=1 ${RAY_DRIVER_NODE_FLAG} apptainer exec --nv 
 RUN_EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
-stop_epoch_s3_sync_watcher
-stop_ray_cluster
-
-persist_outputs
 exit $RUN_EXIT_CODE
