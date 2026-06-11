@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import json
 import os
@@ -1249,6 +1250,62 @@ def combine_rollout_summaries(
     return summary
 
 
+def _write_validation_accuracy_table(
+    *,
+    run_output_dir: Path,
+    epoch_number: int,
+    summary: Dict[str, Any],
+) -> None:
+    table_path = run_output_dir / "validation_accuracy.csv"
+    current_dataset_names = sorted(summary.get("subsets", {}).keys())
+    existing_rows: List[Dict[str, str]] = []
+    existing_dataset_names: List[str] = []
+    if table_path.exists():
+        try:
+            with table_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                existing_rows = [dict(row) for row in reader]
+                existing_dataset_names = [
+                    name for name in (reader.fieldnames or []) if name and name != "epoch"
+                ]
+        except Exception:
+            existing_rows = []
+            existing_dataset_names = []
+
+    dataset_names = sorted(set(existing_dataset_names) | set(current_dataset_names))
+    row: Dict[str, str] = {"epoch": str(epoch_number)}
+    for dataset_name in dataset_names:
+        subset_summary = summary.get("subsets", {}).get(dataset_name, {})
+        row[dataset_name] = (
+            f"{float(subset_summary.get('mean_best_final_correctness', 0.0)):.6f}"
+            if dataset_name in summary.get("subsets", {})
+            else ""
+        )
+
+    existing_rows = [
+        existing_row
+        for existing_row in existing_rows
+        if str(existing_row.get("epoch", "")).strip() != str(epoch_number)
+    ]
+    existing_rows.append(row)
+    existing_rows.sort(key=lambda item: int(str(item.get("epoch", "0")) or 0))
+
+    fieldnames = ["epoch", *dataset_names]
+    with table_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for existing_row in existing_rows:
+            normalized_row = {"epoch": str(existing_row.get("epoch", ""))}
+            for dataset_name in dataset_names:
+                normalized_row[dataset_name] = str(existing_row.get(dataset_name, ""))
+            writer.writerow(normalized_row)
+
+    print(
+        f"[hierarchical-rema][validation] saved accuracy table "
+        f"path={table_path}"
+    )
+
+
 def _build_rollout_trainer(
     args: argparse.Namespace,
     *,
@@ -1575,6 +1632,11 @@ def run_external_validation(
     )
     with (output_dir / "validation_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
+    _write_validation_accuracy_table(
+        run_output_dir=output_dir.parent,
+        epoch_number=epoch_number,
+        summary=summary,
+    )
 
     print(
         f"[hierarchical-rema][validation] epoch={epoch_number} "

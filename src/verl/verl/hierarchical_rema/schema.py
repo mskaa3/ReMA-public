@@ -26,7 +26,6 @@ CANONICAL_SKILL_TAGS: tuple[str, ...] = (
     "discrete_math",
 )
 
-
 class TrainingMode(str, Enum):
     JOINT = "joint"
     ALTERNATING = "alternating"
@@ -224,6 +223,8 @@ class SubtaskNode:
 class DecompositionCandidate:
     decomposition_id: str
     summary: str
+    target_quantity: str
+    final_answer_format_hint: str
     nodes: List[SubtaskNode]
     final_node_id: str
     num_hops: int = 0
@@ -257,6 +258,8 @@ class DecompositionCandidate:
         return {
             "decomposition_id": self.decomposition_id,
             "summary": self.summary,
+            "target_quantity": self.target_quantity,
+            "final_answer_format_hint": self.final_answer_format_hint,
             "final_node_id": self.final_node_id,
             "num_hops": self.num_hops,
             "effective_num_hops": self.effective_num_hops,

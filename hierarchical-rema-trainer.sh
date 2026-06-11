@@ -833,6 +833,14 @@ upload_epoch_folder_to_s3() {
         upload_status=1
     fi
 
+    if [[ -f "${LOCAL_OUTPUT_DIR}/validation_accuracy.csv" ]]; then
+        echo "[hierarchical-rema][s3] syncing validation_accuracy.csv -> ${S3_OUTPUT_PATH}/validation_accuracy.csv"
+        if ! rclone copyto "${LOCAL_OUTPUT_DIR}/validation_accuracy.csv" "${S3_OUTPUT_PATH}/validation_accuracy.csv"; then
+            echo "Warning: failed to sync validation_accuracy.csv" >&2
+            upload_status=1
+        fi
+    fi
+
     for policy_dir in "$epoch_dir"/train/*; do
         [[ -d "$policy_dir" ]] || continue
         local policy_id

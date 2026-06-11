@@ -1023,6 +1023,8 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             "decomposition": {
                 "decomposition_id": candidate.decomposition_id,
                 "summary": candidate.summary,
+                "target_quantity": candidate.target_quantity,
+                "final_answer_format_hint": candidate.final_answer_format_hint,
                 "final_node_id": candidate.final_node_id,
                 "num_hops": candidate.num_hops,
                 "effective_num_hops": candidate.effective_num_hops,

@@ -184,6 +184,20 @@ def _normalize_required_skills_note(raw_value: Any) -> str:
     return text[:160]
 
 
+def _normalize_final_answer_format_hint(raw_value: Any) -> str:
+    text = " ".join(str(raw_value or "").strip().split())
+    if not text or text.lower() in {"none", "null", "n/a"}:
+        return "match the answer format requested by TASK"
+    return text[:200]
+
+
+def _normalize_target_quantity(raw_value: Any) -> str:
+    text = " ".join(str(raw_value or "").strip().split())
+    if not text or text.lower() in {"none", "null", "n/a"}:
+        return "best final answer requested by TASK"
+    return text[:200]
+
+
 _GENERIC_FINAL_ANSWER_PATTERNS: tuple[str, ...] = (
     "return the final answer",
     "provide the final answer",
@@ -360,6 +374,8 @@ def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
     lines = [
         "<decomposition_plan>",
         f"SUMMARY: {candidate.summary}",
+        f"TARGET_QUANTITY: {candidate.target_quantity}",
+        f"FINAL_ANSWER_FORMAT_HINT: {candidate.final_answer_format_hint}",
         f"FINAL_NODE_ID: {candidate.final_node_id}",
     ]
     for node in candidate.nodes:
@@ -437,6 +453,10 @@ def _extract_key_value_payload(text: str) -> Dict[str, Any]:
             payload["decomposition_id"] = raw_value
         elif key == "SUMMARY":
             payload["summary"] = raw_value
+        elif key == "TARGET_QUANTITY":
+            payload["target_quantity"] = raw_value
+        elif key in {"FINAL_ANSWER_FORMAT_HINT", "FINAL_ANSWER_STYLE"}:
+            payload["final_answer_format_hint"] = raw_value
         elif key in {"FINAL_NODE_ID", "FINAL_NODE"}:
             payload["final_node_id"] = raw_value
 
@@ -451,6 +471,8 @@ def _parse_decomposition_plan(text: str) -> Dict[str, Any]:
     payload = _extract_key_value_payload(normalized)
     if payload.get("nodes"):
         payload.setdefault("summary", "Compact decomposition.")
+        payload.setdefault("target_quantity", "best final answer requested by TASK")
+        payload.setdefault("final_answer_format_hint", "match the answer format requested by TASK")
         if not payload.get("final_node_id"):
             payload["final_node_id"] = payload["nodes"][-1]["node_id"]
         return payload
@@ -519,7 +541,7 @@ def salvage_decomposition_payload(
 ) -> Dict[str, Any] | None:
     merged_payload: Dict[str, Any] = {}
     if isinstance(payload, dict):
-        for key in ("decomposition_id", "summary"):
+        for key in ("decomposition_id", "summary", "target_quantity", "final_answer_format_hint"):
             value = payload.get(key)
             if value:
                 merged_payload[key] = value
@@ -535,6 +557,10 @@ def salvage_decomposition_payload(
     )
     if line_payload.get("summary") and not merged_payload.get("summary"):
         merged_payload["summary"] = line_payload["summary"]
+    if line_payload.get("target_quantity") and not merged_payload.get("target_quantity"):
+        merged_payload["target_quantity"] = line_payload["target_quantity"]
+    if line_payload.get("final_answer_format_hint") and not merged_payload.get("final_answer_format_hint"):
+        merged_payload["final_answer_format_hint"] = line_payload["final_answer_format_hint"]
     if line_payload.get("decomposition_id") and not merged_payload.get("decomposition_id"):
         merged_payload["decomposition_id"] = line_payload["decomposition_id"]
     if line_payload.get("final_node_id") and not merged_payload.get("final_node_id"):
@@ -544,6 +570,8 @@ def salvage_decomposition_payload(
 
     if merged_payload.get("nodes"):
         merged_payload.setdefault("summary", "Compact decomposition.")
+        merged_payload.setdefault("target_quantity", "best final answer requested by TASK")
+        merged_payload.setdefault("final_answer_format_hint", "match the answer format requested by TASK")
         if not merged_payload.get("final_node_id"):
             merged_payload["final_node_id"] = merged_payload["nodes"][-1].get("node_id")
         return merged_payload
@@ -721,6 +749,8 @@ def _truncate_to_node_budget(
     return DecompositionCandidate(
         decomposition_id=candidate.decomposition_id,
         summary=f"{candidate.summary} [TRUNCATED]",
+        target_quantity=candidate.target_quantity,
+        final_answer_format_hint=candidate.final_answer_format_hint,
         nodes=new_nodes,
         final_node_id=synthetic_final.node_id,
         num_hops=candidate.num_hops,
@@ -771,6 +801,10 @@ def validate_decomposition_payload(
 ) -> DecompositionCandidate:
     decomposition_id = str(payload.get("decomposition_id") or fallback_id)
     summary = str(payload.get("summary") or "No summary provided.")
+    target_quantity = _normalize_target_quantity(payload.get("target_quantity"))
+    final_answer_format_hint = _normalize_final_answer_format_hint(
+        payload.get("final_answer_format_hint") or payload.get("final_answer_style")
+    )
     final_node_id = _normalize_node_id_token(payload.get("final_node_id"))
     nodes_payload = payload.get("nodes")
     if not isinstance(nodes_payload, list) or not nodes_payload:
@@ -831,6 +865,8 @@ def validate_decomposition_payload(
     raw_candidate = DecompositionCandidate(
         decomposition_id=decomposition_id,
         summary=summary,
+        target_quantity=target_quantity,
+        final_answer_format_hint=final_answer_format_hint,
         nodes=nodes,
         final_node_id=final_node_id,
     )
@@ -888,6 +924,8 @@ def validate_decomposition_payload(
     candidate = DecompositionCandidate(
         decomposition_id=decomposition_id,
         summary=summary,
+        target_quantity=target_quantity,
+        final_answer_format_hint=final_answer_format_hint,
         nodes=canonical_nodes,
         final_node_id=remapped_node_ids[resolved_final_node_id],
     )
@@ -999,6 +1037,8 @@ def build_fallback_decomposition(
     payload = {
         "decomposition_id": f"{task_id}-fallback-decomposition",
         "summary": "Fallback decomposition: solve the full task directly.",
+        "target_quantity": "best final answer requested by TASK",
+        "final_answer_format_hint": "match the answer format requested by TASK",
         "final_node_id": "1",
         "nodes": [
             {

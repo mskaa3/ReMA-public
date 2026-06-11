@@ -131,7 +131,7 @@ def _expected_worker_output_hint(
     node: SubtaskNode,
 ) -> str:
     if decomposition.final_node_id == node.node_id:
-        return "final_scalar_answer"
+        return f"final_answer_matching_{decomposition.final_answer_format_hint}"
 
     instruction = node.instruction.lower()
     output_key = (node.output_key or "").lower()
@@ -151,6 +151,8 @@ def _decomposition_context(decomposition: DecompositionCandidate) -> dict:
     return {
         "decomposition_id": decomposition.decomposition_id,
         "summary": decomposition.summary,
+        "target_quantity": decomposition.target_quantity,
+        "final_answer_format_hint": decomposition.final_answer_format_hint,
         "final_node_id": decomposition.final_node_id,
         "num_hops": decomposition.num_hops,
         "effective_num_hops": decomposition.effective_num_hops,
@@ -191,10 +193,12 @@ def render_decomposer_prompt(
     return (
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <decomposition_plan> block and nothing else.\n"
-        "- Use only these keys: SUMMARY, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE, OUTPUT_KEY.\n"
+        "- Use only these keys: SUMMARY, TARGET_QUANTITY, FINAL_ANSWER_FORMAT_HINT, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE, OUTPUT_KEY.\n"
         "- Use this skeleton:\n"
         "<decomposition_plan>\n"
         "SUMMARY: short summary\n"
+        "TARGET_QUANTITY: the exact mathematical object requested by TASK\n"
+        "FINAL_ANSWER_FORMAT_HINT: integer\n"
         "FINAL_NODE_ID: 2\n"
         "NODE_ID: 1\n"
         "INSTRUCTION: short instruction\n"
@@ -209,6 +213,9 @@ def render_decomposer_prompt(
         f"- Allowed node IDs: {allowed_node_ids}. Use contiguous numeric NODE_ID values in declaration order: 1, 2, ..., N.\n"
         "- Each node must contain exactly one INSTRUCTION line and one DEPENDENCIES line.\n"
         f"{node_budget_contract}"
+        "- TARGET_QUANTITY must name the exact thing the task asks you to determine, not a nearby proxy.\n"
+        "- FINAL_ANSWER_FORMAT_HINT must describe the required answer format in free text, such as `single capital letter A-E`, `common fraction in lowest terms`, `integer`, or `expression in simplest form`.\n"
+        "- Infer TARGET_QUANTITY and FINAL_ANSWER_FORMAT_HINT directly from TASK wording such as `enter the letter`, `express as a fraction`, or `find the value`.\n"
         "- DEPENDENCIES must be `none` or comma-separated earlier node IDs from the allowed set.\n"
         f"- REQUIRED_SKILLS is preferred for substantive nodes; when present, use only these supported skill tags: {skill_tags}.\n"
         "- Use at most 2 REQUIRED_SKILLS tags per node, and prefer 1 when possible.\n"
@@ -224,6 +231,8 @@ def render_decomposer_prompt(
         "- For root nodes, reference the actual equation, expression, case split, or target quantity from TASK instead of vague text like `simplify both sides`.\n"
         "- For intermediate nodes, preserve reusable symbolic state; avoid bare numbers unless the node explicitly asks for a numeric sub-result.\n"
         "- The final node must be a terminal sink node that produces the final answer.\n"
+        "- The final node instruction must explicitly use TARGET_QUANTITY and match FINAL_ANSWER_FORMAT_HINT.\n"
+        "- If the task says to return a letter, fraction, integer, expression, or other specific form, say that directly in FINAL_ANSWER_FORMAT_HINT and make the final node follow it.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
@@ -286,6 +295,8 @@ def render_selector_prompt(
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags.\n\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
+        f"TARGET_QUANTITY: {decomposition.target_quantity}\n"
+        f"FINAL_ANSWER_FORMAT_HINT: {decomposition.final_answer_format_hint}\n"
         f"FINAL_NODE_ID: {decomposition.final_node_id}\n"
         "NODES_BY_ID:\n"
         f"{chr(10).join(node_lines)}\n"
@@ -339,6 +350,7 @@ def render_worker_prompt(
     final_node_contract = (
         "- This is the FINAL_NODE. Put only the final answer inside <worker_result>.\n"
         "- Do not include explanations, labels, sentences, or variable assignments such as `x = 4`; write only `4`.\n"
+        f"- Match FINAL_ANSWER_FORMAT_HINT exactly: {decomposition.final_answer_format_hint}.\n"
     )
     if not is_final_node:
         final_node_contract = (
@@ -367,6 +379,8 @@ def render_worker_prompt(
         "- For expressions, equations, values, or short case splits, return just that content inside the tags.\n"
         "- Do not jump to a scalar too early; preserve an equation, expression, or other reusable symbolic state unless NODE_INSTRUCTION explicitly asks for a numeric result.\n"
         "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
+        f"- TARGET_QUANTITY for this decomposition: {decomposition.target_quantity}.\n"
+        f"- FINAL_ANSWER_FORMAT_HINT for this decomposition: {decomposition.final_answer_format_hint}.\n"
         f"{node_context_contract}"
         f"{final_node_contract}"
         "- Forbidden output patterns: prose outside the allowed tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
@@ -381,6 +395,8 @@ def render_worker_prompt(
         f"NODE_INSTRUCTION: {node.instruction}\n"
         f"NODE_REQUIRED_SKILLS: {node_required_skills}\n"
         f"NODE_REQUIRED_SKILLS_NOTE: {node_required_skills_note}\n"
+        f"TARGET_QUANTITY: {decomposition.target_quantity}\n"
+        f"FINAL_ANSWER_FORMAT_HINT: {decomposition.final_answer_format_hint}\n"
         f"FINAL_NODE: {'yes' if is_final_node else 'no'}\n"
         f"NODE_DEPENDENCIES: {node_dependencies}\n"
         f"DEPENDENCY_RESULTS:\n"
