@@ -55,6 +55,7 @@ SELECTOR_MISSING_FINAL_PENALTY = 0.05
 SELECTOR_EMPTY_OUTPUT_PENALTY = 0.10
 WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
 WORKER_DOWNSTREAM_USED_BONUS = 0.03
+WORKER_LATER_WORKER_USED_BONUS = 0.03
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
 FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
@@ -432,23 +433,33 @@ def _compute_turn_worker_role_bonus_stats(turn_history, worker_roles, score_role
     per_role = {}
     unique_hits = 0
     downstream_hits = 0
+    later_worker_hits = 0
     final_output_norm = _normalize_role_output(final_output)
     valid_worker_count = 0
     for idx, worker in enumerate(active_workers):
         signature = worker['signature']
         unique_local_result = 0.0
         downstream_used = 0.0
+        later_worker_used = 0.0
         if signature:
             valid_worker_count += 1
             if signature_counts.get(signature, 0) == 1:
                 unique_local_result = 1.0
                 unique_hits += 1
+            later_contents = [
+                _normalize_role_output(later_worker['content'])
+                for later_worker in active_workers[idx + 1:]
+            ]
+            if any(signature in later_content for later_content in later_contents):
+                later_worker_used = 1.0
+                later_worker_hits += 1
             if final_output_norm and signature in final_output_norm:
                 downstream_used = 1.0
                 downstream_hits += 1
         per_role[worker['role']] = {
             'unique_local_result': unique_local_result,
             'downstream_used': downstream_used,
+            'later_worker_used': later_worker_used,
         }
 
     denom = valid_worker_count if valid_worker_count > 0 else 1
@@ -456,6 +467,7 @@ def _compute_turn_worker_role_bonus_stats(turn_history, worker_roles, score_role
         'per_role': per_role,
         'unique_local_result_rate': unique_hits / denom if valid_worker_count > 0 else 0.0,
         'downstream_used_rate': downstream_hits / denom if valid_worker_count > 0 else 0.0,
+        'later_worker_used_rate': later_worker_hits / denom if valid_worker_count > 0 else 0.0,
     }
 
 class ReMARewardManager:
@@ -600,6 +612,7 @@ class ReMARewardManager:
         reward_tensor_map['selector_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_unique_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_downstream_used_rate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['worker_later_worker_used_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_local_bonus_mean'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_worker_result_usage_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_consistency_with_worker_results'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -778,12 +791,18 @@ class ReMARewardManager:
                 )
                 reward_tensor_map['worker_unique_local_result_rate'][i_bsz] = worker_bonus_stats['unique_local_result_rate']
                 reward_tensor_map['worker_downstream_used_rate'][i_bsz] = worker_bonus_stats['downstream_used_rate']
+                reward_tensor_map['worker_later_worker_used_rate'][i_bsz] = worker_bonus_stats['later_worker_used_rate']
                 worker_bonus_values = []
                 for role, stats in worker_bonus_stats['per_role'].items():
-                    worker_bonus = stats['downstream_used'] * (
-                        WORKER_UNIQUE_LOCAL_RESULT_BONUS * stats['unique_local_result']
-                        + WORKER_DOWNSTREAM_USED_BONUS * stats['downstream_used']
-                    )
+                    if stats['downstream_used']:
+                        worker_bonus = (
+                            WORKER_UNIQUE_LOCAL_RESULT_BONUS * stats['unique_local_result']
+                            + WORKER_DOWNSTREAM_USED_BONUS
+                        )
+                    elif stats['later_worker_used'] and stats['unique_local_result']:
+                        worker_bonus = WORKER_LATER_WORKER_USED_BONUS
+                    else:
+                        worker_bonus = 0.0
                     worker_bonus *= positive_role_bonus_gate
                     role_bonuses[role] += worker_bonus
                     worker_bonus_values.append(worker_bonus)
@@ -1136,6 +1155,7 @@ class ReMARewardManager:
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
                         'unique_local_result_rate': float(reward_tensor_map['worker_unique_local_result_rate'][i_bsz]),
                         'downstream_used_rate': float(reward_tensor_map['worker_downstream_used_rate'][i_bsz]),
+                        'later_worker_used_rate': float(reward_tensor_map['worker_later_worker_used_rate'][i_bsz]),
                         'local_bonus_mean': float(reward_tensor_map['worker_local_bonus_mean'][i_bsz]),
                     })
                 if score_role in agent_roles:
