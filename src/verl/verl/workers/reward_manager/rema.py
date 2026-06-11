@@ -25,19 +25,19 @@ from concurrent.futures import TimeoutError
 from math_verify.errors import TimeoutException
 
 META_BOXED_PENALTY = 0.25
-WORKER_BOXED_PENALTY = 0.10
-WORKER_FINISH_PENALTY = 0.10
+WORKER_BOXED_PENALTY = 0.05
+WORKER_FINISH_PENALTY = 0.05
 PLANNER_REPEAT_PENALTY = 0.10
 PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
 PLANNER_SUBTASK_TARGET_MIN = 3
 PLANNER_SUBTASK_TARGET_MAX = 5
 PLANNER_SUBTASK_COUNT_PENALTY_PER_TASK = 0.20
 PLANNER_SUBTASK_COUNT_MAX_PENALTY = 0.80
-WORKER_EMPTY_ASSIGNED_PENALTY = 0.10
-WORKER_MISSING_LOCAL_RESULT_PENALTY = 0.20
+WORKER_EMPTY_ASSIGNED_PENALTY = 0.05
+WORKER_MISSING_LOCAL_RESULT_PENALTY = 0.10
 WORKER_SUBTASK_OVERREACH_PENALTY = 0.10
 WORKER_DUPLICATE_RESULT_PENALTY = 0.03
-FINAL_IGNORES_WORKER_RESULTS_PENALTY = 0.20
+FINAL_IGNORES_WORKER_RESULTS_PENALTY = 0.10
 FINAL_IGNORES_MIN_LOCAL_RESULTS = 2
 FINAL_IGNORES_MIN_WORDS = 80
 DECOMPOSER_UNIQUE_LOCAL_RESULT_BONUS = 0.05
@@ -45,6 +45,14 @@ DECOMPOSER_DEPENDENCY_USAGE_BONUS = 0.05
 DECOMPOSER_REPAIR_SUCCESS_BONUS = 0.10
 SELECTOR_ASSIGNMENT_COMPLETENESS_BONUS = 0.05
 SELECTOR_WORKER_VALID_LOCAL_RESULT_BONUS = 0.05
+SELECTOR_EXTRA_ASSIGNMENT_PENALTY_PER_TASK = 0.05
+SELECTOR_EXTRA_ASSIGNMENT_MAX_PENALTY = 0.50
+SELECTOR_MISSING_ASSIGNMENT_PENALTY_PER_TASK = 0.05
+SELECTOR_MISSING_ASSIGNMENT_MAX_PENALTY = 0.30
+SELECTOR_DUPLICATE_ASSIGNMENT_PENALTY_PER_TASK = 0.05
+SELECTOR_DUPLICATE_ASSIGNMENT_MAX_PENALTY = 0.30
+SELECTOR_MISSING_FINAL_PENALTY = 0.05
+SELECTOR_EMPTY_OUTPUT_PENALTY = 0.10
 WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
 WORKER_DOWNSTREAM_USED_BONUS = 0.03
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
@@ -275,6 +283,8 @@ def _compute_selector_turn_bonus_stats(turn_history, worker_roles):
             for subtask in planned_subtasks
         }
         matched_once = sum(1 for count in assigned_counts.values() if count == 1)
+        missing_assigned_count = sum(1 for count in assigned_counts.values() if count == 0)
+        duplicate_assigned_count = sum(max(count - 1, 0) for count in assigned_counts.values())
         extra_assigned_count = sum(
             1 for subtask in assigned_subtasks if subtask not in planned_subtasks
         )
@@ -288,6 +298,8 @@ def _compute_selector_turn_bonus_stats(turn_history, worker_roles):
         precision = 0.0
         recall = 0.0
         extra_assigned_count = len(assigned_subtasks)
+        missing_assigned_count = 0
+        duplicate_assigned_count = 0
         assignment_completeness = 0.0
 
     worker_metrics = _compute_turn_worker_metrics(turn_history, worker_roles)
@@ -303,6 +315,9 @@ def _compute_selector_turn_bonus_stats(turn_history, worker_roles):
         'assignment_recall': recall,
         'assignment_final_present': final_present,
         'assignment_extra_count': float(extra_assigned_count),
+        'assignment_missing_count': float(missing_assigned_count),
+        'assignment_duplicate_count': float(duplicate_assigned_count),
+        'selector_empty_output': 1.0 if not selector_output.strip() else 0.0,
         'worker_valid_local_result_rate': worker_valid_local_result_rate,
     }
 
@@ -428,13 +443,7 @@ def _compute_turn_worker_role_bonus_stats(turn_history, worker_roles, score_role
             if signature_counts.get(signature, 0) == 1:
                 unique_local_result = 1.0
                 unique_hits += 1
-            later_contents = [
-                _normalize_role_output(later_worker['content'])
-                for later_worker in active_workers[idx + 1:]
-            ]
-            if final_output_norm:
-                later_contents.append(final_output_norm)
-            if any(signature in later_content for later_content in later_contents):
+            if final_output_norm and signature in final_output_norm:
                 downstream_used = 1.0
                 downstream_hits += 1
         per_role[worker['role']] = {
@@ -547,6 +556,16 @@ class ReMARewardManager:
         reward_tensor_map['planner_excess_subtask_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_subtask_count_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planner_subtask_count_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_extra_assignment_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_extra_assignment_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_missing_assignment_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_missing_assignment_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_duplicate_assignment_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_duplicate_assignment_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_missing_final_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_missing_final_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_empty_output_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_empty_output_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_empty_assigned_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_empty_assigned_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['worker_missing_local_result_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -573,6 +592,9 @@ class ReMARewardManager:
         reward_tensor_map['selector_assignment_recall'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_assignment_final_present'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_assignment_extra_count'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_assignment_missing_count'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_assignment_duplicate_count'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_empty_output'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_worker_valid_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -705,10 +727,50 @@ class ReMARewardManager:
                 reward_tensor_map['selector_assignment_recall'][i_bsz] = selector_stats['assignment_recall']
                 reward_tensor_map['selector_assignment_final_present'][i_bsz] = selector_stats['assignment_final_present']
                 reward_tensor_map['selector_assignment_extra_count'][i_bsz] = selector_stats['assignment_extra_count']
+                reward_tensor_map['selector_assignment_missing_count'][i_bsz] = selector_stats['assignment_missing_count']
+                reward_tensor_map['selector_assignment_duplicate_count'][i_bsz] = selector_stats['assignment_duplicate_count']
+                reward_tensor_map['selector_empty_output'][i_bsz] = selector_stats['selector_empty_output']
                 reward_tensor_map['selector_worker_valid_local_result_rate'][i_bsz] = selector_stats['worker_valid_local_result_rate']
                 reward_tensor_map['selector_local_bonus_raw'][i_bsz] = selector_local_bonus_raw
                 reward_tensor_map['selector_local_bonus'][i_bsz] = selector_local_bonus
                 role_bonuses['selector'] += selector_local_bonus
+                selector_extra_assignment_penalty = min(
+                    SELECTOR_EXTRA_ASSIGNMENT_MAX_PENALTY,
+                    selector_stats['assignment_extra_count'] * SELECTOR_EXTRA_ASSIGNMENT_PENALTY_PER_TASK,
+                )
+                selector_missing_assignment_penalty = min(
+                    SELECTOR_MISSING_ASSIGNMENT_MAX_PENALTY,
+                    selector_stats['assignment_missing_count'] * SELECTOR_MISSING_ASSIGNMENT_PENALTY_PER_TASK,
+                )
+                selector_duplicate_assignment_penalty = min(
+                    SELECTOR_DUPLICATE_ASSIGNMENT_MAX_PENALTY,
+                    selector_stats['assignment_duplicate_count'] * SELECTOR_DUPLICATE_ASSIGNMENT_PENALTY_PER_TASK,
+                )
+                selector_missing_final_penalty = (
+                    SELECTOR_MISSING_FINAL_PENALTY
+                    if (
+                        selector_stats['assignment_final_present'] == 0.0
+                        and selector_stats['selector_empty_output'] == 0.0
+                    ) else 0.0
+                )
+                selector_empty_output_penalty = (
+                    SELECTOR_EMPTY_OUTPUT_PENALTY
+                    if selector_stats['selector_empty_output'] > 0.0 else 0.0
+                )
+                selector_assignment_penalties = [
+                    ('selector_extra_assignment', selector_extra_assignment_penalty),
+                    ('selector_missing_assignment', selector_missing_assignment_penalty),
+                    ('selector_duplicate_assignment', selector_duplicate_assignment_penalty),
+                    ('selector_missing_final', selector_missing_final_penalty),
+                    ('selector_empty_output', selector_empty_output_penalty),
+                ]
+                for penalty_name, penalty_value in selector_assignment_penalties:
+                    if penalty_value <= 0.0:
+                        continue
+                    reward_tensor_map[f'{penalty_name}_penalty_applied'][i_bsz] = 1.0
+                    reward_tensor_map[f'{penalty_name}_penalty_value'][i_bsz] = penalty_value
+                    active_penalties.append((penalty_name, penalty_value, ['selector']))
+                    role_penalties['selector'] += penalty_value
 
             if turn_histories:
                 worker_bonus_stats = _compute_turn_worker_role_bonus_stats(
@@ -718,7 +780,7 @@ class ReMARewardManager:
                 reward_tensor_map['worker_downstream_used_rate'][i_bsz] = worker_bonus_stats['downstream_used_rate']
                 worker_bonus_values = []
                 for role, stats in worker_bonus_stats['per_role'].items():
-                    worker_bonus = (
+                    worker_bonus = stats['downstream_used'] * (
                         WORKER_UNIQUE_LOCAL_RESULT_BONUS * stats['unique_local_result']
                         + WORKER_DOWNSTREAM_USED_BONUS * stats['downstream_used']
                     )
@@ -1007,7 +1069,9 @@ class ReMARewardManager:
                 if role in meta_roles and meta_has_boxed:
                     role_penalty += META_BOXED_PENALTY
 
-                if role_penalty > 0.0:
+                if role == score_role:
+                    role_score = effective_score - role_penalty
+                elif role_penalty > 0.0:
                     role_score = -max(role_penalty, MIN_NEGATIVE_SHAPED_REWARD)
                 else:
                     role_score = effective_score
@@ -1057,6 +1121,9 @@ class ReMARewardManager:
                         'assignment_recall': float(reward_tensor_map['selector_assignment_recall'][i_bsz]),
                         'assignment_final_present': float(reward_tensor_map['selector_assignment_final_present'][i_bsz]),
                         'assignment_extra_count': float(reward_tensor_map['selector_assignment_extra_count'][i_bsz]),
+                        'assignment_missing_count': float(reward_tensor_map['selector_assignment_missing_count'][i_bsz]),
+                        'assignment_duplicate_count': float(reward_tensor_map['selector_assignment_duplicate_count'][i_bsz]),
+                        'empty_output': float(reward_tensor_map['selector_empty_output'][i_bsz]),
                         'worker_valid_local_result_rate': float(reward_tensor_map['selector_worker_valid_local_result_rate'][i_bsz]),
                         'local_bonus_raw': float(reward_tensor_map['selector_local_bonus_raw'][i_bsz]),
                         'local_bonus': float(reward_tensor_map['selector_local_bonus'][i_bsz]),
