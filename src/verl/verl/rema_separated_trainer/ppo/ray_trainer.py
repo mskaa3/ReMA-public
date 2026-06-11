@@ -40,7 +40,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.rema_trainer.ppo import core_algos
-from verl.rema_trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
+from verl.rema_trainer.ppo.metric_utils import compute_data_metrics, compute_reward_diagnostic_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rema_dataset import RLHFDataset, collate_fn
@@ -1334,8 +1334,11 @@ class RayReMASeparatedTrainer(object):
                             if penalty_applied is not None:
                                 metrics[f'reward/{penalty_name}_applied_count'] = penalty_applied.sum().item()
                                 metrics[f'reward/{penalty_name}_applied_rate'] = penalty_applied.float().mean().item()
+                                metrics[f'reward/penalties/{penalty_name}/applied_count'] = penalty_applied.sum().item()
+                                metrics[f'reward/penalties/{penalty_name}/applied_rate'] = penalty_applied.float().mean().item()
                             if penalty_value is not None:
                                 metrics[f'reward/{penalty_name}_avg_value'] = penalty_value.float().mean().item()
+                                metrics[f'reward/penalties/{penalty_name}/avg_value'] = penalty_value.float().mean().item()
                         # batch.batch['token_level_scores'] = reward_tensor
                         new_batch.batch['acc'] = reward_tensor_map.pop('acc')
                         for key_reward, reward_tensor in reward_tensor_map.items():
@@ -1412,6 +1415,7 @@ class RayReMASeparatedTrainer(object):
                             'rollout/total_prompt_cnt': total_prompt_cnt,
                             'rollout/num_gen_batches': num_gen_batches,
                         })
+                    metrics.update(compute_reward_diagnostic_metrics(batch))
                     
                     with _timer('save_train_generation', timing_raw):
                         # save train generation

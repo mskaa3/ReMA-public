@@ -27,6 +27,73 @@ def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
     return metrics
 
 
+def _log_tensor_metric(metrics: Dict[str, Any], batch: DataProto, source_key: str, target_key: str) -> None:
+    if source_key not in batch.batch:
+        return
+    tensor = batch.batch[source_key]
+    if not torch.is_tensor(tensor):
+        return
+    metrics[target_key] = tensor.float().mean().detach().item()
+
+
+def _log_tensor_summary(metrics: Dict[str, Any], tensor: torch.Tensor, prefix: str) -> None:
+    tensor = tensor.float()
+    metrics[f'{prefix}/mean'] = tensor.mean().detach().item()
+    metrics[f'{prefix}/max'] = tensor.max().detach().item()
+    metrics[f'{prefix}/min'] = tensor.min().detach().item()
+
+
+def compute_reward_diagnostic_metrics(batch: DataProto) -> Dict[str, Any]:
+    """Export reward diagnostics under stable W&B-friendly namespaces."""
+    metrics: Dict[str, Any] = {}
+
+    scalar_aliases = {
+        'acc': 'reward/global/acc',
+        'positive_role_bonus_gate': 'reward/global/positive_bonus_gate',
+        'hierarchy_utilization_gate': 'reward/hierarchy/utilization_gate',
+        'valid_nonfinal_worker_count': 'reward/hierarchy/valid_nonfinal_worker_count',
+        'planned_subtask_count': 'reward/hierarchy/planned_subtask_count',
+        'executed_subtask_count': 'reward/hierarchy/executed_subtask_count',
+        'decomposer_unique_local_result_rate': 'reward/decomposer/unique_local_result_rate',
+        'decomposer_dependency_usage_rate': 'reward/decomposer/dependency_usage_rate',
+        'decomposer_repair_success': 'reward/decomposer/repair_success',
+        'decomposer_plan_parseable_gate': 'reward/decomposer/plan_parseable_gate',
+        'decomposer_local_bonus_raw': 'reward/decomposer/local_bonus_raw',
+        'decomposer_local_bonus': 'reward/decomposer/local_bonus',
+        'selector_assignment_completeness': 'reward/selector/assignment/completeness',
+        'selector_assignment_precision': 'reward/selector/assignment/precision',
+        'selector_assignment_recall': 'reward/selector/assignment/recall',
+        'selector_assignment_final_present': 'reward/selector/assignment/final_present',
+        'selector_assignment_extra_count': 'reward/selector/assignment/extra_count',
+        'selector_assignment_missing_count': 'reward/selector/assignment/missing_count',
+        'selector_assignment_duplicate_count': 'reward/selector/assignment/duplicate_count',
+        'selector_empty_output': 'reward/selector/empty_output_rate',
+        'selector_worker_valid_local_result_rate': 'reward/selector/worker_valid_local_result_rate',
+        'selector_local_bonus_raw': 'reward/selector/local_bonus_raw',
+        'selector_local_bonus': 'reward/selector/local_bonus',
+        'worker_unique_local_result_rate': 'reward/workers/unique_local_result_rate',
+        'worker_downstream_used_rate': 'reward/workers/downstream_used_by_final_rate',
+        'worker_later_worker_used_rate': 'reward/workers/used_by_later_worker_rate',
+        'worker_local_bonus_mean': 'reward/workers/local_bonus_mean',
+        'final_worker_result_usage_rate': 'reward/final/worker_result_usage_rate',
+        'final_consistency_with_worker_results': 'reward/final/consistency_with_worker_results',
+        'final_local_bonus_raw': 'reward/final/local_bonus_raw',
+        'final_local_bonus': 'reward/final/local_bonus',
+    }
+    for source_key, target_key in scalar_aliases.items():
+        _log_tensor_metric(metrics, batch, source_key, target_key)
+
+    agent_roles = batch.meta_info.get('agent_roles', [])
+    for role in agent_roles:
+        reward_key = f'{role}_turn_level_reward'
+        if reward_key not in batch.batch:
+            continue
+        sequence_reward = batch.batch[reward_key].sum(-1)
+        _log_tensor_summary(metrics, sequence_reward, f'reward/roles/{role}/sequence_reward')
+
+    return metrics
+
+
 def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     response_length = batch.batch['responses'].shape[-1]
 
