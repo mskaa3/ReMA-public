@@ -1072,7 +1072,10 @@ class ReMARewardManager:
                 if role == score_role:
                     role_score = effective_score - role_penalty
                 elif role_penalty > 0.0:
-                    role_score = -max(role_penalty, MIN_NEGATIVE_SHAPED_REWARD)
+                    role_score = (
+                        0.0 if float(raw_score) > 0.0
+                        else -max(role_penalty, MIN_NEGATIVE_SHAPED_REWARD)
+                    )
                 else:
                     role_score = effective_score
 
