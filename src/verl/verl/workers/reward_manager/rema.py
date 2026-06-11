@@ -49,7 +49,6 @@ WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
 WORKER_DOWNSTREAM_USED_BONUS = 0.03
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
 FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
-POSITIVE_ROLE_BONUS_MIN_GATE = 0.30
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
 
 
@@ -269,11 +268,26 @@ def _compute_selector_turn_bonus_stats(turn_history, worker_roles):
         subtask.upper()
         for subtask in re.findall(r"\bS\d+\b", selector_output, re.IGNORECASE)
     ]
+    final_present = 1.0 if "final" in selector_output.lower() else 0.0
     if planned_subtasks:
-        assigned_counts = {subtask: assigned_subtasks.count(subtask) for subtask in planned_subtasks}
+        assigned_counts = {
+            subtask: assigned_subtasks.count(subtask)
+            for subtask in planned_subtasks
+        }
         matched_once = sum(1 for count in assigned_counts.values() if count == 1)
-        assignment_completeness = matched_once / len(planned_subtasks)
+        extra_assigned_count = sum(
+            1 for subtask in assigned_subtasks if subtask not in planned_subtasks
+        )
+        precision = (
+            matched_once / len(assigned_subtasks)
+            if assigned_subtasks else 0.0
+        )
+        recall = matched_once / len(planned_subtasks)
+        assignment_completeness = precision * recall * final_present
     else:
+        precision = 0.0
+        recall = 0.0
+        extra_assigned_count = len(assigned_subtasks)
         assignment_completeness = 0.0
 
     worker_metrics = _compute_turn_worker_metrics(turn_history, worker_roles)
@@ -285,7 +299,91 @@ def _compute_selector_turn_bonus_stats(turn_history, worker_roles):
 
     return {
         'assignment_completeness': assignment_completeness,
+        'assignment_precision': precision,
+        'assignment_recall': recall,
+        'assignment_final_present': final_present,
+        'assignment_extra_count': float(extra_assigned_count),
         'worker_valid_local_result_rate': worker_valid_local_result_rate,
+    }
+
+
+def _compute_hierarchy_bonus_gates(turn_history, worker_roles, score_role):
+    decomposer_output = ""
+    active_nonfinal_workers = []
+
+    for msg in turn_history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get('role')
+        content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+        if role == 'decomposer':
+            decomposer_output = content
+            continue
+        if role not in worker_roles or role == score_role:
+            continue
+        assigned_subtasks = msg.get('assigned_subtasks') or []
+        if not assigned_subtasks:
+            continue
+        active_nonfinal_workers.append({
+            'content': content,
+            'has_valid_local_result': bool(_extract_worker_local_result_signature(content)),
+        })
+
+    normalized_decomposer = _normalize_role_output(decomposer_output)
+    has_plan_header = 'plan:' in normalized_decomposer
+    planned_subtasks = {
+        subtask.upper()
+        for subtask in re.findall(r"\bS\d+\b", decomposer_output, re.IGNORECASE)
+    }
+    contains_forbidden_solution_markers = (
+        'boxed' in normalized_decomposer
+        or '[finish]' in normalized_decomposer
+        or 'final answer' in normalized_decomposer
+        or 'final result' in normalized_decomposer
+    )
+    plan_parseable_gate = 1.0 if (
+        has_plan_header
+        and len(planned_subtasks) > 0
+        and not contains_forbidden_solution_markers
+    ) else 0.0
+
+    valid_nonfinal_worker_count = sum(
+        1 for worker in active_nonfinal_workers if worker['has_valid_local_result']
+    )
+    executed_subtasks = set()
+    for msg in turn_history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get('role')
+        if role not in worker_roles or role == score_role:
+            continue
+        assigned_subtasks = [
+            subtask.upper()
+            for subtask in (msg.get('assigned_subtasks') or [])
+            if isinstance(subtask, str)
+        ]
+        if not assigned_subtasks:
+            continue
+        content = msg.get('content') if isinstance(msg.get('content'), str) else ''
+        if not _extract_worker_local_result_signature(content):
+            continue
+        for subtask in assigned_subtasks:
+            if subtask in planned_subtasks:
+                executed_subtasks.add(subtask)
+
+    planned_subtask_count = len(planned_subtasks)
+    executed_subtask_count = len(executed_subtasks)
+    hierarchy_utilization_gate = (
+        executed_subtask_count / planned_subtask_count
+        if planned_subtask_count > 0 else 0.0
+    )
+
+    return {
+        'decomposer_plan_parseable_gate': plan_parseable_gate,
+        'hierarchy_utilization_gate': hierarchy_utilization_gate,
+        'valid_nonfinal_worker_count': valid_nonfinal_worker_count,
+        'planned_subtask_count': planned_subtask_count,
+        'executed_subtask_count': executed_subtask_count,
     }
 
 
@@ -462,10 +560,19 @@ class ReMARewardManager:
         reward_tensor_map['decomposer_unique_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_dependency_usage_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_repair_success'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['decomposer_plan_parseable_gate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['hierarchy_utilization_gate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['valid_nonfinal_worker_count'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['planned_subtask_count'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['executed_subtask_count'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['positive_role_bonus_gate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_assignment_completeness'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_assignment_precision'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_assignment_recall'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_assignment_final_present'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['selector_assignment_extra_count'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_worker_valid_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -538,13 +645,13 @@ class ReMARewardManager:
             role_penalties = {role: 0.0 for role in agent_roles}
             role_bonuses = {role: 0.0 for role in agent_roles}
             active_penalties = []
-            positive_role_bonus_gate = (
-                POSITIVE_ROLE_BONUS_MIN_GATE
-                + (1.0 - POSITIVE_ROLE_BONUS_MIN_GATE) * max(0.0, min(1.0, float(raw_score)))
-            )
+            positive_role_bonus_gate = 1.0 if float(raw_score) > 0.0 else 0.0
             reward_tensor_map['positive_role_bonus_gate'][i_bsz] = positive_role_bonus_gate
 
             if 'decomposer' in agent_roles and turn_histories:
+                hierarchy_bonus_gates = _compute_hierarchy_bonus_gates(
+                    turn_histories[-1], worker_roles, score_role
+                )
                 current_turn_metrics = _compute_turn_worker_metrics(turn_histories[-1], worker_roles)
                 previous_turn_metrics = (
                     _compute_turn_worker_metrics(turn_histories[-2], worker_roles)
@@ -561,10 +668,17 @@ class ReMARewardManager:
                     + DECOMPOSER_DEPENDENCY_USAGE_BONUS * decomposer_dependency_usage_rate
                     + DECOMPOSER_REPAIR_SUCCESS_BONUS * decomposer_repair_success
                 )
+                decomposer_local_bonus *= hierarchy_bonus_gates['decomposer_plan_parseable_gate']
+                decomposer_local_bonus *= hierarchy_bonus_gates['hierarchy_utilization_gate']
                 decomposer_local_bonus *= positive_role_bonus_gate
                 reward_tensor_map['decomposer_unique_local_result_rate'][i_bsz] = decomposer_unique_local_result_rate
                 reward_tensor_map['decomposer_dependency_usage_rate'][i_bsz] = decomposer_dependency_usage_rate
                 reward_tensor_map['decomposer_repair_success'][i_bsz] = decomposer_repair_success
+                reward_tensor_map['decomposer_plan_parseable_gate'][i_bsz] = hierarchy_bonus_gates['decomposer_plan_parseable_gate']
+                reward_tensor_map['hierarchy_utilization_gate'][i_bsz] = hierarchy_bonus_gates['hierarchy_utilization_gate']
+                reward_tensor_map['valid_nonfinal_worker_count'][i_bsz] = hierarchy_bonus_gates['valid_nonfinal_worker_count']
+                reward_tensor_map['planned_subtask_count'][i_bsz] = hierarchy_bonus_gates['planned_subtask_count']
+                reward_tensor_map['executed_subtask_count'][i_bsz] = hierarchy_bonus_gates['executed_subtask_count']
                 reward_tensor_map['decomposer_local_bonus_raw'][i_bsz] = (
                     DECOMPOSER_UNIQUE_LOCAL_RESULT_BONUS * decomposer_unique_local_result_rate
                     + DECOMPOSER_DEPENDENCY_USAGE_BONUS * decomposer_dependency_usage_rate
@@ -574,6 +688,9 @@ class ReMARewardManager:
                 role_bonuses['decomposer'] += decomposer_local_bonus
 
             if 'selector' in agent_roles and turn_histories:
+                hierarchy_bonus_gates = _compute_hierarchy_bonus_gates(
+                    turn_histories[-1], worker_roles, score_role
+                )
                 selector_stats = _compute_selector_turn_bonus_stats(
                     turn_histories[-1], worker_roles
                 )
@@ -581,8 +698,13 @@ class ReMARewardManager:
                     SELECTOR_ASSIGNMENT_COMPLETENESS_BONUS * selector_stats['assignment_completeness']
                     + SELECTOR_WORKER_VALID_LOCAL_RESULT_BONUS * selector_stats['worker_valid_local_result_rate']
                 )
+                selector_local_bonus_raw *= hierarchy_bonus_gates['hierarchy_utilization_gate']
                 selector_local_bonus = selector_local_bonus_raw * positive_role_bonus_gate
                 reward_tensor_map['selector_assignment_completeness'][i_bsz] = selector_stats['assignment_completeness']
+                reward_tensor_map['selector_assignment_precision'][i_bsz] = selector_stats['assignment_precision']
+                reward_tensor_map['selector_assignment_recall'][i_bsz] = selector_stats['assignment_recall']
+                reward_tensor_map['selector_assignment_final_present'][i_bsz] = selector_stats['assignment_final_present']
+                reward_tensor_map['selector_assignment_extra_count'][i_bsz] = selector_stats['assignment_extra_count']
                 reward_tensor_map['selector_worker_valid_local_result_rate'][i_bsz] = selector_stats['worker_valid_local_result_rate']
                 reward_tensor_map['selector_local_bonus_raw'][i_bsz] = selector_local_bonus_raw
                 reward_tensor_map['selector_local_bonus'][i_bsz] = selector_local_bonus
@@ -914,14 +1036,27 @@ class ReMARewardManager:
                         'unique_local_result_rate': float(reward_tensor_map['decomposer_unique_local_result_rate'][i_bsz]),
                         'dependency_usage_rate': float(reward_tensor_map['decomposer_dependency_usage_rate'][i_bsz]),
                         'repair_success': float(reward_tensor_map['decomposer_repair_success'][i_bsz]),
+                        'plan_parseable_gate': float(reward_tensor_map['decomposer_plan_parseable_gate'][i_bsz]),
+                        'hierarchy_utilization_gate': float(reward_tensor_map['hierarchy_utilization_gate'][i_bsz]),
+                        'valid_nonfinal_worker_count': float(reward_tensor_map['valid_nonfinal_worker_count'][i_bsz]),
+                        'planned_subtask_count': float(reward_tensor_map['planned_subtask_count'][i_bsz]),
+                        'executed_subtask_count': float(reward_tensor_map['executed_subtask_count'][i_bsz]),
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
                         'local_bonus_raw': float(reward_tensor_map['decomposer_local_bonus_raw'][i_bsz]),
                         'local_bonus': float(reward_tensor_map['decomposer_local_bonus'][i_bsz]),
                     })
                 if 'selector' in agent_roles:
                     print("[selector_metrics]", {
+                        'hierarchy_utilization_gate': float(reward_tensor_map['hierarchy_utilization_gate'][i_bsz]),
+                        'valid_nonfinal_worker_count': float(reward_tensor_map['valid_nonfinal_worker_count'][i_bsz]),
+                        'planned_subtask_count': float(reward_tensor_map['planned_subtask_count'][i_bsz]),
+                        'executed_subtask_count': float(reward_tensor_map['executed_subtask_count'][i_bsz]),
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
                         'assignment_completeness': float(reward_tensor_map['selector_assignment_completeness'][i_bsz]),
+                        'assignment_precision': float(reward_tensor_map['selector_assignment_precision'][i_bsz]),
+                        'assignment_recall': float(reward_tensor_map['selector_assignment_recall'][i_bsz]),
+                        'assignment_final_present': float(reward_tensor_map['selector_assignment_final_present'][i_bsz]),
+                        'assignment_extra_count': float(reward_tensor_map['selector_assignment_extra_count'][i_bsz]),
                         'worker_valid_local_result_rate': float(reward_tensor_map['selector_worker_valid_local_result_rate'][i_bsz]),
                         'local_bonus_raw': float(reward_tensor_map['selector_local_bonus_raw'][i_bsz]),
                         'local_bonus': float(reward_tensor_map['selector_local_bonus'][i_bsz]),

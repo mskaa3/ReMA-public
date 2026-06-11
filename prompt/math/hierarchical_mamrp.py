@@ -10,6 +10,11 @@ On the first round, decompose the problem into 3 to 5 concrete subtasks.
 
 When previous solutions are available, briefly reflect on what may be wrong, missing, or worth checking, and use that reflection to revise the plan.
 
+When possible, make later subtasks explicitly depend on earlier results.
+For example, if one step computes an intermediate quantity, a later step should
+say that it uses the result of S1 or S2 rather than acting as an unrelated task.
+Each subtask should be concrete and executable by one worker.
+
 Do not solve the problem yourself. Give a plan that workers can execute.
 
 Output in the following format:

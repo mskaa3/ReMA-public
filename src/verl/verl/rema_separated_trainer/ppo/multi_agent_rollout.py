@@ -565,15 +565,17 @@ class MultiAgentRollout:
         subtasks = []
         seen_subtasks = set()
         for line in plan_text.splitlines():
-            match = re.match(r"\s*-\s*(S\d+)\s*[:.)-]\s*(.+?)\s*$", line, re.IGNORECASE)
+            match = re.match(
+                r"\s*(?:[-*]\s*)?(?:\d+\.\s*)?(S\d+)\s*[:.)-]\s*(.+?)\s*$",
+                line,
+                re.IGNORECASE,
+            )
             if match:
                 subtask_id = match.group(1).upper()
                 if subtask_id in seen_subtasks:
                     continue
                 subtasks.append((subtask_id, match.group(2).strip()))
                 seen_subtasks.add(subtask_id)
-        if not subtasks and plan_text.strip():
-            subtasks.append(("S1", plan_text.strip()))
         return subtasks
 
     @staticmethod
@@ -928,7 +930,7 @@ class MultiAgentRollout:
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         question_block = (
                             f"{questions[idx]}\n\n"
-                            if pass_question_to_workers else ""
+                            if pass_question_to_workers and not is_final_stage else ""
                         )
                         work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
