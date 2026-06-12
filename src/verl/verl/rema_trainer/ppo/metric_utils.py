@@ -77,6 +77,7 @@ def compute_reward_diagnostic_metrics(batch: DataProto) -> Dict[str, Any]:
         'worker_local_bonus_mean': 'reward/workers/local_bonus_mean',
         'final_worker_result_usage_rate': 'reward/final/worker_result_usage_rate',
         'final_consistency_with_worker_results': 'reward/final/consistency_with_worker_results',
+        'final_worker_usage_gate': 'reward/final/worker_usage_gate',
         'final_local_bonus_raw': 'reward/final/local_bonus_raw',
         'final_local_bonus': 'reward/final/local_bonus',
     }

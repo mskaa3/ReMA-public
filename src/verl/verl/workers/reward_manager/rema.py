@@ -55,7 +55,6 @@ SELECTOR_MISSING_FINAL_PENALTY = 0.05
 SELECTOR_EMPTY_OUTPUT_PENALTY = 0.10
 WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
 WORKER_DOWNSTREAM_USED_BONUS = 0.03
-WORKER_LATER_WORKER_USED_BONUS = 0.03
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
 FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
@@ -616,6 +615,7 @@ class ReMARewardManager:
         reward_tensor_map['worker_local_bonus_mean'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_worker_result_usage_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_consistency_with_worker_results'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_worker_usage_gate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
         
@@ -682,11 +682,28 @@ class ReMARewardManager:
             active_penalties = []
             positive_role_bonus_gate = 1.0 if float(raw_score) > 0.0 else 0.0
             reward_tensor_map['positive_role_bonus_gate'][i_bsz] = positive_role_bonus_gate
-
-            if 'decomposer' in agent_roles and turn_histories:
+            hierarchy_bonus_gates = None
+            worker_bonus_stats = None
+            final_bonus_stats = None
+            final_worker_usage_gate = 0.0
+            if turn_histories:
                 hierarchy_bonus_gates = _compute_hierarchy_bonus_gates(
                     turn_histories[-1], worker_roles, score_role
                 )
+                worker_bonus_stats = _compute_turn_worker_role_bonus_stats(
+                    turn_histories[-1], worker_roles, score_role
+                )
+                final_bonus_stats = _compute_final_stage_bonus_stats(
+                    turn_histories[-1], worker_roles, score_role
+                )
+                final_worker_usage_gate = (
+                    positive_role_bonus_gate
+                    if final_bonus_stats['worker_result_usage_rate'] > 0.0
+                    else 0.0
+                )
+                reward_tensor_map['final_worker_usage_gate'][i_bsz] = final_worker_usage_gate
+
+            if 'decomposer' in agent_roles and turn_histories:
                 current_turn_metrics = _compute_turn_worker_metrics(turn_histories[-1], worker_roles)
                 previous_turn_metrics = (
                     _compute_turn_worker_metrics(turn_histories[-2], worker_roles)
@@ -705,7 +722,7 @@ class ReMARewardManager:
                 )
                 decomposer_local_bonus *= hierarchy_bonus_gates['decomposer_plan_parseable_gate']
                 decomposer_local_bonus *= hierarchy_bonus_gates['hierarchy_utilization_gate']
-                decomposer_local_bonus *= positive_role_bonus_gate
+                decomposer_local_bonus *= final_worker_usage_gate
                 reward_tensor_map['decomposer_unique_local_result_rate'][i_bsz] = decomposer_unique_local_result_rate
                 reward_tensor_map['decomposer_dependency_usage_rate'][i_bsz] = decomposer_dependency_usage_rate
                 reward_tensor_map['decomposer_repair_success'][i_bsz] = decomposer_repair_success
@@ -723,9 +740,6 @@ class ReMARewardManager:
                 role_bonuses['decomposer'] += decomposer_local_bonus
 
             if 'selector' in agent_roles and turn_histories:
-                hierarchy_bonus_gates = _compute_hierarchy_bonus_gates(
-                    turn_histories[-1], worker_roles, score_role
-                )
                 selector_stats = _compute_selector_turn_bonus_stats(
                     turn_histories[-1], worker_roles
                 )
@@ -734,7 +748,7 @@ class ReMARewardManager:
                     + SELECTOR_WORKER_VALID_LOCAL_RESULT_BONUS * selector_stats['worker_valid_local_result_rate']
                 )
                 selector_local_bonus_raw *= hierarchy_bonus_gates['hierarchy_utilization_gate']
-                selector_local_bonus = selector_local_bonus_raw * positive_role_bonus_gate
+                selector_local_bonus = selector_local_bonus_raw * final_worker_usage_gate
                 reward_tensor_map['selector_assignment_completeness'][i_bsz] = selector_stats['assignment_completeness']
                 reward_tensor_map['selector_assignment_precision'][i_bsz] = selector_stats['assignment_precision']
                 reward_tensor_map['selector_assignment_recall'][i_bsz] = selector_stats['assignment_recall']
@@ -786,9 +800,6 @@ class ReMARewardManager:
                     role_penalties['selector'] += penalty_value
 
             if turn_histories:
-                worker_bonus_stats = _compute_turn_worker_role_bonus_stats(
-                    turn_histories[-1], worker_roles, score_role
-                )
                 reward_tensor_map['worker_unique_local_result_rate'][i_bsz] = worker_bonus_stats['unique_local_result_rate']
                 reward_tensor_map['worker_downstream_used_rate'][i_bsz] = worker_bonus_stats['downstream_used_rate']
                 reward_tensor_map['worker_later_worker_used_rate'][i_bsz] = worker_bonus_stats['later_worker_used_rate']
@@ -799,20 +810,15 @@ class ReMARewardManager:
                             WORKER_UNIQUE_LOCAL_RESULT_BONUS * stats['unique_local_result']
                             + WORKER_DOWNSTREAM_USED_BONUS
                         )
-                    elif stats['later_worker_used'] and stats['unique_local_result']:
-                        worker_bonus = WORKER_LATER_WORKER_USED_BONUS
                     else:
                         worker_bonus = 0.0
-                    worker_bonus *= positive_role_bonus_gate
+                    worker_bonus *= final_worker_usage_gate
                     role_bonuses[role] += worker_bonus
                     worker_bonus_values.append(worker_bonus)
                 if worker_bonus_values:
                     reward_tensor_map['worker_local_bonus_mean'][i_bsz] = sum(worker_bonus_values) / len(worker_bonus_values)
 
             if score_role in agent_roles and turn_histories:
-                final_bonus_stats = _compute_final_stage_bonus_stats(
-                    turn_histories[-1], worker_roles, score_role
-                )
                 final_local_bonus_raw = (
                     FINAL_WORKER_RESULT_USAGE_BONUS * final_bonus_stats['worker_result_usage_rate']
                     + FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS * final_bonus_stats['consistency_with_worker_results']
@@ -1128,6 +1134,7 @@ class ReMARewardManager:
                         'planned_subtask_count': float(reward_tensor_map['planned_subtask_count'][i_bsz]),
                         'executed_subtask_count': float(reward_tensor_map['executed_subtask_count'][i_bsz]),
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'final_worker_usage_gate': float(reward_tensor_map['final_worker_usage_gate'][i_bsz]),
                         'local_bonus_raw': float(reward_tensor_map['decomposer_local_bonus_raw'][i_bsz]),
                         'local_bonus': float(reward_tensor_map['decomposer_local_bonus'][i_bsz]),
                     })
@@ -1138,6 +1145,7 @@ class ReMARewardManager:
                         'planned_subtask_count': float(reward_tensor_map['planned_subtask_count'][i_bsz]),
                         'executed_subtask_count': float(reward_tensor_map['executed_subtask_count'][i_bsz]),
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'final_worker_usage_gate': float(reward_tensor_map['final_worker_usage_gate'][i_bsz]),
                         'assignment_completeness': float(reward_tensor_map['selector_assignment_completeness'][i_bsz]),
                         'assignment_precision': float(reward_tensor_map['selector_assignment_precision'][i_bsz]),
                         'assignment_recall': float(reward_tensor_map['selector_assignment_recall'][i_bsz]),
@@ -1153,6 +1161,7 @@ class ReMARewardManager:
                 if worker_roles:
                     print("[worker_bonus_metrics]", {
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'final_worker_usage_gate': float(reward_tensor_map['final_worker_usage_gate'][i_bsz]),
                         'unique_local_result_rate': float(reward_tensor_map['worker_unique_local_result_rate'][i_bsz]),
                         'downstream_used_rate': float(reward_tensor_map['worker_downstream_used_rate'][i_bsz]),
                         'later_worker_used_rate': float(reward_tensor_map['worker_later_worker_used_rate'][i_bsz]),
@@ -1161,6 +1170,7 @@ class ReMARewardManager:
                 if score_role in agent_roles:
                     print("[final_stage_metrics]", {
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
+                        'final_worker_usage_gate': float(reward_tensor_map['final_worker_usage_gate'][i_bsz]),
                         'worker_result_usage_rate': float(reward_tensor_map['final_worker_result_usage_rate'][i_bsz]),
                         'consistency_with_worker_results': float(reward_tensor_map['final_consistency_with_worker_results'][i_bsz]),
                         'local_bonus_raw': float(reward_tensor_map['final_local_bonus_raw'][i_bsz]),
