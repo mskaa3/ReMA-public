@@ -227,7 +227,7 @@ algorithm:
     enable: True
     max_num_gen_batches: 8
   final_worker_curriculum:
-    enable: True
+    enable: False
     warmup_steps: 200
   switch_agent:
     enable: True

@@ -954,6 +954,11 @@ class MultiAgentRollout:
                                 "- Use the work above to answer the original question."
                             )
                         work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ""
+                        dependency_instruction = (
+                            "Use previous LOCAL_RESULTs from the work above when they are relevant. "
+                            "Do not recompute earlier subtasks unless you need to check an inconsistency.\n\n"
+                            if work_so_far and not is_final_stage else ""
+                        )
                         chat = build_selected_worker_prompt(
                             stage_role,
                             worker_type,
@@ -961,6 +966,7 @@ class MultiAgentRollout:
                             (
                                 f"{question_block}"
                                 f"{work_so_far_block}"
+                                f"{dependency_instruction}"
                                 f"{assigned_subtasks_text}\n\n"
                                 f"{stage_instruction}\n\n"
                             ),
