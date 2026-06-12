@@ -608,6 +608,13 @@ class RayReMASeparatedTrainer(object):
         
         if config.algorithm.filter_groups.enable:
             assert config.actor_rollout_ref.rollout.n > 1
+        final_worker_curriculum = config.algorithm.get('final_worker_curriculum', {})
+        if final_worker_curriculum.get('enable', False):
+            assert self._hierarchy_enabled(), \
+                "algorithm.final_worker_curriculum requires algorithm.hierarchy.enable=True"
+            score_role = self._get_score_role()
+            assert score_role in self._get_train_agent_roles(), \
+                f"score_role={score_role} must be in train_agent_roles for final worker curriculum"
         
         if config.actor_rollout_ref.actor.clip_mode == 'turn':
             assert config.actor_rollout_ref.actor.agg_mode != 'token'
@@ -1137,12 +1144,30 @@ class RayReMASeparatedTrainer(object):
         switch_config = self.config.algorithm.get('switch_agent', {})
         agent_roles = self._get_train_agent_roles()
         start_agent = self._get_start_agent()
+        final_worker_curriculum = self.config.algorithm.get('final_worker_curriculum', {})
+        final_worker_warmup_steps = int(final_worker_curriculum.get('warmup_steps', 0))
+        if (
+            final_worker_curriculum.get('enable', False)
+            and self.global_steps < final_worker_warmup_steps
+        ):
+            score_role = self._get_score_role()
+            self._current_train_agent_idx = agent_roles.index(score_role)
+            if self._current_train_agent != score_role:
+                print(
+                    f'Training curriculum: using final worker {score_role} '
+                    f'until step {final_worker_warmup_steps}'
+                )
+                self._current_train_agent = score_role
+            return
         switch_level = switch_config.get('level', 'step')
         switch_freq = switch_config.get('freq', 1)
+        effective_global_steps = self.global_steps
+        if final_worker_curriculum.get('enable', False):
+            effective_global_steps = max(0, self.global_steps - final_worker_warmup_steps)
         
         # Calculate new agent index based on switch level
         if switch_level == 'step':
-            self._current_train_agent_idx = self.global_steps // switch_freq \
+            self._current_train_agent_idx = effective_global_steps // switch_freq \
                 + agent_roles.index(start_agent)
         elif switch_level == 'epoch':
             if epoch is None:
@@ -1219,6 +1244,8 @@ class RayReMASeparatedTrainer(object):
         total_prompt_cnt = 0 
         all_negative_cnt = 0
         all_positive_cnt = 0
+        mixed_prompt_cnt = 0
+        kept_traj_cnt = 0
 
         for epoch in range(self.config.trainer.total_epochs):
             self._update_current_train_agent(epoch)
@@ -1371,6 +1398,7 @@ class RayReMASeparatedTrainer(object):
                             else:
                                 # keep prompt with none-zero advantages
                                 kept_prompt_uids.append(key_uid)
+                                mixed_prompt_cnt += 1
                             total_prompt_cnt += 1
                     
                     if not self.config.algorithm.filter_groups.enable:
@@ -1384,6 +1412,7 @@ class RayReMASeparatedTrainer(object):
                         for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch['uid']):
                             if traj_from_prompt_uid in kept_prompt_uids:
                                 kept_traj_idxs.append(idx)
+                        kept_traj_cnt += len(kept_traj_idxs)
                         new_batch = new_batch[kept_traj_idxs]
                         if batch is None:
                             batch = new_batch
@@ -1412,8 +1441,14 @@ class RayReMASeparatedTrainer(object):
                         metrics.update({
                             'rollout/all_negative_cnt': all_negative_cnt,
                             'rollout/all_positive_cnt': all_positive_cnt,
+                            'rollout/mixed_prompt_cnt': mixed_prompt_cnt,
+                            'rollout/kept_traj_cnt': kept_traj_cnt,
                             'rollout/total_prompt_cnt': total_prompt_cnt,
                             'rollout/num_gen_batches': num_gen_batches,
+                            'rollout/mixed_prompt_rate': (
+                                mixed_prompt_cnt / total_prompt_cnt
+                                if total_prompt_cnt > 0 else 0.0
+                            ),
                         })
                     metrics.update(compute_reward_diagnostic_metrics(batch))
                     
@@ -1507,7 +1542,15 @@ class RayReMASeparatedTrainer(object):
                             self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
-                metrics.update({'train/current_agent_idx': self._current_train_agent_idx})
+                final_worker_curriculum = self.config.algorithm.get('final_worker_curriculum', {})
+                final_worker_warmup_steps = int(final_worker_curriculum.get('warmup_steps', 0))
+                metrics.update({
+                    'train/current_agent_idx': self._current_train_agent_idx,
+                    'train/final_worker_curriculum_active': float(
+                        final_worker_curriculum.get('enable', False)
+                        and self.global_steps < final_worker_warmup_steps
+                    ),
+                })
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
@@ -1523,6 +1566,8 @@ class RayReMASeparatedTrainer(object):
                 num_gen_batches = 0
                 all_negative_cnt = 0
                 all_positive_cnt = 0
+                mixed_prompt_cnt = 0
+                kept_traj_cnt = 0
                 total_prompt_cnt = 0
 
                 if is_last_step:

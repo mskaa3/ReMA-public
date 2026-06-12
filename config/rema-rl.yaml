@@ -128,7 +128,7 @@ actor_rollout_ref:
     max_num_turns: 3
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     do_sample: True
-    n: 16
+    n: 24
     engine_kwargs:
       vllm:
         swap_space: null
@@ -224,8 +224,11 @@ algorithm:
     horizon: 10000
     target_kl: 0.1
   filter_groups:
-    enable: False
-    max_num_gen_batches: 0
+    enable: True
+    max_num_gen_batches: 8
+  final_worker_curriculum:
+    enable: True
+    warmup_steps: 200
   switch_agent:
     enable: True
     level: step
