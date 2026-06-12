@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=verl-trainer-mn
-#SBATCH --nodes=6
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=72:00:00
