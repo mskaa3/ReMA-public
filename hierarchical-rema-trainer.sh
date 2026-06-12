@@ -835,7 +835,7 @@ upload_epoch_folder_to_s3() {
 
     if [[ -f "${LOCAL_OUTPUT_DIR}/validation_accuracy.csv" ]]; then
         echo "[hierarchical-rema][s3] syncing validation_accuracy.csv -> ${S3_OUTPUT_PATH}/validation_accuracy.csv"
-        if ! rclone copyto "${LOCAL_OUTPUT_DIR}/validation_accuracy.csv" "${S3_OUTPUT_PATH}/validation_accuracy.csv"; then
+        if ! rclone copy "${LOCAL_OUTPUT_DIR}" "${S3_OUTPUT_PATH}" --include "/validation_accuracy.csv"; then
             echo "Warning: failed to sync validation_accuracy.csv" >&2
             upload_status=1
         fi
