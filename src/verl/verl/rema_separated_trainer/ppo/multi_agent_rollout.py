@@ -928,10 +928,12 @@ class MultiAgentRollout:
                         stage_subtasks_by_idx[idx] = assigned_subtasks
                         worker_type_by_idx[idx] = worker_type
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
-                        question_block = (
-                            f"{questions[idx]}\n\n"
-                            if pass_question_to_workers and not is_final_stage else ""
-                        )
+                        if is_final_stage:
+                            question_block = f"Question:\n{questions[idx]}\n\n"
+                        elif pass_question_to_workers:
+                            question_block = f"{questions[idx]}\n\n"
+                        else:
+                            question_block = ""
                         work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
@@ -941,7 +943,11 @@ class MultiAgentRollout:
                             if is_final_stage else
                             "Solve only the step above. "
                             "Do not write [FINISH], \\boxed{}, or Final Answer. "
-                            "Return LOCAL_RESULT and REASONING."
+                            "Output exactly:\n"
+                            "REASONING:\n"
+                            "<brief reasoning for this subtask only>\n\n"
+                            "LOCAL_RESULT:\n"
+                            "<the final result of this subtask only>"
                         )
                         if is_final_stage and not assigned_subtasks_text:
                             assigned_subtasks_text = (
