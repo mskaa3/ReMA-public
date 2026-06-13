@@ -46,6 +46,7 @@ class OfflineTrainingConfig:
     save_final_checkpoint: bool = True
     save_best_checkpoint: bool = False
     save_intermediate_checkpoints: bool = False
+    prune_unselected_checkpoints: bool = False
 
 
 @dataclass
@@ -1065,6 +1066,16 @@ def run_offline_policy_training(
             else "output_dir"
         )
     )
+
+    if is_primary and config.prune_unselected_checkpoints:
+        removable_checkpoint_dirs = []
+        if selected_model_source == "best" and final_checkpoint_path.exists():
+            removable_checkpoint_dirs.append(final_checkpoint_path)
+        elif selected_model_source == "final" and best_checkpoint_path.exists():
+            removable_checkpoint_dirs.append(best_checkpoint_path)
+        for checkpoint_dir in removable_checkpoint_dirs:
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
     summary = {
         "output_dir": str(output_dir),
         "steps": global_step,
@@ -1076,6 +1087,7 @@ def run_offline_policy_training(
         "save_final_checkpoint": config.save_final_checkpoint,
         "save_best_checkpoint": config.save_best_checkpoint,
         "save_intermediate_checkpoints": config.save_intermediate_checkpoints,
+        "prune_unselected_checkpoints": config.prune_unselected_checkpoints,
         "final_checkpoint_path": str(final_checkpoint_path) if final_checkpoint_path.exists() else "",
         "best_checkpoint_path": str(best_checkpoint_path) if best_checkpoint_path.exists() else "",
         "selected_model_path": selected_model_path,

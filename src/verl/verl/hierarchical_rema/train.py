@@ -571,11 +571,21 @@ def _run_distributed_offline_policy_training(
     _ensure_ray_initialized_for_offline_training()
     import ray
 
+    def _cleanup_distributed_training_inputs(*paths: Path) -> None:
+        for path in paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+
     output_dir = Path(config.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_jsonl = write_samples_to_jsonl(train_samples, output_dir / "train_samples.jsonl")
-    val_jsonl = write_samples_to_jsonl(val_samples, output_dir / "val_samples.jsonl") if val_samples else ""
-    config_json = output_dir / "distributed_train_config.json"
+    train_json_path = output_dir / "_offline_grpo_train_samples.jsonl"
+    val_json_path = output_dir / "_offline_grpo_val_samples.jsonl"
+    config_json = output_dir / "_offline_grpo_config.json"
+    train_jsonl = write_samples_to_jsonl(train_samples, train_json_path)
+    val_jsonl = write_samples_to_jsonl(val_samples, val_json_path) if val_samples else ""
     with config_json.open("w", encoding="utf-8") as handle:
         json.dump(asdict(config), handle, indent=2, sort_keys=True)
 
@@ -645,6 +655,10 @@ def _run_distributed_offline_policy_training(
         num_train_samples=len(train_samples),
         num_val_samples=len(val_samples),
     )
+    temp_paths = [train_json_path, config_json]
+    if val_samples:
+        temp_paths.append(val_json_path)
+    _cleanup_distributed_training_inputs(*temp_paths)
     return summary
 
 
@@ -2110,6 +2124,7 @@ def main() -> None:
                         save_final_checkpoint=True,
                         save_best_checkpoint=args.eval_every_steps > 0,
                         save_intermediate_checkpoints=args.checkpoint_mode == "all",
+                        prune_unselected_checkpoints=True,
                     )
                     previous_model_path = current_paths.get(policy_id)
                     if args.offline_grpo_distributed:
