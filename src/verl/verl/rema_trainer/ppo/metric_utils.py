@@ -50,6 +50,7 @@ def compute_reward_diagnostic_metrics(batch: DataProto) -> Dict[str, Any]:
     scalar_aliases = {
         'acc': 'reward/global/acc',
         'positive_role_bonus_gate': 'reward/global/positive_bonus_gate',
+        'upstream_global_correctness_bonus': 'reward/global/upstream_correctness_bonus',
         'hierarchy_utilization_gate': 'reward/hierarchy/utilization_gate',
         'valid_nonfinal_worker_count': 'reward/hierarchy/valid_nonfinal_worker_count',
         'planned_subtask_count': 'reward/hierarchy/planned_subtask_count',

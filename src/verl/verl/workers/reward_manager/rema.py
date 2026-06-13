@@ -27,7 +27,7 @@ from math_verify.errors import TimeoutException
 META_BOXED_PENALTY = 0.25
 WORKER_BOXED_PENALTY = 0.05
 WORKER_FINISH_PENALTY = 0.05
-PLANNER_REPEAT_PENALTY = 0.10
+PLANNER_REPEAT_PENALTY = 0.03
 PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
 PLANNER_SUBTASK_TARGET_MIN = 3
 PLANNER_SUBTASK_TARGET_MAX = 5
@@ -47,8 +47,8 @@ SELECTOR_ASSIGNMENT_COMPLETENESS_BONUS = 0.05
 SELECTOR_WORKER_VALID_LOCAL_RESULT_BONUS = 0.05
 SELECTOR_EXTRA_ASSIGNMENT_PENALTY_PER_TASK = 0.05
 SELECTOR_EXTRA_ASSIGNMENT_MAX_PENALTY = 0.50
-SELECTOR_MISSING_ASSIGNMENT_PENALTY_PER_TASK = 0.05
-SELECTOR_MISSING_ASSIGNMENT_MAX_PENALTY = 0.30
+SELECTOR_MISSING_ASSIGNMENT_PENALTY_PER_TASK = 0.02
+SELECTOR_MISSING_ASSIGNMENT_MAX_PENALTY = 0.15
 SELECTOR_DUPLICATE_ASSIGNMENT_PENALTY_PER_TASK = 0.05
 SELECTOR_DUPLICATE_ASSIGNMENT_MAX_PENALTY = 0.30
 SELECTOR_MISSING_FINAL_PENALTY = 0.05
@@ -57,6 +57,7 @@ WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
 WORKER_DOWNSTREAM_USED_BONUS = 0.03
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
 FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
+UPSTREAM_GLOBAL_CORRECTNESS_BONUS = 0.02
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
 
 
@@ -596,6 +597,7 @@ class ReMARewardManager:
         reward_tensor_map['planned_subtask_count'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['executed_subtask_count'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['positive_role_bonus_gate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['upstream_global_correctness_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['selector_assignment_completeness'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -682,6 +684,15 @@ class ReMARewardManager:
             active_penalties = []
             positive_role_bonus_gate = 1.0 if float(raw_score) > 0.0 else 0.0
             reward_tensor_map['positive_role_bonus_gate'][i_bsz] = positive_role_bonus_gate
+            upstream_global_correctness_bonus = (
+                UPSTREAM_GLOBAL_CORRECTNESS_BONUS * positive_role_bonus_gate
+            )
+            reward_tensor_map['upstream_global_correctness_bonus'][i_bsz] = upstream_global_correctness_bonus
+            for role in agent_roles:
+                if role == score_role:
+                    continue
+                if role in {'decomposer', 'selector'}:
+                    role_bonuses[role] += upstream_global_correctness_bonus
             hierarchy_bonus_gates = None
             worker_bonus_stats = None
             final_bonus_stats = None
@@ -805,16 +816,16 @@ class ReMARewardManager:
                 reward_tensor_map['worker_later_worker_used_rate'][i_bsz] = worker_bonus_stats['later_worker_used_rate']
                 worker_bonus_values = []
                 for role, stats in worker_bonus_stats['per_role'].items():
+                    worker_bonus = upstream_global_correctness_bonus
+                    worker_local_bonus = 0.0
                     if stats['downstream_used']:
-                        worker_bonus = (
+                        worker_local_bonus = (
                             WORKER_UNIQUE_LOCAL_RESULT_BONUS * stats['unique_local_result']
                             + WORKER_DOWNSTREAM_USED_BONUS
                         )
-                    else:
-                        worker_bonus = 0.0
-                    worker_bonus *= final_worker_usage_gate
-                    role_bonuses[role] += worker_bonus
-                    worker_bonus_values.append(worker_bonus)
+                    worker_local_bonus *= final_worker_usage_gate
+                    role_bonuses[role] += worker_bonus + worker_local_bonus
+                    worker_bonus_values.append(worker_local_bonus)
                 if worker_bonus_values:
                     reward_tensor_map['worker_local_bonus_mean'][i_bsz] = sum(worker_bonus_values) / len(worker_bonus_values)
 
@@ -964,7 +975,8 @@ class ReMARewardManager:
             if subtask_count_penalty > 0.0:
                 reward_tensor_map['planner_subtask_count_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['planner_subtask_count_penalty_value'][i_bsz] = subtask_count_penalty
-                active_penalties.append(('planner_subtask_count', subtask_count_penalty, ['decomposer']))
+                # Diagnostic only: this tells us when the planner misses the
+                # preferred task-count band, but it should not dominate solving.
 
             empty_assigned_roles = set()
             missing_local_result_roles = set()
@@ -1058,9 +1070,10 @@ class ReMARewardManager:
             if final_ignores_worker_results:
                 reward_tensor_map['final_ignores_worker_results_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['final_ignores_worker_results_penalty_value'][i_bsz] = FINAL_IGNORES_WORKER_RESULTS_PENALTY
-                active_penalties.append(('final_ignores_worker_results', FINAL_IGNORES_WORKER_RESULTS_PENALTY, [score_role]))
-                if score_role in role_penalties:
-                    role_penalties[score_role] += FINAL_IGNORES_WORKER_RESULTS_PENALTY
+                if float(raw_score) <= 0.0:
+                    active_penalties.append(('final_ignores_worker_results', FINAL_IGNORES_WORKER_RESULTS_PENALTY, [score_role]))
+                    if score_role in role_penalties:
+                        role_penalties[score_role] += FINAL_IGNORES_WORKER_RESULTS_PENALTY
 
             role_shaped_scores = {}
             
