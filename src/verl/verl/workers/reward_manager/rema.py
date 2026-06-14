@@ -113,6 +113,17 @@ def _extract_worker_local_results(text):
     return [result.strip() for result in local_results if result.strip()]
 
 
+def _has_boxed_outside_local_result(text):
+    if not isinstance(text, str):
+        return False
+    for line in text.splitlines():
+        if 'boxed' not in line.lower():
+            continue
+        if not re.match(r"(?i)^\s*LOCAL[_ ]RESULT\s*:", line):
+            return True
+    return False
+
+
 def _is_valid_worker_local_result(text):
     normalized = _normalize_role_output(text)
     return normalized not in {"", "none", "n/a", "na", "null", "unknown"}
@@ -909,7 +920,7 @@ class ReMARewardManager:
                     and msg.get('role') in worker_roles
                     and msg.get('role') != score_role
                     and isinstance(content, str)
-                    and 'boxed' in content.lower()
+                    and _has_boxed_outside_local_result(content)
                     and content != response_str
                 ):
                     worker_boxed_roles.add(msg.get('role'))

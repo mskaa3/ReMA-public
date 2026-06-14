@@ -938,16 +938,18 @@ class MultiAgentRollout:
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
                             "Write the final answer using the work above. "
+                            "When you use a previous LOCAL_RESULT, copy that LOCAL_RESULT value exactly in your solution. "
                             "Include the exact token [FINISH] and put the final answer in \\boxed{}. "
                             "Do not write [FINISH] unless the final answer is present in \\boxed{}."
                             if is_final_stage else
                             "Solve only the step above. "
-                            "Do not write [FINISH], \\boxed{}, or Final Answer. "
+                            "Think through the assigned instruction carefully, including any dependency, warning, or backtracking instruction. "
+                            "Do not write [FINISH] or Final Answer. "
+                            "Use \\boxed{} only in the LOCAL_RESULT line, not in REASONING. "
                             "Output exactly:\n"
                             "REASONING:\n"
                             "<brief reasoning for this subtask only>\n\n"
-                            "LOCAL_RESULT:\n"
-                            "<the final result of this subtask only>"
+                            "LOCAL_RESULT: \\boxed{<the final result of this subtask only>}"
                         )
                         if is_final_stage and not assigned_subtasks_text:
                             assigned_subtasks_text = (

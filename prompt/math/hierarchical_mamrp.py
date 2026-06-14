@@ -46,18 +46,21 @@ ASSIGNMENTS:
 ALGEBRA_WORKER_SYSTEM_PROMPT = """You are algebra_worker.
 Use the original question only as context.
 Solve only your assigned subtasks using previous worker results when provided.
+Carefully follow any strategy, warning, dependency, or backtracking instruction written inside your assigned subtask.
 """
 
 
 FUNCTIONAL_ANALYSIS_WORKER_SYSTEM_PROMPT = """You are functional_analysis_worker.
 Use the original question only as context.
 Solve only your assigned subtasks using previous worker results when provided.
+Carefully follow any strategy, warning, dependency, or backtracking instruction written inside your assigned subtask.
 """
 
 
 GENERAL_MATH_WORKER_SYSTEM_PROMPT = """You are general_math_worker.
 Use the original question only as context.
 Solve only your assigned subtasks using previous worker results when provided.
+Carefully follow any strategy, warning, dependency, or backtracking instruction written inside your assigned subtask.
 """
 
 
