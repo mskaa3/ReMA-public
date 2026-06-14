@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import shutil
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
