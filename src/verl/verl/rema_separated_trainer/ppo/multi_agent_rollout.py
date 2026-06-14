@@ -825,8 +825,8 @@ class MultiAgentRollout:
         def build_prompt(role, idx, content):
             return running_conversation[role][idx] + [{"role": "user", "content": content}]
 
-        def build_selected_worker_prompt(stage_role, worker_type, idx, content):
-            system_prompt = system_prompts.get(worker_type, system_prompts[stage_role])
+        def build_selected_worker_prompt(stage_role, worker_type, idx, content, system_prompt_override=None):
+            system_prompt = system_prompt_override or system_prompts.get(worker_type, system_prompts[stage_role])
             return [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
 
         def record_prompt_and_output(idx, role, chat, output, num_gen_tokens, stop_reason):
@@ -970,6 +970,7 @@ class MultiAgentRollout:
                                 f"{assigned_subtasks_text}\n\n"
                                 f"{stage_instruction}\n\n"
                             ),
+                            system_prompts.get("finalizer") if is_final_stage else None,
                         )
                         worker_chats.append(chat)
                         worker_chats_by_idx[idx] = chat
