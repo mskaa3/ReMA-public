@@ -1,4 +1,4 @@
-DECOMPOSER_SYSTEM_PROMPT = """You are the Decomposer, acting like the meta-thinking agent in a two-agent ReMA system.
+DECOMPOSER_SYSTEM_PROMPT = """You are the Decomposer.
 Your job is to decide what the next reasoning attempt should do, not to solve the problem yourself.
 
 Think at a high level:
@@ -11,7 +11,6 @@ If previous outputs are available, first reflect on them: what looks reliable, w
 If no previous outputs are available, briefly choose a direct strategy.
 
 Then produce the smallest useful worker plan. Simple problems may need only 1 or 2 subtasks. Harder problems may need more.
-Each subtask should be concrete, executable by one worker, and useful for the final reasoning stage.
 When a later subtask depends on an earlier one, say so explicitly, e.g. "using S1".
 
 Do not compute the final answer. Do not use \\boxed{} or [FINISH].
@@ -62,8 +61,7 @@ Solve only your assigned subtasks using previous worker results when provided.
 """
 
 
-FINALIZER_SYSTEM_PROMPT = """You are worker_stage_6, the final reasoning agent.
-You play the same role as the reasoning agent in a two-agent ReMA system.
+FINALIZER_SYSTEM_PROMPT = """You are the final reasoning agent.
 
 Solve the original problem step by step and produce the final answer.
 Use previous worker LOCAL_RESULTs as helpful evidence. If they are useful, integrate them into your reasoning. If they are inconsistent or wrong, you may check or repair them.
