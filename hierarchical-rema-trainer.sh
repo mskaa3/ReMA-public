@@ -841,34 +841,44 @@ upload_epoch_folder_to_s3() {
         fi
     fi
 
-    for policy_dir in "$epoch_dir"/train/*; do
-        [[ -d "$policy_dir" ]] || continue
-        local policy_id
-        policy_id=$(basename "$policy_dir")
-        if [[ -d "$policy_dir/final" ]]; then
-            echo "[hierarchical-rema][s3] syncing best-so-far model ${policy_id} -> ${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"
-            if ! rclone sync "$policy_dir/final" "${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"; then
-                echo "Warning: failed to sync best-so-far model ${policy_id}" >&2
-                upload_status=1
+    local segment_dir=""
+    for segment_dir in "$epoch_dir"/train/segment_*; do
+        [[ -d "$segment_dir" ]] || continue
+        local policy_dir=""
+        for policy_dir in "$segment_dir"/*; do
+            [[ -d "$policy_dir" ]] || continue
+            local policy_id
+            policy_id=$(basename "$policy_dir")
+            if [[ -d "$policy_dir/final" ]]; then
+                echo "[hierarchical-rema][s3] syncing best-so-far model ${policy_id} -> ${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"
+                if ! rclone sync "$policy_dir/final" "${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"; then
+                    echo "Warning: failed to sync best-so-far model ${policy_id}" >&2
+                    upload_status=1
+                fi
             fi
-        fi
-        if [[ -d "$policy_dir/best" ]]; then
-            echo "[hierarchical-rema][s3] syncing best-val model ${policy_id} -> ${S3_BEST_VAL_MODELS_PATH}/${policy_id}"
-            if ! rclone sync "$policy_dir/best" "${S3_BEST_VAL_MODELS_PATH}/${policy_id}"; then
-                echo "Warning: failed to sync best-val model ${policy_id}" >&2
-                upload_status=1
+            if [[ -d "$policy_dir/best" ]]; then
+                echo "[hierarchical-rema][s3] syncing best-val model ${policy_id} -> ${S3_BEST_VAL_MODELS_PATH}/${policy_id}"
+                if ! rclone sync "$policy_dir/best" "${S3_BEST_VAL_MODELS_PATH}/${policy_id}"; then
+                    echo "Warning: failed to sync best-val model ${policy_id}" >&2
+                    upload_status=1
+                fi
             fi
-        fi
+        done
     done
     return "$upload_status"
 }
 
 prune_epoch_local_checkpoints() {
     local epoch_dir="$1"
-    for policy_dir in "$epoch_dir"/train/*; do
-        [[ -d "$policy_dir" ]] || continue
-        rm -rf "$policy_dir"/best 2>/dev/null || true
-        rm -rf "$policy_dir"/checkpoint-* 2>/dev/null || true
+    local segment_dir=""
+    for segment_dir in "$epoch_dir"/train/segment_*; do
+        [[ -d "$segment_dir" ]] || continue
+        local policy_dir=""
+        for policy_dir in "$segment_dir"/*; do
+            [[ -d "$policy_dir" ]] || continue
+            rm -rf "$policy_dir"/best 2>/dev/null || true
+            rm -rf "$policy_dir"/checkpoint-* 2>/dev/null || true
+        done
     done
 }
 
@@ -877,12 +887,16 @@ strip_local_model_artifacts() {
     local epoch_dir=""
     for epoch_dir in "$root_dir"/epoch_*; do
         [[ -d "$epoch_dir" ]] || continue
-        local policy_dir=""
-        for policy_dir in "$epoch_dir"/train/*; do
-            [[ -d "$policy_dir" ]] || continue
-            rm -rf "$policy_dir"/best 2>/dev/null || true
-            rm -rf "$policy_dir"/final 2>/dev/null || true
-            rm -rf "$policy_dir"/checkpoint-* 2>/dev/null || true
+        local segment_dir=""
+        for segment_dir in "$epoch_dir"/train/segment_*; do
+            [[ -d "$segment_dir" ]] || continue
+            local policy_dir=""
+            for policy_dir in "$segment_dir"/*; do
+                [[ -d "$policy_dir" ]] || continue
+                rm -rf "$policy_dir"/best 2>/dev/null || true
+                rm -rf "$policy_dir"/final 2>/dev/null || true
+                rm -rf "$policy_dir"/checkpoint-* 2>/dev/null || true
+            done
         done
     done
 }
@@ -899,15 +913,20 @@ upload_final_models_to_s3() {
     [[ -n "$latest_epoch" ]] || return 0
     [[ -n "${S3_OUTPUT_PATH:-}" ]] || return 0
 
-    for policy_dir in "$latest_epoch"/train/*; do
-        [[ -d "$policy_dir" ]] || continue
-        local policy_id
-        policy_id=$(basename "$policy_dir")
-        if [[ -d "$policy_dir/final" ]]; then
-            echo "[hierarchical-rema][s3] syncing final model ${policy_id} -> ${S3_FINAL_MODELS_PATH}/${policy_id}"
-            rclone sync "$policy_dir/final" "${S3_FINAL_MODELS_PATH}/${policy_id}" || \
-                echo "Warning: failed to sync final model ${policy_id}" >&2
-        fi
+    local segment_dir=""
+    for segment_dir in "$latest_epoch"/train/segment_*; do
+        [[ -d "$segment_dir" ]] || continue
+        local policy_dir=""
+        for policy_dir in "$segment_dir"/*; do
+            [[ -d "$policy_dir" ]] || continue
+            local policy_id
+            policy_id=$(basename "$policy_dir")
+            if [[ -d "$policy_dir/final" ]]; then
+                echo "[hierarchical-rema][s3] syncing final model ${policy_id} -> ${S3_FINAL_MODELS_PATH}/${policy_id}"
+                rclone sync "$policy_dir/final" "${S3_FINAL_MODELS_PATH}/${policy_id}" || \
+                    echo "Warning: failed to sync final model ${policy_id}" >&2
+            fi
+        done
     done
 }
 
@@ -989,6 +1008,9 @@ persist_outputs() {
 
         mkdir -p "$PERSIST_LOCAL_DIR"
         cp -r "$LOCAL_OUTPUT_DIR"/. "$PERSIST_LOCAL_DIR"/ 2>/dev/null || true
+        if [[ "$STRIP_LOCAL_MODELS_AFTER_SYNC" == "1" || "$STRIP_LOCAL_MODELS_AFTER_SYNC" == "true" || "$STRIP_LOCAL_MODELS_AFTER_SYNC" == "True" ]]; then
+            strip_local_model_artifacts "$PERSIST_LOCAL_DIR"
+        fi
     fi
 
     if [[ -n "${TMPDIR:-}" && -d "${TMPDIR:-}" ]]; then
