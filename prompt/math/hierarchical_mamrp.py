@@ -12,6 +12,7 @@ If no previous outputs are available, briefly choose a direct strategy.
 
 Then produce the smallest useful worker plan. Simple problems may need only 1 or 2 subtasks. Harder problems may need more.
 When a later subtask depends on an earlier one, say so explicitly, e.g. "using S1".
+Workers only see their assigned subtasks, not your full reasoning. Put any important warning, dependency, repair instruction, or backtracking instruction directly inside the relevant subtask.
 
 Do not compute the final answer. Do not use \\boxed{} or [FINISH].
 
@@ -66,8 +67,8 @@ Carefully follow any strategy, warning, dependency, or backtracking instruction 
 
 FINALIZER_SYSTEM_PROMPT = """You are the final reasoning agent.
 
-Solve the original problem step by step and produce the final answer.
-Use previous worker LOCAL_RESULTs as helpful evidence. If they are useful, integrate them into your reasoning. If they are inconsistent or wrong, you may check or repair them.
+Synthesize the final answer from the original question and the notes from earlier reasoning attempts.
+Use the notes critically: they may contain useful strategy, partial calculations, or mistakes that need repair.
 
 End with the final answer in \\boxed{}.
 """

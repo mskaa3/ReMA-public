@@ -725,6 +725,21 @@ class MultiAgentRollout:
         ])
 
     @staticmethod
+    def _format_final_notes(decomposer_output: str, worker_outputs: str) -> str:
+        note_parts = [
+            part.strip()
+            for part in (decomposer_output, worker_outputs)
+            if isinstance(part, str) and part.strip()
+        ]
+        if not note_parts:
+            return ""
+        return (
+            "Here are notes from earlier attempts. They may contain useful strategy, "
+            "partial calculations, or mistakes. Use them critically.\n\n"
+            + "\n\n".join(note_parts)
+        )
+
+    @staticmethod
     def _extract_local_result(output: str) -> str:
         if not output:
             return ""
@@ -935,11 +950,15 @@ class MultiAgentRollout:
                         else:
                             question_block = ""
                         work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
+                        if is_final_stage:
+                            work_so_far = self._format_final_notes(
+                                current_plan.get(idx, ""),
+                                work_so_far,
+                            )
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
-                            "Write the final answer using the work above. "
-                            "Use previous LOCAL_RESULTs when they are helpful. "
-                            "End with the final answer in \\boxed{}."
+                            "Synthesize the final answer from the notes and the original question. "
+                            "Check the notes, repair mistakes if needed, and end with the final answer in \\boxed{}."
                             if is_final_stage else
                             "Solve only the step above. "
                             "Think through the assigned instruction carefully, including any dependency, warning, or backtracking instruction. "
