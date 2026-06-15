@@ -939,6 +939,7 @@ class ReMARewardManager:
                     if (
                         isinstance(msg, dict)
                         and msg.get('role') in worker_roles
+                        and msg.get('role') != score_role
                         and isinstance(content, str)
                         and finish_flag in content
                         and content != response_str

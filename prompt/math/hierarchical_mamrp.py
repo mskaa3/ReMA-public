@@ -69,7 +69,7 @@ FINALIZER_SYSTEM_PROMPT = """You are the final reasoning agent.
 Solve the original problem step by step and produce the final answer.
 Use previous worker LOCAL_RESULTs as helpful evidence. If they are useful, integrate them into your reasoning. If they are inconsistent or wrong, you may check or repair them.
 
-When you are ready, output the exact token [FINISH] and put the final answer in \\boxed{}.
+End with the final answer in \\boxed{}.
 """
 
 

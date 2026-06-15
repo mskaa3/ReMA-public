@@ -938,9 +938,8 @@ class MultiAgentRollout:
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
                             "Write the final answer using the work above. "
-                            "When you use a previous LOCAL_RESULT, copy that LOCAL_RESULT value exactly in your solution. "
-                            "Include the exact token [FINISH] and put the final answer in \\boxed{}. "
-                            "Do not write [FINISH] unless the final answer is present in \\boxed{}."
+                            "Use previous LOCAL_RESULTs when they are helpful. "
+                            "End with the final answer in \\boxed{}."
                             if is_final_stage else
                             "Solve only the step above. "
                             "Think through the assigned instruction carefully, including any dependency, warning, or backtracking instruction. "
@@ -994,10 +993,6 @@ class MultiAgentRollout:
                         latest_outputs[idx] = output
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
-                            final_worker_has_answer = "[FINISH]" in output and "\\boxed" in output
-                            if final_worker_has_answer:
-                                finish_flags[idx] = True
-                                finish_reason[idx] = None
                             if self.config.stop_when_truncated and stops[local_idx] == "length":
                                 finish_flags[idx] = True
                                 finish_reason[idx] = "stop_when_truncated"
