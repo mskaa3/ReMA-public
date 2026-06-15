@@ -958,7 +958,24 @@ persist_outputs() {
     if [[ -d "$LOCAL_OUTPUT_DIR" ]]; then
         local s3_upload_succeeded=0
         if [[ -n "${S3_OUTPUT_PATH:-}" ]]; then
-            if rclone copy "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_PATH"; then
+            if [[ "$RUN_KIND" == "train" ]]; then
+                local epoch_dir=""
+                for epoch_dir in "$LOCAL_OUTPUT_DIR"/epoch_*; do
+                    [[ -d "$epoch_dir" ]] || continue
+                    [[ -f "$epoch_dir/epoch_summary.json" ]] || continue
+                    upload_epoch_folder_to_s3 "$epoch_dir" || true
+                done
+                echo "[hierarchical-rema][s3] syncing non-epoch run outputs -> ${S3_OUTPUT_PATH}"
+                if rclone copy \
+                    "$LOCAL_OUTPUT_DIR" \
+                    "$S3_OUTPUT_PATH" \
+                    --exclude "/epoch_*" \
+                    --exclude "/epoch_*/**"; then
+                    s3_upload_succeeded=1
+                else
+                    echo "Warning: failed to upload non-epoch outputs to ${S3_OUTPUT_PATH}" >&2
+                fi
+            elif rclone copy "$LOCAL_OUTPUT_DIR" "$S3_OUTPUT_PATH"; then
                 s3_upload_succeeded=1
             else
                 echo "Warning: failed to upload outputs to ${S3_OUTPUT_PATH}" >&2
