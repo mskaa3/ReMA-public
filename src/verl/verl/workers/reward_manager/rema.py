@@ -58,6 +58,7 @@ WORKER_DOWNSTREAM_USED_BONUS = 0.03
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
 FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
 UPSTREAM_GLOBAL_CORRECTNESS_BONUS = 0.01
+DECOMPOSER_GLOBAL_CORRECTNESS_BONUS = 0.10
 UPSTREAM_HIERARCHICAL_CORRECTNESS_BONUS = 0.02
 MIN_NEGATIVE_SHAPED_REWARD = 1e-6
 
@@ -769,7 +770,8 @@ class ReMARewardManager:
                 )
                 reward_tensor_map['decomposer_local_bonus'][i_bsz] = decomposer_local_bonus
                 decomposer_global_correctness_bonus = (
-                    upstream_global_correctness_bonus
+                    DECOMPOSER_GLOBAL_CORRECTNESS_BONUS
+                    * positive_role_bonus_gate
                     * hierarchy_bonus_gates['decomposer_plan_parseable_gate']
                 )
                 reward_tensor_map['decomposer_global_correctness_bonus'][i_bsz] = (
