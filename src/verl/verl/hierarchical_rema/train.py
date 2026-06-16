@@ -67,6 +67,85 @@ def _checkpoint_path_debug_info(path_str: str, preview_limit: int = 8) -> str:
     return " ".join(info)
 
 
+def _is_missing_local_checkpoint_dir(path_str: str) -> bool:
+    path = Path(path_str).expanduser()
+    return path.is_absolute() and not path.is_dir()
+
+
+def _validation_primary_metric(summary: Dict[str, Any] | None) -> float | None:
+    if not summary:
+        return None
+    value = summary.get("mean_best_final_correctness")
+    if value is None:
+        return None
+    return float(value)
+
+
+def _copy_checkpoint_dir(src: Path, dst: Path) -> None:
+    src = src.expanduser().resolve()
+    dst = dst.expanduser().resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dst = dst.parent / f"{dst.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    if tmp_dst.exists():
+        shutil.rmtree(tmp_dst, ignore_errors=True)
+    shutil.copytree(src, tmp_dst)
+    if dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    tmp_dst.rename(dst)
+
+
+def _best_model_snapshot_sources(current_paths: Dict[str, str]) -> Dict[str, str]:
+    snapshot_sources: Dict[str, str] = {}
+    shared_controller_path = str(current_paths.get("shared_controller") or "").strip()
+    shared_worker_path = str(current_paths.get("shared_worker") or "").strip()
+    decomposer_path = str(current_paths.get("decomposer_controller") or "").strip()
+    selector_path = str(current_paths.get("selector_controller") or "").strip()
+
+    if shared_controller_path:
+        snapshot_sources["shared_controller"] = shared_controller_path
+    if decomposer_path and decomposer_path != shared_controller_path:
+        snapshot_sources["decomposer_controller"] = decomposer_path
+    if selector_path and selector_path != shared_controller_path and selector_path != decomposer_path:
+        snapshot_sources["selector_controller"] = selector_path
+    if shared_worker_path:
+        snapshot_sources["shared_worker"] = shared_worker_path
+    return snapshot_sources
+
+
+def _refresh_best_model_snapshots(
+    current_paths: Dict[str, str],
+    snapshot_root: Path,
+    *,
+    metric_name: str,
+    metric_value: float,
+    epoch_number: int,
+) -> Dict[str, Any]:
+    snapshot_root = snapshot_root.expanduser().resolve()
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    copied: Dict[str, str] = {}
+    skipped: Dict[str, str] = {}
+    for policy_id, model_path in _best_model_snapshot_sources(current_paths).items():
+        source_path = Path(model_path).expanduser()
+        if not source_path.is_dir():
+            skipped[policy_id] = model_path
+            continue
+        destination = snapshot_root / policy_id
+        _copy_checkpoint_dir(source_path, destination)
+        copied[policy_id] = str(destination)
+
+    metadata = {
+        "epoch": epoch_number,
+        "metric_name": metric_name,
+        "metric_value": float(metric_value),
+        "copied_models": copied,
+        "skipped_models": skipped,
+        "source_paths": _best_model_snapshot_sources(current_paths),
+    }
+    with (snapshot_root / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+    return metadata
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Integrated hierarchical ReMA training: tasks -> rollouts -> GRPO update")
     parser.add_argument("--task-source", default="demo", help="Task dataset path or the special value 'demo'")
@@ -138,6 +217,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decomposer-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--selector-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--worker-base-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument(
+        "--shared-runtime-model-root",
+        default="",
+        help=(
+            "Optional shared filesystem root for mirrored active checkpoints. "
+            "When set, selected checkpoints are copied here and the mirrored path "
+            "is used for subsequent rollouts."
+        ),
+    )
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
     parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
@@ -1824,8 +1912,12 @@ def main() -> None:
         "num_loaded_tasks": len(tasks),
         "num_loaded_val_tasks": len(val_tasks),
         "num_epochs": args.num_epochs,
+        "best_model_root": str((output_dir / "best_models").resolve()),
         "epochs": [],
     }
+    best_validation_metric_name = "mean_best_final_correctness"
+    best_validation_metric_so_far: float | None = None
+    best_validation_epoch: int | None = None
 
     print(
         f"[hierarchical-rema][integrated] loaded_tasks={len(tasks)} "
@@ -2165,9 +2257,14 @@ def main() -> None:
                         experiment_name=experiment_name,
                         enable_wandb=False,
                         save_final_checkpoint=True,
-                        save_best_checkpoint=args.eval_every_steps > 0,
+                        save_best_checkpoint=False,
                         save_intermediate_checkpoints=args.checkpoint_mode == "all",
-                        prune_unselected_checkpoints=True,
+                        prune_unselected_checkpoints=False,
+                        selected_checkpoint_mirror_dir=(
+                            str((Path(args.shared_runtime_model_root) / policy_id).expanduser())
+                            if args.shared_runtime_model_root
+                            else ""
+                        ),
                     )
                     previous_model_path = current_paths.get(policy_id)
                     if args.offline_grpo_distributed:
@@ -2211,6 +2308,25 @@ def main() -> None:
                         f"selected_model_source={selected_model_source} "
                         f"{_checkpoint_path_debug_info(selected_model_path)}"
                     )
+                    if _is_missing_local_checkpoint_dir(selected_model_path):
+                        fallback_model_path = ""
+                        fallback_source = ""
+                        if not _is_missing_local_checkpoint_dir(final_model_path):
+                            fallback_model_path = final_model_path
+                            fallback_source = "final_fallback"
+                        elif previous_model_path:
+                            fallback_model_path = previous_model_path
+                            fallback_source = "previous_model_fallback"
+                        if fallback_model_path:
+                            print(
+                                f"[hierarchical-rema][integrated][checkpoint_fallback] "
+                                f"policy={policy_id} segment={segment_index} "
+                                f"missing_selected_checkpoint={selected_model_path} "
+                                f"fallback_source={fallback_source} "
+                                f"{_checkpoint_path_debug_info(fallback_model_path)}"
+                            )
+                            selected_model_path = str(fallback_model_path)
+                            selected_model_source = fallback_source
                     _update_current_paths(current_paths, policy_id, selected_model_path)
                     if args.prune_stale_policy_models and previous_model_path and previous_model_path != selected_model_path:
                         previous_policy_root = Path(previous_model_path).expanduser().resolve().parent
@@ -2324,6 +2440,30 @@ def main() -> None:
                 f"interval={args.external_validation_every_n_epochs}"
             )
 
+        epoch_validation_metric = _validation_primary_metric(validation_summary)
+        best_validation_improved = False
+        best_model_snapshot: Dict[str, Any] | None = None
+        if epoch_validation_metric is not None and (
+            best_validation_metric_so_far is None
+            or epoch_validation_metric > best_validation_metric_so_far
+        ):
+            best_validation_metric_so_far = epoch_validation_metric
+            best_validation_epoch = epoch_number
+            best_validation_improved = True
+            best_model_snapshot = _refresh_best_model_snapshots(
+                current_paths=current_paths,
+                snapshot_root=output_dir / "best_models",
+                metric_name=best_validation_metric_name,
+                metric_value=epoch_validation_metric,
+                epoch_number=epoch_number,
+            )
+            print(
+                f"[hierarchical-rema][best-model] epoch={epoch_number} "
+                f"metric_name={best_validation_metric_name} "
+                f"metric_value={epoch_validation_metric:.6f} "
+                f"snapshot_root={output_dir / 'best_models'}"
+            )
+
         epoch_summary = {
             "epoch": epoch_number,
             "schedule": {
@@ -2336,6 +2476,14 @@ def main() -> None:
             "training_summaries": training_summaries,
             "validation_summary": validation_summary,
             "external_validation_ran": should_run_external_validation,
+            "best_validation_tracker": {
+                "metric_name": best_validation_metric_name,
+                "metric_value": epoch_validation_metric,
+                "improved": best_validation_improved,
+                "best_so_far": best_validation_metric_so_far,
+                "best_epoch": best_validation_epoch,
+                "snapshot": best_model_snapshot or {},
+            },
             "current_policy_paths": dict(current_paths),
         }
         if training_skipped_messages:
@@ -2343,6 +2491,7 @@ def main() -> None:
         with (epoch_dir / "epoch_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(epoch_summary, handle, indent=2, sort_keys=True)
         job_summary["epochs"].append(epoch_summary)
+        job_summary["best_validation_tracker"] = epoch_summary["best_validation_tracker"]
 
         if args.mode == "alternating":
             current_phase = next_phase(current_phase)

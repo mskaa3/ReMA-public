@@ -296,7 +296,7 @@ def main() -> None:
             project_name=args.project_name,
             experiment_name=experiment_name,
             enable_wandb=args.enable_wandb,
-            save_best_checkpoint=args.eval_every_steps > 0,
+            save_best_checkpoint=False,
         )
         summaries[policy_id] = run_offline_policy_training(
             train_samples=split["train"],

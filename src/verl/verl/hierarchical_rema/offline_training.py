@@ -6,6 +6,7 @@ import math
 import os
 import random
 import shutil
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -48,6 +49,7 @@ class OfflineTrainingConfig:
     save_best_checkpoint: bool = False
     save_intermediate_checkpoints: bool = False
     prune_unselected_checkpoints: bool = False
+    selected_checkpoint_mirror_dir: str = ""
 
 
 @dataclass
@@ -121,6 +123,18 @@ def _resolve_dtype(torch, dtype_name: str):
     if dtype_name == "auto":
         return "auto"
     return getattr(torch, dtype_name)
+
+
+def _mirror_checkpoint_dir(src: Path, dst: Path) -> None:
+    dst = dst.expanduser().resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dst = dst.parent / f"{dst.name}.tmp-{uuid.uuid4().hex[:8]}"
+    if tmp_dst.exists():
+        shutil.rmtree(tmp_dst, ignore_errors=True)
+    shutil.copytree(src, tmp_dst)
+    if dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    tmp_dst.rename(dst)
 
 
 def _set_random_seeds(seed: int) -> None:
@@ -1050,20 +1064,20 @@ def run_offline_policy_training(
     final_checkpoint_path = output_dir / "final"
     best_checkpoint_path = output_dir / "best"
     selected_model_path = (
-        str(best_checkpoint_path)
-        if config.save_best_checkpoint and best_checkpoint_path.exists()
+        str(final_checkpoint_path)
+        if config.save_final_checkpoint and final_checkpoint_path.exists()
         else (
-            str(final_checkpoint_path)
-            if config.save_final_checkpoint and final_checkpoint_path.exists()
+            str(best_checkpoint_path)
+            if config.save_best_checkpoint and best_checkpoint_path.exists()
             else str(output_dir)
         )
     )
     selected_model_source = (
-        "best"
-        if config.save_best_checkpoint and best_checkpoint_path.exists()
+        "final"
+        if config.save_final_checkpoint and final_checkpoint_path.exists()
         else (
-            "final"
-            if config.save_final_checkpoint and final_checkpoint_path.exists()
+            "best"
+            if config.save_best_checkpoint and best_checkpoint_path.exists()
             else "output_dir"
         )
     )
@@ -1076,6 +1090,15 @@ def run_offline_policy_training(
             removable_checkpoint_dirs.append(best_checkpoint_path)
         for checkpoint_dir in removable_checkpoint_dirs:
             shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+    mirrored_selected_model_path = ""
+    mirror_dir = (config.selected_checkpoint_mirror_dir or "").strip()
+    if is_primary and mirror_dir and Path(selected_model_path).is_dir():
+        mirror_path = Path(mirror_dir)
+        _mirror_checkpoint_dir(Path(selected_model_path), mirror_path)
+        mirrored_selected_model_path = str(mirror_path.expanduser().resolve())
+        selected_model_path = mirrored_selected_model_path
+        selected_model_source = f"{selected_model_source}_mirrored"
 
     summary = {
         "output_dir": str(output_dir),
@@ -1093,6 +1116,7 @@ def run_offline_policy_training(
         "best_checkpoint_path": str(best_checkpoint_path) if best_checkpoint_path.exists() else "",
         "selected_model_path": selected_model_path,
         "selected_model_source": selected_model_source,
+        "mirrored_selected_model_path": mirrored_selected_model_path,
         "best_val_loss": best_val_loss,
         "best_val_step": best_val_step,
         **_count_parameters(model),
@@ -1179,7 +1203,11 @@ def evaluate_controller_model(
 
 
 def _save_model_checkpoint(model, tokenizer, output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output_dir = output_dir.parent / f"{output_dir.name}.tmp-{uuid.uuid4().hex[:8]}"
+    if tmp_output_dir.exists():
+        shutil.rmtree(tmp_output_dir, ignore_errors=True)
     base_model = model.module if hasattr(model, "module") else model
     original_use_cache = getattr(base_model.config, "use_cache", None)
     generation_config = getattr(base_model, "generation_config", None)
@@ -1194,13 +1222,18 @@ def _save_model_checkpoint(model, tokenizer, output_dir: Path) -> None:
             base_model.config.use_cache = True
         if generation_config is not None and original_generation_use_cache is not None:
             generation_config.use_cache = True
-        base_model.save_pretrained(output_dir)
-        tokenizer.save_pretrained(output_dir)
+        base_model.save_pretrained(tmp_output_dir)
+        tokenizer.save_pretrained(tmp_output_dir)
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        tmp_output_dir.rename(output_dir)
     finally:
         if original_use_cache is not None:
             base_model.config.use_cache = original_use_cache
         if generation_config is not None and original_generation_use_cache is not None:
             generation_config.use_cache = original_generation_use_cache
+        if tmp_output_dir.exists():
+            shutil.rmtree(tmp_output_dir, ignore_errors=True)
 
 
 def _parse_cli_args() -> argparse.Namespace:
