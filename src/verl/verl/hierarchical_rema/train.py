@@ -627,16 +627,36 @@ def _run_distributed_offline_policy_training(
         max_restarts=0,
         runtime_env=_offline_training_ray_runtime_env(),
     )(RayOfflineGRPOWorker)
-    workers = [
-        worker_cls.options(scheduling_strategy="SPREAD").remote()
-        for _ in range(world_size)
-    ]
+    try:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    except Exception:
+        NodeAffinitySchedulingStrategy = None
+
+    driver_node_id = None
+    try:
+        driver_node_id = ray.get_runtime_context().get_node_id()
+    except Exception:
+        driver_node_id = None
+
+    workers = []
+    for rank in range(world_size):
+        if rank == 0 and driver_node_id and NodeAffinitySchedulingStrategy is not None:
+            worker = worker_cls.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=driver_node_id,
+                    soft=False,
+                )
+            ).remote()
+        else:
+            worker = worker_cls.options(scheduling_strategy="SPREAD").remote()
+        workers.append(worker)
     master_addr = ray.get(workers[0].get_node_ip.remote())
     print(
         f"[hierarchical-rema][grpo] launching distributed offline learner "
         f"nnodes={nnodes} gpus_per_node={gpus_per_node} world_size={world_size} "
         f"policy_output_dir={output_dir} backend=ray master_addr={master_addr} "
-        f"cluster_gpu={cluster_gpus:.0f}"
+        f"cluster_gpu={cluster_gpus:.0f} "
+        f"driver_node_id={driver_node_id or '<unknown>'}"
     )
     try:
         results = ray.get(
