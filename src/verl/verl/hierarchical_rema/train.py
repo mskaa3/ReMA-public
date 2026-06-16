@@ -44,6 +44,29 @@ from .schema import (
 )
 
 
+def _checkpoint_path_debug_info(path_str: str, preview_limit: int = 8) -> str:
+    path = Path(path_str).expanduser()
+    exists = path.exists()
+    is_dir = path.is_dir()
+    preview: List[str] = []
+    preview_error = ""
+    if exists and is_dir:
+        try:
+            preview = sorted(child.name for child in path.iterdir())[:preview_limit]
+        except Exception as exc:
+            preview_error = str(exc)
+    info = [
+        f"path={path}",
+        f"exists={exists}",
+        f"is_dir={is_dir}",
+    ]
+    if preview:
+        info.append(f"entries={preview}")
+    if preview_error:
+        info.append(f"preview_error={preview_error}")
+    return " ".join(info)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Integrated hierarchical ReMA training: tasks -> rollouts -> GRPO update")
     parser.add_argument("--task-source", default="demo", help="Task dataset path or the special value 'demo'")
@@ -2162,6 +2185,12 @@ def main() -> None:
                     final_model_path = str(policy_dir / "final")
                     selected_model_path = str(summary.get("selected_model_path") or final_model_path)
                     selected_model_source = str(summary.get("selected_model_source") or "final")
+                    print(
+                        f"[hierarchical-rema][integrated][checkpoint] "
+                        f"policy={policy_id} segment={segment_index} "
+                        f"selected_model_source={selected_model_source} "
+                        f"{_checkpoint_path_debug_info(selected_model_path)}"
+                    )
                     _update_current_paths(current_paths, policy_id, selected_model_path)
                     if args.prune_stale_policy_models and previous_model_path and previous_model_path != selected_model_path:
                         previous_policy_root = Path(previous_model_path).expanduser().resolve().parent

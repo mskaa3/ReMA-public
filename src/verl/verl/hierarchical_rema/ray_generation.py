@@ -35,6 +35,29 @@ class _RayBundle:
     resource_pool: object
 
 
+def _path_debug_info(path_str: str, preview_limit: int = 8) -> str:
+    path = Path(path_str).expanduser()
+    exists = path.exists()
+    is_dir = path.is_dir()
+    preview: List[str] = []
+    preview_error = ""
+    if exists and is_dir:
+        try:
+            preview = sorted(child.name for child in path.iterdir())[:preview_limit]
+        except Exception as exc:
+            preview_error = str(exc)
+    info = [
+        f"path={path}",
+        f"exists={exists}",
+        f"is_dir={is_dir}",
+    ]
+    if preview:
+        info.append(f"entries={preview}")
+    if preview_error:
+        info.append(f"preview_error={preview_error}")
+    return " ".join(info)
+
+
 def build_vllm_rollout_config_dict(
     *,
     model_path: str,
@@ -329,6 +352,17 @@ class RayVLLMGenerationManager:
             from workers.fsdp_workers import ActorRolloutRefWorker
 
         local_model_path = copy_to_local(key.model_path)
+        print(
+            f"[hierarchical-rema][ray-generation] event=bundle_model_path "
+            f"remote={key.model_path} local={local_model_path} "
+            f"{_path_debug_info(local_model_path)}"
+        )
+        local_model_dir = Path(local_model_path).expanduser()
+        if local_model_dir.is_absolute() and (not local_model_dir.exists() or not local_model_dir.is_dir()):
+            raise FileNotFoundError(
+                "Ray bundle model path is not a readable local checkpoint directory: "
+                f"{_path_debug_info(local_model_path)}"
+            )
         tokenizer = hf_tokenizer(
             local_model_path,
             trust_remote_code=self.config.trust_remote_code,
