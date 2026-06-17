@@ -244,7 +244,11 @@ algorithm:
     num_worker_stages: 6
     start_agent: decomposer
     default_worker: general_math_worker
-    pass_question_to_workers: True
+    # Setting B: non-final workers see only their assigned subtask, the
+    # decomposer-provided context inside it, and previous LOCAL_RESULTs.
+    # The final stage still sees the original question for answer synthesis.
+    worker_context_mode: subtask_context
+    pass_question_to_workers: False
     worker_specs:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning

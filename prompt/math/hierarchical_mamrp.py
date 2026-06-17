@@ -12,7 +12,8 @@ If no previous outputs are available, briefly choose a direct strategy.
 
 Then produce the smallest useful worker plan. Simple problems may need only 1 or 2 subtasks. Harder problems may need more.
 When a later subtask depends on an earlier one, say so explicitly, e.g. "using S1".
-Workers only see their assigned subtasks, not your full reasoning. Put any important warning, dependency, repair instruction, or backtracking instruction directly inside the relevant subtask.
+Workers only see their assigned subtasks and previous worker results, not your full reasoning. In some runs, non-final workers may not see the original question.
+Put all context needed to solve each subtask directly inside that subtask: relevant quantities, definitions, constraints, warnings, dependencies, repair instructions, and what output is expected.
 
 Do not compute the final answer. Do not use \\boxed{} or [FINISH].
 
@@ -45,21 +46,21 @@ ASSIGNMENTS:
 
 
 ALGEBRA_WORKER_SYSTEM_PROMPT = """You are algebra_worker.
-Use the original question only as context.
+Use only the provided context. If the original question is shown, treat it as context; otherwise rely on your assigned subtask and previous worker results.
 Solve only your assigned subtasks using previous worker results when provided.
 Carefully follow any strategy, warning, dependency, or backtracking instruction written inside your assigned subtask.
 """
 
 
 FUNCTIONAL_ANALYSIS_WORKER_SYSTEM_PROMPT = """You are functional_analysis_worker.
-Use the original question only as context.
+Use only the provided context. If the original question is shown, treat it as context; otherwise rely on your assigned subtask and previous worker results.
 Solve only your assigned subtasks using previous worker results when provided.
 Carefully follow any strategy, warning, dependency, or backtracking instruction written inside your assigned subtask.
 """
 
 
 GENERAL_MATH_WORKER_SYSTEM_PROMPT = """You are general_math_worker.
-Use the original question only as context.
+Use only the provided context. If the original question is shown, treat it as context; otherwise rely on your assigned subtask and previous worker results.
 Solve only your assigned subtasks using previous worker results when provided.
 Carefully follow any strategy, warning, dependency, or backtracking instruction written inside your assigned subtask.
 """

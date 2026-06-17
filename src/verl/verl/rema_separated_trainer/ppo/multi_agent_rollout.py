@@ -815,6 +815,15 @@ class MultiAgentRollout:
         default_worker = hierarchy_config.get("default_worker", worker_types[-1] if worker_types else selector_role)
         worker_specs = hierarchy_config.get("worker_specs", {})
         pass_question_to_workers = hierarchy_config.get("pass_question_to_workers", False)
+        worker_context_mode = hierarchy_config.get(
+            "worker_context_mode",
+            "full_question" if pass_question_to_workers else "subtask_context",
+        )
+        pass_question_to_workers = worker_context_mode in {
+            "full_question",
+            "question",
+            "full",
+        }
         worker_spec_text = self._format_worker_specs(worker_specs, worker_types)
 
         conversation_history = {
@@ -948,7 +957,11 @@ class MultiAgentRollout:
                         elif pass_question_to_workers:
                             question_block = f"{questions[idx]}\n\n"
                         else:
-                            question_block = ""
+                            question_block = (
+                                "You do not see the full original question. "
+                                "Use the assigned subtask as your task context; it should contain the needed facts. "
+                                "Use previous LOCAL_RESULTs when provided.\n\n"
+                            )
                         work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         if is_final_stage:
                             work_so_far = self._format_final_notes(
