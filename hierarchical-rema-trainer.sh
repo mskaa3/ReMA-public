@@ -261,11 +261,12 @@ RAY_STOP_TIMEOUT_SECONDS=${RAY_STOP_TIMEOUT_SECONDS:-60}
 # Usually leave alone: runtime paths / artifact plumbing.
 LOCAL_VERL_DIR=${LOCAL_VERL_DIR:-$TMPDIR/verl}
 LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH:-$TMPDIR/verl-rema-v3.sif}
-DEFAULT_RAY_TMP_BASE=${TMPDIR_LOCAL:-${TMPDIR:-/tmp/${USER:-user}}}
-if [[ "${SLURM_NNODES:-1}" -gt 1 && -n "${TMPDIR_LUSTRE:-}" ]]; then
-    DEFAULT_RAY_TMP_BASE="$TMPDIR_LUSTRE"
-fi
+DEFAULT_RAY_TMP_BASE=${TMPDIR_LOCAL:-/tmp/${USER:-user}}
 RAY_LOCAL_TMPDIR=${RAY_LOCAL_TMPDIR:-$DEFAULT_RAY_TMP_BASE/ray_${JOB_ID}}
+
+if [[ "${SLURM_NNODES:-1}" -gt 1 && -z "${TMPDIR_LOCAL:-}" ]]; then
+    echo "[hierarchical-rema][ray] warning multi-node job has no TMPDIR_LOCAL; Ray temp will use /tmp. Consider requesting local storage via SLURM GRES." >&2
+fi
 
 S3_EPOCHS_PATH=${S3_EPOCHS_PATH:-${S3_OUTPUT_PATH}/epochs}
 S3_BEST_SO_FAR_MODELS_PATH=${S3_BEST_SO_FAR_MODELS_PATH:-${S3_OUTPUT_PATH}/best_so_far_models}
