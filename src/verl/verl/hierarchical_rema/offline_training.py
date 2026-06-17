@@ -243,6 +243,17 @@ def _distributed_barrier(context: DistributedTrainingContext, device) -> None:
         dist.barrier()
 
 
+def _distributed_any_true(flag: bool, device, context: DistributedTrainingContext) -> bool:
+    if not context.enabled:
+        return bool(flag)
+    torch = _lazy_torch()
+    import torch.distributed as dist
+
+    tensor = torch.tensor(1 if flag else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return bool(tensor.item())
+
+
 def _load_scheduler_factory():
     _ensure_repo_root_on_path()
     try:
@@ -801,7 +812,8 @@ def run_offline_policy_training(
             print(f"[hierarchical-rema][grpo] epoch {epoch + 1}/{config.epochs}")
         for batch_idx, batch in enumerate(train_loader):
             valid_row_mask = batch["loss_mask"][:, :-1].sum(dim=1) > 0
-            if not bool(valid_row_mask.any().item()):
+            local_has_valid_rows = bool(valid_row_mask.any().item())
+            if _distributed_any_true(not local_has_valid_rows, device, distributed_context):
                 skipped_empty_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
@@ -814,6 +826,17 @@ def run_offline_policy_training(
                 continue
             if not bool(valid_row_mask.all().item()):
                 batch = _filter_batch_rows(batch, valid_row_mask)
+                if _distributed_any_true(len(batch["sample_index"]) == 0, device, distributed_context):
+                    skipped_empty_batches += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    step_selector_format_counts = _empty_selector_format_counts()
+                    step_role_reward_stats = _empty_role_reward_stats()
+                    if is_primary:
+                        print(
+                            f"[hierarchical-rema][grpo] skipping locally-empty filtered batch "
+                            f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                        )
+                    continue
                 skipped_empty_batches += 1
 
             input_ids = batch["input_ids"].to(device)
@@ -827,7 +850,7 @@ def run_offline_policy_training(
                 position_ids=position_ids,
                 use_cache=False,
             )
-            if not _all_finite(outputs.logits):
+            if _distributed_any_true(not _all_finite(outputs.logits), device, distributed_context):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
@@ -847,7 +870,11 @@ def run_offline_policy_training(
                 dtype=token_log_probs.dtype,
             )
             advantages = batch["advantage"].to(device).unsqueeze(-1).expand_as(token_log_probs)
-            if not _all_finite(token_log_probs, old_log_probs, advantages, loss_mask):
+            if _distributed_any_true(
+                not _all_finite(token_log_probs, old_log_probs, advantages, loss_mask),
+                device,
+                distributed_context,
+            ):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
@@ -868,7 +895,11 @@ def run_offline_policy_training(
             )
             entropy = core_algos.compute_entropy_loss(outputs.logits[:, :-1, :], loss_mask)
             loss = pg_loss - config.entropy_coeff * entropy
-            if not _all_finite(pg_loss, clipfrac, approx_kl, clipfrac_lower, entropy, loss):
+            if _distributed_any_true(
+                not _all_finite(pg_loss, clipfrac, approx_kl, clipfrac_lower, entropy, loss),
+                device,
+                distributed_context,
+            ):
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
