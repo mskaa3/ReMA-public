@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import random
@@ -660,6 +661,16 @@ def _offline_training_alloc_conf() -> str | None:
     return stripped or None
 
 
+def _distributed_offline_input_dir(output_dir: Path, config: OfflineTrainingConfig) -> Path:
+    mirror_dir = (config.selected_checkpoint_mirror_dir or "").strip()
+    if not mirror_dir:
+        return output_dir
+    resolved_mirror_dir = Path(mirror_dir).expanduser().resolve()
+    shared_job_root = resolved_mirror_dir.parent.parent
+    output_digest = hashlib.sha1(str(output_dir).encode("utf-8")).hexdigest()[:10]
+    return shared_job_root / "_distributed_offline_grpo" / f"{output_dir.name}-{output_digest}"
+
+
 def _ensure_ray_initialized_for_offline_training() -> None:
     import ray
 
@@ -700,9 +711,11 @@ def _run_distributed_offline_policy_training(
 
     output_dir = Path(config.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_json_path = output_dir / "_offline_grpo_train_samples.jsonl"
-    val_json_path = output_dir / "_offline_grpo_val_samples.jsonl"
-    config_json = output_dir / "_offline_grpo_config.json"
+    distributed_input_dir = _distributed_offline_input_dir(output_dir, config)
+    distributed_input_dir.mkdir(parents=True, exist_ok=True)
+    train_json_path = distributed_input_dir / "_offline_grpo_train_samples.jsonl"
+    val_json_path = distributed_input_dir / "_offline_grpo_val_samples.jsonl"
+    config_json = distributed_input_dir / "_offline_grpo_config.json"
     train_jsonl = write_samples_to_jsonl(train_samples, train_json_path)
     val_jsonl = write_samples_to_jsonl(val_samples, val_json_path) if val_samples else ""
     with config_json.open("w", encoding="utf-8") as handle:
@@ -751,6 +764,7 @@ def _run_distributed_offline_policy_training(
         f"[hierarchical-rema][grpo] launching distributed offline learner "
         f"nnodes={nnodes} gpus_per_node={gpus_per_node} world_size={world_size} "
         f"policy_output_dir={output_dir} backend=ray master_addr={master_addr} "
+        f"shared_input_dir={distributed_input_dir} "
         f"cluster_gpu={cluster_gpus:.0f} "
         f"driver_node_id={driver_node_id or '<unknown>'}"
     )
