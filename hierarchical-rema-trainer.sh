@@ -43,6 +43,7 @@ esac
 
 LOCAL_OUTPUT_DIR=${LOCAL_OUTPUT_DIR:-$RUN_ROOT/output}
 PERSIST_LOCAL_DIR=${PERSIST_LOCAL_DIR:-${SLURM_SUBMIT_DIR:-$PWD}/outputs/${OUTPUT_SUBDIR}/${JOB_ID}}
+SHARED_RUNTIME_MODEL_ROOT=${SHARED_RUNTIME_MODEL_ROOT:-$PERSIST_LOCAL_DIR/_runtime_active_models}
 RUNTIME_LOG=${RUNTIME_LOG:-$LOCAL_OUTPUT_DIR/runtime.log}
 RUN_METADATA_FILE=${RUN_METADATA_FILE:-$LOCAL_OUTPUT_DIR/run_metadata.txt}
 
@@ -260,10 +261,9 @@ RAY_LOCAL_TMPDIR=${RAY_LOCAL_TMPDIR:-/tmp/${USER:-user}/hierarchical_rema_${JOB_
 
 S3_EPOCHS_PATH=${S3_EPOCHS_PATH:-${S3_OUTPUT_PATH}/epochs}
 S3_BEST_SO_FAR_MODELS_PATH=${S3_BEST_SO_FAR_MODELS_PATH:-${S3_OUTPUT_PATH}/best_so_far_models}
-S3_BEST_VAL_MODELS_PATH=${S3_BEST_VAL_MODELS_PATH:-${S3_OUTPUT_PATH}/best_val_models}
 S3_FINAL_MODELS_PATH=${S3_FINAL_MODELS_PATH:-${S3_OUTPUT_PATH}/final_models}
 
-mkdir -p "$RUN_ROOT" "$LOCAL_OUTPUT_DIR" "$PERSIST_LOCAL_DIR"
+mkdir -p "$RUN_ROOT" "$LOCAL_OUTPUT_DIR" "$PERSIST_LOCAL_DIR" "$SHARED_RUNTIME_MODEL_ROOT"
 
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
     RAY_CPUS_PER_NODE=${RAY_CPUS_PER_NODE:-$SLURM_CPUS_PER_TASK}
@@ -751,6 +751,8 @@ NUM_EPOCHS=$NUM_EPOCHS
 MODEL_PATH=$MODEL_PATH
 DECOMPOSER_MODEL_PATH=$DECOMPOSER_MODEL_PATH
 SELECTOR_MODEL_PATH=$SELECTOR_MODEL_PATH
+WORKER_BASE_MODEL_PATH=$WORKER_BASE_MODEL_PATH
+SHARED_RUNTIME_MODEL_ROOT=$SHARED_RUNTIME_MODEL_ROOT
 BACKEND=$BACKEND
 TASK=$TASK
 MODE=$MODE
@@ -812,7 +814,6 @@ EPOCH_S3_SYNC_INTERVAL=$EPOCH_S3_SYNC_INTERVAL
 GRPO_PASSES_PER_SUBSET=$GRPO_PASSES_PER_SUBSET
 S3_EPOCHS_PATH=$S3_EPOCHS_PATH
 S3_BEST_SO_FAR_MODELS_PATH=$S3_BEST_SO_FAR_MODELS_PATH
-S3_BEST_VAL_MODELS_PATH=$S3_BEST_VAL_MODELS_PATH
 S3_FINAL_MODELS_PATH=$S3_FINAL_MODELS_PATH
 EOF
 }
@@ -822,9 +823,21 @@ upload_epoch_folder_to_s3() {
     local epoch_name
     epoch_name=$(basename "$epoch_dir")
     local upload_status=0
+    local should_sync_best_so_far=0
+    local best_models_root="${LOCAL_OUTPUT_DIR}/best_models"
 
     if [[ -z "${S3_OUTPUT_PATH:-}" ]]; then
         return 0
+    fi
+
+    if [[ -f "$epoch_dir/epoch_summary.json" ]]; then
+        should_sync_best_so_far=$(python3 -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+tracker = data.get("best_validation_tracker") or {}
+print("1" if tracker.get("improved") else "0")
+' "$epoch_dir/epoch_summary.json" 2>/dev/null || echo 0)
     fi
 
     echo "[hierarchical-rema][s3] uploading epoch folder ${epoch_name} -> ${S3_EPOCHS_PATH}/${epoch_name}"
@@ -841,30 +854,19 @@ upload_epoch_folder_to_s3() {
         fi
     fi
 
-    local segment_dir=""
-    for segment_dir in "$epoch_dir"/train/segment_*; do
-        [[ -d "$segment_dir" ]] || continue
-        local policy_dir=""
-        for policy_dir in "$segment_dir"/*; do
-            [[ -d "$policy_dir" ]] || continue
+    if [[ "$should_sync_best_so_far" == "1" && -d "$best_models_root" ]]; then
+        local best_policy_dir=""
+        for best_policy_dir in "$best_models_root"/*; do
+            [[ -d "$best_policy_dir" ]] || continue
             local policy_id
-            policy_id=$(basename "$policy_dir")
-            if [[ -d "$policy_dir/final" ]]; then
-                echo "[hierarchical-rema][s3] syncing best-so-far model ${policy_id} -> ${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"
-                if ! rclone sync "$policy_dir/final" "${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"; then
-                    echo "Warning: failed to sync best-so-far model ${policy_id}" >&2
-                    upload_status=1
-                fi
-            fi
-            if [[ -d "$policy_dir/best" ]]; then
-                echo "[hierarchical-rema][s3] syncing best-val model ${policy_id} -> ${S3_BEST_VAL_MODELS_PATH}/${policy_id}"
-                if ! rclone sync "$policy_dir/best" "${S3_BEST_VAL_MODELS_PATH}/${policy_id}"; then
-                    echo "Warning: failed to sync best-val model ${policy_id}" >&2
-                    upload_status=1
-                fi
+            policy_id=$(basename "$best_policy_dir")
+            echo "[hierarchical-rema][s3] syncing best-so-far model ${policy_id} -> ${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"
+            if ! rclone sync "$best_policy_dir" "${S3_BEST_SO_FAR_MODELS_PATH}/${policy_id}"; then
+                echo "Warning: failed to sync best-so-far model ${policy_id}" >&2
+                upload_status=1
             fi
         done
-    done
+    fi
     return "$upload_status"
 }
 
@@ -899,6 +901,12 @@ strip_local_model_artifacts() {
             done
         done
     done
+}
+
+cleanup_runtime_model_cache() {
+    if [[ -n "${SHARED_RUNTIME_MODEL_ROOT:-}" && -d "${SHARED_RUNTIME_MODEL_ROOT:-}" ]]; then
+        rm -rf "${SHARED_RUNTIME_MODEL_ROOT}" 2>/dev/null || true
+    fi
 }
 
 upload_final_models_to_s3() {
@@ -1013,6 +1021,8 @@ persist_outputs() {
         fi
     fi
 
+    cleanup_runtime_model_cache
+
     if [[ -n "${TMPDIR:-}" && -d "${TMPDIR:-}" ]]; then
         rm -rf "$TMPDIR"/*
     fi
@@ -1050,6 +1060,7 @@ write_run_metadata
 echo "[hierarchical-rema] starting run"
 echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
 echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
+echo "[hierarchical-rema] SHARED_RUNTIME_MODEL_ROOT=$SHARED_RUNTIME_MODEL_ROOT"
 echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
 if [[ "$MULTINODE_RAY_ENABLED" == "1" ]]; then
     echo "[hierarchical-rema] RAY_ADDRESS=${RAY_ADDRESS_VALUE}"
@@ -1161,6 +1172,7 @@ python3 -m hierarchical_rema.train \
   --num-epochs ${NUM_EPOCHS} \
   ${PARAMETER_SHARING_FLAG} \
   --worker-base-model-path ${WORKER_BASE_MODEL_PATH} \
+  --shared-runtime-model-root ${SHARED_RUNTIME_MODEL_ROOT} \
   --num-decompositions ${NUM_DECOMPOSITIONS} \
   --num-selections ${NUM_SELECTIONS} \
   --max-nodes-per-decomposition ${MAX_NODES_PER_DECOMPOSITION} \

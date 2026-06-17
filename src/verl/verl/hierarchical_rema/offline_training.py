@@ -231,6 +231,18 @@ def _all_reduce_sum(value: float, device, context: DistributedTrainingContext) -
     return float(tensor.item())
 
 
+def _distributed_barrier(context: DistributedTrainingContext, device) -> None:
+    if not context.enabled:
+        return
+    torch = _lazy_torch()
+    import torch.distributed as dist
+
+    if dist.get_backend() == "nccl" and torch.cuda.is_available() and getattr(device, "type", None) == "cuda":
+        dist.barrier(device_ids=[device.index if device.index is not None else torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
 def _load_scheduler_factory():
     _ensure_repo_root_on_path()
     try:
@@ -1016,8 +1028,10 @@ def run_offline_policy_training(
                     ):
                         best_val_loss = val_metrics["val_loss"]
                         best_val_step = global_step
+                        _distributed_barrier(distributed_context, device)
                         if is_primary:
                             _save_model_checkpoint(model, tokenizer, output_dir / "best")
+                        _distributed_barrier(distributed_context, device)
                     if is_primary:
                         with eval_log_path.open("a", encoding="utf-8") as handle:
                             handle.write(json.dumps({"step": global_step, **val_metrics}, sort_keys=True) + "\n")
@@ -1036,15 +1050,20 @@ def run_offline_policy_training(
                     and config.save_steps > 0
                     and global_step % config.save_steps == 0
                 ):
+                    _distributed_barrier(distributed_context, device)
                     if is_primary:
                         _save_model_checkpoint(model, tokenizer, output_dir / f"checkpoint-{global_step}")
                         print(
                             f"[hierarchical-rema][grpo] saved checkpoint step={global_step} "
                             f"path={output_dir / f'checkpoint-{global_step}'}"
                         )
+                    _distributed_barrier(distributed_context, device)
 
-    if config.save_final_checkpoint and is_primary:
-        _save_model_checkpoint(model, tokenizer, output_dir / "final")
+    if config.save_final_checkpoint:
+        _distributed_barrier(distributed_context, device)
+        if is_primary:
+            _save_model_checkpoint(model, tokenizer, output_dir / "final")
+        _distributed_barrier(distributed_context, device)
     final_val_metrics = {}
     if val_loader is not None:
         final_val_metrics = evaluate_controller_model(
@@ -1059,8 +1078,10 @@ def run_offline_policy_training(
         ):
             best_val_loss = final_val_metrics["val_loss"]
             best_val_step = global_step
+            _distributed_barrier(distributed_context, device)
             if is_primary:
                 _save_model_checkpoint(model, tokenizer, output_dir / "best")
+            _distributed_barrier(distributed_context, device)
     final_checkpoint_path = output_dir / "final"
     best_checkpoint_path = output_dir / "best"
     selected_model_path = (

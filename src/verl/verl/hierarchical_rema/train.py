@@ -542,6 +542,8 @@ def _relay_offline_metrics_to_tracking(
         step=log_step_offset,
     )
 
+    queued_logs: List[tuple[int, int, Dict[str, float | int]]] = []
+
     metrics_log_path = output_dir / "train_metrics.jsonl"
     if metrics_log_path.exists():
         with metrics_log_path.open("r", encoding="utf-8") as handle:
@@ -579,7 +581,7 @@ def _relay_offline_metrics_to_tracking(
                 for record_key, metric_suffix in optional_int_fields.items():
                     if record_key in record:
                         metrics[f"{tracking_prefix}train/{metric_suffix}"] = int(record[record_key])
-                tracking.log(metrics, step=step)
+                queued_logs.append((step, 0, metrics))
 
     eval_log_path = output_dir / "eval_metrics.jsonl"
     if eval_log_path.exists():
@@ -590,10 +592,16 @@ def _relay_offline_metrics_to_tracking(
                     continue
                 record = json.loads(line)
                 step = log_step_offset + int(record["step"])
-                tracking.log(
-                    {f"{tracking_prefix}val/val_loss": float(record["val_loss"])},
-                    step=step,
+                queued_logs.append(
+                    (
+                        step,
+                        1,
+                        {f"{tracking_prefix}val/val_loss": float(record["val_loss"])},
+                    )
                 )
+
+    for step, _, metrics in sorted(queued_logs, key=lambda item: (item[0], item[1])):
+        tracking.log(metrics, step=step)
 
     summary_path = output_dir / "summary.json"
     if summary_path.exists():
