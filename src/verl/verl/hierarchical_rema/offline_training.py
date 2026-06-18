@@ -824,19 +824,27 @@ def run_offline_policy_training(
                         f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
                     )
                 continue
-            if not bool(valid_row_mask.all().item()):
+
+            # Every rank must execute the same collectives in the same order.
+            # Keep the "filtered empty batch" sync unconditional so one rank
+            # cannot enter a scalar all-reduce while another is already in DDP
+            # gradient reduction for the same step.
+            local_has_invalid_rows = not bool(valid_row_mask.all().item())
+            if local_has_invalid_rows:
                 batch = _filter_batch_rows(batch, valid_row_mask)
-                if _distributed_any_true(len(batch["sample_index"]) == 0, device, distributed_context):
-                    skipped_empty_batches += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    step_selector_format_counts = _empty_selector_format_counts()
-                    step_role_reward_stats = _empty_role_reward_stats()
-                    if is_primary:
-                        print(
-                            f"[hierarchical-rema][grpo] skipping locally-empty filtered batch "
-                            f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
-                        )
-                    continue
+            local_filtered_batch_empty = len(batch["sample_index"]) == 0
+            if _distributed_any_true(local_filtered_batch_empty, device, distributed_context):
+                skipped_empty_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                step_selector_format_counts = _empty_selector_format_counts()
+                step_role_reward_stats = _empty_role_reward_stats()
+                if is_primary:
+                    print(
+                        f"[hierarchical-rema][grpo] skipping locally-empty filtered batch "
+                        f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
+                    )
+                continue
+            if local_has_invalid_rows:
                 skipped_empty_batches += 1
 
             input_ids = batch["input_ids"].to(device)
