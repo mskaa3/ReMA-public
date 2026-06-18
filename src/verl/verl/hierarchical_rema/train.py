@@ -227,6 +227,14 @@ def parse_args() -> argparse.Namespace:
             "is used for subsequent rollouts."
         ),
     )
+    parser.add_argument(
+        "--distributed-offline-input-root",
+        default="",
+        help=(
+            "Optional shared filesystem root used to stage distributed offline-GRPO "
+            "helper files such as replay JSONL shards and config snapshots."
+        ),
+    )
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
     parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
@@ -661,7 +669,16 @@ def _offline_training_alloc_conf() -> str | None:
     return stripped or None
 
 
-def _distributed_offline_input_dir(output_dir: Path, config: OfflineTrainingConfig) -> Path:
+def _distributed_offline_input_dir(
+    output_dir: Path,
+    config: OfflineTrainingConfig,
+    shared_input_root: str = "",
+) -> Path:
+    shared_root = shared_input_root.strip()
+    if shared_root:
+        resolved_shared_root = Path(shared_root).expanduser().resolve()
+        output_digest = hashlib.sha1(str(output_dir).encode("utf-8")).hexdigest()[:10]
+        return resolved_shared_root / f"{output_dir.name}-{output_digest}"
     mirror_dir = (config.selected_checkpoint_mirror_dir or "").strip()
     if not mirror_dir:
         return output_dir
@@ -697,6 +714,7 @@ def _run_distributed_offline_policy_training(
     nnodes: int,
     gpus_per_node: int,
     master_port: int,
+    shared_input_root: str = "",
 ) -> Dict[str, Any]:
     _ensure_ray_initialized_for_offline_training()
     import ray
@@ -711,7 +729,11 @@ def _run_distributed_offline_policy_training(
 
     output_dir = Path(config.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    distributed_input_dir = _distributed_offline_input_dir(output_dir, config)
+    distributed_input_dir = _distributed_offline_input_dir(
+        output_dir,
+        config,
+        shared_input_root=shared_input_root,
+    )
     distributed_input_dir.mkdir(parents=True, exist_ok=True)
     train_json_path = distributed_input_dir / "_offline_grpo_train_samples.jsonl"
     val_json_path = distributed_input_dir / "_offline_grpo_val_samples.jsonl"
@@ -2300,6 +2322,7 @@ def main() -> None:
                             nnodes=args.offline_grpo_nnodes,
                             gpus_per_node=args.offline_grpo_gpus_per_node,
                             master_port=args.offline_grpo_master_port,
+                            shared_input_root=args.distributed_offline_input_root,
                         )
                     else:
                         previous_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
