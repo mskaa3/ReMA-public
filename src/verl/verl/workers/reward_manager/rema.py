@@ -772,6 +772,7 @@ class ReMARewardManager:
                 decomposer_global_correctness_bonus = (
                     DECOMPOSER_GLOBAL_CORRECTNESS_BONUS
                     * positive_role_bonus_gate
+                    * final_worker_usage_gate
                     * hierarchy_bonus_gates['decomposer_plan_parseable_gate']
                 )
                 reward_tensor_map['decomposer_global_correctness_bonus'][i_bsz] = (
@@ -806,6 +807,7 @@ class ReMARewardManager:
                 reward_tensor_map['selector_local_bonus'][i_bsz] = selector_local_bonus
                 selector_global_correctness_bonus = (
                     upstream_global_correctness_bonus
+                    * final_worker_usage_gate
                     * selector_stats['assignment_completeness']
                 )
                 reward_tensor_map['selector_global_correctness_bonus'][i_bsz] = (
