@@ -45,7 +45,12 @@ case "$RUN_KIND" in
         ;;
 esac
 
-LOCAL_OUTPUT_DIR=${LOCAL_OUTPUT_DIR:-$RUN_ROOT/output}
+if [[ "$RUN_KIND" == "train" && -n "${TMPDIR_LUSTRE:-}" ]]; then
+    DEFAULT_LOCAL_OUTPUT_DIR="${TMPDIR_LUSTRE}/hierarchical_rema_train_${JOB_ID}/output"
+else
+    DEFAULT_LOCAL_OUTPUT_DIR="$RUN_ROOT/output"
+fi
+LOCAL_OUTPUT_DIR=${LOCAL_OUTPUT_DIR:-$DEFAULT_LOCAL_OUTPUT_DIR}
 PERSIST_LOCAL_DIR=${PERSIST_LOCAL_DIR:-${SLURM_SUBMIT_DIR:-$PWD}/outputs/${OUTPUT_SUBDIR}/${JOB_ID}}
 SHARED_RUNTIME_MODEL_ROOT=${SHARED_RUNTIME_MODEL_ROOT:-$PERSIST_LOCAL_DIR/_runtime_active_models}
 RUNTIME_LOG=${RUNTIME_LOG:-$LOCAL_OUTPUT_DIR/runtime.log}
@@ -243,8 +248,8 @@ SAVE_STEPS=${SAVE_STEPS:-200}
 EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-10}
 CHECKPOINT_MODE=${CHECKPOINT_MODE:-final}
 PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-false}
-PRUNE_UPLOADED_LOCAL_CHECKPOINTS=${PRUNE_UPLOADED_LOCAL_CHECKPOINTS:-false}
-STRIP_LOCAL_MODELS_AFTER_SYNC=${STRIP_LOCAL_MODELS_AFTER_SYNC:-false}
+PRUNE_UPLOADED_LOCAL_CHECKPOINTS=${PRUNE_UPLOADED_LOCAL_CHECKPOINTS:-true}
+STRIP_LOCAL_MODELS_AFTER_SYNC=${STRIP_LOCAL_MODELS_AFTER_SYNC:-true}
 DEVICE=${DEVICE:-cuda}
 TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-true}
@@ -253,7 +258,7 @@ ENABLE_WANDB=${ENABLE_WANDB:-false}
 WANDB_PROJECT=${WANDB_PROJECT:-multi-grpo-rema}
 WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-${MODE_TAG}-${PARAMETER_SHARING_TAG}-${MODEL_NAME_TAG}-${JOB_ID}}
 DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}
-EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-false}
+EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-true}
 EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-300}
 OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF=${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 RAY_STOP_TIMEOUT_SECONDS=${RAY_STOP_TIMEOUT_SECONDS:-60}
@@ -718,6 +723,7 @@ write_run_metadata() {
 JOB_ID=$JOB_ID
 RUN_KIND=$RUN_KIND
 DEFAULT_RUN_TMP_BASE=$DEFAULT_RUN_TMP_BASE
+DEFAULT_LOCAL_OUTPUT_DIR=$DEFAULT_LOCAL_OUTPUT_DIR
 DEFAULT_RAY_TMP_BASE=$DEFAULT_RAY_TMP_BASE
 TMPDIR=${TMPDIR:-}
 TMPDIR_LUSTRE=${TMPDIR_LUSTRE:-}
@@ -883,6 +889,33 @@ print("1" if tracker.get("improved") else "0")
             fi
         done
     fi
+
+    sync_epoch_final_models_to_s3 "$epoch_dir" || upload_status=1
+    return "$upload_status"
+}
+
+sync_epoch_final_models_to_s3() {
+    local epoch_dir="$1"
+    [[ -n "${S3_OUTPUT_PATH:-}" ]] || return 0
+
+    local upload_status=0
+    local segment_dir=""
+    for segment_dir in "$epoch_dir"/train/segment_*; do
+        [[ -d "$segment_dir" ]] || continue
+        local policy_dir=""
+        for policy_dir in "$segment_dir"/*; do
+            [[ -d "$policy_dir" ]] || continue
+            local policy_id
+            policy_id=$(basename "$policy_dir")
+            if [[ -d "$policy_dir/final" ]]; then
+                echo "[hierarchical-rema][s3] syncing final model ${policy_id} -> ${S3_FINAL_MODELS_PATH}/${policy_id}"
+                if ! rclone sync "$policy_dir/final" "${S3_FINAL_MODELS_PATH}/${policy_id}"; then
+                    echo "Warning: failed to sync final model ${policy_id}" >&2
+                    upload_status=1
+                fi
+            fi
+        done
+    done
     return "$upload_status"
 }
 
@@ -895,6 +928,7 @@ prune_epoch_local_checkpoints() {
         for policy_dir in "$segment_dir"/*; do
             [[ -d "$policy_dir" ]] || continue
             rm -rf "$policy_dir"/best 2>/dev/null || true
+            rm -rf "$policy_dir"/final 2>/dev/null || true
             rm -rf "$policy_dir"/checkpoint-* 2>/dev/null || true
         done
     done
