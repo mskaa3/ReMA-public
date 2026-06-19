@@ -249,6 +249,9 @@ algorithm:
     # The final stage still sees the original question for answer synthesis.
     worker_context_mode: subtask_context
     pass_question_to_workers: False
+    # Correct final answers that do not use worker LOCAL_RESULTs keep this
+    # fraction of raw_score; using worker results restores the full raw_score.
+    final_raw_score_usage_floor: 0.5
     worker_specs:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning

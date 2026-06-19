@@ -57,6 +57,7 @@ WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
 WORKER_DOWNSTREAM_USED_BONUS = 0.03
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
 FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
+FINAL_RAW_SCORE_USAGE_FLOOR = 0.50
 UPSTREAM_GLOBAL_CORRECTNESS_BONUS = 0.01
 DECOMPOSER_GLOBAL_CORRECTNESS_BONUS = 0.10
 UPSTREAM_HIERARCHICAL_CORRECTNESS_BONUS = 0.02
@@ -636,6 +637,8 @@ class ReMARewardManager:
         reward_tensor_map['final_worker_result_usage_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_consistency_with_worker_results'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_worker_usage_gate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_raw_score_usage_multiplier'] = torch.ones(batch_size, dtype=torch.float32)
+        reward_tensor_map['final_effective_raw_score'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
         
@@ -713,6 +716,14 @@ class ReMARewardManager:
             worker_bonus_stats = None
             final_bonus_stats = None
             final_worker_usage_gate = 0.0
+            final_raw_score_usage_floor = float(
+                hierarchy_config.get(
+                    'final_raw_score_usage_floor',
+                    FINAL_RAW_SCORE_USAGE_FLOOR,
+                )
+            )
+            final_raw_score_usage_floor = max(0.0, min(1.0, final_raw_score_usage_floor))
+            final_raw_score_usage_multiplier = 1.0
             if turn_histories:
                 hierarchy_bonus_gates = _compute_hierarchy_bonus_gates(
                     turn_histories[-1], worker_roles, score_role
@@ -728,13 +739,25 @@ class ReMARewardManager:
                     if final_bonus_stats['worker_result_usage_rate'] > 0.0
                     else 0.0
                 )
+                final_raw_score_usage_multiplier = (
+                    final_raw_score_usage_floor
+                    + (1.0 - final_raw_score_usage_floor) * final_worker_usage_gate
+                )
                 reward_tensor_map['final_worker_usage_gate'][i_bsz] = final_worker_usage_gate
+                reward_tensor_map['final_raw_score_usage_multiplier'][i_bsz] = final_raw_score_usage_multiplier
+                reward_tensor_map['final_effective_raw_score'][i_bsz] = (
+                    float(raw_score) * final_raw_score_usage_multiplier
+                )
                 upstream_hierarchical_correctness_bonus = (
                     UPSTREAM_HIERARCHICAL_CORRECTNESS_BONUS * final_worker_usage_gate
                 )
                 reward_tensor_map['upstream_hierarchical_correctness_bonus'][i_bsz] = (
                     upstream_hierarchical_correctness_bonus
                 )
+            reward_tensor_map['final_raw_score_usage_multiplier'][i_bsz] = final_raw_score_usage_multiplier
+            reward_tensor_map['final_effective_raw_score'][i_bsz] = (
+                float(raw_score) * final_raw_score_usage_multiplier
+            )
             if 'decomposer' in agent_roles and turn_histories:
                 current_turn_metrics = _compute_turn_worker_metrics(turn_histories[-1], worker_roles)
                 previous_turn_metrics = (
@@ -1146,7 +1169,10 @@ class ReMARewardManager:
                 # Only the final scoring role receives the global task reward.
                 # Other roles are shaped only by their own penalties or future
                 # local credit mechanisms.
-                effective_score = raw_score if role == score_role else 0.0
+                effective_score = (
+                    float(raw_score) * final_raw_score_usage_multiplier
+                    if role == score_role else 0.0
+                )
                 effective_score += role_bonuses.get(role, 0.0)
                 if role == score_role and data_item.meta_info['mask_unfinished_reward']:
                     # For the final scoring role, zero the global correctness reward
@@ -1254,6 +1280,8 @@ class ReMARewardManager:
                     print("[final_stage_metrics]", {
                         'positive_bonus_gate': float(reward_tensor_map['positive_role_bonus_gate'][i_bsz]),
                         'final_worker_usage_gate': float(reward_tensor_map['final_worker_usage_gate'][i_bsz]),
+                        'raw_score_usage_multiplier': float(reward_tensor_map['final_raw_score_usage_multiplier'][i_bsz]),
+                        'effective_raw_score': float(reward_tensor_map['final_effective_raw_score'][i_bsz]),
                         'worker_result_usage_rate': float(reward_tensor_map['final_worker_result_usage_rate'][i_bsz]),
                         'consistency_with_worker_results': float(reward_tensor_map['final_consistency_with_worker_results'][i_bsz]),
                         'local_bonus_raw': float(reward_tensor_map['final_local_bonus_raw'][i_bsz]),
