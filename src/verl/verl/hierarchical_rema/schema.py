@@ -137,6 +137,7 @@ class VLLMBackendConfig:
     max_model_len: Optional[int] = None
     dtype: str = "bfloat16"
     enforce_eager: bool = False
+    enable_sleep_mode: bool = False
     free_cache_engine: bool = False
     enable_chunked_prefill: bool = True
     load_format: str = "dummy_dtensor"

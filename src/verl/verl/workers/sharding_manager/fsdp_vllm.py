@@ -46,6 +46,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         full_params: bool = False,
         device_mesh: DeviceMesh = None,
         offload_param: bool = False,
+        enable_sleep_mode: bool = True,
     ):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer intialized in vLLMAsyncRollout.load_model
@@ -54,6 +55,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.model_config = model_config
         self.device_mesh = device_mesh
         self.offload_param = offload_param
+        self.enable_sleep_mode = enable_sleep_mode
 
         # Full params
         self.full_params = full_params
@@ -106,10 +108,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
             del params
         else:
-            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-                self.inference_engine.wake_up(tags=["weights"])
-            else:
-                self.inference_engine.wake_up()
+            if self.enable_sleep_mode:
+                if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                    self.inference_engine.wake_up(tags=["weights"])
+                else:
+                    self.inference_engine.wake_up()
 
             # update model params
             self.update_params(params)
@@ -119,7 +122,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 offload_fsdp_model_to_cpu(self.module)
             torch.cuda.empty_cache()
 
-            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+            if self.enable_sleep_mode and "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
                 self.inference_engine.wake_up(tags=["kv_cache"])
 
         log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
@@ -131,13 +134,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
     def __exit__(self, exc_type, exc_value, traceback):
         # TODO(ZSL): check this
-        if vllm_version in (
-            "0.5.4",
-            "0.6.3",
-        ):
-            self.inference_engine.offload_model_weights()
-        else:
-            self.inference_engine.sleep(level=1)
+        if self.enable_sleep_mode:
+            if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+                self.inference_engine.offload_model_weights()
+            else:
+                self.inference_engine.sleep(level=1)
 
         self.module.train()
 

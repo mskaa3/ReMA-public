@@ -403,6 +403,7 @@ class ActorRolloutRefWorker(Worker):
                 full_params="hf" in self.config.rollout.load_format,
                 device_mesh=rollout_device_mesh,
                 offload_param=self._is_offload_param,
+                enable_sleep_mode=self.config.rollout.get("enable_sleep_mode", False),
             )
             log_gpu_memory_usage('After building sharding manager',
                                  logger=None)

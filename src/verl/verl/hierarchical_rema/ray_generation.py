@@ -96,6 +96,7 @@ def build_vllm_rollout_config_dict(
             "gpu_memory_utilization": config.gpu_memory_utilization,
             "ignore_eos": False,
             "enforce_eager": config.enforce_eager,
+            "enable_sleep_mode": config.enable_sleep_mode,
             "free_cache_engine": config.free_cache_engine,
             "load_format": config.load_format,
             "tensor_model_parallel_size": config.tensor_model_parallel_size,

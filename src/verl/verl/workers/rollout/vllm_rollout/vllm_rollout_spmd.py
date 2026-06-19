@@ -84,6 +84,7 @@ class vLLMRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+        self.enable_sleep_mode = bool(config.get("enable_sleep_mode", False))
         assert not (
             not config.enforce_eager and config.free_cache_engine
         ), "disable CUDA graph (enforce_eager = False) if free cache engine"
@@ -115,7 +116,7 @@ class vLLMRollout(BaseRollout):
 
         self.inference_engine = LLM(
             model=model_path,
-            enable_sleep_mode=config.get("enable_sleep_mode", True),
+            enable_sleep_mode=self.enable_sleep_mode,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
             dtype=config.dtype,
@@ -132,7 +133,8 @@ class vLLMRollout(BaseRollout):
         )
 
         # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        if self.enable_sleep_mode:
+            self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,

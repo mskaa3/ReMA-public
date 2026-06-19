@@ -327,6 +327,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--vllm-max-num-seqs", type=int, default=2048)
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
+    parser.add_argument(
+        "--enable-vllm-sleep-mode",
+        dest="vllm_enable_sleep_mode",
+        action="store_true",
+        help="Enable vLLM sleep/wake transitions between rollout generations to save GPU memory.",
+    )
+    parser.add_argument(
+        "--disable-vllm-sleep-mode",
+        dest="vllm_enable_sleep_mode",
+        action="store_false",
+        help="Keep the vLLM rollout engine awake between generations to avoid sleep-mode teardown crashes.",
+    )
+    parser.set_defaults(vllm_enable_sleep_mode=False)
     parser.add_argument("--disable-rollout-logging", action="store_true")
     parser.add_argument("--rollout-log-mode", choices=["best", "all"], default="best")
     parser.add_argument("--rollout-log-detail", choices=["compact", "full"], default="compact")
@@ -1571,6 +1584,7 @@ def _build_rollout_trainer(
             max_num_seqs=args.vllm_max_num_seqs,
             max_model_len=args.vllm_max_model_len,
             dtype=args.torch_dtype,
+            enable_sleep_mode=args.vllm_enable_sleep_mode,
             trust_remote_code=args.trust_remote_code,
         ),
         rollout_logging_config=rollout_logging_config,
@@ -1650,6 +1664,7 @@ def _build_rollout_backend(
         max_num_seqs=args.vllm_max_num_seqs,
         max_model_len=args.vllm_max_model_len,
         dtype=args.torch_dtype,
+        enable_sleep_mode=args.vllm_enable_sleep_mode,
         trust_remote_code=args.trust_remote_code,
     )
     return RayVLLMHierarchicalBackend(config=vllm_config)
