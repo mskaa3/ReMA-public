@@ -774,18 +774,30 @@ class MultiAgentRollout:
         last_worker_output: str,
         worker_roles: List[str],
     ) -> str:
-        fragments = []
+        sections = []
+        if plan and plan.strip():
+            sections.append(f"PREVIOUS PLAN:\n{plan.strip()}")
+        if assignments and assignments.strip():
+            sections.append(f"PREVIOUS ASSIGNMENTS:\n{assignments.strip()}")
+
+        worker_sections = []
         for worker_role in worker_roles:
             output = worker_results.get(worker_role, "")
-            reasoning = self._extract_reasoning(output)
-            local_result = self._extract_local_result(output)
-            if reasoning:
-                fragments.append(reasoning)
-            if local_result and local_result not in reasoning:
-                fragments.append(local_result)
-        if last_worker_output and last_worker_output not in "\n\n".join(fragments):
-            fragments.append(last_worker_output)
-        return "\n\n".join(fragment for fragment in fragments if fragment.strip())
+            if output and output.strip():
+                worker_sections.append(f"{worker_role}:\n{output.strip()}")
+        if worker_sections:
+            sections.append("PREVIOUS WORKER RESULTS:\n" + "\n\n".join(worker_sections))
+
+        if last_worker_output and last_worker_output.strip():
+            sections.append(f"PREVIOUS FINAL ATTEMPT:\n{last_worker_output.strip()}")
+
+        if not sections:
+            return ""
+        return (
+            "FEEDBACK FROM THE PREVIOUS ROUND:\n"
+            "Use this to decide what to keep, repair, or replace in the next plan.\n\n"
+            + "\n\n".join(sections)
+        )
 
     def _run_hierarchical_conversation(
         self,
@@ -819,6 +831,7 @@ class MultiAgentRollout:
             "worker_context_mode",
             "full_question" if pass_question_to_workers else "subtask_context",
         )
+        final_context_mode = hierarchy_config.get("final_context_mode", "full_question")
         pass_question_to_workers = worker_context_mode in {
             "full_question",
             "question",
@@ -953,7 +966,13 @@ class MultiAgentRollout:
                         worker_type_by_idx[idx] = worker_type
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
-                            question_block = f"Question:\n{questions[idx]}\n\n"
+                            if final_context_mode in {"notes_only", "notes", "no_question"}:
+                                question_block = (
+                                    "Synthesize the final answer using only the decomposer notes "
+                                    "and worker outputs below.\n\n"
+                                )
+                            else:
+                                question_block = f"Question:\n{questions[idx]}\n\n"
                         elif pass_question_to_workers:
                             question_block = f"{questions[idx]}\n\n"
                         else:
@@ -970,7 +989,7 @@ class MultiAgentRollout:
                             )
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
-                            "Synthesize the final answer from the notes and the original question. "
+                            "Synthesize the final answer from the available notes. "
                             "Check the notes, repair mistakes if needed, and end with the final answer in \\boxed{}."
                             if is_final_stage else
                             "Solve only the step above. "

@@ -246,8 +246,10 @@ algorithm:
     default_worker: general_math_worker
     # Setting B: non-final workers see only their assigned subtask, the
     # decomposer-provided context inside it, and previous LOCAL_RESULTs.
-    # The final stage still sees the original question for answer synthesis.
+    # With notes_only, the final stage must synthesize from decomposer notes
+    # and worker outputs instead of reading the original question directly.
     worker_context_mode: subtask_context
+    final_context_mode: notes_only
     pass_question_to_workers: False
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
