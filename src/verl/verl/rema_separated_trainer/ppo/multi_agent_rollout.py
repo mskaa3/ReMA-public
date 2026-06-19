@@ -1003,7 +1003,7 @@ class MultiAgentRollout:
                         )
                         if is_final_stage and not assigned_subtasks_text:
                             assigned_subtasks_text = (
-                                "- Use the work above to answer the original question."
+                                "- Use the work above to synthesize the final answer."
                             )
                         work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ""
                         dependency_instruction = (
