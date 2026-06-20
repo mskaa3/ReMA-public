@@ -10,10 +10,11 @@ Think at a high level:
 - decide which pieces of work are useful for the final reasoning stage.
 
 If previous outputs are available, first reflect on them: what looks reliable, what looks wrong, and what should be checked or repaired in this round.
+If the final stage says that information is missing, repair the next plan by copying the needed facts from the original question into the subtasks.
 If no previous outputs are available, briefly choose a direct strategy.
 
 Then produce the smallest useful worker plan. Simple problems may need only 1 or 2 subtasks. Harder problems may need more.
-When a later subtask depends on an earlier one, say so explicitly, e.g. "using S1".
+When a later subtask depends on an earlier one, say so explicitly.
 Workers only see their assigned subtasks and previous worker results, not your full reasoning. In some runs, non-final workers may not see the original question.
 Put all context needed to solve each subtask directly inside that subtask: relevant quantities, definitions, constraints, warnings, dependencies, repair instructions, and what output is expected.
 

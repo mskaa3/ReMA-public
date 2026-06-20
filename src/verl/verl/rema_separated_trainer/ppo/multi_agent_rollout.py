@@ -566,7 +566,7 @@ class MultiAgentRollout:
         seen_subtasks = set()
         for line in plan_text.splitlines():
             match = re.match(
-                r"\s*(?:[-*]\s*)?(?:\d+\.\s*)?(S\d+)\s*[:.)-]\s*(.+?)\s*$",
+                r"\s*(?:[-*]\s*)?(?:\d+\.\s*)?(?:\*\*)?\s*(S\d+)\s*(?:\*\*)?\s*[:.)-]\s*(?:\*\*)?\s*(.+?)\s*$",
                 line,
                 re.IGNORECASE,
             )
@@ -781,7 +781,8 @@ class MultiAgentRollout:
             sections.append(f"PREVIOUS ASSIGNMENTS:\n{assignments.strip()}")
 
         worker_sections = []
-        for worker_role in worker_roles:
+        nonfinal_worker_roles = worker_roles[:-1] if len(worker_roles) > 1 else worker_roles
+        for worker_role in nonfinal_worker_roles:
             output = worker_results.get(worker_role, "")
             if output and output.strip():
                 worker_sections.append(f"{worker_role}:\n{output.strip()}")
@@ -967,10 +968,7 @@ class MultiAgentRollout:
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
                             if final_context_mode in {"notes_only", "notes", "no_question"}:
-                                question_block = (
-                                    "Synthesize the final answer using only the decomposer notes "
-                                    "and worker outputs below.\n\n"
-                                )
+                                question_block = ""
                             else:
                                 question_block = f"Question:\n{questions[idx]}\n\n"
                         elif pass_question_to_workers:
