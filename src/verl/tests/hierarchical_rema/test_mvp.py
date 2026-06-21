@@ -4,13 +4,20 @@ try:
     from verl.hierarchical_rema import (
         AlternatingPhase,
         ControllerPolicyConfig,
+        DecompositionCandidate,
+        DecompositionRollout,
         HierarchicalGRPOTrainer,
         RewardWeights,
         RolloutLoggingConfig,
         RolloutConfig,
+        SelectionCandidate,
+        SelectionRewardBreakdown,
+        SelectionRollout,
+        SubtaskNode,
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        WorkerExecution,
         WorkerRewardMode,
         WorkerPoolConfig,
         WorkerSpec,
@@ -18,6 +25,8 @@ try:
     from verl.hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
     from verl.hierarchical_rema.prompts import render_decomposer_prompt, render_selector_prompt
     from verl.hierarchical_rema.structured import (
+        apply_decomposition_limits,
+        build_fallback_decomposition,
         extract_decomposition_payload,
         extract_json_dict,
         extract_selection_payload,
@@ -26,13 +35,20 @@ except ModuleNotFoundError:
     from hierarchical_rema import (
         AlternatingPhase,
         ControllerPolicyConfig,
+        DecompositionCandidate,
+        DecompositionRollout,
         HierarchicalGRPOTrainer,
         RewardWeights,
         RolloutLoggingConfig,
         RolloutConfig,
+        SelectionCandidate,
+        SelectionRewardBreakdown,
+        SelectionRollout,
+        SubtaskNode,
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        WorkerExecution,
         WorkerRewardMode,
         WorkerPoolConfig,
         WorkerSpec,
@@ -40,6 +56,8 @@ except ModuleNotFoundError:
     from hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
     from hierarchical_rema.prompts import render_decomposer_prompt, render_selector_prompt
     from hierarchical_rema.structured import (
+        apply_decomposition_limits,
+        build_fallback_decomposition,
         extract_decomposition_payload,
         extract_json_dict,
         extract_selection_payload,
@@ -143,6 +161,142 @@ def test_final_answer_correctness_only_reward_mode_clamps_worker_reward() -> Non
     assert strong_selection.reward.total_reward == 1.0
     assert strong_selection.reward.total_reward == strong_selection.reward.final_answer_correctness
     assert weak_selection.reward.total_reward == weak_selection.reward.final_answer_correctness
+
+
+def test_fallback_paths_do_not_keep_positive_controller_reward_by_default() -> None:
+    trainer = HierarchicalGRPOTrainer(
+        controller_format_fallback_penalty=0.25,
+        controller_fallback_positive_reward_scale=0.0,
+    )
+    fallback_payload = {"validation": {"fallback_used": True}}
+    clean_selector_payload = {"validation": {"fallback_used": False}}
+
+    assert trainer.orchestrator._format_adjusted_reward(
+        1.0,
+        fallback_payload,
+        role="decomposer",
+    ) == -0.25
+    assert trainer.orchestrator._format_adjusted_reward(
+        1.0,
+        clean_selector_payload,
+        role="selector",
+        upstream_payloads=(fallback_payload,),
+    ) == 0.0
+    assert trainer.orchestrator._format_adjusted_reward(
+        -0.4,
+        clean_selector_payload,
+        role="selector",
+        upstream_payloads=(fallback_payload,),
+    ) == -0.4
+
+
+def test_worker_training_skips_samples_from_fallback_decompositions() -> None:
+    trainer = HierarchicalGRPOTrainer(train_worker_model=True)
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+    worker_pool = make_worker_pool()
+    rollout_config = RolloutConfig()
+    fallback_decomposition = build_fallback_decomposition(
+        task_id=task.task_id,
+        task_prompt=task.prompt,
+        raw_text="bad decomposition",
+        error_message="forced fallback for test",
+        rollout_config=rollout_config,
+    )
+    fallback_decomposition.raw_payload["controller_prompt"] = "Decompose the task."
+
+    selection_rollout = SelectionRollout(
+        selection=SelectionCandidate(selection_id="sel-1", assignments=[]),
+        executions=[
+            WorkerExecution(
+                node_id="1",
+                worker_id=worker_pool.workers[0].worker_id,
+                output_text="4",
+                raw_output_text="4",
+                worker_prompt="Solve the task directly.",
+                entropy=0.0,
+                confidence_reward=0.0,
+                compatibility=0.0,
+            )
+        ],
+        final_answer="4",
+        reward=SelectionRewardBreakdown(
+            final_answer_correctness=1.0,
+            confidence_reward=0.0,
+            compatibility_reward=0.0,
+            total_reward=1.0,
+        ),
+    )
+    decomposition_rollout = DecompositionRollout(
+        decomposition=fallback_decomposition,
+        selections=[selection_rollout],
+        base_decomposition_reward=1.0,
+        decomposition_reward=1.0,
+    )
+
+    training_batch = trainer.orchestrator._build_training_batch(
+        task=task,
+        worker_pool=worker_pool,
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        schedule=TrainingScheduleConfig(
+            mode=TrainingMode.ALTERNATING,
+            alternating_phase=AlternatingPhase.DECOMPOSER,
+        ),
+        decompositions=[decomposition_rollout],
+    )
+
+    assert training_batch.worker_samples == []
+    assert training_batch.worker_grpo_stats["num_decompositions_skipped_fallback"] == 1
+    assert training_batch.worker_grpo_stats["num_worker_samples_skipped_fallback"] == 1
+
+
+def test_fallback_decomposition_receives_single_node_triviality_penalty() -> None:
+    rollout_config = RolloutConfig(
+        soft_hop_penalty=0.1,
+        trivial_single_node_penalty=1.0,
+    )
+
+    fallback_decomposition = build_fallback_decomposition(
+        task_id="task-1",
+        task_prompt="Solve for x: 2x + 3 = 11.",
+        raw_text="malformed output",
+        error_message="format fallback",
+        rollout_config=rollout_config,
+    )
+
+    assert len(fallback_decomposition.nodes) == 1
+    assert fallback_decomposition.final_node_id == "1"
+    assert fallback_decomposition.soft_penalty == 1.0
+
+
+def test_shallow_two_node_plan_receives_triviality_penalty() -> None:
+    rollout_config = RolloutConfig(
+        soft_hop_penalty=0.1,
+        trivial_shallow_two_node_penalty=0.5,
+    )
+    candidate = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="too shallow",
+        target_quantity="best final answer requested by TASK",
+        final_answer_format_hint="match the answer format requested by TASK",
+        nodes=[
+            SubtaskNode(
+                node_id="1",
+                instruction="Identify the relevant quantities.",
+                output_key="quantities",
+            ),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    limited_candidate = apply_decomposition_limits(candidate, rollout_config)
+
+    assert limited_candidate.soft_penalty == 0.5
 
 
 def test_alternating_selector_phase_freezes_decomposer() -> None:

@@ -241,6 +241,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
     parser.add_argument("--soft-hop-penalty", type=float, default=0.1)
+    parser.add_argument(
+        "--trivial-single-node-penalty",
+        type=float,
+        default=1.0,
+        help="Soft penalty applied to one-node decompositions.",
+    )
+    parser.add_argument(
+        "--trivial-shallow-two-node-penalty",
+        type=float,
+        default=0.5,
+        help="Soft penalty applied to shallow generic two-node decompositions.",
+    )
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--controller-temperature", type=float, default=None)
     parser.add_argument("--worker-temperature", type=float, default=None)
@@ -424,6 +436,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Penalty subtracted from controller sample reward/advantage when fallback output was used",
+    )
+    parser.add_argument(
+        "--controller-fallback-positive-reward-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Scale applied to the positive part of controller reward when the controller sample "
+            "or its upstream plan used a fallback path. 0.0 blocks positive fallback reward entirely; "
+            "1.0 preserves the old behavior."
+        ),
     )
     parser.add_argument(
         "--selector-partial-completion-penalty",
@@ -974,6 +996,8 @@ def _rollout_config_for_schedule(
         hard_max_hops=base_rollout_config.hard_max_hops,
         soft_hop_penalty=base_rollout_config.soft_hop_penalty,
         soft_hop_penalty_power=base_rollout_config.soft_hop_penalty_power,
+        trivial_single_node_penalty=base_rollout_config.trivial_single_node_penalty,
+        trivial_shallow_two_node_penalty=base_rollout_config.trivial_shallow_two_node_penalty,
     )
 
 
@@ -1591,6 +1615,7 @@ def _build_rollout_trainer(
         backend=backend,
         controller_format_retry_penalty=args.controller_format_retry_penalty,
         controller_format_fallback_penalty=args.controller_format_fallback_penalty,
+        controller_fallback_positive_reward_scale=args.controller_fallback_positive_reward_scale,
         selector_partial_completion_penalty=args.selector_partial_completion_penalty,
         decomposer_reward_aggregation=args.decomposer_reward_aggregation,
         decomposer_no_correct_selection_scale=args.decomposer_no_correct_selection_scale,
@@ -1752,6 +1777,8 @@ def run_external_validation(
         hard_max_hops=base_rollout_config.hard_max_hops,
         soft_hop_penalty=base_rollout_config.soft_hop_penalty,
         soft_hop_penalty_power=base_rollout_config.soft_hop_penalty_power,
+        trivial_single_node_penalty=base_rollout_config.trivial_single_node_penalty,
+        trivial_shallow_two_node_penalty=base_rollout_config.trivial_shallow_two_node_penalty,
     )
     validation_schedule = TrainingScheduleConfig(mode=TrainingMode.JOINT)
     workload = rollout_workload_estimate(
@@ -1952,6 +1979,8 @@ def main() -> None:
         soft_max_hops=args.soft_max_hops,
         hard_max_hops=args.hard_max_hops,
         soft_hop_penalty=args.soft_hop_penalty,
+        trivial_single_node_penalty=args.trivial_single_node_penalty,
+        trivial_shallow_two_node_penalty=args.trivial_shallow_two_node_penalty,
     )
 
     current_paths = {

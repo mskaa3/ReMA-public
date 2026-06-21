@@ -112,6 +112,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
     parser.add_argument("--soft-hop-penalty", type=float, default=0.1)
+    parser.add_argument("--trivial-single-node-penalty", type=float, default=1.0)
+    parser.add_argument("--trivial-shallow-two-node-penalty", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument(
@@ -201,6 +203,8 @@ def main() -> None:
         soft_max_hops=args.soft_max_hops,
         hard_max_hops=args.hard_max_hops,
         soft_hop_penalty=args.soft_hop_penalty,
+        trivial_single_node_penalty=args.trivial_single_node_penalty,
+        trivial_shallow_two_node_penalty=args.trivial_shallow_two_node_penalty,
     )
     worker_pool = make_worker_pool(base_model_path=args.worker_base_model_path)
 

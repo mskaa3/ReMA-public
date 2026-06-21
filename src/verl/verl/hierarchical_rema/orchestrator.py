@@ -69,6 +69,7 @@ class HierarchicalReMAOrchestrator:
         worker_memory: WorkerPerformanceMemory,
         controller_format_retry_penalty: float = 0.0,
         controller_format_fallback_penalty: float = 0.0,
+        controller_fallback_positive_reward_scale: float = 0.0,
         selector_partial_completion_penalty: float = 0.0,
         decomposer_reward_aggregation: str = "best",
         decomposer_no_correct_selection_scale: float = 0.25,
@@ -81,6 +82,10 @@ class HierarchicalReMAOrchestrator:
         self.worker_memory = worker_memory
         self.controller_format_retry_penalty = max(float(controller_format_retry_penalty), 0.0)
         self.controller_format_fallback_penalty = max(float(controller_format_fallback_penalty), 0.0)
+        self.controller_fallback_positive_reward_scale = min(
+            max(float(controller_fallback_positive_reward_scale), 0.0),
+            1.0,
+        )
         self.selector_partial_completion_penalty = max(
             float(selector_partial_completion_penalty),
             0.0,
@@ -188,6 +193,16 @@ class HierarchicalReMAOrchestrator:
             "num_errors": len(errors) if isinstance(errors, list) else 0,
         }
 
+    @staticmethod
+    def _uses_fallback_path(payload: Dict[str, object]) -> bool:
+        validation = HierarchicalReMAOrchestrator._raw_controller_validation(payload)
+        if not validation:
+            return False
+        return bool(
+            validation.get("fallback_used")
+            or validation.get("batch_repair_fallback")
+        )
+
     def _controller_format_penalty(self, payload: Dict[str, object], *, role: str) -> float:
         validation = self._raw_controller_validation(payload)
         if not validation:
@@ -216,14 +231,58 @@ class HierarchicalReMAOrchestrator:
             penalty += self.selector_partial_completion_penalty
         return penalty
 
+    def _reward_after_fallback_mask(
+        self,
+        raw_reward: float,
+        payload: Dict[str, object],
+        *,
+        upstream_payloads: Sequence[Dict[str, object]] = (),
+    ) -> float:
+        uses_fallback = self._uses_fallback_path(payload) or any(
+            self._uses_fallback_path(candidate_payload)
+            for candidate_payload in upstream_payloads
+        )
+        if not uses_fallback:
+            return raw_reward
+        positive_reward = max(float(raw_reward), 0.0)
+        negative_reward = min(float(raw_reward), 0.0)
+        return (
+            negative_reward
+            + positive_reward * self.controller_fallback_positive_reward_scale
+        )
+
+    def _controller_training_reward_components(
+        self,
+        raw_reward: float,
+        payload: Dict[str, object],
+        *,
+        role: str,
+        upstream_payloads: Sequence[Dict[str, object]] = (),
+    ) -> tuple[float, float, float]:
+        reward_after_fallback_mask = self._reward_after_fallback_mask(
+            raw_reward,
+            payload,
+            upstream_payloads=upstream_payloads,
+        )
+        format_penalty = self._controller_format_penalty(payload, role=role)
+        adjusted_reward = reward_after_fallback_mask - format_penalty
+        return adjusted_reward, reward_after_fallback_mask, format_penalty
+
     def _format_adjusted_reward(
         self,
         raw_reward: float,
         payload: Dict[str, object],
         *,
         role: str,
+        upstream_payloads: Sequence[Dict[str, object]] = (),
     ) -> float:
-        return raw_reward - self._controller_format_penalty(payload, role=role)
+        adjusted_reward, _, _ = self._controller_training_reward_components(
+            raw_reward,
+            payload,
+            role=role,
+            upstream_payloads=upstream_payloads,
+        )
+        return adjusted_reward
 
     def run_task(
         self,
@@ -355,6 +414,7 @@ class HierarchicalReMAOrchestrator:
                         selection.reward.total_reward,
                         selection.selection.raw_payload,
                         role="selector",
+                        upstream_payloads=(decomposition.raw_payload,),
                     )
                     for selection in selection_rollouts
                 ]
@@ -622,6 +682,8 @@ class HierarchicalReMAOrchestrator:
             "num_samples_total": 0,
             "num_samples_used": 0,
             "num_samples_skipped": 0,
+            "num_decompositions_skipped_fallback": 0,
+            "num_worker_samples_skipped_fallback": 0,
             "mean_group_size_used": 0.0,
         }
 
@@ -636,12 +698,16 @@ class HierarchicalReMAOrchestrator:
 
         if include_decomposer:
             for decomposition_rollout in decompositions:
-                adjusted_reward = self._format_adjusted_reward(
-                    decomposition_rollout.decomposition_reward,
-                    decomposition_rollout.decomposition.raw_payload,
-                    role="decomposer",
+                adjusted_reward, reward_after_fallback_mask, format_penalty = (
+                    self._controller_training_reward_components(
+                        decomposition_rollout.decomposition_reward,
+                        decomposition_rollout.decomposition.raw_payload,
+                        role="decomposer",
+                    )
                 )
-                format_penalty = decomposition_rollout.decomposition_reward - adjusted_reward
+                fallback_reward_mask = (
+                    decomposition_rollout.decomposition_reward - reward_after_fallback_mask
+                )
                 adjusted_advantage = decomposition_rollout.decomposer_advantage
                 decomposer_samples.append(
                     ControllerTrainingSample(
@@ -658,7 +724,11 @@ class HierarchicalReMAOrchestrator:
                             "model_path": policy_config.model_for_role("decomposer"),
                             "parameter_sharing": policy_config.parameter_sharing,
                             "reward_before_format_penalty": decomposition_rollout.decomposition_reward,
+                            "reward_after_fallback_mask_before_format_penalty": reward_after_fallback_mask,
                             "advantage_used_for_training": adjusted_advantage,
+                            "fallback_reward_mask": fallback_reward_mask,
+                            "fallback_reward_mask_applied": fallback_reward_mask > 0.0,
+                            "fallback_positive_reward_scale": self.controller_fallback_positive_reward_scale,
                             "format_penalty": format_penalty,
                             "format_validation": self._controller_validation_info(
                                 decomposition_rollout.decomposition.raw_payload
@@ -671,12 +741,17 @@ class HierarchicalReMAOrchestrator:
         if include_selector:
             for decomposition_rollout in decompositions:
                 for selection_rollout in decomposition_rollout.selections:
-                    adjusted_reward = self._format_adjusted_reward(
-                        selection_rollout.reward.total_reward,
-                        selection_rollout.selection.raw_payload,
-                        role="selector",
+                    adjusted_reward, reward_after_fallback_mask, format_penalty = (
+                        self._controller_training_reward_components(
+                            selection_rollout.reward.total_reward,
+                            selection_rollout.selection.raw_payload,
+                            role="selector",
+                            upstream_payloads=(decomposition_rollout.decomposition.raw_payload,),
+                        )
                     )
-                    format_penalty = selection_rollout.reward.total_reward - adjusted_reward
+                    fallback_reward_mask = (
+                        selection_rollout.reward.total_reward - reward_after_fallback_mask
+                    )
                     adjusted_advantage = selection_rollout.selector_advantage
                     selector_samples.append(
                         ControllerTrainingSample(
@@ -694,10 +769,17 @@ class HierarchicalReMAOrchestrator:
                                 "model_path": policy_config.model_for_role("selector"),
                                 "parameter_sharing": policy_config.parameter_sharing,
                                 "reward_before_format_penalty": selection_rollout.reward.total_reward,
+                                "reward_after_fallback_mask_before_format_penalty": reward_after_fallback_mask,
                                 "advantage_used_for_training": adjusted_advantage,
+                                "fallback_reward_mask": fallback_reward_mask,
+                                "fallback_reward_mask_applied": fallback_reward_mask > 0.0,
+                                "fallback_positive_reward_scale": self.controller_fallback_positive_reward_scale,
                                 "format_penalty": format_penalty,
                                 "format_validation": self._controller_validation_info(
                                     selection_rollout.selection.raw_payload
+                                ),
+                                "decomposition_format_validation": self._controller_validation_info(
+                                    decomposition_rollout.decomposition.raw_payload
                                 ),
                                 "training_target_source": "canonical_selection_plan",
                             },
@@ -708,6 +790,13 @@ class HierarchicalReMAOrchestrator:
             worker_lookup = worker_pool.workers_by_id()
             worker_groups: Dict[str, List[tuple[SelectionRollout, WorkerExecution, str, float, str]]] = {}
             for decomposition_rollout in decompositions:
+                if self._uses_fallback_path(decomposition_rollout.decomposition.raw_payload):
+                    worker_grpo_stats["num_decompositions_skipped_fallback"] += 1
+                    worker_grpo_stats["num_worker_samples_skipped_fallback"] += sum(
+                        len(selection_rollout.executions)
+                        for selection_rollout in decomposition_rollout.selections
+                    )
+                    continue
                 node_map = decomposition_rollout.decomposition.nodes_by_id()
                 for selection_rollout in decomposition_rollout.selections:
                     for execution in selection_rollout.executions:
@@ -829,6 +918,7 @@ class HierarchicalGRPOTrainer:
     backend: Optional[HierarchicalBackend] = None
     controller_format_retry_penalty: float = 0.0
     controller_format_fallback_penalty: float = 0.0
+    controller_fallback_positive_reward_scale: float = 0.0
     selector_partial_completion_penalty: float = 0.0
     decomposer_reward_aggregation: str = "best"
     decomposer_no_correct_selection_scale: float = 0.25
@@ -856,6 +946,7 @@ class HierarchicalGRPOTrainer:
             worker_memory=self.worker_memory,
             controller_format_retry_penalty=self.controller_format_retry_penalty,
             controller_format_fallback_penalty=self.controller_format_fallback_penalty,
+            controller_fallback_positive_reward_scale=self.controller_fallback_positive_reward_scale,
             selector_partial_completion_penalty=self.selector_partial_completion_penalty,
             decomposer_reward_aggregation=self.decomposer_reward_aggregation,
             decomposer_no_correct_selection_scale=self.decomposer_no_correct_selection_scale,

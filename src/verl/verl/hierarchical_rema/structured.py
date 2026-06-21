@@ -779,8 +779,16 @@ def apply_decomposition_limits(
                 node_exceedance ** rollout_config.soft_hop_penalty_power
             )
 
-    if original_node_count == 2 and _is_shallow_two_node_plan(candidate):
-        candidate.soft_penalty += rollout_config.soft_hop_penalty
+    if original_node_count == 1:
+        candidate.soft_penalty += max(
+            rollout_config.trivial_single_node_penalty,
+            rollout_config.soft_hop_penalty,
+        )
+    elif original_node_count == 2 and _is_shallow_two_node_plan(candidate):
+        candidate.soft_penalty += max(
+            rollout_config.trivial_shallow_two_node_penalty,
+            rollout_config.soft_hop_penalty,
+        )
 
     limited_candidate = candidate
     if len(limited_candidate.nodes) > rollout_config.max_nodes_per_decomposition:

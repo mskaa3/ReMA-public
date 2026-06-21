@@ -83,6 +83,8 @@ class RolloutConfig:
     hard_max_hops: Optional[int] = None
     soft_hop_penalty: float = 0.1
     soft_hop_penalty_power: float = 1.0
+    trivial_single_node_penalty: float = 1.0
+    trivial_shallow_two_node_penalty: float = 0.5
 
 
 @dataclass

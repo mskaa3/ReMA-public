@@ -224,7 +224,7 @@ def render_decomposer_prompt(
         "- OUTPUT_KEY is optional and only for readability.\n"
         "- Do not tailor the decomposition to a particular worker roster.\n"
         "- Return a DAG, not a chain unless the task truly needs one.\n"
-        "- Prefer a few smaller meaningful steps over a single node; use one node only when the task is genuinely atomic or cannot be usefully divided.\n"
+        "- Prefer a few smaller meaningful steps over a single node; one-node and shallow two-node decompositions are penalized unless the task is genuinely atomic or cannot be usefully divided.\n"
         "- Keep the summary and node instructions short.\n"
         "- Every node instruction must name the concrete mathematical artifact it should output.\n"
         "- Prefer grounded instructions like `rewrite ... as ...`, `return the simplified expression ...`, `name the chosen method ...`, or `return the final scalar answer ...`.\n"
