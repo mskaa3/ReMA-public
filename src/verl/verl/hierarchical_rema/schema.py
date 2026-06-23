@@ -26,6 +26,8 @@ CANONICAL_SKILL_TAGS: tuple[str, ...] = (
     "discrete_math",
 )
 
+REDACTED_FINAL_ANSWER_LEAK_OUTPUT = "[redacted: upstream node leaked final answer]"
+
 class TrainingMode(str, Enum):
     JOINT = "joint"
     ALTERNATING = "alternating"

@@ -915,9 +915,11 @@ def validate_decomposition_payload(
     for original_node_id in canonical_order:
         original_node = original_node_map[original_node_id]
         remapped_node_id = remapped_node_ids[original_node_id]
-        output_key = original_node.output_key
-        if output_key == f"{original_node_id}_output":
-            output_key = f"{remapped_node_id}_output"
+        output_key = (
+            "final_answer"
+            if original_node_id == resolved_final_node_id
+            else f"{remapped_node_id}_output"
+        )
         canonical_nodes.append(
             SubtaskNode(
                 node_id=remapped_node_id,

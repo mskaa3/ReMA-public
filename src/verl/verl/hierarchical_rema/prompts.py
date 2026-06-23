@@ -5,6 +5,7 @@ from typing import Dict, Sequence
 from .schema import (
     CANONICAL_SKILL_TAGS,
     DecompositionCandidate,
+    REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
     SubtaskNode,
     TaskExample,
     WorkerPerformanceSnapshot,
@@ -134,9 +135,8 @@ def _expected_worker_output_hint(
         return f"final_answer_matching_{decomposition.final_answer_format_hint}"
 
     instruction = node.instruction.lower()
-    output_key = (node.output_key or "").lower()
 
-    if "equation" in instruction or "equation" in output_key:
+    if "equation" in instruction:
         return "transformed_equation"
     if any(token in instruction for token in ("expression", "simplify", "expand", "factor")):
         return "simplified_expression"
@@ -193,7 +193,7 @@ def render_decomposer_prompt(
     return (
         "OUTPUT CONTRACT:\n"
         "- Return exactly one <decomposition_plan> block and nothing else.\n"
-        "- Use only these keys: SUMMARY, TARGET_QUANTITY, FINAL_ANSWER_FORMAT_HINT, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE, OUTPUT_KEY.\n"
+        "- Use only these keys: SUMMARY, TARGET_QUANTITY, FINAL_ANSWER_FORMAT_HINT, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE.\n"
         "- Use this skeleton:\n"
         "<decomposition_plan>\n"
         "SUMMARY: short summary\n"
@@ -221,7 +221,6 @@ def render_decomposer_prompt(
         "- Use at most 2 REQUIRED_SKILLS tags per node, and prefer 1 when possible.\n"
         "- REQUIRED_SKILLS_NOTE is optional. When used, keep it very short and specific, such as `equation manipulation`, `counting argument`, or `coordinate setup`.\n"
         "- Do not list every possible skill or repeat the same broad tag across all nodes unless the task genuinely requires it.\n"
-        "- OUTPUT_KEY is optional and only for readability.\n"
         "- Do not tailor the decomposition to a particular worker roster.\n"
         "- Return a DAG, not a chain unless the task truly needs one.\n"
         "- Prefer a few smaller meaningful steps over a single node; one-node and shallow two-node decompositions are penalized unless the task is genuinely atomic or cannot be usefully divided.\n"
@@ -254,7 +253,7 @@ def render_selector_prompt(
         skills = ",".join(node.required_skills) if node.required_skills else "none"
         skill_note = f" | skill_note={node.required_skills_note}" if node.required_skills_note else ""
         node_lines.append(
-            f"{node.node_id}: deps={dependencies} | skills={skills}{skill_note} | output={node.output_key} | instruction={node.instruction}"
+            f"{node.node_id}: deps={dependencies} | skills={skills}{skill_note} | instruction={node.instruction}"
         )
 
     worker_lines = []
@@ -363,6 +362,7 @@ def render_worker_prompt(
         "- Do only the current NODE_INSTRUCTION. Do not solve future nodes, repeat the full task, or add explanations unless the instruction explicitly asks for them.\n"
         "- Use DEPENDENCY_RESULTS as the current working context when they are provided.\n"
         "- Treat dependency results as factual inputs from earlier nodes. If a dependency says `sin(alpha) = 1/2`, use that value directly.\n"
+        f"- If a dependency result is exactly `{REDACTED_FINAL_ANSWER_LEAK_OUTPUT}`, that upstream node leaked a premature final answer. Treat that dependency as unavailable evidence and do not try to infer or reconstruct the hidden answer from it.\n"
         "- You may include at most one <worker_scratchpad> block before the final <worker_result> block.\n"
         "- If you use <worker_scratchpad>, make it a short but logically connected piece of reasoning that helps solve the current node.\n"
         "- The scratchpad should show useful mathematical thinking such as a transformation, substitution, case split, geometric fact, or intermediate deduction that moves from the available context toward the required node artifact.\n"

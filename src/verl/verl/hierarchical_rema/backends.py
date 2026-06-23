@@ -17,15 +17,15 @@ from .prompts import (
 )
 from .rewarding import (
     compatibility_score,
-    contains_answer_like_content,
-    compute_final_answer_correctness,
     entropy_to_confidence_reward,
+    is_non_final_answer_leak,
     skill_match_score,
 )
 from .schema import (
     ControllerPolicyConfig,
     DecompositionCandidate,
     HFBackendConfig,
+    REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
     RolloutConfig,
     SelectionCandidate,
     SubtaskNode,
@@ -102,22 +102,20 @@ def _postprocess_worker_output(
         return "", invalid_reason, final_answer_leak, answer_containment, False
 
     if node.node_id != decomposition.final_node_id:
-        if (
-            compute_final_answer_correctness(
-                normalized_output,
-                task.ground_truth,
-                task_metadata=task.metadata,
-            )
-            > 0.0
-            or contains_answer_like_content(
-                normalized_output,
-                task.ground_truth,
-                task_metadata=task.metadata,
-            )
+        if is_non_final_answer_leak(
+            normalized_output,
+            task.ground_truth,
+            task_metadata=task.metadata,
         ):
             final_answer_leak = True
             invalid_reason = "non_final_contains_ground_truth"
-            return "", invalid_reason, final_answer_leak, answer_containment, False
+            return (
+                REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
+                invalid_reason,
+                final_answer_leak,
+                answer_containment,
+                False,
+            )
 
     return normalized_output, invalid_reason, final_answer_leak, answer_containment, True
 

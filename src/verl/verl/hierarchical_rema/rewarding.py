@@ -106,6 +106,72 @@ def _extract_answer_like_candidates(text: str) -> List[str]:
     return candidates
 
 
+def _extract_non_final_leak_candidates(text: str) -> List[str]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return []
+
+    candidates: List[str] = []
+    seen = set()
+
+    def _add(candidate: str) -> None:
+        cleaned = candidate.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            candidates.append(cleaned)
+
+    def _strip_outer_math_delimiters(candidate: str) -> str:
+        cleaned = candidate.strip()
+        if len(cleaned) >= 2 and cleaned.startswith("$") and cleaned.endswith("$"):
+            cleaned = cleaned[1:-1].strip()
+        if cleaned.startswith("\\(") and cleaned.endswith("\\)"):
+            cleaned = cleaned[2:-2].strip()
+        if cleaned.startswith("\\[") and cleaned.endswith("\\]"):
+            cleaned = cleaned[2:-2].strip()
+        if cleaned.startswith("$"):
+            cleaned = cleaned[1:].strip()
+        if cleaned.endswith("$"):
+            cleaned = cleaned[:-1].strip()
+        cleaned = cleaned.rstrip(".,;:")
+        return cleaned
+
+    def _add_with_variants(candidate: str) -> None:
+        _add(candidate)
+        stripped_candidate = _strip_outer_math_delimiters(candidate)
+        if stripped_candidate != candidate.strip():
+            _add(stripped_candidate)
+
+    _add_with_variants(stripped)
+
+    lines = [line.strip(" -*\t") for line in stripped.splitlines() if line.strip()]
+    if lines:
+        _add_with_variants(lines[-1])
+    for line in lines[-3:]:
+        match = _FINAL_CLAUSE_PATTERN.search(line)
+        if match:
+            _add_with_variants(match.group(1))
+
+    for match in _BOXED_ANSWER_PATTERN.finditer(stripped):
+        _add_with_variants(match.group(1))
+
+    return candidates
+
+
+def is_non_final_answer_leak(
+    text: str,
+    reference: str,
+    task_metadata: Dict[str, Any] | None = None,
+) -> bool:
+    for candidate in _extract_non_final_leak_candidates(text):
+        if _score_single_prediction_candidate(
+            candidate,
+            reference,
+            task_metadata=task_metadata,
+        ) > 0.0:
+            return True
+    return False
+
+
 def contains_answer_like_content(
     text: str,
     reference: str,
@@ -365,16 +431,18 @@ def build_selection_reward(
                 execution.answer_containment = False
                 continue
             execution.answer_containment = (
-                contains_answer_like_content(
+                compute_final_answer_correctness(
                     execution.output_text,
                     final_answer,
                     task_metadata=task_metadata,
                 )
-                or contains_answer_like_content(
+                > 0.0
+                or compute_final_answer_correctness(
                     execution.output_text,
                     ground_truth,
                     task_metadata=task_metadata,
                 )
+                > 0.0
             )
             if execution.answer_containment:
                 non_final_answer_containment_count += 1

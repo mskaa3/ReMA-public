@@ -1,6 +1,7 @@
 import json
 
 try:
+    from verl.hierarchical_rema.backends import _postprocess_worker_output
     from verl.hierarchical_rema import (
         AlternatingPhase,
         ControllerPolicyConfig,
@@ -17,21 +18,28 @@ try:
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
         WorkerExecution,
         WorkerRewardMode,
         WorkerPoolConfig,
         WorkerSpec,
     )
     from verl.hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
-    from verl.hierarchical_rema.prompts import render_decomposer_prompt, render_selector_prompt
+    from verl.hierarchical_rema.prompts import (
+        render_decomposer_prompt,
+        render_selector_prompt,
+        render_worker_prompt,
+    )
     from verl.hierarchical_rema.structured import (
         apply_decomposition_limits,
         build_fallback_decomposition,
         extract_decomposition_payload,
         extract_json_dict,
         extract_selection_payload,
+        validate_decomposition_payload,
     )
 except ModuleNotFoundError:
+    from hierarchical_rema.backends import _postprocess_worker_output
     from hierarchical_rema import (
         AlternatingPhase,
         ControllerPolicyConfig,
@@ -48,19 +56,25 @@ except ModuleNotFoundError:
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
         WorkerExecution,
         WorkerRewardMode,
         WorkerPoolConfig,
         WorkerSpec,
     )
     from hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
-    from hierarchical_rema.prompts import render_decomposer_prompt, render_selector_prompt
+    from hierarchical_rema.prompts import (
+        render_decomposer_prompt,
+        render_selector_prompt,
+        render_worker_prompt,
+    )
     from hierarchical_rema.structured import (
         apply_decomposition_limits,
         build_fallback_decomposition,
         extract_decomposition_payload,
         extract_json_dict,
         extract_selection_payload,
+        validate_decomposition_payload,
     )
 
 
@@ -522,23 +536,202 @@ def test_selector_prompt_uses_compact_decomposition_context() -> None:
     assert '"raw_payload"' not in prompt
     assert '"raw_text"' not in prompt
     assert "Allowed node IDs:" in prompt
-    assert "Preferred answer is one line per node: `node_id: worker_index`." in prompt
+    assert "- Use exactly one line per node in the form: `node_id: worker_id`." in prompt
+    assert " | output=" not in prompt
 
 
 def test_decomposer_prompt_declares_strict_output_contract() -> None:
-    trainer = HierarchicalGRPOTrainer()
-    worker_pool = make_worker_pool()
     task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
 
     prompt = render_decomposer_prompt(
         task=task,
-        worker_pool=worker_pool,
-        worker_performance=trainer.orchestrator.worker_memory.snapshot(worker_pool),
+        max_nodes_hint=4,
     )
 
-    assert "Response must start with <decomposition_plan>" in prompt
-    assert "Use plain numeric node IDs like 1, 2, 3 in topological order." in prompt
-    assert "Every node block must include NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, OUTPUT_KEY." in prompt
+    assert "- Return exactly one <decomposition_plan> block and nothing else." in prompt
+    assert "Use only these keys: SUMMARY, TARGET_QUANTITY, FINAL_ANSWER_FORMAT_HINT, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE." in prompt
+    assert "Allowed node IDs: 1, 2, 3, 4." in prompt
+    assert "OUTPUT_KEY" not in prompt
+
+
+def test_non_final_worker_output_does_not_blank_signed_values() -> None:
+    task = make_task("algebra", "Solve x^2 + 3x = 0.", "3", "5")
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="solve roots",
+        target_quantity="solution set",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Solve the quadratic.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the positive root only.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="<worker_result>0; -3</worker_result>",
+        )
+    )
+
+    assert normalized_output == "0; -3"
+    assert invalid_reason == ""
+    assert final_answer_leak is False
+    assert answer_containment is False
+    assert success is True
+
+
+def test_non_final_worker_output_blanks_explicit_final_answer_clause() -> None:
+    task = make_task(
+        "algebra",
+        "Find the integer solution.",
+        "3",
+        "4",
+    )
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Analyze the cases.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="<worker_result>\nAfter simplifying, the answer is 3.\n</worker_result>",
+        )
+    )
+
+    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
+    assert invalid_reason == "non_final_contains_ground_truth"
+    assert final_answer_leak is True
+    assert answer_containment is False
+    assert success is False
+
+
+def test_non_final_worker_output_blanks_boxed_final_answer() -> None:
+    task = make_task(
+        "algebra",
+        "Find the integer solution.",
+        "3",
+        "4",
+    )
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Analyze the cases.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="<worker_result>\n\\boxed{3}\n</worker_result>",
+        )
+    )
+
+    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
+    assert invalid_reason == "non_final_contains_ground_truth"
+    assert final_answer_leak is True
+    assert answer_containment is False
+    assert success is False
+
+
+def test_worker_prompt_explains_redacted_dependency_outputs() -> None:
+    task = make_task("algebra", "Find the integer solution.", "3", "4")
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Analyze the cases.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+    worker_pool = make_worker_pool()
+    prompt = render_worker_prompt(
+        task=task,
+        decomposition=decomposition,
+        node=decomposition.nodes[1],
+        worker=worker_pool.workers[0],
+        dependency_outputs={"1": REDACTED_FINAL_ANSWER_LEAK_OUTPUT},
+    )
+
+    assert REDACTED_FINAL_ANSWER_LEAK_OUTPUT in prompt
+    assert "Treat that dependency as unavailable evidence" in prompt
+
+
+def test_decomposition_output_keys_are_canonicalized() -> None:
+    payload = {
+        "decomposition_id": "decomp-1",
+        "summary": "short plan",
+        "target_quantity": "integer",
+        "final_answer_format_hint": "integer",
+        "final_node_id": "20",
+        "nodes": [
+            {
+                "node_id": "10",
+                "instruction": "Analyze the equation.",
+                "dependencies": [],
+                "required_skills": ["analysis"],
+                "output_key": "1234567890abcdefghijklmnopQERTYUIOP1234567890abcdefgHJKLOMN",
+            },
+            {
+                "node_id": "20",
+                "instruction": "Return the final answer.",
+                "dependencies": ["10"],
+                "required_skills": ["algebra"],
+                "output_key": "another_garbage_key",
+            },
+        ],
+    }
+
+    candidate = validate_decomposition_payload(
+        payload=payload,
+        rollout_config=RolloutConfig(),
+        fallback_id="decomp-1",
+    )
+
+    assert [node.output_key for node in candidate.nodes] == ["1_output", "final_answer"]
 
 
 def test_line_based_controller_plans_are_parseable() -> None:
