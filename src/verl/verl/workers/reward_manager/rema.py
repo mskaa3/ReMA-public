@@ -29,6 +29,7 @@ WORKER_BOXED_PENALTY = 0.05
 WORKER_FINISH_PENALTY = 0.05
 PLANNER_REPEAT_PENALTY = 0.03
 PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
+ENABLE_PLANNER_SUBTASK_COUNT_PENALTY = False
 PLANNER_SUBTASK_TARGET_MIN = 3
 PLANNER_SUBTASK_TARGET_MAX = 5
 PLANNER_SUBTASK_COUNT_PENALTY_PER_TASK = 0.20
@@ -1032,7 +1033,7 @@ class ReMARewardManager:
                 active_penalties.append(('planner_excess_subtask', PLANNER_EXCESS_SUBTASK_PENALTY, sorted(excess_subtask_roles)))
 
             subtask_count_penalty = 0.0
-            if 'decomposer' in agent_roles:
+            if ENABLE_PLANNER_SUBTASK_COUNT_PENALTY and 'decomposer' in agent_roles:
                 for msg in valid_history:
                     if not (
                         isinstance(msg, dict)

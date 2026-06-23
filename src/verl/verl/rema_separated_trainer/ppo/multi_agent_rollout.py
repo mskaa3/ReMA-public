@@ -975,9 +975,8 @@ class MultiAgentRollout:
                             question_block = f"{questions[idx]}\n\n"
                         else:
                             question_block = (
-                                "You do not see the full original question. "
-                                "Use the assigned subtask as your task context; it should contain the needed facts. "
-                                "Use previous LOCAL_RESULTs when provided.\n\n"
+                                "The assigned subtask is your task context and should contain the needed facts. "
+                                "Use previous LOCAL_RESULTs when they help.\n\n"
                             )
                         work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         if is_final_stage:
@@ -990,14 +989,14 @@ class MultiAgentRollout:
                             "Synthesize the final answer from the available notes. "
                             "Check the notes, repair mistakes if needed, and end with the final answer in \\boxed{}."
                             if is_final_stage else
-                            "Solve only the step above. "
-                            "Think through the assigned instruction carefully, including any dependency, warning, or backtracking instruction. "
-                            "Do not write [FINISH] or Final Answer. "
-                            "Use \\boxed{} only in the LOCAL_RESULT line, not in REASONING. "
+                            "Work on the assigned subtask above. "
+                            "Reason step by step with concrete calculations, transformations, or checks. "
+                            "Verify dependencies, warnings, boundary cases, signs, domains, units, and repair instructions. "
+                            "Finish with one concise LOCAL_RESULT for this subtask. "
                             "Output exactly:\n"
                             "REASONING:\n"
-                            "<brief reasoning for this subtask only>\n\n"
-                            "LOCAL_RESULT: \\boxed{<the final result of this subtask only>}"
+                            "<step-by-step reasoning for this subtask>\n\n"
+                            "LOCAL_RESULT: \\boxed{<useful result of this subtask>}"
                         )
                         if is_final_stage and not assigned_subtasks_text:
                             assigned_subtasks_text = (
@@ -1006,7 +1005,7 @@ class MultiAgentRollout:
                         work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ""
                         dependency_instruction = (
                             "Use previous LOCAL_RESULTs from the work above when they are relevant. "
-                            "Do not recompute earlier subtasks unless you need to check an inconsistency.\n\n"
+                            "Check earlier subtasks when an inconsistency matters.\n\n"
                             if work_so_far and not is_final_stage else ""
                         )
                         chat = build_selected_worker_prompt(
