@@ -248,6 +248,7 @@ def test_worker_training_skips_samples_from_fallback_decompositions() -> None:
             total_reward=1.0,
         ),
     )
+    selection_rollout.selection.raw_payload["controller_prompt"] = "Assign workers."
     decomposition_rollout = DecompositionRollout(
         decomposition=fallback_decomposition,
         selections=[selection_rollout],
@@ -260,8 +261,7 @@ def test_worker_training_skips_samples_from_fallback_decompositions() -> None:
         worker_pool=worker_pool,
         policy_config=ControllerPolicyConfig(parameter_sharing=False),
         schedule=TrainingScheduleConfig(
-            mode=TrainingMode.ALTERNATING,
-            alternating_phase=AlternatingPhase.DECOMPOSER,
+            mode=TrainingMode.JOINT,
         ),
         decompositions=[decomposition_rollout],
     )
@@ -416,7 +416,10 @@ def test_shallow_two_node_plan_receives_triviality_penalty() -> None:
 
 
 def test_alternating_selector_phase_freezes_decomposer() -> None:
-    trainer = HierarchicalGRPOTrainer()
+    trainer = HierarchicalGRPOTrainer(
+        train_worker_model=True,
+        min_worker_grpo_group_size=1,
+    )
     task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
     rollout = trainer.run(
         task=task,
@@ -433,11 +436,15 @@ def test_alternating_selector_phase_freezes_decomposer() -> None:
     assert len(rollout.decompositions[0].selections) == 3
     assert len(rollout.training_batch.decomposer_samples) == 0
     assert len(rollout.training_batch.selector_samples) == 3
+    assert len(rollout.training_batch.worker_samples) > 0
     assert rollout.training_batch.frozen_roles == ["decomposer"]
 
 
 def test_alternating_decomposer_phase_freezes_selector() -> None:
-    trainer = HierarchicalGRPOTrainer()
+    trainer = HierarchicalGRPOTrainer(
+        train_worker_model=True,
+        min_worker_grpo_group_size=1,
+    )
     task = make_task("analysis", "Differentiate sin(x).", "cos(x)", "sin(x)")
     rollout = trainer.run(
         task=task,
@@ -454,6 +461,7 @@ def test_alternating_decomposer_phase_freezes_selector() -> None:
     assert all(len(decomposition.selections) == 1 for decomposition in rollout.decompositions)
     assert len(rollout.training_batch.decomposer_samples) == 4
     assert len(rollout.training_batch.selector_samples) == 0
+    assert rollout.training_batch.worker_samples == []
     assert rollout.training_batch.frozen_roles == ["selector"]
 
 

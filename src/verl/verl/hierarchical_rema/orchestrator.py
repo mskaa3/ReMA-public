@@ -695,6 +695,12 @@ class HierarchicalReMAOrchestrator:
             schedule.mode == TrainingMode.ALTERNATING
             and schedule.alternating_phase == AlternatingPhase.SELECTOR
         )
+        include_worker = self.train_worker_model and (
+            schedule.mode == TrainingMode.JOINT or (
+                schedule.mode == TrainingMode.ALTERNATING
+                and schedule.alternating_phase == AlternatingPhase.SELECTOR
+            )
+        )
 
         if include_decomposer:
             for decomposition_rollout in decompositions:
@@ -786,7 +792,7 @@ class HierarchicalReMAOrchestrator:
                         )
                     )
 
-        if self.train_worker_model:
+        if include_worker:
             worker_lookup = worker_pool.workers_by_id()
             worker_groups: Dict[
                 str,
