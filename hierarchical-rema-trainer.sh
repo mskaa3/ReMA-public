@@ -232,6 +232,12 @@ TRAIN_POLICY_ID=${TRAIN_POLICY_ID:-}
 TRAIN_VAL_RATIO=${TRAIN_VAL_RATIO:-0.05}
 TRAIN_MIN_REWARD=${TRAIN_MIN_REWARD:-}
 TRAIN_MIN_ADVANTAGE=${TRAIN_MIN_ADVANTAGE:-}
+# Controller sample provenance filter:
+#   all = current behavior
+#   no_fallback = drop fallback-derived controller samples
+#   allow_local_repair = keep only clean or locally repaired controller samples
+#   clean_only = keep only clean controller samples
+CONTROLLER_SAMPLE_QUALITY_FILTER=${CONTROLLER_SAMPLE_QUALITY_FILTER:-all}
 DECOMPOSER_REWARD_AGGREGATION=${DECOMPOSER_REWARD_AGGREGATION:-best}
 DECOMPOSER_NO_CORRECT_SELECTION_SCALE=${DECOMPOSER_NO_CORRECT_SELECTION_SCALE:-0.25}
 CONTROLLER_FORMAT_RETRY_PENALTY=${CONTROLLER_FORMAT_RETRY_PENALTY:-0.05}
@@ -446,6 +452,8 @@ TRAIN_MIN_ADVANTAGE_FLAG=""
 if [[ -n "$TRAIN_MIN_ADVANTAGE" ]]; then
     TRAIN_MIN_ADVANTAGE_FLAG="--min-advantage ${TRAIN_MIN_ADVANTAGE}"
 fi
+
+CONTROLLER_SAMPLE_QUALITY_FILTER_FLAG="--controller-sample-quality-filter ${CONTROLLER_SAMPLE_QUALITY_FILTER}"
 
 VLLM_MAX_MODEL_LEN_FLAG=""
 if [[ -n "$VLLM_MAX_MODEL_LEN" ]]; then
@@ -1354,6 +1362,7 @@ python3 -m hierarchical_rema.train \
   ${TRAIN_POLICY_ID_FLAG} \
   ${TRAIN_MIN_REWARD_FLAG} \
   ${TRAIN_MIN_ADVANTAGE_FLAG} \
+  ${CONTROLLER_SAMPLE_QUALITY_FILTER_FLAG} \
   --decomposer-reward-aggregation ${DECOMPOSER_REWARD_AGGREGATION} \
   --decomposer-no-correct-selection-scale ${DECOMPOSER_NO_CORRECT_SELECTION_SCALE} \
   --controller-format-retry-penalty ${CONTROLLER_FORMAT_RETRY_PENALTY} \

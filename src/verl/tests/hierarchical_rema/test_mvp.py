@@ -5,8 +5,10 @@ try:
     from verl.hierarchical_rema import (
         AlternatingPhase,
         ControllerPolicyConfig,
+        ControllerTrainingSample,
         DecompositionCandidate,
         DecompositionRollout,
+        HierarchicalTrainingBatch,
         HierarchicalGRPOTrainer,
         RewardWeights,
         RolloutLoggingConfig,
@@ -16,6 +18,7 @@ try:
         SelectionRollout,
         SubtaskNode,
         TaskExample,
+        TaskRollout,
         TrainingMode,
         TrainingScheduleConfig,
         REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
@@ -24,6 +27,7 @@ try:
         WorkerPoolConfig,
         WorkerSpec,
     )
+    from verl.hierarchical_rema.controller_data import controller_samples_from_task_rollouts
     from verl.hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
     from verl.hierarchical_rema.prompts import (
         render_decomposer_prompt,
@@ -43,8 +47,10 @@ except ModuleNotFoundError:
     from hierarchical_rema import (
         AlternatingPhase,
         ControllerPolicyConfig,
+        ControllerTrainingSample,
         DecompositionCandidate,
         DecompositionRollout,
+        HierarchicalTrainingBatch,
         HierarchicalGRPOTrainer,
         RewardWeights,
         RolloutLoggingConfig,
@@ -54,6 +60,7 @@ except ModuleNotFoundError:
         SelectionRollout,
         SubtaskNode,
         TaskExample,
+        TaskRollout,
         TrainingMode,
         TrainingScheduleConfig,
         REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
@@ -62,6 +69,7 @@ except ModuleNotFoundError:
         WorkerPoolConfig,
         WorkerSpec,
     )
+    from hierarchical_rema.controller_data import controller_samples_from_task_rollouts
     from hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
     from hierarchical_rema.prompts import (
         render_decomposer_prompt,
@@ -698,6 +706,233 @@ def test_worker_prompt_explains_redacted_dependency_outputs() -> None:
 
     assert REDACTED_FINAL_ANSWER_LEAK_OUTPUT in prompt
     assert "Treat that dependency as unavailable evidence" in prompt
+
+
+def test_controller_sample_quality_filter_clean_only_keeps_only_clean_controller_samples() -> None:
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+    rollout = TaskRollout(
+        task=task,
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+        decompositions=[],
+        training_batch=HierarchicalTrainingBatch(
+            decomposer_samples=[
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="clean",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": False,
+                            "attempt": 0,
+                        }
+                    },
+                ),
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="local",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": False,
+                            "local_salvage_used": True,
+                        }
+                    },
+                ),
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="model",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": False,
+                            "attempt": 1,
+                            "errors_before_success": ["parse error"],
+                        }
+                    },
+                ),
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="fallback",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": True,
+                        }
+                    },
+                ),
+            ],
+            selector_samples=[
+                ControllerTrainingSample(
+                    role="selector",
+                    policy_id="selector_controller",
+                    group_id="selector-clean",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": False,
+                            "attempt": 0,
+                        },
+                        "decomposition_format_validation": {
+                            "fallback_used": False,
+                            "attempt": 0,
+                        },
+                    },
+                ),
+                ControllerTrainingSample(
+                    role="selector",
+                    policy_id="selector_controller",
+                    group_id="selector-upstream-local",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": False,
+                            "attempt": 0,
+                        },
+                        "decomposition_format_validation": {
+                            "fallback_used": False,
+                            "local_salvage_used": True,
+                        },
+                    },
+                ),
+            ],
+        ),
+    )
+
+    samples = controller_samples_from_task_rollouts(
+        task_rollouts=[rollout],
+        roles=["decomposer", "selector"],
+        controller_sample_quality_filter="clean_only",
+    )
+
+    assert [sample.group_id for sample in samples] == ["clean", "selector-clean"]
+
+
+def test_controller_sample_quality_filter_allow_local_repair_excludes_model_repair_and_fallback() -> None:
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+    rollout = TaskRollout(
+        task=task,
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+        decompositions=[],
+        training_batch=HierarchicalTrainingBatch(
+            decomposer_samples=[
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="clean",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={"format_validation": {"fallback_used": False, "attempt": 0}},
+                ),
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="local",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={"format_validation": {"fallback_used": False, "local_salvage_used": True}},
+                ),
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="model",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={"format_validation": {"fallback_used": False, "attempt": 2}},
+                ),
+                ControllerTrainingSample(
+                    role="decomposer",
+                    policy_id="decomposer_controller",
+                    group_id="fallback",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={"format_validation": {"fallback_used": True}},
+                ),
+            ],
+            selector_samples=[
+                ControllerTrainingSample(
+                    role="selector",
+                    policy_id="selector_controller",
+                    group_id="selector-local",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": False,
+                            "partial_completion_used": True,
+                            "batch_repair_fallback": True,
+                        },
+                        "decomposition_format_validation": {
+                            "fallback_used": False,
+                            "attempt": 0,
+                        },
+                    },
+                ),
+                ControllerTrainingSample(
+                    role="selector",
+                    policy_id="selector_controller",
+                    group_id="selector-upstream-model",
+                    prompt_text="prompt",
+                    completion_text="completion",
+                    reward=1.0,
+                    advantage=1.0,
+                    metadata={
+                        "format_validation": {
+                            "fallback_used": False,
+                            "attempt": 0,
+                        },
+                        "decomposition_format_validation": {
+                            "fallback_used": False,
+                            "attempt": 1,
+                        },
+                    },
+                ),
+            ],
+        ),
+    )
+
+    samples = controller_samples_from_task_rollouts(
+        task_rollouts=[rollout],
+        roles=["decomposer", "selector"],
+        controller_sample_quality_filter="allow_local_repair",
+    )
+
+    assert [sample.group_id for sample in samples] == ["clean", "local", "selector-local"]
 
 
 def test_decomposition_output_keys_are_canonicalized() -> None:

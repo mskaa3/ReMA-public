@@ -399,6 +399,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-advantage", type=float, default=None)
     parser.add_argument(
+        "--controller-sample-quality-filter",
+        choices=["all", "no_fallback", "allow_local_repair", "clean_only"],
+        default="all",
+        help=(
+            "How strictly to filter controller replay samples by repair/fallback provenance. "
+            "`all` keeps current behavior, `no_fallback` drops fallback-derived controller samples, "
+            "`allow_local_repair` keeps only clean or locally repaired controller samples, and "
+            "`clean_only` keeps only clean controller samples. Worker samples are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--min-worker-grpo-group-size",
         type=int,
         default=3,
@@ -2281,6 +2292,7 @@ def main() -> None:
                     min_reward=args.min_reward,
                     min_advantage=args.min_advantage,
                     source_path=str(segment_rollout_dir),
+                    controller_sample_quality_filter=args.controller_sample_quality_filter,
                 )
                 policy_splits = prepare_policy_splits(
                     samples=samples,

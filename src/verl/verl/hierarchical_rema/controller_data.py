@@ -68,11 +68,65 @@ def discover_rollout_files(
     return sorted(set(files))
 
 
+def _controller_validation_bucket(validation: Optional[Dict]) -> str:
+    if not isinstance(validation, dict):
+        return "clean"
+    if bool(validation.get("fallback_used")):
+        return "fallback"
+    if bool(validation.get("local_salvage_used")) or bool(validation.get("partial_completion_used")):
+        return "local_repair"
+
+    attempt_raw = validation.get("attempt", 0)
+    try:
+        attempt_count = max(int(attempt_raw), 0)
+    except (TypeError, ValueError):
+        attempt_count = 0
+
+    errors_before_success = validation.get("errors_before_success")
+    if isinstance(errors_before_success, list):
+        attempt_count = max(attempt_count, len(errors_before_success))
+
+    if attempt_count > 0 or bool(validation.get("batch_repair_fallback")):
+        return "model_repair"
+    return "clean"
+
+
+def _controller_sample_matches_quality_filter(
+    *,
+    role: str,
+    metadata: Dict,
+    quality_filter: str,
+) -> bool:
+    normalized_filter = str(quality_filter or "all").strip().lower()
+    if normalized_filter == "all" or role == "worker":
+        return True
+
+    buckets = [
+        _controller_validation_bucket(
+            metadata.get("format_validation") if isinstance(metadata, dict) else None
+        )
+    ]
+    if role == "selector" and isinstance(metadata, dict):
+        buckets.append(_controller_validation_bucket(metadata.get("decomposition_format_validation")))
+
+    if normalized_filter == "no_fallback":
+        return all(bucket != "fallback" for bucket in buckets)
+    if normalized_filter == "allow_local_repair":
+        return all(bucket not in {"model_repair", "fallback"} for bucket in buckets)
+    if normalized_filter == "clean_only":
+        return all(bucket == "clean" for bucket in buckets)
+    raise ValueError(
+        "controller_sample_quality_filter must be one of: all, no_fallback, "
+        "allow_local_repair, clean_only"
+    )
+
+
 def load_controller_samples_from_rollouts(
     rollout_paths: Sequence[str],
     roles: Optional[Sequence[str]] = None,
     min_reward: Optional[float] = None,
     min_advantage: Optional[float] = None,
+    controller_sample_quality_filter: str = "all",
 ) -> List[ControllerReplaySample]:
     allowed_roles = set(roles) if roles else None
     samples: List[ControllerReplaySample] = []
@@ -98,6 +152,13 @@ def load_controller_samples_from_rollouts(
                             continue
                         if min_advantage is not None and advantage < min_advantage:
                             continue
+                        metadata = dict(sample.get("metadata", {}))
+                        if not _controller_sample_matches_quality_filter(
+                            role=role,
+                            metadata=metadata,
+                            quality_filter=controller_sample_quality_filter,
+                        ):
+                            continue
                         samples.append(
                             ControllerReplaySample(
                                 role=role,
@@ -107,7 +168,7 @@ def load_controller_samples_from_rollouts(
                                 completion_text=sample["completion_text"],
                                 reward=reward,
                                 advantage=advantage,
-                                metadata=dict(sample.get("metadata", {})),
+                                metadata=metadata,
                                 task_id=task_id,
                                 source_path=str(rollout_path),
                                 timestamp=timestamp,
@@ -124,6 +185,7 @@ def controller_samples_from_task_rollouts(
     min_reward: Optional[float] = None,
     min_advantage: Optional[float] = None,
     source_path: str = "",
+    controller_sample_quality_filter: str = "all",
 ) -> List[ControllerReplaySample]:
     allowed_roles = set(roles) if roles else None
     samples: List[ControllerReplaySample] = []
@@ -140,6 +202,13 @@ def controller_samples_from_task_rollouts(
                     continue
                 if min_advantage is not None and advantage < min_advantage:
                     continue
+                metadata = dict(sample.metadata)
+                if not _controller_sample_matches_quality_filter(
+                    role=role,
+                    metadata=metadata,
+                    quality_filter=controller_sample_quality_filter,
+                ):
+                    continue
                 samples.append(
                     ControllerReplaySample(
                         role=role,
@@ -149,7 +218,7 @@ def controller_samples_from_task_rollouts(
                         completion_text=sample.completion_text,
                         reward=reward,
                         advantage=advantage,
-                        metadata=dict(sample.metadata),
+                        metadata=metadata,
                         task_id=rollout.task.task_id,
                         source_path=source_path,
                         timestamp=None,
