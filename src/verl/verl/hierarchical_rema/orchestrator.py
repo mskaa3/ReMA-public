@@ -788,7 +788,10 @@ class HierarchicalReMAOrchestrator:
 
         if self.train_worker_model:
             worker_lookup = worker_pool.workers_by_id()
-            worker_groups: Dict[str, List[tuple[SelectionRollout, WorkerExecution, str, float, str]]] = {}
+            worker_groups: Dict[
+                str,
+                List[tuple[SelectionRollout, WorkerExecution, str, float, str, str]],
+            ] = {}
             for decomposition_rollout in decompositions:
                 if self._uses_fallback_path(decomposition_rollout.decomposition.raw_payload):
                     worker_grpo_stats["num_decompositions_skipped_fallback"] += 1
@@ -815,7 +818,10 @@ class HierarchicalReMAOrchestrator:
                         normalized_instruction = self._normalized_instruction_key(
                             node.instruction if node is not None else execution.node_id
                         )
-                        worker_group_key = f"{execution.worker_id}::{normalized_instruction}"
+                        decomposition_id = decomposition_rollout.decomposition.decomposition_id
+                        worker_group_key = (
+                            f"{decomposition_id}::{execution.worker_id}::{normalized_instruction}"
+                        )
                         worker_groups.setdefault(worker_group_key, []).append(
                             (
                                 selection_rollout,
@@ -823,6 +829,7 @@ class HierarchicalReMAOrchestrator:
                                 model_path or "",
                                 reward,
                                 normalized_instruction,
+                                decomposition_id,
                             )
                         )
 
@@ -842,15 +849,23 @@ class HierarchicalReMAOrchestrator:
                 grouped_advantages = group_relative_advantages(grouped_rewards)
                 worker_id = grouped_payloads[0][1].worker_id
                 normalized_instruction = grouped_payloads[0][4]
+                decomposition_id = grouped_payloads[0][5]
                 instruction_hash = hashlib.sha1(
                     normalized_instruction.encode("utf-8")
                 ).hexdigest()[:12]
                 group_id = (
-                    f"task:{task.task_id}:worker:{worker_id}:"
+                    f"task:{task.task_id}:decomposition:{decomposition_id}:worker:{worker_id}:"
                     f"instr:{instruction_hash}"
                 )
                 for advantage, payload in zip(grouped_advantages, grouped_payloads):
-                    selection_rollout, execution, model_path, reward, normalized_instruction = payload
+                    (
+                        selection_rollout,
+                        execution,
+                        model_path,
+                        reward,
+                        normalized_instruction,
+                        decomposition_id,
+                    ) = payload
                     worker_samples.append(
                         ControllerTrainingSample(
                             role="worker",
@@ -864,9 +879,12 @@ class HierarchicalReMAOrchestrator:
                                 "model_path": model_path,
                                 "worker_id": execution.worker_id,
                                 "node_id": execution.node_id,
+                                "decomposition_id": decomposition_id,
                                 "selection_id": selection_rollout.selection.selection_id,
                                 "advantage_group_size": group_size,
-                                "advantage_group_kind": "worker_id_and_normalized_instruction_within_task",
+                                "advantage_group_kind": (
+                                    "worker_id_and_normalized_instruction_within_task_and_decomposition"
+                                ),
                                 "normalized_node_instruction": normalized_instruction,
                                 "invalid_reason": execution.invalid_reason,
                                 "final_answer_leak": execution.final_answer_leak,

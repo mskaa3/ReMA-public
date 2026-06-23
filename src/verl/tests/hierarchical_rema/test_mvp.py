@@ -271,6 +271,100 @@ def test_worker_training_skips_samples_from_fallback_decompositions() -> None:
     assert training_batch.worker_grpo_stats["num_worker_samples_skipped_fallback"] == 1
 
 
+def test_worker_grpo_groups_do_not_cross_decomposition_boundaries() -> None:
+    trainer = HierarchicalGRPOTrainer(
+        train_worker_model=True,
+        min_worker_grpo_group_size=1,
+    )
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+    worker_pool = make_worker_pool()
+    worker_id = worker_pool.workers[0].worker_id
+
+    def make_decomposition_rollout(
+        decomposition_id: str,
+        selection_id: str,
+        raw_output_text: str,
+        reward: float,
+    ) -> DecompositionRollout:
+        decomposition = DecompositionCandidate(
+            decomposition_id=decomposition_id,
+            summary="one-step solve",
+            target_quantity="final answer",
+            final_answer_format_hint="integer",
+            nodes=[
+                SubtaskNode(
+                    node_id="1",
+                    instruction="Solve the equation.",
+                    output_key="final_answer",
+                )
+            ],
+            final_node_id="1",
+        )
+        selection_rollout = SelectionRollout(
+            selection=SelectionCandidate(selection_id=selection_id, assignments=[]),
+            executions=[
+                WorkerExecution(
+                    node_id="1",
+                    worker_id=worker_id,
+                    output_text=raw_output_text,
+                    raw_output_text=raw_output_text,
+                    worker_prompt="Solve the equation.",
+                    entropy=0.0,
+                    confidence_reward=0.0,
+                    compatibility=1.0,
+                )
+            ],
+            final_answer=raw_output_text,
+            reward=SelectionRewardBreakdown(
+                final_answer_correctness=reward,
+                confidence_reward=0.0,
+                compatibility_reward=0.0,
+                total_reward=reward,
+            ),
+        )
+        decomposition.raw_payload["controller_prompt"] = "Decompose the task."
+        selection_rollout.selection.raw_payload["controller_prompt"] = "Assign workers."
+        return DecompositionRollout(
+            decomposition=decomposition,
+            selections=[selection_rollout],
+            base_decomposition_reward=reward,
+            decomposition_reward=reward,
+        )
+
+    training_batch = trainer.orchestrator._build_training_batch(
+        task=task,
+        worker_pool=worker_pool,
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+        decompositions=[
+            make_decomposition_rollout("decomp-1", "sel-1", "4", 1.0),
+            make_decomposition_rollout("decomp-2", "sel-2", "5", 0.0),
+        ],
+    )
+
+    assert len(training_batch.worker_samples) == 2
+    group_ids = {sample.group_id for sample in training_batch.worker_samples}
+    assert len(group_ids) == 2
+    assert any(
+        group_id.startswith(f"task:{task.task_id}:decomposition:decomp-1:worker:{worker_id}:instr:")
+        for group_id in group_ids
+    )
+    assert any(
+        group_id.startswith(f"task:{task.task_id}:decomposition:decomp-2:worker:{worker_id}:instr:")
+        for group_id in group_ids
+    )
+    assert {sample.metadata["decomposition_id"] for sample in training_batch.worker_samples} == {
+        "decomp-1",
+        "decomp-2",
+    }
+    assert all(sample.metadata["advantage_group_size"] == 1 for sample in training_batch.worker_samples)
+    assert all(
+        sample.metadata["advantage_group_kind"]
+        == "worker_id_and_normalized_instruction_within_task_and_decomposition"
+        for sample in training_batch.worker_samples
+    )
+
+
 def test_fallback_decomposition_receives_single_node_triviality_penalty() -> None:
     rollout_config = RolloutConfig(
         soft_hop_penalty=0.1,
