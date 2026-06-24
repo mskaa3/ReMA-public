@@ -26,6 +26,7 @@ from math_verify.errors import TimeoutException
 
 META_BOXED_PENALTY = 0.25
 WORKER_BOXED_PENALTY = 0.05
+ENABLE_WORKER_BOXED_PENALTY = False
 WORKER_FINISH_PENALTY = 0.05
 PLANNER_REPEAT_PENALTY = 0.03
 PLANNER_EXCESS_SUBTASK_PENALTY = 0.10
@@ -941,23 +942,24 @@ class ReMARewardManager:
                 active_penalties.append(('meta_boxed', META_BOXED_PENALTY, sorted(meta_roles.intersection(agent_roles))))
 
             worker_boxed_roles = set()
-            for msg in valid_history:
-                content = msg.get('content') if isinstance(msg, dict) else None
-                if (
-                    isinstance(msg, dict)
-                    and msg.get('role') in worker_roles
-                    and msg.get('role') != score_role
-                    and isinstance(content, str)
-                    and _has_boxed_outside_local_result(content)
-                    and content != response_str
-                ):
-                    worker_boxed_roles.add(msg.get('role'))
-            if worker_boxed_roles:
-                reward_tensor_map['worker_boxed_penalty_applied'][i_bsz] = 1.0
-                reward_tensor_map['worker_boxed_penalty_value'][i_bsz] = WORKER_BOXED_PENALTY
-                active_penalties.append(('worker_boxed', WORKER_BOXED_PENALTY, sorted(worker_boxed_roles)))
-                for role in worker_boxed_roles:
-                    role_penalties[role] += WORKER_BOXED_PENALTY
+            if ENABLE_WORKER_BOXED_PENALTY:
+                for msg in valid_history:
+                    content = msg.get('content') if isinstance(msg, dict) else None
+                    if (
+                        isinstance(msg, dict)
+                        and msg.get('role') in worker_roles
+                        and msg.get('role') != score_role
+                        and isinstance(content, str)
+                        and _has_boxed_outside_local_result(content)
+                        and content != response_str
+                    ):
+                        worker_boxed_roles.add(msg.get('role'))
+                if worker_boxed_roles:
+                    reward_tensor_map['worker_boxed_penalty_applied'][i_bsz] = 1.0
+                    reward_tensor_map['worker_boxed_penalty_value'][i_bsz] = WORKER_BOXED_PENALTY
+                    active_penalties.append(('worker_boxed', WORKER_BOXED_PENALTY, sorted(worker_boxed_roles)))
+                    for role in worker_boxed_roles:
+                        role_penalties[role] += WORKER_BOXED_PENALTY
 
             finish_flag = data.meta_info.get('finish_flag')
             worker_finish_roles = set()

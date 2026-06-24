@@ -13,6 +13,26 @@ import re
 def normalize_text(text):
     return unicodedata.normalize('NFKC', text)
 
+
+def _has_usable_final_boxed_answer(text: str) -> bool:
+    """Return True when the final stage produced a boxed answer, not a refusal."""
+    if not isinstance(text, str) or "\\boxed" not in text:
+        return False
+
+    normalized = " ".join(text.lower().split())
+    missing_info_markers = (
+        "not enough information",
+        "insufficient information",
+        "missing information",
+        "missing notes",
+        "cannot synthesize",
+        "cannot proceed",
+        "cannot provide",
+        "please provide",
+        "no final answer",
+    )
+    return not any(marker in normalized for marker in missing_info_markers)
+
 def _pad_history(input_historys: List[List[Dict[str, str]]],
                  max_length: int,
                  pad_value={
@@ -1044,6 +1064,9 @@ class MultiAgentRollout:
                             if self.config.stop_when_truncated and stops[local_idx] == "length":
                                 finish_flags[idx] = True
                                 finish_reason[idx] = "stop_when_truncated"
+                            elif _has_usable_final_boxed_answer(output):
+                                finish_flags[idx] = True
+                                finish_reason[idx] = "final_boxed_answer"
 
             # Keep exactly one history slot per role per hierarchical turn.
             for idx in unfinished_indices:

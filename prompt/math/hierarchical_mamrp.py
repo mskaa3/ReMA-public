@@ -11,7 +11,7 @@ Strict rules:
 - Do not write the final answer, use \\boxed{}, or write [FINISH].
 - In the PLAN, use only lines starting with "- S<number>:".
 - Do not use numbered lists like "1.", "2.", "3." in the PLAN.
-- Stop after the PLAN.
+- The response is complete immediately after the last PLAN item.
 
 Output exactly:
 
