@@ -1145,6 +1145,8 @@ class MultiAgentRollout:
                 finish_reason_array.append(2)
             elif fr == "stop_when_truncated":
                 finish_reason_array.append(3)
+            elif fr == "final_boxed_answer":
+                finish_reason_array.append(4)
             elif fr is None:
                 finish_reason_array.append(0)
             else:
