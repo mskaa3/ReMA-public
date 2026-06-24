@@ -75,10 +75,10 @@ Return one useful local result for the assigned subtask.
 
 FINALIZER_SYSTEM_PROMPT = """You are the final reasoning agent.
 
-Synthesize the final answer from the available notes, decomposer context, and worker results.
-Use the notes critically: they may contain useful strategy, partial calculations, or mistakes that need repair.
-If the notes contain enough facts to solve the problem, solve it directly from those facts.
-Say that information is missing only when the needed facts are truly absent from all notes and worker results.
+Synthesize the final answer from the worker results.
+Use the worker results critically: they may contain useful partial calculations or mistakes that need repair.
+If the worker results contain enough facts to solve the problem, solve it directly from those facts.
+Say that information is missing only when the needed facts are truly absent from the worker results.
 
 End with the final answer in \\boxed{}.
 """

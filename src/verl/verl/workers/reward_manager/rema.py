@@ -57,6 +57,7 @@ SELECTOR_MISSING_FINAL_PENALTY = 0.05
 SELECTOR_EMPTY_OUTPUT_PENALTY = 0.10
 WORKER_UNIQUE_LOCAL_RESULT_BONUS = 0.03
 WORKER_DOWNSTREAM_USED_BONUS = 0.03
+WORKER_DEPENDENCY_USED_BONUS = 0.02
 FINAL_WORKER_RESULT_USAGE_BONUS = 0.05
 FINAL_CONSISTENCY_WITH_WORKER_RESULTS_BONUS = 0.05
 FINAL_RAW_SCORE_USAGE_FLOOR = 0.50
@@ -457,11 +458,20 @@ def _compute_turn_worker_role_bonus_stats(turn_history, worker_roles, score_role
         unique_local_result = 0.0
         downstream_used = 0.0
         later_worker_used = 0.0
+        dependency_used = 0.0
         if signature:
             valid_worker_count += 1
             if signature_counts.get(signature, 0) == 1:
                 unique_local_result = 1.0
                 unique_hits += 1
+            current_content = _normalize_role_output(worker['content'])
+            previous_signatures = [
+                previous_worker['signature']
+                for previous_worker in active_workers[:idx]
+                if previous_worker['signature']
+            ]
+            if any(previous_signature in current_content for previous_signature in previous_signatures):
+                dependency_used = 1.0
             later_contents = [
                 _normalize_role_output(later_worker['content'])
                 for later_worker in active_workers[idx + 1:]
@@ -476,6 +486,7 @@ def _compute_turn_worker_role_bonus_stats(turn_history, worker_roles, score_role
             'unique_local_result': unique_local_result,
             'downstream_used': downstream_used,
             'later_worker_used': later_worker_used,
+            'dependency_used': dependency_used,
             'has_valid_local_result': 1.0 if signature else 0.0,
         }
 
@@ -890,7 +901,7 @@ class ReMARewardManager:
                 for role, stats in worker_bonus_stats['per_role'].items():
                     worker_global_bonus = (
                         upstream_global_correctness_bonus
-                        * stats['has_valid_local_result']
+                        * stats['downstream_used']
                     )
                     worker_hierarchical_bonus = (
                         upstream_hierarchical_correctness_bonus
@@ -901,6 +912,7 @@ class ReMARewardManager:
                         worker_local_bonus = (
                             WORKER_UNIQUE_LOCAL_RESULT_BONUS * stats['unique_local_result']
                             + WORKER_DOWNSTREAM_USED_BONUS
+                            + WORKER_DEPENDENCY_USED_BONUS * stats['dependency_used']
                         )
                     worker_local_bonus *= final_worker_usage_gate
                     role_bonuses[role] += (
@@ -1104,6 +1116,8 @@ class ReMARewardManager:
                 reward_tensor_map['worker_subtask_overreach_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_subtask_overreach_penalty_value'][i_bsz] = WORKER_SUBTASK_OVERREACH_PENALTY
                 active_penalties.append(('worker_subtask_overreach', WORKER_SUBTASK_OVERREACH_PENALTY, sorted(overreach_roles)))
+                for role in overreach_roles:
+                    role_penalties[role] += WORKER_SUBTASK_OVERREACH_PENALTY
 
             duplicate_worker_roles = set()
             for i_turn in range(num_turns):

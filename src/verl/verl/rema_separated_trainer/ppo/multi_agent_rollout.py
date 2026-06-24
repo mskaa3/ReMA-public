@@ -33,6 +33,30 @@ def _has_usable_final_boxed_answer(text: str) -> bool:
     )
     return not any(marker in normalized for marker in missing_info_markers)
 
+
+def _extract_local_result_values(text: str) -> List[str]:
+    if not isinstance(text, str):
+        return []
+
+    return [
+        match.strip()
+        for match in re.findall(r"(?im)^\s*LOCAL[_ ]RESULT\s*:\s*(.+?)\s*$", text)
+        if match.strip()
+    ]
+
+
+def _final_uses_worker_local_result(final_output: str, completed_results: List[Tuple[str, str, str, str]]) -> bool:
+    if not isinstance(final_output, str) or not final_output.strip():
+        return False
+
+    normalized_final = " ".join(final_output.lower().split())
+    for _, _, _, worker_output in completed_results:
+        for local_result in _extract_local_result_values(worker_output):
+            normalized_result = " ".join(local_result.lower().split())
+            if normalized_result and normalized_result in normalized_final:
+                return True
+    return False
+
 def _pad_history(input_historys: List[List[Dict[str, str]]],
                  max_length: int,
                  pad_value={
@@ -745,6 +769,17 @@ class MultiAgentRollout:
         ])
 
     @staticmethod
+    def _format_worker_results_for_final(completed_results: List[Tuple[str, str, str, str]]) -> str:
+        sections = [
+            f"{stage_role} as {worker_type} ({subtask_ids}):\n{output.strip()}"
+            for stage_role, worker_type, subtask_ids, output in completed_results
+            if output and output.strip()
+        ]
+        if not sections:
+            return ""
+        return "WORKER RESULTS:\n" + "\n\n".join(sections)
+
+    @staticmethod
     def _format_final_notes(decomposer_output: str, worker_outputs: str) -> str:
         note_parts = [
             part.strip()
@@ -992,22 +1027,31 @@ class MultiAgentRollout:
                             else:
                                 question_block = f"Question:\n{questions[idx]}\n\n"
                         elif pass_question_to_workers:
-                            question_block = f"{questions[idx]}\n\n"
+                            question_block = (
+                                f"Reference problem:\n{questions[idx]}\n\n"
+                                "Use the reference problem only to recover facts needed for the assigned subtask.\n\n"
+                            )
                         else:
                             question_block = (
                                 "The assigned subtask is your task context and should contain the needed facts. "
                                 "Use previous LOCAL_RESULTs when they help.\n\n"
                             )
-                        work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         if is_final_stage:
-                            work_so_far = self._format_final_notes(
-                                current_plan.get(idx, ""),
-                                work_so_far,
-                            )
+                            if final_context_mode in {"worker_results_only", "workers_only", "local_results_only"}:
+                                work_so_far = self._format_worker_results_for_final(
+                                    completed_results_by_idx[idx]
+                                )
+                            else:
+                                work_so_far = self._format_final_notes(
+                                    current_plan.get(idx, ""),
+                                    self._format_work_so_far(completed_results_by_idx[idx]),
+                                )
+                        else:
+                            work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         stage_instruction = (
-                            "Synthesize the final answer from the available notes. "
-                            "Check the notes, repair mistakes if needed, and end with the final answer in \\boxed{}."
+                            "Synthesize the final answer from the worker results. "
+                            "Check the worker results, repair mistakes if needed, and end with the final answer in \\boxed{}."
                             if is_final_stage else
                             "Work on the assigned subtask above. "
                             "Reason step by step with concrete calculations, transformations, or checks. "
@@ -1056,6 +1100,7 @@ class MultiAgentRollout:
                             [subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]],
                         )
                         subtask_ids = ", ".join([subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]])
+                        previous_completed_results = list(completed_results_by_idx[idx])
                         completed_results_by_idx[idx].append((stage_role, worker_type_by_idx[idx], subtask_ids, output))
 
                         latest_outputs[idx] = output
@@ -1064,7 +1109,10 @@ class MultiAgentRollout:
                             if self.config.stop_when_truncated and stops[local_idx] == "length":
                                 finish_flags[idx] = True
                                 finish_reason[idx] = "stop_when_truncated"
-                            elif _has_usable_final_boxed_answer(output):
+                            elif (
+                                _has_usable_final_boxed_answer(output)
+                                and _final_uses_worker_local_result(output, previous_completed_results)
+                            ):
                                 finish_flags[idx] = True
                                 finish_reason[idx] = "final_boxed_answer"
 
