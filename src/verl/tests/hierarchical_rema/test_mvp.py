@@ -35,6 +35,7 @@ try:
         render_selector_prompt,
         render_worker_prompt,
     )
+    from verl.hierarchical_rema.rewarding import build_selection_reward
     from verl.hierarchical_rema.structured import (
         StructuredOutputError,
         apply_decomposition_limits,
@@ -78,6 +79,7 @@ except ModuleNotFoundError:
         render_selector_prompt,
         render_worker_prompt,
     )
+    from hierarchical_rema.rewarding import build_selection_reward
     from hierarchical_rema.structured import (
         StructuredOutputError,
         apply_decomposition_limits,
@@ -384,7 +386,7 @@ def test_fallback_decomposition_receives_single_node_triviality_penalty() -> Non
 
     assert len(fallback_decomposition.nodes) == 1
     assert fallback_decomposition.final_node_id == "1"
-    assert fallback_decomposition.soft_penalty == 1.0
+    assert fallback_decomposition.soft_penalty == 1.2
 
 
 def test_shallow_two_node_plan_receives_triviality_penalty() -> None:
@@ -415,7 +417,7 @@ def test_shallow_two_node_plan_receives_triviality_penalty() -> None:
 
     limited_candidate = apply_decomposition_limits(candidate, rollout_config)
 
-    assert limited_candidate.soft_penalty == 0.5
+    assert limited_candidate.soft_penalty == 0.6
 
 
 def test_generic_simplify_wrapper_two_node_plan_receives_triviality_penalty() -> None:
@@ -446,7 +448,179 @@ def test_generic_simplify_wrapper_two_node_plan_receives_triviality_penalty() ->
 
     limited_candidate = apply_decomposition_limits(candidate, rollout_config)
 
-    assert limited_candidate.soft_penalty == 0.5
+    assert limited_candidate.soft_penalty == 0.6
+
+
+def test_node_count_target_penalty_applies_outside_preferred_band() -> None:
+    rollout_config = RolloutConfig(
+        preferred_node_count_min=3,
+        preferred_node_count_max=5,
+        node_count_target_penalty_per_step=0.1,
+        node_count_target_max_penalty=0.4,
+    )
+    candidate = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="too many nodes",
+        target_quantity="answer",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Compute a.", output_key="1_output"),
+            SubtaskNode(node_id="2", instruction="Compute b.", dependencies=["1"], output_key="2_output"),
+            SubtaskNode(node_id="3", instruction="Compute c.", dependencies=["2"], output_key="3_output"),
+            SubtaskNode(node_id="4", instruction="Compute d.", dependencies=["3"], output_key="4_output"),
+            SubtaskNode(node_id="5", instruction="Compute e.", dependencies=["4"], output_key="5_output"),
+            SubtaskNode(node_id="6", instruction="Return the final answer.", dependencies=["5"], output_key="final_answer"),
+        ],
+        final_node_id="6",
+    )
+
+    limited_candidate = apply_decomposition_limits(candidate, rollout_config)
+
+    assert limited_candidate.soft_penalty == 0.1
+
+
+def test_selection_reward_adds_hierarchy_usage_bonuses() -> None:
+    executions = [
+        WorkerExecution(
+            node_id="1",
+            worker_id="symbolic_manipulation_worker",
+            output_text="a = 2",
+            raw_output_text="a = 2",
+            entropy=0.1,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+        WorkerExecution(
+            node_id="2",
+            worker_id="calculation_worker",
+            output_text="a = 2, so b = 3",
+            raw_output_text="a = 2, so b = 3",
+            dependency_outputs={"1": "a = 2"},
+            entropy=0.1,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+        WorkerExecution(
+            node_id="3",
+            worker_id="logic_constraints_worker",
+            output_text="Using a = 2 and a = 2, so b = 3.\nThe answer is 5",
+            raw_output_text="Using a = 2 and a = 2, so b = 3.\nThe answer is 5",
+            dependency_outputs={"1": "a = 2", "2": "a = 2, so b = 3"},
+            entropy=0.1,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+    ]
+
+    reward = build_selection_reward(
+        final_answer="Using a = 2 and a = 2, so b = 3.\nThe answer is 5",
+        ground_truth="5",
+        executions=executions,
+        weights=RewardWeights(),
+        final_node_id="3",
+    )
+
+    assert reward.positive_bonus_gate == 1.0
+    assert reward.hierarchy_utilization_gate == 1.0
+    assert reward.dependency_usage_rate == 1.0
+    assert reward.final_dependency_usage_rate == 1.0
+    assert reward.worker_unique_result_bonus > 0.0
+    assert reward.worker_downstream_used_bonus > 0.0
+    assert reward.final_stage_usage_bonus > 0.0
+    assert reward.final_ignores_hierarchy_penalty == 0.0
+    assert executions[0].downstream_used is True
+    assert executions[1].dependency_used is True
+
+
+def test_selection_reward_penalizes_final_answer_that_ignores_dependencies() -> None:
+    executions = [
+        WorkerExecution(
+            node_id="1",
+            worker_id="symbolic_manipulation_worker",
+            output_text="a = 2",
+            raw_output_text="a = 2",
+            entropy=0.1,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+        WorkerExecution(
+            node_id="2",
+            worker_id="calculation_worker",
+            output_text="a = 2, so b = 3",
+            raw_output_text="a = 2, so b = 3",
+            dependency_outputs={"1": "a = 2"},
+            entropy=0.1,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+        WorkerExecution(
+            node_id="3",
+            worker_id="logic_constraints_worker",
+            output_text="5",
+            raw_output_text="5",
+            dependency_outputs={"1": "a = 2", "2": "a = 2, so b = 3"},
+            entropy=0.1,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+    ]
+
+    reward = build_selection_reward(
+        final_answer="5",
+        ground_truth="5",
+        executions=executions,
+        weights=RewardWeights(),
+        final_node_id="3",
+    )
+
+    assert reward.hierarchy_utilization_gate == 0.0
+    assert reward.final_dependency_usage_rate == 0.0
+    assert reward.final_raw_score_usage_multiplier == 0.5
+    assert reward.final_ignores_hierarchy_penalty > 0.0
+    assert reward.worker_unique_result_bonus == 0.0
+    assert reward.worker_downstream_used_bonus == 0.0
+    assert reward.final_stage_usage_bonus == 0.0
+
+
+def test_decomposer_reward_gets_dependency_usage_bonus_only_for_gated_correct_selections() -> None:
+    trainer = HierarchicalGRPOTrainer(
+        reward_weights=RewardWeights(decomposer_dependency_usage_bonus=0.05),
+    )
+    gated_selection = SelectionRollout(
+        selection=SelectionCandidate(selection_id="sel-1", assignments=[]),
+        executions=[],
+        final_answer="5",
+        reward=SelectionRewardBreakdown(
+            final_answer_correctness=1.0,
+            confidence_reward=0.0,
+            compatibility_reward=0.0,
+            total_reward=1.0,
+            positive_bonus_gate=1.0,
+            hierarchy_utilization_gate=1.0,
+            dependency_usage_rate=1.0,
+        ),
+    )
+    ungated_selection = SelectionRollout(
+        selection=SelectionCandidate(selection_id="sel-2", assignments=[]),
+        executions=[],
+        final_answer="4",
+        reward=SelectionRewardBreakdown(
+            final_answer_correctness=0.0,
+            confidence_reward=0.0,
+            compatibility_reward=0.0,
+            total_reward=0.5,
+            positive_bonus_gate=0.0,
+            hierarchy_utilization_gate=1.0,
+            dependency_usage_rate=1.0,
+        ),
+    )
+
+    reward = trainer.orchestrator._aggregate_decomposition_selection_reward(
+        selection_rollouts=[gated_selection, ungated_selection],
+        selection_training_rewards=[1.0, 0.5],
+    )
+
+    assert reward == pytest.approx(1.05)
 
 
 def test_validate_decomposition_rejects_unused_nodes_outside_path_to_final() -> None:

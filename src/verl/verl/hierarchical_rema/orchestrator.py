@@ -159,6 +159,23 @@ class HierarchicalReMAOrchestrator:
                 negative_reward
                 + positive_reward * self.decomposer_no_correct_selection_scale
             )
+        gated_dependency_rollouts = [
+            selection
+            for selection in selection_rollouts
+            if selection.reward.positive_bonus_gate > 0.0
+            and selection.reward.hierarchy_utilization_gate > 0.0
+        ]
+        if gated_dependency_rollouts:
+            aggregated_reward += (
+                self.reward_weights.decomposer_dependency_usage_bonus
+                * (
+                    sum(
+                        selection.reward.dependency_usage_rate
+                        for selection in gated_dependency_rollouts
+                    )
+                    / len(gated_dependency_rollouts)
+                )
+            )
         return aggregated_reward
 
     @staticmethod
@@ -920,6 +937,18 @@ class HierarchicalReMAOrchestrator:
                                     if execution.answer_containment and not execution.final_answer_leak
                                     else 0.0
                                 ),
+                                "unique_result": execution.unique_result,
+                                "downstream_used": execution.downstream_used,
+                                "dependency_used": execution.dependency_used,
+                                "selection_worker_unique_result_bonus": selection_rollout.reward.worker_unique_result_bonus,
+                                "selection_worker_duplicate_result_penalty": selection_rollout.reward.worker_duplicate_result_penalty,
+                                "selection_worker_downstream_used_bonus": selection_rollout.reward.worker_downstream_used_bonus,
+                                "selection_final_stage_usage_bonus": selection_rollout.reward.final_stage_usage_bonus,
+                                "selection_final_ignores_hierarchy_penalty": selection_rollout.reward.final_ignores_hierarchy_penalty,
+                                "selection_hierarchy_utilization_gate": selection_rollout.reward.hierarchy_utilization_gate,
+                                "selection_dependency_usage_rate": selection_rollout.reward.dependency_usage_rate,
+                                "selection_final_dependency_usage_rate": selection_rollout.reward.final_dependency_usage_rate,
+                                "selection_final_raw_score_usage_multiplier": selection_rollout.reward.final_raw_score_usage_multiplier,
                             },
                         )
                     )

@@ -39,6 +39,21 @@ def exact_match(prediction: str, reference: str) -> float:
     return 1.0 if normalize_answer(prediction) == normalize_answer(reference) else 0.0
 
 
+def _strip_outer_math_delimiters(candidate: str) -> str:
+    cleaned = str(candidate or "").strip()
+    if len(cleaned) >= 2 and cleaned.startswith("$") and cleaned.endswith("$"):
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.startswith("\\(") and cleaned.endswith("\\)"):
+        cleaned = cleaned[2:-2].strip()
+    if cleaned.startswith("\\[") and cleaned.endswith("\\]"):
+        cleaned = cleaned[2:-2].strip()
+    if cleaned.startswith("$"):
+        cleaned = cleaned[1:].strip()
+    if cleaned.endswith("$"):
+        cleaned = cleaned[:-1].strip()
+    return cleaned.rstrip(".,;:")
+
+
 def _contains_normalized_reference(text: str, reference: str) -> bool:
     normalized_text = normalize_answer(text)
     normalized_reference = normalize_answer(reference)
@@ -278,6 +293,154 @@ def entropy_to_confidence_reward(entropy: float, entropy_cap: float) -> float:
     return 1.0 - (clipped / entropy_cap)
 
 
+def _execution_signature(text: str) -> str:
+    return normalize_answer(_strip_outer_math_delimiters(text))
+
+
+def _is_valid_execution_output(execution: WorkerExecution) -> bool:
+    return bool(str(execution.output_text or "").strip()) and not execution.invalid_reason
+
+
+def _usage_rate(text: str, candidate_values: Iterable[str]) -> float:
+    unique_signatures: List[str] = []
+    seen = set()
+    for candidate_value in candidate_values:
+        signature = _execution_signature(candidate_value)
+        if not signature or signature in seen:
+            continue
+        seen.add(signature)
+        unique_signatures.append(signature)
+    if not unique_signatures:
+        return 0.0
+    used_count = sum(
+        1
+        for signature in unique_signatures
+        if _contains_normalized_reference(text, signature)
+    )
+    return used_count / len(unique_signatures)
+
+
+def _compute_hierarchy_reward_stats(
+    executions: Sequence[WorkerExecution],
+    final_node_id: str | None,
+) -> Dict[str, float | bool]:
+    for execution in executions:
+        execution.unique_result = False
+        execution.downstream_used = False
+        execution.dependency_used = False
+
+    signature_by_node: Dict[str, str] = {}
+    signature_counts: Dict[str, int] = {}
+    valid_executions: List[WorkerExecution] = []
+    for execution in executions:
+        if not _is_valid_execution_output(execution):
+            continue
+        signature = _execution_signature(execution.output_text)
+        if not signature:
+            continue
+        valid_executions.append(execution)
+        signature_by_node[execution.node_id] = signature
+        signature_counts[signature] = signature_counts.get(signature, 0) + 1
+
+    valid_non_final_executions = [
+        execution
+        for execution in valid_executions
+        if execution.node_id != final_node_id
+    ]
+
+    for index, execution in enumerate(executions):
+        signature = signature_by_node.get(execution.node_id)
+        if not signature:
+            continue
+        execution.unique_result = signature_counts.get(signature, 0) == 1
+        later_outputs = [
+            later_execution.output_text
+            for later_execution in executions[index + 1 :]
+            if _is_valid_execution_output(later_execution)
+        ]
+        execution.downstream_used = any(
+            _contains_normalized_reference(later_output, signature)
+            for later_output in later_outputs
+        )
+        if execution.node_id == final_node_id:
+            continue
+        if execution.dependency_outputs:
+            execution.dependency_used = (
+                _usage_rate(execution.output_text, execution.dependency_outputs.values()) > 0.0
+            )
+
+    dependency_usage_candidates = [
+        execution
+        for execution in valid_non_final_executions
+        if execution.dependency_outputs
+    ]
+    dependency_usage_rate = (
+        sum(1 for execution in dependency_usage_candidates if execution.dependency_used)
+        / len(dependency_usage_candidates)
+        if dependency_usage_candidates
+        else 0.0
+    )
+
+    final_execution = next(
+        (execution for execution in executions if execution.node_id == final_node_id),
+        None,
+    )
+    final_has_dependencies = bool(
+        final_execution
+        and any(
+            _execution_signature(dependency_output)
+            for dependency_output in final_execution.dependency_outputs.values()
+        )
+    )
+    final_dependency_usage_rate = (
+        _usage_rate(final_execution.output_text, final_execution.dependency_outputs.values())
+        if final_execution is not None and _is_valid_execution_output(final_execution) and final_has_dependencies
+        else 0.0
+    )
+    final_output_uses_dependencies = final_dependency_usage_rate > 0.0
+    multiple_nodes_executed = len(valid_executions) >= 2 and len(valid_non_final_executions) >= 1
+    hierarchy_utilization_gate = 1.0 if (
+        multiple_nodes_executed
+        and final_has_dependencies
+        and final_output_uses_dependencies
+    ) else 0.0
+
+    unique_result_rate = (
+        sum(1 for execution in valid_executions if execution.unique_result)
+        / len(valid_executions)
+        if valid_executions
+        else 0.0
+    )
+    duplicate_result_rate = (
+        sum(
+            1
+            for execution in valid_executions
+            if signature_counts.get(signature_by_node.get(execution.node_id, ""), 0) > 1
+        )
+        / len(valid_executions)
+        if valid_executions
+        else 0.0
+    )
+    downstream_used_rate = (
+        sum(1 for execution in valid_non_final_executions if execution.downstream_used)
+        / len(valid_non_final_executions)
+        if valid_non_final_executions
+        else 0.0
+    )
+
+    return {
+        "unique_result_rate": unique_result_rate,
+        "duplicate_result_rate": duplicate_result_rate,
+        "downstream_used_rate": downstream_used_rate,
+        "dependency_usage_rate": dependency_usage_rate,
+        "final_dependency_usage_rate": final_dependency_usage_rate,
+        "multiple_nodes_executed": multiple_nodes_executed,
+        "final_has_dependencies": final_has_dependencies,
+        "final_output_uses_dependencies": final_output_uses_dependencies,
+        "hierarchy_utilization_gate": hierarchy_utilization_gate,
+    }
+
+
 def group_relative_advantages(values: Sequence[float]) -> List[float]:
     if len(values) <= 1:
         return [0.0 for _ in values]
@@ -406,6 +569,14 @@ def build_selection_reward(
         ground_truth,
         task_metadata=task_metadata,
     )
+    hierarchy_stats = _compute_hierarchy_reward_stats(
+        executions=executions,
+        final_node_id=final_node_id,
+    )
+    positive_bonus_gate = 1.0 if final_correct > 0.0 else 0.0
+    hierarchy_bonus_gate = positive_bonus_gate * float(
+        hierarchy_stats["hierarchy_utilization_gate"]
+    )
     confidence_reward = (
         sum(
             entropy_to_confidence_reward(execution.entropy, weights.entropy_cap)
@@ -465,6 +636,8 @@ def build_selection_reward(
         if executions
         else 0.0
     )
+    final_ignores_hierarchy_penalty = 0.0
+    final_raw_score_usage_multiplier = 1.0
     if weights.worker_reward_mode == WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY:
         total_reward = (
             final_correct
@@ -472,14 +645,53 @@ def build_selection_reward(
             - intermediate_final_answer_penalty
             - non_final_answer_containment_penalty
         )
+        worker_unique_result_bonus = 0.0
+        worker_duplicate_result_penalty = 0.0
+        worker_downstream_used_bonus = 0.0
+        final_stage_usage_bonus = 0.0
     else:
+        worker_unique_result_bonus = (
+            weights.worker_unique_result_bonus
+            * float(hierarchy_stats["unique_result_rate"])
+            * hierarchy_bonus_gate
+        )
+        worker_duplicate_result_penalty = (
+            weights.worker_duplicate_result_penalty
+            * float(hierarchy_stats["duplicate_result_rate"])
+        )
+        worker_downstream_used_bonus = (
+            weights.worker_downstream_used_bonus
+            * float(hierarchy_stats["downstream_used_rate"])
+            * hierarchy_bonus_gate
+        )
+        final_stage_usage_bonus = (
+            weights.final_stage_usage_bonus
+            * float(hierarchy_stats["final_dependency_usage_rate"])
+            * hierarchy_bonus_gate
+        )
+        if (
+            hierarchy_stats["multiple_nodes_executed"]
+            and hierarchy_stats["final_has_dependencies"]
+        ):
+            final_raw_score_usage_multiplier = (
+                1.0
+                if hierarchy_stats["final_output_uses_dependencies"]
+                else min(max(weights.final_raw_score_usage_floor, 0.0), 1.0)
+            )
+            if not hierarchy_stats["final_output_uses_dependencies"]:
+                final_ignores_hierarchy_penalty = weights.final_ignores_hierarchy_penalty
         total_reward = (
-            weights.final_answer * final_correct
+            weights.final_answer * final_correct * final_raw_score_usage_multiplier
             + weights.confidence * confidence_reward
             + weights.compatibility * compatibility_reward
+            + worker_unique_result_bonus
+            + worker_downstream_used_bonus
+            + final_stage_usage_bonus
             - worker_format_penalty
             - intermediate_final_answer_penalty
             - non_final_answer_containment_penalty
+            - worker_duplicate_result_penalty
+            - final_ignores_hierarchy_penalty
         )
     return SelectionRewardBreakdown(
         final_answer_correctness=final_correct,
@@ -489,4 +701,14 @@ def build_selection_reward(
         worker_format_penalty=worker_format_penalty,
         intermediate_final_answer_penalty=intermediate_final_answer_penalty,
         non_final_answer_containment_penalty=non_final_answer_containment_penalty,
+        worker_unique_result_bonus=worker_unique_result_bonus,
+        worker_duplicate_result_penalty=worker_duplicate_result_penalty,
+        worker_downstream_used_bonus=worker_downstream_used_bonus,
+        final_stage_usage_bonus=final_stage_usage_bonus,
+        final_ignores_hierarchy_penalty=final_ignores_hierarchy_penalty,
+        positive_bonus_gate=positive_bonus_gate,
+        hierarchy_utilization_gate=float(hierarchy_stats["hierarchy_utilization_gate"]),
+        dependency_usage_rate=float(hierarchy_stats["dependency_usage_rate"]),
+        final_dependency_usage_rate=float(hierarchy_stats["final_dependency_usage_rate"]),
+        final_raw_score_usage_multiplier=final_raw_score_usage_multiplier,
     )

@@ -473,7 +473,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-replay-copy", action="store_true", help="Save train/val/all sample JSONL files per policy for inspection")
 
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument(
         "--worker-learning-rate",
         type=float,

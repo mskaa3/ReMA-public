@@ -74,6 +74,13 @@ class RewardWeights:
     worker_reward_mode: WorkerRewardMode = WorkerRewardMode.CURRENT
     worker_success_weight: float = 0.0
     worker_final_correctness_weight: float = 0.5
+    decomposer_dependency_usage_bonus: float = 0.05
+    worker_unique_result_bonus: float = 0.03
+    worker_duplicate_result_penalty: float = 0.03
+    worker_downstream_used_bonus: float = 0.03
+    final_stage_usage_bonus: float = 0.05
+    final_ignores_hierarchy_penalty: float = 0.10
+    final_raw_score_usage_floor: float = 0.5
 
 
 @dataclass
@@ -91,6 +98,10 @@ class RolloutConfig:
     soft_hop_penalty_power: float = 1.0
     trivial_single_node_penalty: float = 1.0
     trivial_shallow_two_node_penalty: float = 0.5
+    preferred_node_count_min: int = 3
+    preferred_node_count_max: int = 5
+    node_count_target_penalty_per_step: float = 0.1
+    node_count_target_max_penalty: float = 0.4
 
 
 @dataclass
@@ -327,6 +338,9 @@ class WorkerExecution:
     success: bool = True
     final_answer_leak: bool = False
     answer_containment: bool = False
+    unique_result: bool = False
+    downstream_used: bool = False
+    dependency_used: bool = False
     invalid_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -344,6 +358,16 @@ class SelectionRewardBreakdown:
     worker_format_penalty: float = 0.0
     intermediate_final_answer_penalty: float = 0.0
     non_final_answer_containment_penalty: float = 0.0
+    worker_unique_result_bonus: float = 0.0
+    worker_duplicate_result_penalty: float = 0.0
+    worker_downstream_used_bonus: float = 0.0
+    final_stage_usage_bonus: float = 0.0
+    final_ignores_hierarchy_penalty: float = 0.0
+    positive_bonus_gate: float = 0.0
+    hierarchy_utilization_gate: float = 0.0
+    dependency_usage_rate: float = 0.0
+    final_dependency_usage_rate: float = 0.0
+    final_raw_score_usage_multiplier: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

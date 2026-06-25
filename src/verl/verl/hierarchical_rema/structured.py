@@ -847,6 +847,20 @@ def apply_decomposition_limits(
             rollout_config.soft_hop_penalty,
         )
 
+    preferred_min = max(int(rollout_config.preferred_node_count_min), 1)
+    preferred_max = max(int(rollout_config.preferred_node_count_max), preferred_min)
+    if original_node_count < preferred_min:
+        distance = preferred_min - original_node_count
+    elif original_node_count > preferred_max:
+        distance = original_node_count - preferred_max
+    else:
+        distance = 0
+    if distance > 0:
+        candidate.soft_penalty += min(
+            rollout_config.node_count_target_max_penalty,
+            distance * rollout_config.node_count_target_penalty_per_step,
+        )
+
     limited_candidate = candidate
     if len(limited_candidate.nodes) > rollout_config.max_nodes_per_decomposition:
         limited_candidate = _truncate_to_node_budget(
