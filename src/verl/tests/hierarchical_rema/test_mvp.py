@@ -432,10 +432,10 @@ def test_alternating_selector_phase_freezes_decomposer() -> None:
         ),
     )
 
-    assert len(rollout.decompositions) == 1
+    assert len(rollout.decompositions) == 4
     assert len(rollout.decompositions[0].selections) == 3
     assert len(rollout.training_batch.decomposer_samples) == 0
-    assert len(rollout.training_batch.selector_samples) == 3
+    assert len(rollout.training_batch.selector_samples) == 12
     assert len(rollout.training_batch.worker_samples) > 0
     assert rollout.training_batch.frozen_roles == ["decomposer"]
 
@@ -458,11 +458,45 @@ def test_alternating_decomposer_phase_freezes_selector() -> None:
     )
 
     assert len(rollout.decompositions) == 4
-    assert all(len(decomposition.selections) == 1 for decomposition in rollout.decompositions)
+    assert all(len(decomposition.selections) == 2 for decomposition in rollout.decompositions)
     assert len(rollout.training_batch.decomposer_samples) == 4
     assert len(rollout.training_batch.selector_samples) == 0
     assert rollout.training_batch.worker_samples == []
     assert rollout.training_batch.frozen_roles == ["selector"]
+
+
+def test_alternating_rollout_counts_use_wider_phase_specific_caps() -> None:
+    trainer = HierarchicalGRPOTrainer(
+        train_worker_model=True,
+        min_worker_grpo_group_size=1,
+    )
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+
+    selector_rollout = trainer.run(
+        task=task,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(num_decompositions=16, num_selections_per_decomposition=16),
+        schedule=TrainingScheduleConfig(
+            mode=TrainingMode.ALTERNATING,
+            alternating_phase=AlternatingPhase.SELECTOR,
+        ),
+    )
+    assert len(selector_rollout.decompositions) == 4
+    assert all(len(decomposition.selections) == 4 for decomposition in selector_rollout.decompositions)
+
+    decomposer_rollout = trainer.run(
+        task=task,
+        worker_pool=make_worker_pool(),
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        rollout_config=RolloutConfig(num_decompositions=16, num_selections_per_decomposition=16),
+        schedule=TrainingScheduleConfig(
+            mode=TrainingMode.ALTERNATING,
+            alternating_phase=AlternatingPhase.DECOMPOSER,
+        ),
+    )
+    assert len(decomposer_rollout.decompositions) == 8
+    assert all(len(decomposition.selections) == 2 for decomposition in decomposer_rollout.decompositions)
 
 
 def test_controller_prompts_include_worker_performance_history() -> None:

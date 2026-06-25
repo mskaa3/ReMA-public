@@ -80,6 +80,10 @@ class RewardWeights:
 class RolloutConfig:
     num_decompositions: int = 3
     num_selections_per_decomposition: int = 2
+    alternating_selector_num_decompositions: int = 4
+    alternating_selector_num_selections: int = 4
+    alternating_decomposer_num_decompositions: int = 8
+    alternating_decomposer_num_selections: int = 2
     max_nodes_per_decomposition: int = 4
     soft_max_hops: Optional[int] = None
     hard_max_hops: Optional[int] = None

@@ -477,9 +477,23 @@ class HierarchicalReMAOrchestrator:
         num_selections = rollout_config.num_selections_per_decomposition
         if schedule.mode == TrainingMode.ALTERNATING:
             if schedule.alternating_phase == AlternatingPhase.SELECTOR:
-                num_decompositions = 1
+                num_decompositions = min(
+                    num_decompositions,
+                    max(int(rollout_config.alternating_selector_num_decompositions), 1),
+                )
+                num_selections = min(
+                    num_selections,
+                    max(int(rollout_config.alternating_selector_num_selections), 1),
+                )
             else:
-                num_selections = 1
+                num_decompositions = min(
+                    num_decompositions,
+                    max(int(rollout_config.alternating_decomposer_num_decompositions), 1),
+                )
+                num_selections = min(
+                    num_selections,
+                    max(int(rollout_config.alternating_decomposer_num_selections), 1),
+                )
         return num_decompositions, num_selections
 
     def _finalize_task_rollout(

@@ -237,6 +237,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
+    parser.add_argument("--alternating-selector-num-decompositions", type=int, default=4)
+    parser.add_argument("--alternating-selector-num-selections", type=int, default=4)
+    parser.add_argument("--alternating-decomposer-num-decompositions", type=int, default=8)
+    parser.add_argument("--alternating-decomposer-num-selections", type=int, default=2)
     parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
@@ -996,12 +1000,30 @@ def _rollout_config_for_schedule(
     num_selections = base_rollout_config.num_selections_per_decomposition
     if schedule.mode == TrainingMode.ALTERNATING:
         if schedule.alternating_phase == AlternatingPhase.SELECTOR:
-            num_selections = max(num_selections, 2)
+            num_decompositions = min(
+                num_decompositions,
+                max(int(base_rollout_config.alternating_selector_num_decompositions), 1),
+            )
+            num_selections = min(
+                num_selections,
+                max(int(base_rollout_config.alternating_selector_num_selections), 1),
+            )
         elif schedule.alternating_phase == AlternatingPhase.DECOMPOSER:
-            num_decompositions = max(num_decompositions, 2)
+            num_decompositions = min(
+                num_decompositions,
+                max(int(base_rollout_config.alternating_decomposer_num_decompositions), 1),
+            )
+            num_selections = min(
+                num_selections,
+                max(int(base_rollout_config.alternating_decomposer_num_selections), 1),
+            )
     return RolloutConfig(
         num_decompositions=num_decompositions,
         num_selections_per_decomposition=num_selections,
+        alternating_selector_num_decompositions=base_rollout_config.alternating_selector_num_decompositions,
+        alternating_selector_num_selections=base_rollout_config.alternating_selector_num_selections,
+        alternating_decomposer_num_decompositions=base_rollout_config.alternating_decomposer_num_decompositions,
+        alternating_decomposer_num_selections=base_rollout_config.alternating_decomposer_num_selections,
         max_nodes_per_decomposition=base_rollout_config.max_nodes_per_decomposition,
         soft_max_hops=base_rollout_config.soft_max_hops,
         hard_max_hops=base_rollout_config.hard_max_hops,
@@ -1265,11 +1287,6 @@ def rollout_workload_estimate(
 ) -> Dict[str, int]:
     num_decompositions = rollout_config.num_decompositions
     num_selections = rollout_config.num_selections_per_decomposition
-    if schedule.mode == TrainingMode.ALTERNATING:
-        if schedule.alternating_phase == AlternatingPhase.SELECTOR:
-            num_decompositions = 1
-        else:
-            num_selections = 1
 
     max_nodes = max(int(rollout_config.max_nodes_per_decomposition), 1)
     controller_generations_per_task = num_decompositions + (num_decompositions * num_selections)
@@ -1986,6 +2003,10 @@ def main() -> None:
     base_rollout_config = RolloutConfig(
         num_decompositions=args.num_decompositions,
         num_selections_per_decomposition=args.num_selections,
+        alternating_selector_num_decompositions=args.alternating_selector_num_decompositions,
+        alternating_selector_num_selections=args.alternating_selector_num_selections,
+        alternating_decomposer_num_decompositions=args.alternating_decomposer_num_decompositions,
+        alternating_decomposer_num_selections=args.alternating_decomposer_num_selections,
         max_nodes_per_decomposition=max_nodes_per_decomposition,
         soft_max_hops=args.soft_max_hops,
         hard_max_hops=args.hard_max_hops,
