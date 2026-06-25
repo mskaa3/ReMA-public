@@ -24,6 +24,10 @@ _FINAL_CLAUSE_PATTERN = re.compile(
     r"(?:the\s+answer\s+is|the\s+value\s+is|therefore|thus|so|hence|must\s+be|equals?)\s*[:=]?\s*(.+)",
     flags=re.IGNORECASE,
 )
+_NAMED_RESULT_CLAUSE_PATTERN = re.compile(
+    r"^(?:therefore|thus|hence|so)?\s*,?\s*the\s+[a-z0-9_\\{}^$().\-\s]{1,80}?\s+is\s*[:=]?\s*(.*)$",
+    flags=re.IGNORECASE,
+)
 _BOUNDARY_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
 
 
@@ -146,10 +150,20 @@ def _extract_non_final_leak_candidates(text: str) -> List[str]:
     lines = [line.strip(" -*\t") for line in stripped.splitlines() if line.strip()]
     if lines:
         _add_with_variants(lines[-1])
-    for line in lines[-3:]:
+    start_index = max(len(lines) - 3, 0)
+    for offset, line in enumerate(lines[start_index:], start=start_index):
         match = _FINAL_CLAUSE_PATTERN.search(line)
         if match:
             _add_with_variants(match.group(1))
+        named_match = _NAMED_RESULT_CLAUSE_PATTERN.search(line)
+        if named_match:
+            remainder = named_match.group(1).strip()
+            if remainder:
+                _add_with_variants(remainder)
+            elif offset + 1 < len(lines):
+                trailing_block = "\n".join(lines[offset + 1 :]).strip()
+                if trailing_block:
+                    _add_with_variants(trailing_block)
 
     for match in _BOXED_ANSWER_PATTERN.finditer(stripped):
         _add_with_variants(match.group(1))
@@ -163,7 +177,7 @@ def is_non_final_answer_leak(
     task_metadata: Dict[str, Any] | None = None,
 ) -> bool:
     for candidate in _extract_non_final_leak_candidates(text):
-        if _score_single_prediction_candidate(
+        if compute_final_answer_correctness(
             candidate,
             reference,
             task_metadata=task_metadata,

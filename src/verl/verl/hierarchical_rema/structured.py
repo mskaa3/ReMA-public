@@ -200,10 +200,27 @@ def _normalize_target_quantity(raw_value: Any) -> str:
 
 _GENERIC_FINAL_ANSWER_PATTERNS: tuple[str, ...] = (
     "return the final answer",
+    "return the answer",
+    "return the result",
     "provide the final answer",
+    "provide the answer",
+    "provide the result",
     "give the final answer",
+    "give the answer",
+    "give the result",
     "state the final answer",
+    "state the answer",
     "best final answer",
+    "simplify the expression",
+    "simplify the result",
+    "simplify the final result",
+    "express the answer",
+    "express the result",
+    "express the final answer",
+    "express the value",
+    "express the probability",
+    "express the quotient",
+    "express the sum",
 )
 _GENERIC_NODE1_PREFIXES: tuple[str, ...] = (
     "identify",
@@ -262,15 +279,39 @@ def _is_shallow_two_node_plan(candidate: DecompositionCandidate) -> bool:
     if final_node.dependencies != [first_node.node_id]:
         return False
 
-    first_instruction = " ".join(first_node.instruction.strip().lower().split())
     final_instruction = " ".join(final_node.instruction.strip().lower().split())
     if not (
-        _looks_generic_instruction(first_instruction, _GENERIC_NODE1_PREFIXES)
-        and _looks_generic_instruction(final_instruction, _GENERIC_FINAL_PREFIXES)
+        _is_generic_final_answer_instruction(final_instruction)
+        or (
+            _looks_generic_instruction(final_instruction, _GENERIC_FINAL_PREFIXES)
+            and (
+                any(marker in final_instruction for marker in _GENERIC_FINAL_MARKERS)
+                or "expression" in final_instruction
+            )
+        )
     ):
         return False
 
-    return any(marker in final_instruction for marker in _GENERIC_FINAL_MARKERS)
+    return True
+
+
+def _node_ids_on_paths_to_final(
+    nodes: Sequence[SubtaskNode],
+    final_node_id: str,
+) -> set[str]:
+    node_map = {node.node_id: node for node in nodes}
+    reachable: set[str] = set()
+    frontier = [final_node_id]
+    while frontier:
+        node_id = frontier.pop()
+        if node_id in reachable:
+            continue
+        reachable.add(node_id)
+        node = node_map.get(node_id)
+        if node is None:
+            continue
+        frontier.extend(node.dependencies)
+    return reachable
 
 
 def _infer_required_skills_from_instruction(instruction: str) -> List[str]:
@@ -903,6 +944,21 @@ def validate_decomposition_payload(
             declared_sink_ids = [node.node_id for node in nodes if node.node_id in sink_node_ids]
             resolved_final_node_id = declared_sink_ids[-1]
 
+    original_node_map = raw_candidate.nodes_by_id()
+    resolved_final_node = original_node_map[resolved_final_node_id]
+    if len(nodes) > 1 and not resolved_final_node.dependencies:
+        raise StructuredOutputError(
+            "FINAL_NODE_ID must depend on earlier nodes when decomposition has multiple nodes"
+        )
+
+    path_to_final_node_ids = _node_ids_on_paths_to_final(nodes, resolved_final_node_id)
+    dead_node_ids = [node.node_id for node in nodes if node.node_id not in path_to_final_node_ids]
+    if dead_node_ids:
+        raise StructuredOutputError(
+            "Decomposition contains unused nodes that do not contribute to FINAL_NODE_ID: "
+            + ", ".join(dead_node_ids)
+        )
+
     canonical_order = [node_id for node_id in raw_order if node_id != resolved_final_node_id]
     canonical_order.append(resolved_final_node_id)
 
@@ -910,7 +966,6 @@ def validate_decomposition_payload(
         original_node_id: str(index)
         for index, original_node_id in enumerate(canonical_order, start=1)
     }
-    original_node_map = raw_candidate.nodes_by_id()
     canonical_nodes: List[SubtaskNode] = []
     for original_node_id in canonical_order:
         original_node = original_node_map[original_node_id]

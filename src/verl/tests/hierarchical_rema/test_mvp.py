@@ -1,4 +1,5 @@
 import json
+import pytest
 
 try:
     from verl.hierarchical_rema.backends import _postprocess_worker_output
@@ -35,6 +36,7 @@ try:
         render_worker_prompt,
     )
     from verl.hierarchical_rema.structured import (
+        StructuredOutputError,
         apply_decomposition_limits,
         build_fallback_decomposition,
         extract_decomposition_payload,
@@ -77,6 +79,7 @@ except ModuleNotFoundError:
         render_worker_prompt,
     )
     from hierarchical_rema.structured import (
+        StructuredOutputError,
         apply_decomposition_limits,
         build_fallback_decomposition,
         extract_decomposition_payload,
@@ -413,6 +416,100 @@ def test_shallow_two_node_plan_receives_triviality_penalty() -> None:
     limited_candidate = apply_decomposition_limits(candidate, rollout_config)
 
     assert limited_candidate.soft_penalty == 0.5
+
+
+def test_generic_simplify_wrapper_two_node_plan_receives_triviality_penalty() -> None:
+    rollout_config = RolloutConfig(
+        soft_hop_penalty=0.1,
+        trivial_shallow_two_node_penalty=0.5,
+    )
+    candidate = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="wrapper plan",
+        target_quantity="matrix M",
+        final_answer_format_hint="matrix",
+        nodes=[
+            SubtaskNode(
+                node_id="1",
+                instruction="Solve for the entries of the matrix.",
+                output_key="1_output",
+            ),
+            SubtaskNode(
+                node_id="2",
+                instruction="Simplify the expression.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    limited_candidate = apply_decomposition_limits(candidate, rollout_config)
+
+    assert limited_candidate.soft_penalty == 0.5
+
+
+def test_validate_decomposition_rejects_unused_nodes_outside_path_to_final() -> None:
+    payload = {
+        "decomposition_id": "decomp-1",
+        "summary": "invalid disconnected plan",
+        "target_quantity": "answer",
+        "final_answer_format_hint": "integer",
+        "final_node_id": "3",
+        "nodes": [
+            {
+                "node_id": "1",
+                "instruction": "Solve the task.",
+                "dependencies": [],
+            },
+            {
+                "node_id": "2",
+                "instruction": "Unused detour.",
+                "dependencies": [],
+            },
+            {
+                "node_id": "3",
+                "instruction": "Return the final answer.",
+                "dependencies": ["1"],
+            },
+        ],
+    }
+
+    with pytest.raises(StructuredOutputError, match="unused nodes"):
+        validate_decomposition_payload(
+            payload=payload,
+            rollout_config=RolloutConfig(),
+            fallback_id="decomp-1",
+        )
+
+
+def test_validate_decomposition_rejects_final_node_without_dependencies_when_multinode() -> None:
+    payload = {
+        "decomposition_id": "decomp-1",
+        "summary": "invalid wrapper plan",
+        "target_quantity": "answer",
+        "final_answer_format_hint": "integer",
+        "final_node_id": "2",
+        "nodes": [
+            {
+                "node_id": "1",
+                "instruction": "Analyze the structure.",
+                "dependencies": [],
+            },
+            {
+                "node_id": "2",
+                "instruction": "Return the final answer.",
+                "dependencies": [],
+            },
+        ],
+    }
+
+    with pytest.raises(StructuredOutputError, match="must depend on earlier nodes"):
+        validate_decomposition_payload(
+            payload=payload,
+            rollout_config=RolloutConfig(),
+            fallback_id="decomp-1",
+        )
 
 
 def test_alternating_selector_phase_freezes_decomposer() -> None:
@@ -803,6 +900,93 @@ def test_non_final_worker_output_blanks_boxed_final_answer() -> None:
             decomposition=decomposition,
             node=decomposition.nodes[0],
             raw_output_text="<worker_result>\n\\boxed{3}\n</worker_result>",
+        )
+    )
+
+    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
+    assert invalid_reason == "non_final_contains_ground_truth"
+    assert final_answer_leak is True
+    assert answer_containment is False
+    assert success is False
+
+
+def test_non_final_worker_output_blanks_named_value_clause() -> None:
+    task = make_task(
+        "algebra",
+        "Solve for y.",
+        "\\frac{4}{13}",
+        "1",
+    )
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="value of y",
+        final_answer_format_hint="fraction",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Solve the equation.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="<worker_result>\nThe value of y is $\\frac{4}{13}$.\n</worker_result>",
+        )
+    )
+
+    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
+    assert invalid_reason == "non_final_contains_ground_truth"
+    assert final_answer_leak is True
+    assert answer_containment is False
+    assert success is False
+
+
+def test_non_final_worker_output_blanks_multiline_named_result_clause() -> None:
+    task = make_task(
+        "algebra",
+        "Find the matrix.",
+        "\\begin{pmatrix} 2 & -3 \\\\ 0 & 3 \\end{pmatrix}",
+        "0",
+    )
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="matrix",
+        final_answer_format_hint="matrix",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Solve for the matrix.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text=(
+                "<worker_result>\n"
+                "Thus, the matrix M is:\n"
+                "\\[\n"
+                "\\begin{pmatrix} 2 & -3 \\\\ 0 & 3 \\end{pmatrix}\n"
+                "\\]\n"
+                "</worker_result>"
+            ),
         )
     )
 
