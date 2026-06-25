@@ -123,9 +123,15 @@ export RAY_ADDRESS=${IP_HEAD}; \
 python3 -m verl.rema_separated_trainer.main_ppo \
   --config-path=/home/ajanz/projects/ReMA-public/config \
   --config-name=rema-rl.yaml \
-  actor_rollout_ref.model.path=${MODEL_PATH} \
-  trainer.nnodes=${SLURM_NNODES} \
-  trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE}"
+	  actor_rollout_ref.model.path=${MODEL_PATH} \
+	  trainer.nnodes=${SLURM_NNODES} \
+	  trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
+	  trainer.val_before_train=False \
+	  trainer.test_freq=50 \
+	  actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+	  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+	  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+	  algorithm.hierarchy.num_worker_stages=3"
 
 echo "Submitting trainer on Ray head"
 PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \

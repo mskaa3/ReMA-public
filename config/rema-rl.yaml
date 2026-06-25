@@ -30,7 +30,7 @@ actor_rollout_ref:
     clip_mode: turn
     ppo_mini_batch_size: 12  # per GPU
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
-    ppo_micro_batch_size_per_gpu: 8
+    ppo_micro_batch_size_per_gpu: 16
     use_dynamic_bsz: True
     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
     grad_clip: 1.0
@@ -93,7 +93,7 @@ actor_rollout_ref:
       fsdp_size: -1
       forward_prefetch: False
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
-    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_micro_batch_size_per_gpu: 4
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: 1  # ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
@@ -115,7 +115,7 @@ actor_rollout_ref:
     free_cache_engine: False
     load_format: dummy_dtensor
     tensor_model_parallel_size: 1
-    max_num_batched_tokens: 8192
+    max_num_batched_tokens: 16384
     max_model_len: 8192
     max_num_seqs: 2048
     stop_when_truncated: True
@@ -241,7 +241,7 @@ algorithm:
     decomposer_role: decomposer
     selector_role: selector
     worker_roles: [algebra_worker, functional_analysis_worker, general_math_worker]
-    num_worker_stages: 6
+    num_worker_stages: 3
     start_agent: decomposer
     default_worker: general_math_worker
     # Non-final workers see the original problem as reference context, but the
@@ -257,7 +257,7 @@ algorithm:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning
       general_math_worker: fallback mathematical reasoning and synthesis support
-    train_agent_roles: [decomposer, selector, worker_stage_1, worker_stage_2, worker_stage_3, worker_stage_4, worker_stage_5, worker_stage_6]
+    train_agent_roles: [decomposer, selector, worker_stage_1, worker_stage_2, worker_stage_3]
 
 trainer:
   debug_mode: False
@@ -269,7 +269,7 @@ trainer:
   experiment_name: verl_trainer  #-${data.train_batch_size}_n-${actor_rollout_ref.rollout.n}
   logger: ['console', 'wandb']
   log_val_generations: 0
-  val_before_train: True
+  val_before_train: False
   val_only: False  # True for evaluation only
   val_generations_to_log_to_wandb: 0
   nnodes: 1
@@ -279,7 +279,7 @@ trainer:
   # auto: find the last ckpt to resume. If can't find, start from scratch
   resume_mode: auto # or auto or resume_path if
   resume_from_path: null
-  test_freq: 10
+  test_freq: 50
   critic_warmup: 0
   default_hdfs_dir: null
   remove_previous_ckpt_in_save: True
