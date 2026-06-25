@@ -617,17 +617,18 @@ def test_controller_prompts_include_worker_performance_history() -> None:
         schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
     )
 
-    prompt_text = render_decomposer_prompt(
-        second_task,
-        worker_pool,
-        trainer.orchestrator.worker_memory.snapshot(worker_pool),
+    prompt_text = render_selector_prompt(
+        task=second_task,
+        decomposition=second_rollout.decompositions[0].decomposition,
+        worker_pool=worker_pool,
+        worker_performance=trainer.orchestrator.worker_memory.snapshot(worker_pool),
     )
 
-    assert "AVAILABLE_WORKERS:" in prompt_text
-    assert "arithmetic_prealgebra_worker" in prompt_text
-    assert "complete=" in prompt_text
+    assert "WORKERS_BY_ID:" in prompt_text
+    assert "calculation_worker" in prompt_text
+    assert "skills=" in prompt_text
     assert "avg_reward=" in prompt_text
-    assert '"available_workers"' not in prompt_text
+    assert '"workers_by_id"' not in prompt_text
 
 
 def test_soft_hop_penalty_and_hard_hop_truncation_are_applied() -> None:
@@ -1287,6 +1288,39 @@ def test_decomposition_output_keys_are_canonicalized() -> None:
     )
 
     assert [node.output_key for node in candidate.nodes] == ["1_output", "final_answer"]
+
+
+def test_required_skills_normalize_new_role_like_labels() -> None:
+    payload = {
+        "decomposition_id": "decomp-1",
+        "summary": "short plan",
+        "target_quantity": "answer",
+        "final_answer_format_hint": "integer",
+        "final_node_id": "20",
+        "nodes": [
+            {
+                "node_id": "10",
+                "instruction": "Compute the intermediate quantity.",
+                "dependencies": [],
+                "required_skills": ["calculation", "casework"],
+            },
+            {
+                "node_id": "20",
+                "instruction": "Return the final answer.",
+                "dependencies": ["10"],
+                "required_skills": ["logic_constraints", "function_analysis"],
+            },
+        ],
+    }
+
+    candidate = validate_decomposition_payload(
+        payload=payload,
+        rollout_config=RolloutConfig(),
+        fallback_id="decomp-1",
+    )
+
+    assert candidate.nodes[0].required_skills == ["arithmetic", "combinatorics"]
+    assert candidate.nodes[1].required_skills == ["discrete_math", "analysis"]
 
 
 def test_line_based_controller_plans_are_parseable() -> None:

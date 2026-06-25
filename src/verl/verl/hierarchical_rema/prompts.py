@@ -43,39 +43,50 @@ Assign the most suitable worker to each decomposition node using the node requir
 # </worker_result>"""
 
 
-DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT = """You are an arithmetic and prealgebra worker.
-Be exact with fractions, ratios, signs, and straightforward simplifications, and prefer exact forms over decimals unless the task asks for approximation.
+DEFAULT_CALCULATION_WORKER_PROMPT = """You are a calculation worker.
+Handle careful arithmetic, numeric evaluation, units, ratios, signs, and simple formulas. Prefer exact forms over decimals unless the task explicitly asks for approximation.
 
 """
 
 
-DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT = """You are an algebra and symbolic manipulation worker.
-Solve equations and carry out substitutions, factoring, expanding, and symbolic simplification carefully while keeping expressions exact.
+DEFAULT_SYMBOLIC_MANIPULATION_WORKER_PROMPT = """You are a symbolic manipulation worker.
+Factor, expand, isolate variables, substitute expressions, rewrite equivalent forms, and simplify symbolic expressions carefully while keeping them exact.
 
 """
 
 
-DEFAULT_GEOMETRY_TRIGONOMETRY_WORKER_PROMPT = """You are a geometry and trigonometry worker.
-Use Euclidean or coordinate geometry, angle and length relations, and trigonometric identities precisely, keeping notation clean and exact.
+DEFAULT_GEOMETRY_RELATION_WORKER_PROMPT = """You are a geometry relation worker.
+Use Euclidean or coordinate geometry, angle and length relations, diagram structure, and trigonometric setup precisely, keeping notation clean and exact.
 
 """
 
 
-DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT = """You are a calculus and analysis worker.
+DEFAULT_FUNCTION_ANALYSIS_WORKER_PROMPT = """You are a function analysis worker.
 Reason carefully about limits, derivatives, integrals, continuity, extrema, and function behavior, and keep the result mathematically exact.
 
 """
 
 
-DEFAULT_DISCRETE_NUMBER_THEORY_WORKER_PROMPT = """You are a discrete mathematics and number theory worker.
-Use divisibility, modular arithmetic, parity, counting, combinatorics, invariants, and elementary probability with precise case splits or arithmetic constraints when helpful.
+DEFAULT_COUNTING_CASEWORK_WORKER_PROMPT = """You are a counting and casework worker.
+Handle counting, combinatorics, probability, and discrete case splits carefully. Keep cases explicit and avoid skipping constraints or double-counting.
 
 """
 
 
-# Backward-compatible aliases for any older imports that still expect the two-worker setup.
-DEFAULT_ALGEBRA_WORKER_PROMPT = DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT
-DEFAULT_ANALYSIS_WORKER_PROMPT = DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT
+DEFAULT_LOGIC_CONSTRAINTS_WORKER_PROMPT = """You are a logic and constraints worker.
+Handle divisibility, parity, gcd/lcm structure, invariants, contradiction arguments, and condition-chaining carefully. Keep the logic explicit and avoid unsupported jumps.
+
+"""
+
+
+# Backward-compatible aliases for older imports and any stale configs.
+DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT = DEFAULT_CALCULATION_WORKER_PROMPT
+DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT = DEFAULT_SYMBOLIC_MANIPULATION_WORKER_PROMPT
+DEFAULT_GEOMETRY_TRIGONOMETRY_WORKER_PROMPT = DEFAULT_GEOMETRY_RELATION_WORKER_PROMPT
+DEFAULT_CALCULUS_ANALYSIS_WORKER_PROMPT = DEFAULT_FUNCTION_ANALYSIS_WORKER_PROMPT
+DEFAULT_DISCRETE_NUMBER_THEORY_WORKER_PROMPT = DEFAULT_LOGIC_CONSTRAINTS_WORKER_PROMPT
+DEFAULT_ALGEBRA_WORKER_PROMPT = DEFAULT_SYMBOLIC_MANIPULATION_WORKER_PROMPT
+DEFAULT_ANALYSIS_WORKER_PROMPT = DEFAULT_FUNCTION_ANALYSIS_WORKER_PROMPT
 
 
 def _compact_performance_summary(snapshot: WorkerPerformanceSnapshot) -> dict:
