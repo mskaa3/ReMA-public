@@ -56,6 +56,15 @@ KNOWN_WORKER_TAGS = (
 
 _WORKER_ALLOWED_TAGS = frozenset(("worker_scratchpad",) + KNOWN_WORKER_TAGS)
 _WORKER_TAG_PATTERN = re.compile(r"</?\s*([a-zA-Z_][a-zA-Z0-9_\-]*)\s*>")
+_STRICT_WORKER_RESULT_BLOCK_PATTERN = re.compile(
+    r"<worker_result>\s*(.*?)\s*</worker_result>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_STRICT_WORKER_OUTPUT_PATTERN = re.compile(
+    r"\A\s*(?:<worker_scratchpad>\s*.*?\s*</worker_scratchpad>\s*)?"
+    r"<worker_result>\s*.*?\s*</worker_result>\s*\Z",
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 def _extract_tagged_content(text: str, tags: tuple[str, ...] = KNOWN_CONTROLLER_TAGS) -> str:
     for tag in tags:
@@ -86,8 +95,18 @@ def extract_worker_result_payload(text: str) -> Dict[str, str] | None:
     if tag_names and not tag_names.issubset(_WORKER_ALLOWED_TAGS):
         return None
 
-    normalized = _normalize_structured_text(stripped, tags=KNOWN_WORKER_TAGS)
-    if normalized == stripped and "<worker_result" not in stripped.lower():
+    if not _STRICT_WORKER_OUTPUT_PATTERN.fullmatch(stripped):
+        return None
+
+    result_match = _STRICT_WORKER_RESULT_BLOCK_PATTERN.search(stripped)
+    if result_match is None:
+        return None
+    normalized = result_match.group(1).strip()
+    nested_worker_tags = {
+        match.group(1).lower()
+        for match in _WORKER_TAG_PATTERN.finditer(normalized)
+    }
+    if nested_worker_tags & _WORKER_ALLOWED_TAGS:
         return None
 
     result_lines: List[str] = []
