@@ -41,6 +41,7 @@ try:
         build_fallback_decomposition,
         extract_decomposition_payload,
         extract_json_dict,
+        extract_worker_result_text,
         extract_selection_payload,
         validate_decomposition_payload,
     )
@@ -84,6 +85,7 @@ except ModuleNotFoundError:
         build_fallback_decomposition,
         extract_decomposition_payload,
         extract_json_dict,
+        extract_worker_result_text,
         extract_selection_payload,
         validate_decomposition_payload,
     )
@@ -831,6 +833,45 @@ def test_non_final_worker_output_does_not_blank_signed_values() -> None:
     assert success is True
 
 
+def test_malformed_worker_output_requires_closed_worker_result_block() -> None:
+    task = make_task("algebra", "Find the integer solution.", "3", "4")
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Analyze the cases.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="<worker_scratchpad>\n<worker_result>\nconcise result",
+        )
+    )
+
+    assert normalized_output == ""
+    assert invalid_reason == "missing_worker_result"
+    assert final_answer_leak is False
+    assert answer_containment is False
+    assert success is False
+
+
+def test_worker_output_rejects_text_outside_worker_blocks() -> None:
+    assert extract_worker_result_text("4\n<worker_result>\n4\n</worker_result>") == ""
+
+
 def test_non_final_worker_output_blanks_explicit_final_answer_clause() -> None:
     task = make_task(
         "algebra",
@@ -1027,6 +1068,37 @@ def test_worker_prompt_explains_redacted_dependency_outputs() -> None:
 
     assert REDACTED_FINAL_ANSWER_LEAK_OUTPUT in prompt
     assert "Treat that dependency as unavailable evidence" in prompt
+
+
+def test_worker_prompt_does_not_include_concise_result_placeholder() -> None:
+    task = make_task("algebra", "Find the integer solution.", "3", "4")
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Analyze the cases.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+    worker_pool = make_worker_pool()
+    prompt = render_worker_prompt(
+        task=task,
+        decomposition=decomposition,
+        node=decomposition.nodes[1],
+        worker=worker_pool.workers[0],
+        dependency_outputs={"1": "x = 3"},
+    )
+
+    assert "concise result" not in prompt
+    assert "From 2x = 8, divide both sides by 2." in prompt
 
 
 def test_controller_sample_quality_filter_clean_only_keeps_only_clean_controller_samples() -> None:
