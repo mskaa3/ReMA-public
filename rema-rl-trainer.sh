@@ -17,8 +17,18 @@ rclone copy s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rem
 source ./env.sh
 export HF_HOME=$TMPDIR/hf_home
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+PRD_EXPORT_ENABLE=${PRD_EXPORT_ENABLE:-0}
+PRD_EXPORT_MAX_RECORDS=${PRD_EXPORT_MAX_RECORDS:-50000}
+PRD_EXPORT_LOCAL=${PRD_EXPORT_LOCAL:-$TMPDIR/prd_reward_composer/prd_records_${SLURM_JOB_ID}.jsonl}
+PRD_EXPORT_REMOTE=${PRD_EXPORT_REMOTE:-}
 
-COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install --force-reinstall math-verify;python3 -m pip install --force-reinstall --no-deps antlr4-python3-runtime==4.9.3;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_separated_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml actor_rollout_ref.model.path=${MODEL_PATH} trainer.n_gpus_per_node=2 trainer.val_before_train=False trainer.test_freq=50 actor_rollout_ref.rollout.max_num_batched_tokens=16384 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 algorithm.hierarchy.num_worker_stages=3"
+PRD_EXPORT_OVERRIDES=""
+if [[ "${PRD_EXPORT_ENABLE}" == "1" || "${PRD_EXPORT_ENABLE}" == "true" ]]; then
+    PRD_EXPORT_OVERRIDES="algorithm.hierarchy.reward_composer.export_jsonl_path=${PRD_EXPORT_LOCAL} algorithm.hierarchy.reward_composer.export_jsonl_max_records=${PRD_EXPORT_MAX_RECORDS}"
+    echo "PRD reward-composer export enabled: ${PRD_EXPORT_LOCAL}"
+fi
+
+COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install --force-reinstall math-verify;python3 -m pip install --force-reinstall --no-deps antlr4-python3-runtime==4.9.3;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_separated_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml actor_rollout_ref.model.path=${MODEL_PATH} trainer.n_gpus_per_node=2 trainer.val_before_train=False trainer.test_freq=50 actor_rollout_ref.rollout.max_num_batched_tokens=16384 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 algorithm.hierarchy.num_worker_stages=3 ${PRD_EXPORT_OVERRIDES}"
 
 srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \
@@ -27,6 +37,16 @@ srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR/verl,dst=/root/ReMA-public/src/verl \
     $TMPDIR/verl-rema-v3.sif \
     bash -c "$COMMAND"
+
+if [[ ("${PRD_EXPORT_ENABLE}" == "1" || "${PRD_EXPORT_ENABLE}" == "true") && -n "${PRD_EXPORT_REMOTE}" ]]; then
+    if [[ -s "${PRD_EXPORT_LOCAL}" ]]; then
+        gzip -c "${PRD_EXPORT_LOCAL}" > "${PRD_EXPORT_LOCAL}.gz"
+        rclone copyto "${PRD_EXPORT_LOCAL}.gz" "${PRD_EXPORT_REMOTE}/prd_records_${SLURM_JOB_ID}.jsonl.gz"
+        echo "Uploaded PRD export to ${PRD_EXPORT_REMOTE}/prd_records_${SLURM_JOB_ID}.jsonl.gz"
+    else
+        echo "No PRD export found at ${PRD_EXPORT_LOCAL}; skipping upload"
+    fi
+fi
 
 if [[ -n $TMPDIR ]]; then
     rm -rf $TMPDIR/*

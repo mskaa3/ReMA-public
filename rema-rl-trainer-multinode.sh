@@ -25,6 +25,10 @@ export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka
 export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/rema}
+export PRD_EXPORT_ENABLE=${PRD_EXPORT_ENABLE:-0}
+export PRD_EXPORT_MAX_RECORDS=${PRD_EXPORT_MAX_RECORDS:-50000}
+export PRD_EXPORT_LOCAL=${PRD_EXPORT_LOCAL:-${JOB_TMP}/prd_reward_composer/prd_records_${SLURM_JOB_ID}.jsonl}
+export PRD_EXPORT_REMOTE=${PRD_EXPORT_REMOTE:-}
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}
@@ -38,6 +42,17 @@ if [[ "$HEAD_NODE_IP" == *" "* ]]; then
     fi
 fi
 IP_HEAD=${HEAD_NODE_IP}:${RAY_PORT}
+
+PRD_EXPORT_OVERRIDES=""
+if [[ "${PRD_EXPORT_ENABLE}" == "1" || "${PRD_EXPORT_ENABLE}" == "true" ]]; then
+    PRD_EXPORT_OVERRIDES="algorithm.hierarchy.reward_composer.export_jsonl_path=${PRD_EXPORT_LOCAL} algorithm.hierarchy.reward_composer.export_jsonl_max_records=${PRD_EXPORT_MAX_RECORDS}"
+    echo "PRD reward-composer export enabled: ${PRD_EXPORT_LOCAL}"
+    if [[ -n "${PRD_EXPORT_REMOTE}" ]]; then
+        echo "PRD export will be uploaded to: ${PRD_EXPORT_REMOTE}"
+    else
+        echo "PRD_EXPORT_REMOTE is not set; export will remain only on node-local scratch until cleanup."
+    fi
+fi
 
 echo "Preparing node-local JOB_TMP at ${JOB_TMP} on all nodes"
 srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
@@ -131,12 +146,27 @@ python3 -m verl.rema_separated_trainer.main_ppo \
 	  actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
 	  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
 	  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
-	  algorithm.hierarchy.num_worker_stages=3"
+	  algorithm.hierarchy.num_worker_stages=3 \
+      ${PRD_EXPORT_OVERRIDES}"
 
 echo "Submitting trainer on Ray head"
 PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
     apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
     bash -c "$COMMAND"
+
+if [[ ("${PRD_EXPORT_ENABLE}" == "1" || "${PRD_EXPORT_ENABLE}" == "true") && -n "${PRD_EXPORT_REMOTE}" ]]; then
+    echo "Uploading PRD reward-composer export from head node"
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" bash -lc '
+        set -euo pipefail
+        if [[ ! -s "'"${PRD_EXPORT_LOCAL}"'" ]]; then
+            echo "No PRD export found at '"${PRD_EXPORT_LOCAL}"'; skipping upload"
+            exit 0
+        fi
+        gzip -c "'"${PRD_EXPORT_LOCAL}"'" > "'"${PRD_EXPORT_LOCAL}"'.gz"
+        rclone copyto "'"${PRD_EXPORT_LOCAL}"'.gz" "'"${PRD_EXPORT_REMOTE}"'/prd_records_'"${SLURM_JOB_ID}"'.jsonl.gz"
+        echo "Uploaded PRD export to '"${PRD_EXPORT_REMOTE}"'/prd_records_'"${SLURM_JOB_ID}"'.jsonl.gz"
+    '
+fi
 
 if [[ -n ${JOB_TMP:-} ]]; then
     srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc 'rm -rf "$JOB_TMP"/*'

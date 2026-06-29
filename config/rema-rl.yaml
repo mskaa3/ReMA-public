@@ -253,6 +253,16 @@ algorithm:
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
     final_raw_score_usage_floor: 0.5
+    reward_composer:
+      enable: False
+      checkpoint_path: null
+      # Blend learned PRD rewards with the current manual role rewards:
+      # role_reward = (1 - alpha) * manual_reward + alpha * prd_reward.
+      blend_alpha: 0.0
+      # Optional offline-training export. When set, reward manager appends one
+      # JSONL record per scored sample with reward_sources and manual role_scores.
+      export_jsonl_path: null
+      export_jsonl_max_records: null
     worker_specs:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning
