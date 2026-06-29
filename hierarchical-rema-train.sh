@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=hierarchical-rema-train-rolechanged
-#SBATCH --nodes=2
+#SBATCH --nodes=3
 #SBATCH --cpus-per-gpu=4
 #SBATCH --time=168:00:00
 #SBATCH --mem=200gb
@@ -60,7 +60,7 @@ export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-32}
 export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-32}
 
 # Distributed rollout / learner runtime.
-export RAY_NNODES=${RAY_NNODES:-${SLURM_JOB_NUM_NODES:-2}}
+export RAY_NNODES=${RAY_NNODES:-${SLURM_JOB_NUM_NODES:-3}}
 export RAY_N_GPUS_PER_NODE=${RAY_N_GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE##*:}}
 export OFFLINE_GRPO_DISTRIBUTED=${OFFLINE_GRPO_DISTRIBUTED:-true}
 export OFFLINE_GRPO_NNODES=${OFFLINE_GRPO_NNODES:-$RAY_NNODES}
@@ -81,7 +81,7 @@ export OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF=${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CO
 # Reward/training switches that are still commonly toggled in experiments.
 export CONTROLLER_FORMAT_RETRY_PENALTY=${CONTROLLER_FORMAT_RETRY_PENALTY:-0.2} # subtract from controller reward/advantage when output needed repair
 export CONTROLLER_FORMAT_FALLBACK_PENALTY=${CONTROLLER_FORMAT_FALLBACK_PENALTY:-0.25}
-export FINAL_ANSWER_CORRECTNESS_REWARD_ONLY=${FINAL_ANSWER_CORRECTNESS_REWARD_ONLY:-false}
+export FINAL_ANSWER_CORRECTNESS_REWARD_ONLY=${FINAL_ANSWER_CORRECTNESS_REWARD_ONLY:-true}
 export TRAIN_MIN_REWARD=${TRAIN_MIN_REWARD:-}
 # Controller sample provenance filter:
 #   all = current behavior
