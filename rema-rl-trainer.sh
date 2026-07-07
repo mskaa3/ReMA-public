@@ -29,6 +29,7 @@ PRD_ONLINE_BLEND_RAMP_STEPS=${PRD_ONLINE_BLEND_RAMP_STEPS:-200}
 PRD_ONLINE_SYNC_INTERVAL=${PRD_ONLINE_SYNC_INTERVAL:-50}
 PRD_ONLINE_EMA_BETA=${PRD_ONLINE_EMA_BETA:-0.9}
 ROLLOUT_N=${ROLLOUT_N:-32}
+TEST_FREQ=${TEST_FREQ:-10}
 
 PRD_EXPORT_OVERRIDES=""
 if [[ "${PRD_EXPORT_ENABLE}" == "1" || "${PRD_EXPORT_ENABLE}" == "true" ]]; then
@@ -45,7 +46,7 @@ else
     echo "Online PRD reward composer disabled; rollout.n=${ROLLOUT_N}"
 fi
 
-COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install --force-reinstall math-verify;python3 -m pip install --force-reinstall --no-deps antlr4-python3-runtime==4.9.3;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_separated_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml actor_rollout_ref.model.path=${MODEL_PATH} trainer.n_gpus_per_node=2 trainer.val_before_train=False trainer.test_freq=50 actor_rollout_ref.rollout.max_num_batched_tokens=16384 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 algorithm.hierarchy.num_worker_stages=3 ${PRD_ONLINE_OVERRIDES} ${PRD_EXPORT_OVERRIDES}"
+COMMAND="unset ROCR_VISIBLE_DEVICES;python3 -m pip install --force-reinstall math-verify;python3 -m pip install --force-reinstall --no-deps antlr4-python3-runtime==4.9.3;export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH;python3 -m verl.rema_separated_trainer.main_ppo --config-path=/home/ajanz/projects/ReMA-public/config --config-name=rema-rl.yaml actor_rollout_ref.model.path=${MODEL_PATH} trainer.n_gpus_per_node=2 trainer.val_before_train=False trainer.test_freq=${TEST_FREQ} actor_rollout_ref.rollout.max_num_batched_tokens=16384 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 algorithm.hierarchy.num_worker_stages=3 ${PRD_ONLINE_OVERRIDES} ${PRD_EXPORT_OVERRIDES}"
 
 srun apptainer exec --nv --writable-tmpfs \
     --mount type=bind,src=$TMPDIR,dst=$TMPDIR \

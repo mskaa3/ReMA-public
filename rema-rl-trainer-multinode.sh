@@ -37,6 +37,7 @@ export PRD_ONLINE_BLEND_RAMP_STEPS=${PRD_ONLINE_BLEND_RAMP_STEPS:-200}
 export PRD_ONLINE_SYNC_INTERVAL=${PRD_ONLINE_SYNC_INTERVAL:-50}
 export PRD_ONLINE_EMA_BETA=${PRD_ONLINE_EMA_BETA:-0.9}
 export ROLLOUT_N=${ROLLOUT_N:-32}
+export TEST_FREQ=${TEST_FREQ:-10}
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}
@@ -166,7 +167,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
 	  trainer.nnodes=${SLURM_NNODES} \
 	  trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
 	  trainer.val_before_train=False \
-	  trainer.test_freq=50 \
+	  trainer.test_freq=${TEST_FREQ} \
 	  actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
 	  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
 	  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
