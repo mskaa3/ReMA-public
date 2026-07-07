@@ -72,14 +72,21 @@ else
 fi
 
 echo "Preparing node-local JOB_TMP at ${JOB_TMP} on all nodes"
-srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
     set -euo pipefail
+    echo "[$(hostname)] prepare: mkdir ${JOB_TMP}"
     mkdir -p "$JOB_TMP"
+    echo "[$(hostname)] prepare: cleanup old staged data"
     rm -rf "$JOB_TMP/overall_math" "$JOB_TMP/MATH" "$JOB_TMP/verl"
+    echo "[$(hostname)] prepare: copy data/overall_math"
     cp -r "$SLURM_SUBMIT_DIR/data/overall_math" "$JOB_TMP/overall_math"
+    echo "[$(hostname)] prepare: copy data/MATH"
     cp -r "$SLURM_SUBMIT_DIR/data/MATH" "$JOB_TMP/MATH"
+    echo "[$(hostname)] prepare: copy src/verl"
     cp -r "$SLURM_SUBMIT_DIR/src/verl" "$JOB_TMP/verl"
-    rclone copy "$SIF_REMOTE" "$JOB_TMP/"
+    echo "[$(hostname)] prepare: copy sif ${SIF_REMOTE}"
+    rclone copy "$SIF_REMOTE" "$JOB_TMP/" --stats=30s --stats-one-line
+    echo "[$(hostname)] prepare: done"
 '
 
 echo "Preparing node-local Ray temp dir at ${RAY_NODE_TMP}"
