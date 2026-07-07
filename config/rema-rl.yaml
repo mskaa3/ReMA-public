@@ -266,15 +266,22 @@ algorithm:
       # JSONL record per scored sample with reward_sources and manual role_scores.
       export_jsonl_path: null
       export_jsonl_max_records: null
+      # Optional graph prior for learned PRD routing. "soft" biases credit to
+      # flow along decomposer -> selector -> workers -> final while still
+      # allowing non-obvious cross-role signals. "hard" masks reverse links.
+      graph_prior_mode: soft
+      graph_prior_soft_distance_penalty: 1.0
+      graph_prior_reverse_distance_penalty: 3.0
       online:
         enable: False
         init_checkpoint_path: null
-        lr: 1.0e-3
+        lr: 3.0e-4
         weight_decay: 0.0
         hidden_dim: 128
         source_embed_dim: 32
         global_context_dim: null
         routing_activation: sigmoid
+        routing_floor: 0.05
         warmup_steps: 200
         blend_alpha: 0.05
         blend_alpha_max: 0.05
@@ -285,6 +292,9 @@ algorithm:
         ema_beta: 0.9
         grad_clip: 1.0
         use_manual_role_features: False
+        graph_prior_mode: soft
+        graph_prior_soft_distance_penalty: 1.0
+        graph_prior_reverse_distance_penalty: 3.0
     worker_specs:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning

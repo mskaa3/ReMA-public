@@ -179,6 +179,7 @@ from verl.workers.reward_manager.prd_composer import (
     PRD_REWARD_SOURCE_NAMES,
     PRD_ROLE_FEATURE_NAMES,
     PRDRewardComposer,
+    build_prd_graph_prior_tensors,
     build_prd_role_feature_tensor,
     build_prd_source_tensor,
 )
@@ -457,6 +458,7 @@ class RayReMASeparatedTrainer(object):
         source_embed_dim = int(online_config.get('source_embed_dim', 32))
         global_context_dim = online_config.get('global_context_dim', None)
         routing_activation = str(online_config.get('routing_activation', 'sigmoid'))
+        routing_floor = float(online_config.get('routing_floor', 0.0))
         init_checkpoint_path = online_config.get('init_checkpoint_path')
         if init_checkpoint_path:
             self.online_prd_train = PRDRewardComposer.from_checkpoint(init_checkpoint_path, map_location='cpu')
@@ -468,12 +470,13 @@ class RayReMASeparatedTrainer(object):
                 source_embed_dim=source_embed_dim,
                 global_context_dim=global_context_dim,
                 routing_activation=routing_activation,
+                routing_floor=routing_floor,
             )
         self.online_prd_active = copy.deepcopy(self.online_prd_train)
         self.online_prd_active.eval()
         self.online_prd_optimizer = torch.optim.AdamW(
             self.online_prd_train.parameters(),
-            lr=float(online_config.get('lr', 1e-3)),
+            lr=float(online_config.get('lr', 3e-4)),
             weight_decay=float(online_config.get('weight_decay', 0.0)),
         )
 
@@ -541,6 +544,15 @@ class RayReMASeparatedTrainer(object):
             'role_features': torch.stack(role_feature_rows, dim=0),
             'agent_roles': agent_roles,
             'score_role': score_role,
+            'graph_prior': build_prd_graph_prior_tensors(
+                agent_roles,
+                score_role,
+                worker_roles,
+                PRD_REWARD_SOURCE_NAMES,
+                mode=str(self.online_prd_config.get('graph_prior_mode', 'none')),
+                soft_distance_penalty=float(self.online_prd_config.get('graph_prior_soft_distance_penalty', 1.0)),
+                reverse_distance_penalty=float(self.online_prd_config.get('graph_prior_reverse_distance_penalty', 3.0)),
+            ),
         }
 
     @staticmethod
@@ -598,10 +610,16 @@ class RayReMASeparatedTrainer(object):
         source_values = prd_batch['source_values']
         role_features = prd_batch['role_features']
         agent_roles = prd_batch['agent_roles']
+        routing_bias, routing_mask = prd_batch['graph_prior']
 
         # Train PRD_train from current rollout groups.
         self.online_prd_train.train()
-        train_output = self.online_prd_train(source_values, role_features)
+        train_output = self.online_prd_train(
+            source_values,
+            role_features,
+            routing_bias=routing_bias,
+            routing_mask=routing_mask,
+        )
         raw_scores = reward_tensor_map['acc'].float()
         uid_list = list(data_batch.non_tensor_batch['uid'])
         uid_to_indices = defaultdict(list)
@@ -649,6 +667,16 @@ class RayReMASeparatedTrainer(object):
         metrics['reward/prd_online/mixed_group_count'] = mixed_group_count
         metrics['reward/prd_online/skipped_group_count'] = skipped_group_count
         metrics['reward/prd_online/group_count'] = len(uid_to_indices)
+        metrics['reward/prd_online/graph_prior_mode_id'] = {
+            'none': 0.0,
+            'soft': 1.0,
+            'hard': 2.0,
+        }.get(str(self.online_prd_config.get('graph_prior_mode', 'none')), -1.0)
+        if routing_bias is not None:
+            metrics['reward/prd_online/graph_prior_bias_mean'] = float(routing_bias.float().mean().item())
+            metrics['reward/prd_online/graph_prior_bias_std'] = self._safe_tensor_std(routing_bias.float())
+        if routing_mask is not None:
+            metrics['reward/prd_online/graph_prior_mask_mean'] = float(routing_mask.float().mean().item())
         metrics['reward/prd_online/train_routing_mean'] = float(train_routing.mean().item())
         metrics['reward/prd_online/train_routing_std'] = self._safe_tensor_std(train_routing)
         metrics['reward/prd_online/train_rollout_score_mean'] = float(train_rollout_scores.mean().item())
@@ -678,7 +706,12 @@ class RayReMASeparatedTrainer(object):
 
         self.online_prd_active.eval()
         with torch.no_grad():
-            active_output = self.online_prd_active(source_values, role_features)
+            active_output = self.online_prd_active(
+                source_values,
+                role_features,
+                routing_bias=routing_bias,
+                routing_mask=routing_mask,
+            )
         prd_role_scores = active_output['role_scores']
         active_routing = active_output['routing']
         active_rollout_scores = prd_role_scores.sum(dim=1)

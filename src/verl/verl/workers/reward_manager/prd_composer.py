@@ -10,7 +10,7 @@ manual reward.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -60,6 +60,39 @@ PRD_ROLE_FEATURE_NAMES: List[str] = [
     "manual_role_penalty",
     "manual_role_score",
 ]
+
+
+PRD_SOURCE_STAGE: Dict[str, int] = {
+    "decomposer_plan_parseable_gate": 0,
+    "hierarchy_utilization_gate": 0,
+    "decomposer_unique_local_result_rate": 0,
+    "decomposer_dependency_usage_rate": 0,
+    "decomposer_repair_success": 0,
+    "selector_assignment_completeness": 1,
+    "selector_assignment_precision": 1,
+    "selector_assignment_recall": 1,
+    "selector_assignment_final_present": 1,
+    "selector_worker_valid_local_result_rate": 1,
+    "worker_unique_local_result_rate": 2,
+    "worker_downstream_used_rate": 2,
+    "worker_later_worker_used_rate": 2,
+    "final_worker_result_usage_rate": 3,
+    "final_consistency_with_worker_results": 3,
+    "penalty_meta_boxed": 0,
+    "penalty_worker_finish": 2,
+    "penalty_worker_empty_assigned": 2,
+    "penalty_worker_missing_local_result": 2,
+    "penalty_worker_subtask_overreach": 2,
+    "penalty_worker_duplicate_result": 2,
+    "penalty_selector_extra_assignment": 1,
+    "penalty_selector_missing_assignment": 1,
+    "penalty_selector_duplicate_assignment": 1,
+    "penalty_selector_missing_final": 1,
+    "penalty_selector_empty_output": 1,
+    "penalty_final_ignores_worker_results": 3,
+    "penalty_planner_repeat": 0,
+    "penalty_planner_excess_subtask": 0,
+}
 
 
 @dataclass(frozen=True)
@@ -129,6 +162,76 @@ def build_prd_role_feature_tensor(
     return torch.tensor(rows, device=device, dtype=dtype)
 
 
+def _role_stage(role: str, score_role: Optional[str], worker_roles: Iterable[str]) -> int:
+    worker_roles = set(worker_roles)
+    if role == "decomposer":
+        return 0
+    if role == "selector":
+        return 1
+    if role == score_role:
+        return 3
+    if role in worker_roles:
+        return 2
+    return 2
+
+
+def build_prd_graph_prior_tensors(
+    agent_roles: Sequence[str],
+    score_role: Optional[str],
+    worker_roles: Iterable[str],
+    source_names: Sequence[str] = PRD_REWARD_SOURCE_NAMES,
+    *,
+    mode: str = "none",
+    soft_distance_penalty: float = 1.0,
+    reverse_distance_penalty: float = 3.0,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Build optional graph priors for role/source reward routing.
+
+    The graph follows the protocol order:
+    decomposer -> selector -> non-final workers -> final.
+
+    A source owned by a downstream stage can credit upstream stages because
+    upstream decisions could have caused that downstream outcome.  Reverse
+    edges are discouraged in soft mode and removed in hard mode.
+    """
+
+    if mode not in {"none", "soft", "hard"}:
+        raise ValueError(f"Unsupported PRD graph prior mode: {mode}")
+    if mode == "none":
+        return None, None
+
+    role_stages = [
+        _role_stage(role, score_role, worker_roles)
+        for role in agent_roles
+    ]
+    source_stages = [
+        int(PRD_SOURCE_STAGE.get(source_name, 2))
+        for source_name in source_names
+    ]
+    bias_rows = []
+    mask_rows = []
+    for role_stage in role_stages:
+        bias_row = []
+        mask_row = []
+        for source_stage in source_stages:
+            if role_stage <= source_stage:
+                distance = source_stage - role_stage
+                allowed = 1.0
+            else:
+                distance = reverse_distance_penalty + role_stage - source_stage
+                allowed = 0.0
+            bias_row.append(-float(soft_distance_penalty) * float(distance))
+            mask_row.append(allowed)
+        bias_rows.append(bias_row)
+        mask_rows.append(mask_row)
+
+    routing_bias = torch.tensor(bias_rows, device=device, dtype=dtype)
+    routing_mask = torch.tensor(mask_rows, device=device, dtype=dtype) if mode == "hard" else None
+    return routing_bias, routing_mask
+
+
 class PRDRewardComposer(nn.Module):
     """A lightweight reward-source router.
 
@@ -149,16 +252,20 @@ class PRDRewardComposer(nn.Module):
         source_embed_dim: int = 32,
         global_context_dim: Optional[int] = None,
         routing_activation: str = "sigmoid",
+        routing_floor: float = 0.0,
     ) -> None:
         super().__init__()
         if routing_activation not in {"sigmoid", "softmax"}:
             raise ValueError(f"Unsupported routing activation: {routing_activation}")
+        if not 0.0 <= float(routing_floor) < 1.0:
+            raise ValueError(f"routing_floor must be in [0, 1), got {routing_floor}")
         self.num_sources = int(num_sources)
         self.role_feature_dim = int(role_feature_dim)
         self.hidden_dim = int(hidden_dim)
         self.source_embed_dim = int(source_embed_dim)
         self.global_context_dim = int(global_context_dim or hidden_dim)
         self.routing_activation = routing_activation
+        self.routing_floor = float(routing_floor)
 
         self.source_embedding = nn.Embedding(self.num_sources, self.source_embed_dim)
         self.global_encoder = nn.Sequential(
@@ -185,7 +292,13 @@ class PRDRewardComposer(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, source_values: torch.Tensor, role_features: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        source_values: torch.Tensor,
+        role_features: torch.Tensor,
+        routing_bias: Optional[torch.Tensor] = None,
+        routing_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         if source_values.dim() != 2:
             raise ValueError(f"source_values must be [batch, sources], got {tuple(source_values.shape)}")
         if role_features.dim() != 3:
@@ -221,10 +334,27 @@ class PRDRewardComposer(nn.Module):
             dim=-1,
         )
         routing_logits = self.routing_head(pair_hidden).squeeze(-1)
+        if routing_bias is not None:
+            while routing_bias.dim() < routing_logits.dim():
+                routing_bias = routing_bias.unsqueeze(0)
+            routing_logits = routing_logits + routing_bias.to(
+                device=routing_logits.device,
+                dtype=routing_logits.dtype,
+            )
+        if routing_mask is not None:
+            while routing_mask.dim() < routing_logits.dim():
+                routing_mask = routing_mask.unsqueeze(0)
+            routing_mask = routing_mask.to(device=routing_logits.device, dtype=routing_logits.dtype)
+            if self.routing_activation == "softmax":
+                routing_logits = routing_logits.masked_fill(routing_mask <= 0, -1e9)
         if self.routing_activation == "softmax":
             routing = torch.softmax(routing_logits, dim=-1)
         else:
             routing = torch.sigmoid(routing_logits)
+            if self.routing_floor > 0.0:
+                routing = self.routing_floor + (1.0 - self.routing_floor) * routing
+        if routing_mask is not None and self.routing_activation != "softmax":
+            routing = routing * routing_mask
 
         role_scores = (routing * source_values.unsqueeze(1)).sum(dim=-1)
         return {"role_scores": role_scores, "routing": routing, "routing_logits": routing_logits}
@@ -243,6 +373,7 @@ class PRDRewardComposer(nn.Module):
             "source_embed_dim": self.source_embed_dim,
             "global_context_dim": self.global_context_dim,
             "routing_activation": self.routing_activation,
+            "routing_floor": self.routing_floor,
             "source_names": list(source_names),
             "role_feature_names": list(role_feature_names),
         }
@@ -257,6 +388,7 @@ class PRDRewardComposer(nn.Module):
             source_embed_dim=int(payload.get("source_embed_dim", 32)),
             global_context_dim=int(payload.get("global_context_dim", payload.get("hidden_dim", 128))),
             routing_activation=str(payload.get("routing_activation", "sigmoid")),
+            routing_floor=float(payload.get("routing_floor", 0.0)),
         )
         model.load_state_dict(payload["state_dict"])
         return model

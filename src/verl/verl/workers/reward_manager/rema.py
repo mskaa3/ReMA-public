@@ -29,6 +29,7 @@ from math_verify.errors import TimeoutException
 from verl.workers.reward_manager.prd_composer import (
     PRD_REWARD_SOURCE_NAMES,
     PRDRewardComposer,
+    build_prd_graph_prior_tensors,
     build_prd_role_feature_tensor,
     build_prd_source_tensor,
 )
@@ -1382,8 +1383,26 @@ class ReMARewardManager:
                         else None
                     ),
                 ).unsqueeze(0)
+                routing_bias, routing_mask = build_prd_graph_prior_tensors(
+                    agent_roles,
+                    score_role,
+                    worker_roles,
+                    PRD_REWARD_SOURCE_NAMES,
+                    mode=str(reward_composer_config.get('graph_prior_mode', 'none')),
+                    soft_distance_penalty=float(
+                        reward_composer_config.get('graph_prior_soft_distance_penalty', 1.0)
+                    ),
+                    reverse_distance_penalty=float(
+                        reward_composer_config.get('graph_prior_reverse_distance_penalty', 3.0)
+                    ),
+                )
                 with torch.no_grad():
-                    prd_output = prd_composer(source_tensor, role_feature_tensor)
+                    prd_output = prd_composer(
+                        source_tensor,
+                        role_feature_tensor,
+                        routing_bias=routing_bias,
+                        routing_mask=routing_mask,
+                    )
                 prd_role_scores = prd_output['role_scores'].squeeze(0).tolist()
                 routing_mean = float(prd_output['routing'].mean().item())
                 manual_mean = (
