@@ -259,10 +259,32 @@ algorithm:
       # Blend learned PRD rewards with the current manual role rewards:
       # role_reward = (1 - alpha) * manual_reward + alpha * prd_reward.
       blend_alpha: 0.0
+      # Keep False for learned PRD experiments; True is only useful for
+      # debugging imitation because it exposes manual role rewards as inputs.
+      use_manual_role_features: False
       # Optional offline-training export. When set, reward manager appends one
       # JSONL record per scored sample with reward_sources and manual role_scores.
       export_jsonl_path: null
       export_jsonl_max_records: null
+      online:
+        enable: False
+        init_checkpoint_path: null
+        lr: 1.0e-3
+        weight_decay: 0.0
+        hidden_dim: 128
+        source_embed_dim: 32
+        global_context_dim: null
+        routing_activation: sigmoid
+        warmup_steps: 200
+        blend_alpha: 0.05
+        blend_alpha_max: 0.05
+        blend_ramp_steps: 200
+        min_group_size: 2
+        mixed_groups_only: True
+        sync_interval: 50
+        ema_beta: 0.9
+        grad_clip: 1.0
+        use_manual_role_features: False
     worker_specs:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning

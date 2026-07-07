@@ -14,6 +14,7 @@
 
 from functools import partial
 from typing import Dict
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -1358,6 +1359,9 @@ class ReMARewardManager:
                     "raw_score": float(raw_score),
                     "num_turns": int(num_turns),
                     "data_source": data_source,
+                    "prompt_key": hashlib.sha1(
+                        str(data_item.non_tensor_batch.get('question', '')).encode('utf-8')
+                    ).hexdigest(),
                 },
             )
 
@@ -1372,7 +1376,11 @@ class ReMARewardManager:
                     worker_roles,
                     role_bonuses=role_bonuses,
                     role_penalties=role_penalties,
-                    manual_role_scores=manual_role_scores,
+                    manual_role_scores=(
+                        manual_role_scores
+                        if reward_composer_config.get('use_manual_role_features', False)
+                        else None
+                    ),
                 ).unsqueeze(0)
                 with torch.no_grad():
                     prd_output = prd_composer(source_tensor, role_feature_tensor)
