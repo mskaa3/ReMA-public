@@ -283,7 +283,7 @@ LOGGING_STEPS=${LOGGING_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-200}
 EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-10}
 CHECKPOINT_MODE=${CHECKPOINT_MODE:-final}
-PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-false}
+PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-true}
 PRUNE_UPLOADED_LOCAL_CHECKPOINTS=${PRUNE_UPLOADED_LOCAL_CHECKPOINTS:-true}
 STRIP_LOCAL_MODELS_AFTER_SYNC=${STRIP_LOCAL_MODELS_AFTER_SYNC:-true}
 DEVICE=${DEVICE:-cuda}
@@ -1006,7 +1006,10 @@ print("1" if tracker.get("improved") else "0")
     fi
 
     echo "[hierarchical-rema][s3] uploading epoch folder ${epoch_name} -> ${S3_EPOCHS_PATH}/${epoch_name}"
-    if ! rclone copy "$epoch_dir" "${S3_EPOCHS_PATH}/${epoch_name}"; then
+    if ! rclone copy "$epoch_dir" "${S3_EPOCHS_PATH}/${epoch_name}" \
+        --exclude "/train/segment_*/**/final/**" \
+        --exclude "/train/segment_*/**/best/**" \
+        --exclude "/train/segment_*/**/checkpoint-*/**"; then
         echo "Warning: failed to upload epoch folder ${epoch_name} to ${S3_EPOCHS_PATH}/${epoch_name}" >&2
         upload_status=1
     fi
