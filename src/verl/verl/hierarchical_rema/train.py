@@ -287,6 +287,30 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Weight assigned to worker-node compatibility in selection reward",
     )
+    parser.add_argument(
+        "--gfam-reward-model-pkl",
+        default="",
+        help=(
+            "Optional GFAM-v1 checkpoint path. When set, per-role rewards come from the "
+            "graph reward model instead of the handcrafted rollout reward."
+        ),
+    )
+    parser.add_argument(
+        "--gfam-reward-model-device",
+        default="auto",
+        help="Torch device for GFAM reward inference: auto, cpu, cuda, or mps.",
+    )
+    parser.add_argument(
+        "--gfam-reward-model-encoder-backend",
+        default=None,
+        choices=("sentence-transformers", "transformers", "hashing"),
+        help="Optional override of the encoder backend stored in the GFAM checkpoint.",
+    )
+    parser.add_argument(
+        "--gfam-reward-model-encoder-model",
+        default=None,
+        help="Optional override of the encoder model stored in the GFAM checkpoint.",
+    )
     # parser.add_argument(
     #     "--worker-success-weight",
     #     type=float,
@@ -626,6 +650,7 @@ def _relay_offline_metrics_to_tracking(
                 optional_float_fields = {
                     "selector_mean_reward": "selector_mean_reward",
                     "decomposer_mean_reward": "decomposer_mean_reward",
+                    "worker_mean_reward": "worker_mean_reward",
                 }
                 optional_int_fields = {
                     "selector_samples_total": "selector_samples_total",
@@ -1308,6 +1333,16 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         for decomposition in rollout.decompositions
         for selection in decomposition.selections
     ]
+    worker_rewards = [
+        (
+            float(execution.reward_model_reward)
+            if execution.reward_model_reward is not None
+            else float(selection.reward.total_reward)
+        )
+        for decomposition in rollout.decompositions
+        for selection in decomposition.selections
+        for execution in selection.executions
+    ]
     selection_correctness = [
         selection.reward.final_answer_correctness
         for decomposition in rollout.decompositions
@@ -1318,6 +1353,7 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         "best_decomposition_reward": best_decomposition.decomposition_reward,
         "best_selection_reward": max(selection_rewards) if selection_rewards else 0.0,
         "mean_selection_reward": sum(selection_rewards) / max(len(selection_rewards), 1),
+        "mean_worker_reward": sum(worker_rewards) / max(len(worker_rewards), 1),
         "best_final_correctness": max(selection_correctness) if selection_correctness else 0.0,
     }
 
@@ -1331,6 +1367,7 @@ def epoch_rollout_summary(
     best_decomposition_rewards = []
     best_selection_rewards = []
     mean_selection_rewards = []
+    mean_worker_rewards = []
     best_correctness = []
     subset_metrics: Dict[str, Dict[str, Any]] = {}
     worker_grpo_group_total = 0
@@ -1346,6 +1383,7 @@ def epoch_rollout_summary(
         best_decomposition_rewards.append(metrics["best_decomposition_reward"])
         best_selection_rewards.append(metrics["best_selection_reward"])
         mean_selection_rewards.append(metrics["mean_selection_reward"])
+        mean_worker_rewards.append(metrics["mean_worker_reward"])
         best_correctness.append(metrics["best_final_correctness"])
         worker_stats = rollout.training_batch.worker_grpo_stats or {}
         worker_grpo_group_total += int(worker_stats.get("num_groups_total", 0))
@@ -1381,6 +1419,7 @@ def epoch_rollout_summary(
                     "best_decomposition_rewards": [],
                     "best_selection_rewards": [],
                     "mean_selection_rewards": [],
+                    "mean_worker_rewards": [],
                     "best_correctness": [],
                 },
             )
@@ -1389,6 +1428,7 @@ def epoch_rollout_summary(
             bucket["best_decomposition_rewards"].append(metrics["best_decomposition_reward"])
             bucket["best_selection_rewards"].append(metrics["best_selection_reward"])
             bucket["mean_selection_rewards"].append(metrics["mean_selection_reward"])
+            bucket["mean_worker_rewards"].append(metrics["mean_worker_reward"])
             bucket["best_correctness"].append(metrics["best_final_correctness"])
 
     summary = {
@@ -1396,6 +1436,7 @@ def epoch_rollout_summary(
         "mean_best_decomposition_reward": sum(best_decomposition_rewards) / max(len(best_decomposition_rewards), 1),
         "mean_best_selection_reward": sum(best_selection_rewards) / max(len(best_selection_rewards), 1),
         "mean_selection_reward": sum(mean_selection_rewards) / max(len(mean_selection_rewards), 1),
+        "mean_worker_reward": sum(mean_worker_rewards) / max(len(mean_worker_rewards), 1),
         "mean_best_final_correctness": sum(best_correctness) / max(len(best_correctness), 1),
         "worker_grpo_min_group_size": worker_grpo_min_group_size,
         "worker_grpo_num_groups_total": worker_grpo_group_total,
@@ -1419,6 +1460,7 @@ def epoch_rollout_summary(
                 "mean_best_decomposition_reward": sum(bucket["best_decomposition_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_best_selection_reward": sum(bucket["best_selection_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_selection_reward": sum(bucket["mean_selection_rewards"]) / max(bucket["num_tasks"], 1),
+                "mean_worker_reward": sum(bucket["mean_worker_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_best_final_correctness": sum(bucket["best_correctness"]) / max(bucket["num_tasks"], 1),
             }
             for subset_name, bucket in subset_metrics.items()
@@ -1436,6 +1478,7 @@ def combine_rollout_summaries(
     total_best_decomposition_reward = 0.0
     total_best_selection_reward = 0.0
     total_mean_selection_reward = 0.0
+    total_mean_worker_reward = 0.0
     total_best_final_correctness = 0.0
     combined_tasks: List[Dict[str, Any]] = []
     subset_accumulators: Dict[str, Dict[str, float]] = {}
@@ -1446,6 +1489,7 @@ def combine_rollout_summaries(
         total_best_decomposition_reward += float(summary.get("mean_best_decomposition_reward", 0.0)) * num_tasks
         total_best_selection_reward += float(summary.get("mean_best_selection_reward", 0.0)) * num_tasks
         total_mean_selection_reward += float(summary.get("mean_selection_reward", 0.0)) * num_tasks
+        total_mean_worker_reward += float(summary.get("mean_worker_reward", 0.0)) * num_tasks
         total_best_final_correctness += float(summary.get("mean_best_final_correctness", 0.0)) * num_tasks
 
         if include_tasks:
@@ -1462,6 +1506,7 @@ def combine_rollout_summaries(
                     "best_decomposition_reward_sum": 0.0,
                     "best_selection_reward_sum": 0.0,
                     "mean_selection_reward_sum": 0.0,
+                    "mean_worker_reward_sum": 0.0,
                     "best_final_correctness_sum": 0.0,
                 },
             )
@@ -1477,6 +1522,9 @@ def combine_rollout_summaries(
             bucket["mean_selection_reward_sum"] += (
                 float(subset_summary.get("mean_selection_reward", 0.0)) * subset_tasks
             )
+            bucket["mean_worker_reward_sum"] += (
+                float(subset_summary.get("mean_worker_reward", 0.0)) * subset_tasks
+            )
             bucket["best_final_correctness_sum"] += (
                 float(subset_summary.get("mean_best_final_correctness", 0.0)) * subset_tasks
             )
@@ -1486,6 +1534,7 @@ def combine_rollout_summaries(
         "mean_best_decomposition_reward": total_best_decomposition_reward / max(total_tasks, 1),
         "mean_best_selection_reward": total_best_selection_reward / max(total_tasks, 1),
         "mean_selection_reward": total_mean_selection_reward / max(total_tasks, 1),
+        "mean_worker_reward": total_mean_worker_reward / max(total_tasks, 1),
         "mean_best_final_correctness": total_best_final_correctness / max(total_tasks, 1),
         "tasks": combined_tasks if include_tasks else [],
     }
@@ -1497,6 +1546,7 @@ def combine_rollout_summaries(
                 "mean_best_decomposition_reward": bucket["best_decomposition_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_best_selection_reward": bucket["best_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_selection_reward": bucket["mean_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
+                "mean_worker_reward": bucket["mean_worker_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_best_final_correctness": bucket["best_final_correctness_sum"] / max(bucket["num_tasks"], 1.0),
             }
             for subset_name, bucket in subset_accumulators.items()
@@ -1587,6 +1637,16 @@ def _build_rollout_trainer(
         if args.final_answer_correctness_reward_only
         else WorkerRewardMode.CURRENT
     )
+    gfam_reward_scorer = None
+    if getattr(args, "gfam_reward_model_pkl", ""):
+        from .gfam_reward import GFAMRewardScorer
+
+        gfam_reward_scorer = GFAMRewardScorer(
+            checkpoint_path=args.gfam_reward_model_pkl,
+            device=args.gfam_reward_model_device,
+            encoder_backend=args.gfam_reward_model_encoder_backend,
+            encoder_model=args.gfam_reward_model_encoder_model,
+        )
     return HierarchicalGRPOTrainer(
         reward_weights=RewardWeights(
             final_answer=args.final_answer_reward_weight,
@@ -1650,6 +1710,7 @@ def _build_rollout_trainer(
         track_workers_history=args.track_workers_history,
         train_worker_model=args.train_worker_model,
         min_worker_grpo_group_size=args.min_worker_grpo_group_size,
+        gfam_reward_scorer=gfam_reward_scorer,
     )
 
 
@@ -2102,6 +2163,7 @@ def main() -> None:
         rollout_start_time = time.time()
         running_best_selection_reward = 0.0
         running_best_decomposition_reward = 0.0
+        running_mean_worker_reward = 0.0
         running_best_correctness = 0.0
         tasks_completed = 0
         rollout_tracking_step = tracking_step_offset
@@ -2226,6 +2288,19 @@ def main() -> None:
                         ]
                         running_best_selection_reward += max(selection_rewards)
                         running_best_decomposition_reward += best_decomposition.decomposition_reward
+                        worker_rewards = [
+                            (
+                                float(execution.reward_model_reward)
+                                if execution.reward_model_reward is not None
+                                else float(selection.reward.total_reward)
+                            )
+                            for decomposition in batch_rollout.decompositions
+                            for selection in decomposition.selections
+                            for execution in selection.executions
+                        ]
+                        running_mean_worker_reward += (
+                            sum(worker_rewards) / max(len(worker_rewards), 1)
+                        )
                         running_best_correctness += max(selection_correctness) if selection_correctness else 0.0
 
                     tasks_completed += len(batch_rollouts)
@@ -2253,6 +2328,7 @@ def main() -> None:
                             "eta_s": eta_seconds,
                             "avg_best_selection_reward": running_best_selection_reward / tasks_completed,
                             "avg_best_decomposition_reward": running_best_decomposition_reward / tasks_completed,
+                            "avg_mean_worker_reward": running_mean_worker_reward / tasks_completed,
                             "avg_best_final_correctness": running_best_correctness / tasks_completed,
                         }
                         print(
@@ -2262,6 +2338,7 @@ def main() -> None:
                             f"elapsed_s={elapsed:.1f} eta_s={eta_seconds:.1f} "
                             f"avg_best_selection_reward={progress_metrics['avg_best_selection_reward']:.4f} "
                             f"avg_best_decomposition_reward={progress_metrics['avg_best_decomposition_reward']:.4f} "
+                            f"avg_mean_worker_reward={progress_metrics['avg_mean_worker_reward']:.4f} "
                             f"avg_best_final_correctness={progress_metrics['avg_best_final_correctness']:.4f}"
                         )
                         with rollout_progress_path.open("w", encoding="utf-8") as handle:
@@ -2277,6 +2354,7 @@ def main() -> None:
                                     "rollout_progress/eta_s": progress_metrics["eta_s"],
                                     "rollout_progress/avg_best_selection_reward": progress_metrics["avg_best_selection_reward"],
                                     "rollout_progress/avg_best_decomposition_reward": progress_metrics["avg_best_decomposition_reward"],
+                                    "rollout_progress/avg_mean_worker_reward": progress_metrics["avg_mean_worker_reward"],
                                     "rollout_progress/avg_best_final_correctness": progress_metrics["avg_best_final_correctness"],
                                 },
                                 step=rollout_tracking_step,
@@ -2494,6 +2572,7 @@ def main() -> None:
             f"[hierarchical-rema][integrated] epoch={epoch_number} "
             f"mean_best_selection_reward={rollout_summary['mean_best_selection_reward']:.4f} "
             f"mean_best_decomposition_reward={rollout_summary['mean_best_decomposition_reward']:.4f} "
+            f"mean_worker_reward={rollout_summary['mean_worker_reward']:.4f} "
             f"mean_best_final_correctness={rollout_summary['mean_best_final_correctness']:.4f}"
         )
         if tracking is not None:
@@ -2501,6 +2580,7 @@ def main() -> None:
                 {
                     "rollout/mean_best_selection_reward": rollout_summary["mean_best_selection_reward"],
                     "rollout/mean_best_decomposition_reward": rollout_summary["mean_best_decomposition_reward"],
+                    "rollout/mean_worker_reward": rollout_summary["mean_worker_reward"],
                     "rollout/mean_best_final_correctness": rollout_summary["mean_best_final_correctness"],
                     "rollout/num_tasks": rollout_summary["num_tasks"],
                     "rollout/worker_grpo_min_group_size": rollout_summary["worker_grpo_min_group_size"],

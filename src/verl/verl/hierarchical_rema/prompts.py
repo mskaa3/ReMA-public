@@ -93,8 +93,6 @@ def _compact_performance_summary(snapshot: WorkerPerformanceSnapshot) -> dict:
     return {
         "num_assignments": snapshot.num_assignments,
         "average_reward": snapshot.average_reward,
-        "average_confidence_reward": snapshot.average_confidence_reward,
-        "average_compatibility": snapshot.average_compatibility,
         "recent_history": snapshot.recent_history[-3:],
     }
 

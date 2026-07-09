@@ -113,12 +113,52 @@ class RolloutRecorder:
             return [RolloutRecorder._strip_worker_prompts(item) for item in payload]
         return payload
 
+    @staticmethod
+    def _uses_gfam_rewards(task_rollout: TaskRollout) -> bool:
+        return any(
+            selection.reward.reward_model_source == "gfam_v1"
+            for decomposition in task_rollout.decompositions
+            for selection in decomposition.selections
+        )
+
+    @staticmethod
+    def _strip_gfam_handcrafted_reward_fields(payload):
+        if isinstance(payload, dict):
+            cleaned = {}
+            for key, value in payload.items():
+                if key == "soft_penalty":
+                    continue
+                cleaned[key] = RolloutRecorder._strip_gfam_handcrafted_reward_fields(value)
+            return cleaned
+        if isinstance(payload, list):
+            return [RolloutRecorder._strip_gfam_handcrafted_reward_fields(item) for item in payload]
+        return payload
+
+    @staticmethod
+    def _gfam_reward_summary(selection_rollout, decomposition_rollout) -> Dict:
+        compiled_rewards = selection_rollout.reward_model_outputs.get("compiled_rewards", {})
+        workers_payload = compiled_rewards.get("workers", {})
+        return {
+            "source": selection_rollout.reward.reward_model_source,
+            "decomposer_reward": decomposition_rollout.decomposition_reward,
+            "selector_reward": selection_rollout.reward.total_reward,
+            "final_reward": compiled_rewards.get("final", {}).get("reward"),
+            "worker_rewards": {
+                node_id: payload.get("reward")
+                for node_id, payload in workers_payload.items()
+            },
+            "graph_summary": selection_rollout.reward_model_outputs.get("graph_summary", {}),
+        }
+
     def _task_payload(self, rollout: TaskRollout, timestamp: str) -> Dict:
         if not self.config.compact_mode:
+            rollout_payload = self._strip_worker_prompts(rollout.to_dict())
+            if self._uses_gfam_rewards(rollout):
+                rollout_payload = self._strip_gfam_handcrafted_reward_fields(rollout_payload)
             return {
                 "timestamp": timestamp,
                 "task_id": rollout.task.task_id,
-                "rollout": self._strip_worker_prompts(rollout.to_dict()),
+                "rollout": rollout_payload,
             }
         best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
         best_selection = max(
@@ -166,7 +206,7 @@ class RolloutRecorder:
                 "rollout": self._strip_worker_prompts(decomposition_rollout.to_dict()),
             }
         decomposition = decomposition_rollout.decomposition
-        return {
+        payload = {
             "timestamp": timestamp,
             "task_id": task_rollout.task.task_id,
             "task_prompt": task_rollout.task.prompt,
@@ -182,7 +222,6 @@ class RolloutRecorder:
             "summary": decomposition.summary,
             "num_hops": decomposition.num_hops,
             "effective_num_hops": decomposition.effective_num_hops,
-            "soft_penalty": decomposition.soft_penalty,
             "was_hard_truncated": decomposition.was_hard_truncated,
             "decomposition_raw_text": decomposition.raw_text,
             "nodes": [
@@ -197,6 +236,22 @@ class RolloutRecorder:
                 for node in decomposition.nodes
             ],
         }
+        if any(
+            selection.reward.reward_model_source == "gfam_v1"
+            for selection in decomposition_rollout.selections
+        ):
+            payload["reward_model_source"] = "gfam_v1"
+            payload["graph_summary"] = next(
+                (
+                    selection.reward_model_outputs.get("graph_summary", {})
+                    for selection in decomposition_rollout.selections
+                    if selection.reward.reward_model_source == "gfam_v1"
+                ),
+                {},
+            )
+        else:
+            payload["soft_penalty"] = decomposition.soft_penalty
+        return payload
 
     def _selection_payload(
         self,
@@ -206,6 +261,9 @@ class RolloutRecorder:
         timestamp: str,
     ) -> Dict:
         if not self.config.compact_mode:
+            selection_payload = self._strip_worker_prompts(selection_rollout.to_dict())
+            if selection_rollout.reward.reward_model_source == "gfam_v1":
+                selection_payload = self._strip_gfam_handcrafted_reward_fields(selection_payload)
             return {
                 "timestamp": timestamp,
                 "task_id": task_rollout.task.task_id,
@@ -218,9 +276,10 @@ class RolloutRecorder:
                 "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
                 "selection_id": selection_rollout.selection.selection_id,
                 "score": selection_rollout.reward.total_reward,
-                "rollout": self._strip_worker_prompts(selection_rollout.to_dict()),
+                "reward_model_outputs": self._strip_worker_prompts(selection_rollout.reward_model_outputs),
+                "rollout": selection_payload,
             }
-        return {
+        payload = {
             "timestamp": timestamp,
             "task_id": task_rollout.task.task_id,
             "task_prompt": task_rollout.task.prompt,
@@ -238,6 +297,7 @@ class RolloutRecorder:
             "selection_raw_text": selection_rollout.selection.raw_text,
             "final_answer": selection_rollout.final_answer,
             "reward": selection_rollout.reward.to_dict(),
+            "reward_model_outputs": self._strip_worker_prompts(selection_rollout.reward_model_outputs),
             "assignments": [
                 {
                     "node_id": assignment.node_id,
@@ -254,12 +314,24 @@ class RolloutRecorder:
                     "output_text": execution.output_text,
                     "dependency_outputs": execution.dependency_outputs,
                     "entropy": execution.entropy,
-                    "confidence_reward": execution.confidence_reward,
-                    "compatibility": execution.compatibility,
+                    **(
+                        {"reward_model_reward": execution.reward_model_reward}
+                        if execution.reward_model_reward is not None
+                        else {
+                            "confidence_reward": execution.confidence_reward,
+                            "compatibility": execution.compatibility,
+                        }
+                    ),
                 }
                 for execution in selection_rollout.executions
             ],
         }
+        if selection_rollout.reward.reward_model_source == "gfam_v1":
+            payload["reward_model"] = self._gfam_reward_summary(
+                selection_rollout=selection_rollout,
+                decomposition_rollout=decomposition_rollout,
+            )
+        return payload
 
     @staticmethod
     def _append_jsonl(path: Path, payload: Dict) -> None:

@@ -637,6 +637,7 @@ def _empty_role_reward_stats() -> Dict[str, Dict[str, float]]:
     return {
         "selector": {"sum": 0.0, "count": 0.0},
         "decomposer": {"sum": 0.0, "count": 0.0},
+        "worker": {"sum": 0.0, "count": 0.0},
     }
 
 
@@ -959,6 +960,14 @@ def run_offline_policy_training(
                     device,
                     distributed_context,
                 )
+                worker_reward_count = int(
+                    round(_all_reduce_sum(step_role_reward_stats["worker"]["count"], device, distributed_context))
+                )
+                worker_reward_sum = _all_reduce_sum(
+                    step_role_reward_stats["worker"]["sum"],
+                    device,
+                    distributed_context,
+                )
                 metrics = {
                     "step": global_step,
                     "epoch": epoch,
@@ -997,6 +1006,9 @@ def run_offline_policy_training(
                 if decomposer_reward_count > 0:
                     metrics["decomposer_mean_reward"] = decomposer_reward_sum / decomposer_reward_count
                     metrics["decomposer_reward_count"] = decomposer_reward_count
+                if worker_reward_count > 0:
+                    metrics["worker_mean_reward"] = worker_reward_sum / worker_reward_count
+                    metrics["worker_reward_count"] = worker_reward_count
                 step_selector_format_counts = _empty_selector_format_counts()
                 step_role_reward_stats = _empty_role_reward_stats()
                 if is_primary:
@@ -1027,6 +1039,8 @@ def run_offline_policy_training(
                             concise_metrics[f"{tracking_prefix}train/selector_mean_reward"] = metrics["selector_mean_reward"]
                         if "decomposer_mean_reward" in metrics:
                             concise_metrics[f"{tracking_prefix}train/decomposer_mean_reward"] = metrics["decomposer_mean_reward"]
+                        if "worker_mean_reward" in metrics:
+                            concise_metrics[f"{tracking_prefix}train/worker_mean_reward"] = metrics["worker_mean_reward"]
                         selector_format_log = ""
                         if metrics["selector_samples_total"] > 0:
                             selector_format_log = (
@@ -1041,6 +1055,8 @@ def run_offline_policy_training(
                             role_reward_log += f" selector_mean_reward={metrics['selector_mean_reward']:.4f}"
                         if "decomposer_mean_reward" in metrics:
                             role_reward_log += f" decomposer_mean_reward={metrics['decomposer_mean_reward']:.4f}"
+                        if "worker_mean_reward" in metrics:
+                            role_reward_log += f" worker_mean_reward={metrics['worker_mean_reward']:.4f}"
                         print(
                             f"[hierarchical-rema][grpo] step={global_step}/{total_update_steps} "
                             f"epoch={epoch + 1}/{config.epochs} "

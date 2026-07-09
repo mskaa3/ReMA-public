@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import re
-from typing import Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from .backends import (
     DecompositionRequest,
@@ -46,6 +46,9 @@ from .schema import (
 )
 from .structured import format_decomposition_plan, format_selection_plan
 
+if TYPE_CHECKING:
+    from .gfam_reward import GFAMRewardScorer
+
 
 @dataclass
 class _SelectionExecutionState:
@@ -76,6 +79,7 @@ class HierarchicalReMAOrchestrator:
         track_workers_history: bool = True,
         train_worker_model: bool = False,
         min_worker_grpo_group_size: int = 3,
+        gfam_reward_scorer: GFAMRewardScorer | None = None,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
@@ -103,6 +107,7 @@ class HierarchicalReMAOrchestrator:
         self.track_workers_history = bool(track_workers_history)
         self.train_worker_model = bool(train_worker_model)
         self.min_worker_grpo_group_size = max(int(min_worker_grpo_group_size), 1)
+        self.gfam_reward_scorer = gfam_reward_scorer
 
     @staticmethod
     def _canonical_decomposition_completion(candidate: DecompositionCandidate) -> str:
@@ -125,6 +130,8 @@ class HierarchicalReMAOrchestrator:
 
     @staticmethod
     def _worker_training_reward(selection: SelectionRollout, execution: WorkerExecution) -> float:
+        if execution.reward_model_reward is not None:
+            return float(execution.reward_model_reward)
         reward = float(selection.reward.total_reward)
         if execution.invalid_reason:
             reward -= WORKER_INVALID_RESULT_PENALTY
@@ -141,12 +148,19 @@ class HierarchicalReMAOrchestrator:
     ) -> float:
         if not selection_training_rewards:
             return 0.0
+        uses_reward_model = any(
+            selection.reward.reward_model_source == "gfam_v1"
+            for selection in selection_rollouts
+        )
         if self.decomposer_reward_aggregation == "best":
             aggregated_reward = max(selection_training_rewards)
         else:
             aggregated_reward = sum(selection_training_rewards) / max(
                 len(selection_training_rewards), 1
             )
+
+        if uses_reward_model:
+            return aggregated_reward
 
         has_correct_selection = any(
             selection.reward.final_answer_correctness > 0.0
@@ -301,6 +315,50 @@ class HierarchicalReMAOrchestrator:
         )
         return adjusted_reward
 
+    def _apply_gfam_reward_model(
+        self,
+        *,
+        task: TaskExample,
+        decomposition: DecompositionCandidate,
+        selection: SelectionCandidate,
+        executions: List[WorkerExecution],
+        final_answer: str,
+        reward,
+    ) -> tuple[object, Dict[str, object]]:
+        if self.gfam_reward_scorer is None:
+            return reward, {}
+
+        scored = self.gfam_reward_scorer.score_rollout(
+            task=task,
+            decomposition=decomposition,
+            selection=selection,
+            executions=executions,
+            final_answer=final_answer,
+        )
+        compiled_rewards = scored.get("compiled_rewards", {})
+        selector_payload = compiled_rewards.get("selector", {})
+        worker_payloads = compiled_rewards.get("workers", {})
+        reward.total_reward = float(selector_payload.get("reward", reward.total_reward))
+        reward.reward_model_source = "gfam_v1"
+        for execution in executions:
+            worker_payload = worker_payloads.get(execution.node_id)
+            if worker_payload is not None and "reward" in worker_payload:
+                execution.reward_model_reward = float(worker_payload["reward"])
+        return reward, {
+            "source": "gfam_v1",
+            "compiled_rewards": compiled_rewards,
+            "graph_summary": scored.get("graph_summary", {}),
+        }
+
+    @staticmethod
+    def _decomposer_reward_for_selection(selection_rollout: SelectionRollout) -> float:
+        if selection_rollout.reward.reward_model_source == "gfam_v1":
+            compiled_rewards = selection_rollout.reward_model_outputs.get("compiled_rewards", {})
+            decomposer_payload = compiled_rewards.get("decomposer", {})
+            if "reward" in decomposer_payload:
+                return float(decomposer_payload["reward"])
+        return float(selection_rollout.reward.total_reward)
+
     def run_task(
         self,
         task: TaskExample,
@@ -426,7 +484,7 @@ class HierarchicalReMAOrchestrator:
                     selection_rollout_map[(task_index, decomposition_index, selection_index)]
                     for selection_index in range(num_selections)
                 ]
-                selection_training_rewards = [
+                selector_training_rewards = [
                     self._format_adjusted_reward(
                         selection.reward.total_reward,
                         selection.selection.raw_payload,
@@ -436,16 +494,27 @@ class HierarchicalReMAOrchestrator:
                     for selection in selection_rollouts
                 ]
                 selection_advantages = group_relative_advantages(
-                    selection_training_rewards
+                    selector_training_rewards
                 )
                 for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
                     selection_rollout.selector_advantage = advantage
 
+                decomposer_selection_rewards = [
+                    self._decomposer_reward_for_selection(selection_rollout)
+                    for selection_rollout in selection_rollouts
+                ]
+
                 base_decomposition_reward = self._aggregate_decomposition_selection_reward(
                     selection_rollouts=selection_rollouts,
-                    selection_training_rewards=selection_training_rewards,
+                    selection_training_rewards=decomposer_selection_rewards,
                 )
-                decomposition_reward = base_decomposition_reward - decomposition.soft_penalty
+                if any(
+                    selection.reward.reward_model_source == "gfam_v1"
+                    for selection in selection_rollouts
+                ):
+                    decomposition_reward = base_decomposition_reward
+                else:
+                    decomposition_reward = base_decomposition_reward - decomposition.soft_penalty
                 decomposition_rollouts.append(
                     DecompositionRollout(
                         decomposition=decomposition,
@@ -625,6 +694,14 @@ class HierarchicalReMAOrchestrator:
                 task_metadata=state.task.metadata,
                 final_node_id=state.decomposition.final_node_id,
             )
+            reward, reward_model_outputs = self._apply_gfam_reward_model(
+                task=state.task,
+                decomposition=state.decomposition,
+                selection=state.selection,
+                executions=state.executions,
+                final_answer=final_answer,
+                reward=reward,
+            )
             selection_rollout_map[
                 (state.task_index, state.decomposition_index, state.selection_index)
             ] = SelectionRollout(
@@ -632,6 +709,7 @@ class HierarchicalReMAOrchestrator:
                 executions=state.executions,
                 final_answer=final_answer,
                 reward=reward,
+                reward_model_outputs=reward_model_outputs,
             )
         return selection_rollout_map
 
@@ -672,11 +750,20 @@ class HierarchicalReMAOrchestrator:
             task_metadata=task.metadata,
             final_node_id=decomposition.final_node_id,
         )
+        reward, reward_model_outputs = self._apply_gfam_reward_model(
+            task=task,
+            decomposition=decomposition,
+            selection=selection,
+            executions=executions,
+            final_answer=final_answer,
+            reward=reward,
+        )
         return SelectionRollout(
             selection=selection,
             executions=executions,
             final_answer=final_answer,
             reward=reward,
+            reward_model_outputs=reward_model_outputs,
         )
 
     def _update_worker_memory(
@@ -918,6 +1005,7 @@ class HierarchicalReMAOrchestrator:
                                 "node_id": execution.node_id,
                                 "decomposition_id": decomposition_id,
                                 "selection_id": selection_rollout.selection.selection_id,
+                                "reward_model_reward": execution.reward_model_reward,
                                 "advantage_group_size": group_size,
                                 "advantage_group_kind": (
                                     "worker_id_and_normalized_instruction_within_task_and_decomposition"
@@ -992,6 +1080,7 @@ class HierarchicalGRPOTrainer:
     track_workers_history: bool = True
     train_worker_model: bool = False
     min_worker_grpo_group_size: int = 3
+    gfam_reward_scorer: GFAMRewardScorer | None = None
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -1020,6 +1109,7 @@ class HierarchicalGRPOTrainer:
             track_workers_history=self.track_workers_history,
             train_worker_model=self.train_worker_model,
             min_worker_grpo_group_size=self.min_worker_grpo_group_size,
+            gfam_reward_scorer=self.gfam_reward_scorer,
         )
         self._current_phase = AlternatingPhase.SELECTOR
 

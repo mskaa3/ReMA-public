@@ -341,11 +341,15 @@ class WorkerExecution:
     unique_result: bool = False
     downstream_used: bool = False
     dependency_used: bool = False
+    reward_model_reward: Optional[float] = None
     invalid_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload.pop("success", None)
+        if self.reward_model_reward is not None:
+            payload.pop("confidence_reward", None)
+            payload.pop("compatibility", None)
         return payload
 
 
@@ -368,8 +372,14 @@ class SelectionRewardBreakdown:
     dependency_usage_rate: float = 0.0
     final_dependency_usage_rate: float = 0.0
     final_raw_score_usage_multiplier: float = 1.0
+    reward_model_source: str = "handcrafted"
 
     def to_dict(self) -> Dict[str, Any]:
+        if self.reward_model_source == "gfam_v1":
+            return {
+                "total_reward": self.total_reward,
+                "reward_model_source": self.reward_model_source,
+            }
         return asdict(self)
 
 
@@ -379,6 +389,7 @@ class SelectionRollout:
     executions: List[WorkerExecution]
     final_answer: str
     reward: SelectionRewardBreakdown
+    reward_model_outputs: Dict[str, Any] = field(default_factory=dict)
     selector_advantage: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -387,6 +398,7 @@ class SelectionRollout:
             "executions": [execution.to_dict() for execution in self.executions],
             "final_answer": self.final_answer,
             "reward": self.reward.to_dict(),
+            "reward_model_outputs": self.reward_model_outputs,
             "selector_advantage": self.selector_advantage,
         }
 

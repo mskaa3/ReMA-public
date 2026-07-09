@@ -490,25 +490,46 @@ class WorkerPerformanceMemory:
         reward_weights: RewardWeights,
     ) -> None:
         stats = self._stats_for(execution.worker_id)
-        stats["num_assignments"] += 1
-        stats["total_reward"] += selection_reward.total_reward
-        stats["total_confidence_reward"] += execution.confidence_reward
-        stats["total_compatibility"] += execution.compatibility
-        stats["recent_history"].append(
-            {
-                "task_id": task_id,
-                "node_id": execution.node_id,
-                "selection_reward": selection_reward.total_reward,
-                "final_answer_correctness": selection_reward.final_answer_correctness,
-                "confidence_reward": execution.confidence_reward,
-                "compatibility": execution.compatibility,
-                "entropy": execution.entropy,
-            }
+        uses_reward_model = (
+            selection_reward.reward_model_source == "gfam_v1"
+            and execution.reward_model_reward is not None
         )
+        observed_reward = (
+            float(execution.reward_model_reward)
+            if execution.reward_model_reward is not None
+            else float(selection_reward.total_reward)
+        )
+        stats["num_assignments"] += 1
+        stats["total_reward"] += observed_reward
+        if uses_reward_model:
+            stats["recent_history"].append(
+                {
+                    "task_id": task_id,
+                    "node_id": execution.node_id,
+                    "reward_source": selection_reward.reward_model_source,
+                    "observed_reward": observed_reward,
+                    "entropy": execution.entropy,
+                }
+            )
+        else:
+            stats["total_confidence_reward"] += execution.confidence_reward
+            stats["total_compatibility"] += execution.compatibility
+            stats["recent_history"].append(
+                {
+                    "task_id": task_id,
+                    "node_id": execution.node_id,
+                    "selection_reward": selection_reward.total_reward,
+                    "observed_reward": observed_reward,
+                    "final_answer_correctness": selection_reward.final_answer_correctness,
+                    "confidence_reward": execution.confidence_reward,
+                    "compatibility": execution.compatibility,
+                    "entropy": execution.entropy,
+                }
+            )
         if len(stats["recent_history"]) > self.max_recent_history:
             stats["recent_history"] = stats["recent_history"][-self.max_recent_history:]
 
-        outcome = selection_reward.final_answer_correctness
+        outcome = observed_reward if uses_reward_model else selection_reward.final_answer_correctness
         self.update(execution.worker_id, outcome)
 
     def snapshot_for(self, worker_id: str) -> WorkerPerformanceSnapshot:

@@ -76,6 +76,10 @@ else
     S3_OUTPUT_PATH=$DEFAULT_S3_OUTPUT_PATH
 fi
 SIF_IMAGE_PATH=${SIF_IMAGE_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v3.sif}
+GFAM_REWARD_MODEL_PKL_PATH=${GFAM_REWARD_MODEL_PKL_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/jmoska/hierarchical_rema/best_overall_model.pkl}
+GFAM_REWARD_MODEL_DEVICE=${GFAM_REWARD_MODEL_DEVICE:-cpu}
+GFAM_REWARD_MODEL_ENCODER_BACKEND=${GFAM_REWARD_MODEL_ENCODER_BACKEND:-}
+GFAM_REWARD_MODEL_ENCODER_MODEL=${GFAM_REWARD_MODEL_ENCODER_MODEL:-}
 
 # Frequently adjusted: high-level experiment shape.
 BACKEND=${BACKEND:-mock}
@@ -310,6 +314,7 @@ STREAM_RUNTIME_LOG_TO_STDOUT=${STREAM_RUNTIME_LOG_TO_STDOUT:-$DEFAULT_STREAM_RUN
 # Usually leave alone: runtime paths / artifact plumbing.
 LOCAL_VERL_DIR=${LOCAL_VERL_DIR:-$TMPDIR/verl}
 LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH:-$TMPDIR/verl-rema-v3.sif}
+LOCAL_GFAM_REWARD_MODEL_PKL_PATH=${LOCAL_GFAM_REWARD_MODEL_PKL_PATH:-$TMPDIR/gfam_reward_model.pkl}
 DEFAULT_RAY_TMP_BASE=${TMPDIR_LOCAL:-/tmp/${USER:-user}}
 RAY_LOCAL_TMPDIR=${RAY_LOCAL_TMPDIR:-$DEFAULT_RAY_TMP_BASE/ray_${JOB_ID}}
 
@@ -332,6 +337,13 @@ if [[ "$COPY_OUTPUTS_TO_PERSIST_LOCAL_DIR" == "1" || "$COPY_OUTPUTS_TO_PERSIST_L
     mkdir -p "$PERSIST_LOCAL_DIR"
 fi
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR"
+
+if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" && "$GFAM_REWARD_MODEL_PKL_PATH" != /* && "$GFAM_REWARD_MODEL_PKL_PATH" != *:* && -e "$SOURCE_DIR/$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
+    GFAM_REWARD_MODEL_PKL_PATH="$SOURCE_DIR/$GFAM_REWARD_MODEL_PKL_PATH"
+fi
+if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" && "$GFAM_REWARD_MODEL_PKL_PATH" != /* && "$GFAM_REWARD_MODEL_PKL_PATH" != *:* && "$GFAM_REWARD_MODEL_PKL_PATH" == s3min-* ]]; then
+    GFAM_REWARD_MODEL_PKL_PATH="s3v2:${GFAM_REWARD_MODEL_PKL_PATH}"
+fi
 
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
     RAY_CPUS_PER_NODE=${RAY_CPUS_PER_NODE:-$SLURM_CPUS_PER_TASK}
@@ -469,6 +481,17 @@ if [[ "$VLLM_ENABLE_SLEEP_MODE" == "1" || "$VLLM_ENABLE_SLEEP_MODE" == "true" ||
     VLLM_SLEEP_MODE_FLAG="--enable-vllm-sleep-mode"
 fi
 
+GFAM_REWARD_MODEL_FLAGS=""
+if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
+    GFAM_REWARD_MODEL_FLAGS="--gfam-reward-model-pkl ${LOCAL_GFAM_REWARD_MODEL_PKL_PATH} --gfam-reward-model-device ${GFAM_REWARD_MODEL_DEVICE}"
+    if [[ -n "$GFAM_REWARD_MODEL_ENCODER_BACKEND" ]]; then
+        GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-reward-model-encoder-backend ${GFAM_REWARD_MODEL_ENCODER_BACKEND}"
+    fi
+    if [[ -n "$GFAM_REWARD_MODEL_ENCODER_MODEL" ]]; then
+        GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-reward-model-encoder-model ${GFAM_REWARD_MODEL_ENCODER_MODEL}"
+    fi
+fi
+
 MULTINODE_RAY_ENABLED=0
 if [[ "$BACKEND" == "vllm" && "${RAY_NNODES:-1}" -gt 1 ]]; then
     MULTINODE_RAY_ENABLED=1
@@ -502,6 +525,8 @@ stage_runtime_payload() {
     local runtime_done_file="${LOCAL_VERL_DIR}.stage_complete"
     local image_lock_dir="${LOCAL_SIF_IMAGE_PATH}.stage_lock"
     local image_done_file="${LOCAL_SIF_IMAGE_PATH}.stage_complete"
+    local gfam_lock_dir="${LOCAL_GFAM_REWARD_MODEL_PKL_PATH}.stage_lock"
+    local gfam_done_file="${LOCAL_GFAM_REWARD_MODEL_PKL_PATH}.stage_complete"
 
     mkdir -p "$TMPDIR"
     mkdir -p "$RAY_LOCAL_TMPDIR"
@@ -530,6 +555,23 @@ stage_runtime_payload() {
         fi
         rmdir "$image_lock_dir" >/dev/null 2>&1 || true
     fi
+
+    if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" && ! -f "$gfam_done_file" ]]; then
+        while ! mkdir "$gfam_lock_dir" 2>/dev/null; do
+            sleep 1
+        done
+        if [[ ! -f "$gfam_done_file" ]]; then
+            mkdir -p "$(dirname "$LOCAL_GFAM_REWARD_MODEL_PKL_PATH")"
+            rm -f "$LOCAL_GFAM_REWARD_MODEL_PKL_PATH"
+            if [[ "$GFAM_REWARD_MODEL_PKL_PATH" == *:* ]]; then
+                rclone copyto "$GFAM_REWARD_MODEL_PKL_PATH" "$LOCAL_GFAM_REWARD_MODEL_PKL_PATH"
+            else
+                cp "$GFAM_REWARD_MODEL_PKL_PATH" "$LOCAL_GFAM_REWARD_MODEL_PKL_PATH"
+            fi
+            touch "$gfam_done_file"
+        fi
+        rmdir "$gfam_lock_dir" >/dev/null 2>&1 || true
+    fi
 }
 
 stage_runtime_on_current_node() {
@@ -548,6 +590,8 @@ runtime_lock_dir=\"${LOCAL_VERL_DIR}.stage_lock\"
 runtime_done_file=\"${LOCAL_VERL_DIR}.stage_complete\"
 image_lock_dir=\"${LOCAL_SIF_IMAGE_PATH}.stage_lock\"
 image_done_file=\"${LOCAL_SIF_IMAGE_PATH}.stage_complete\"
+gfam_lock_dir=\"${LOCAL_GFAM_REWARD_MODEL_PKL_PATH}.stage_lock\"
+gfam_done_file=\"${LOCAL_GFAM_REWARD_MODEL_PKL_PATH}.stage_complete\"
 
 mkdir -p \"$TMPDIR\"
 mkdir -p \"$RAY_LOCAL_TMPDIR\"
@@ -575,6 +619,23 @@ if [[ ! -f \"\$image_done_file\" ]]; then
         touch \"\$image_done_file\"
     fi
     rmdir \"\$image_lock_dir\" >/dev/null 2>&1 || true
+fi
+
+if [[ -n \"${GFAM_REWARD_MODEL_PKL_PATH}\" && ! -f \"\$gfam_done_file\" ]]; then
+    while ! mkdir \"\$gfam_lock_dir\" 2>/dev/null; do
+        sleep 1
+    done
+    if [[ ! -f \"\$gfam_done_file\" ]]; then
+        mkdir -p \"$(dirname "$LOCAL_GFAM_REWARD_MODEL_PKL_PATH")\"
+        rm -f \"$LOCAL_GFAM_REWARD_MODEL_PKL_PATH\"
+        if [[ \"${GFAM_REWARD_MODEL_PKL_PATH}\" == *:* ]]; then
+            rclone copyto \"${GFAM_REWARD_MODEL_PKL_PATH}\" \"$LOCAL_GFAM_REWARD_MODEL_PKL_PATH\"
+        else
+            cp \"${GFAM_REWARD_MODEL_PKL_PATH}\" \"$LOCAL_GFAM_REWARD_MODEL_PKL_PATH\"
+        fi
+        touch \"\$gfam_done_file\"
+    fi
+    rmdir \"\$gfam_lock_dir\" >/dev/null 2>&1 || true
 fi
 "
 }
@@ -1383,6 +1444,7 @@ python3 -m hierarchical_rema.train \
   --confidence-reward-weight ${CONFIDENCE_REWARD_WEIGHT} \
   --compatibility-reward-weight ${COMPATIBILITY_REWARD_WEIGHT} \
   ${FINAL_ANSWER_CORRECTNESS_REWARD_ONLY_FLAG} \
+  ${GFAM_REWARD_MODEL_FLAGS} \
   ${TRACK_WORKERS_HISTORY_FLAG} \
   ${TRAIN_WORKER_MODEL_FLAG} \
   --min-worker-grpo-group-size ${MIN_WORKER_GRPO_GROUP_SIZE} \
