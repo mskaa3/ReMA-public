@@ -736,30 +736,63 @@ class RayReMASeparatedTrainer(object):
             )
 
         num_turns = data_batch.non_tensor_batch['num_turns']
+        last_turn_indices = torch.tensor(
+            [max(int(num_turn) - 1, 0) for num_turn in num_turns],
+            dtype=torch.long,
+        )
         for role_idx, role in enumerate(agent_roles):
             key = f'{role}_turn_level_reward'
             if key not in reward_tensor_map:
                 continue
             reward_tensor = reward_tensor_map[key].clone()
-            manual_scores = []
-            blended_scores = []
-            for i_bsz in range(reward_tensor.shape[0]):
-                last_turn_idx = max(int(num_turns[i_bsz]) - 1, 0)
-                manual_score = reward_tensor[i_bsz, last_turn_idx]
-                blended_score = (
-                    (1.0 - alpha) * manual_score
-                    + alpha * prd_role_scores[i_bsz, role_idx]
-                )
-                reward_tensor[i_bsz, last_turn_idx] = blended_score
-                manual_scores.append(manual_score.detach())
-                blended_scores.append(blended_score.detach())
+            batch_indices = torch.arange(reward_tensor.shape[0], dtype=torch.long)
+            last_turn_indices_on_device = last_turn_indices.to(reward_tensor.device)
+            batch_indices_on_device = batch_indices.to(reward_tensor.device)
+
+            manual_sequence_scores = reward_tensor.sum(dim=1).detach()
+            manual_scores = reward_tensor[
+                batch_indices_on_device,
+                last_turn_indices_on_device,
+            ].detach()
+            prd_scores = prd_role_scores[:, role_idx].to(
+                device=reward_tensor.device,
+                dtype=reward_tensor.dtype,
+            )
+            blended_scores = (
+                (1.0 - alpha) * manual_scores
+                + alpha * prd_scores
+            )
+            reward_tensor[
+                batch_indices_on_device,
+                last_turn_indices_on_device,
+            ] = blended_scores
+
+            blended_sequence_scores = reward_tensor.sum(dim=1).detach()
+            actual_delta = (blended_scores - manual_scores).detach()
+            expected_delta = (alpha * (prd_scores - manual_scores)).detach()
             reward_tensor_map[key] = reward_tensor
-            manual_scores = torch.stack(manual_scores)
-            blended_scores = torch.stack(blended_scores)
             metrics[f'reward/prd_online/roles/{role}/manual_score_mean'] = float(manual_scores.mean().item())
             metrics[f'reward/prd_online/roles/{role}/blended_score_mean'] = float(blended_scores.mean().item())
             metrics[f'reward/prd_online/roles/{role}/blend_delta_mean'] = float(
-                (blended_scores - manual_scores).mean().item()
+                actual_delta.mean().item()
+            )
+            metrics[f'reward/prd_online/roles/{role}/expected_blend_delta_mean'] = float(
+                expected_delta.mean().item()
+            )
+            metrics[f'reward/prd_online/roles/{role}/blend_delta_abs_max'] = float(
+                actual_delta.abs().max().item()
+            )
+            metrics[f'reward/prd_online/roles/{role}/blend_changed_count'] = float(
+                (actual_delta.abs() > 1e-8).sum().item()
+            )
+            metrics[f'reward/prd_online/roles/{role}/manual_sequence_score_mean'] = float(
+                manual_sequence_scores.mean().item()
+            )
+            metrics[f'reward/prd_online/roles/{role}/blended_sequence_score_mean'] = float(
+                blended_sequence_scores.mean().item()
+            )
+            metrics[f'reward/prd_online/roles/{role}/sequence_blend_delta_mean'] = float(
+                (blended_sequence_scores - manual_sequence_scores).mean().item()
             )
         return reward_tensor_map
 
