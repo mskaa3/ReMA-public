@@ -62,6 +62,38 @@ PRD_ROLE_FEATURE_NAMES: List[str] = [
 ]
 
 
+ROLE_PRD_FEATURE_NAMES: List[str] = [
+    "is_decomposer",
+    "is_selector",
+    "is_worker",
+    "is_final",
+    "role_index_norm",
+    "decomposer_plan_parseable_gate",
+    "hierarchy_utilization_gate",
+    "decomposer_dependency_usage_rate",
+    "decomposer_repair_success",
+    "planner_repeat_penalty",
+    "planner_excess_subtask_penalty",
+    "selector_assignment_completeness",
+    "selector_assignment_precision",
+    "selector_assignment_recall",
+    "selector_assignment_final_present",
+    "selector_empty_output",
+    "selector_extra_assignment_penalty",
+    "selector_missing_assignment_penalty",
+    "selector_missing_final_penalty",
+    "worker_unique_local_result_rate",
+    "worker_downstream_used_rate",
+    "worker_later_worker_used_rate",
+    "worker_missing_local_result_penalty",
+    "worker_duplicate_result_penalty",
+    "worker_subtask_overreach_penalty",
+    "final_worker_result_usage_rate",
+    "final_consistency_with_worker_results",
+    "final_ignores_worker_results_penalty",
+]
+
+
 PRD_SOURCE_STAGE: Dict[str, int] = {
     "decomposer_plan_parseable_gate": 0,
     "hierarchy_utilization_gate": 0,
@@ -173,6 +205,56 @@ def _role_stage(role: str, score_role: Optional[str], worker_roles: Iterable[str
     if role in worker_roles:
         return 2
     return 2
+
+
+def build_role_prd_graph_prior_tensors(
+    agent_roles: Sequence[str],
+    score_role: Optional[str],
+    worker_roles: Iterable[str],
+    *,
+    mode: str = "none",
+    soft_distance_penalty: float = 1.0,
+    reverse_distance_penalty: float = 3.0,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Build optional priors for role-to-role credit attention.
+
+    Rows are credited target roles and columns are context/source roles.  A
+    downstream role can provide evidence for upstream credit, e.g. final usage
+    can credit a worker, while hard mode masks reverse protocol edges.
+    """
+
+    if mode not in {"none", "soft", "hard"}:
+        raise ValueError(f"Unsupported role PRD graph prior mode: {mode}")
+    if mode == "none":
+        return None, None
+
+    worker_roles = set(worker_roles)
+    role_stages = [
+        _role_stage(role, score_role, worker_roles)
+        for role in agent_roles
+    ]
+    bias_rows = []
+    mask_rows = []
+    for target_stage in role_stages:
+        bias_row = []
+        mask_row = []
+        for source_stage in role_stages:
+            if target_stage <= source_stage:
+                distance = source_stage - target_stage
+                allowed = 1.0
+            else:
+                distance = reverse_distance_penalty + target_stage - source_stage
+                allowed = 0.0
+            bias_row.append(-float(soft_distance_penalty) * float(distance))
+            mask_row.append(allowed)
+        bias_rows.append(bias_row)
+        mask_rows.append(mask_row)
+
+    attention_bias = torch.tensor(bias_rows, device=device, dtype=dtype)
+    attention_mask = torch.tensor(mask_rows, device=device, dtype=dtype) if mode == "hard" else None
+    return attention_bias, attention_mask
 
 
 def build_prd_graph_prior_tensors(
@@ -388,6 +470,122 @@ class PRDRewardComposer(nn.Module):
             source_embed_dim=int(payload.get("source_embed_dim", 32)),
             global_context_dim=int(payload.get("global_context_dim", payload.get("hidden_dim", 128))),
             routing_activation=str(payload.get("routing_activation", "sigmoid")),
+            routing_floor=float(payload.get("routing_floor", 0.0)),
+        )
+        model.load_state_dict(payload["state_dict"])
+        return model
+
+
+class RolePRDCreditRouter(nn.Module):
+    """A role-to-role credit router closer to PRD-style role relevance.
+
+    Inputs:
+        role_features: ``[batch, num_roles, role_feature_dim]``
+
+    Outputs:
+        ``role_scores``: ``[batch, num_roles]``
+        ``routing``: ``[batch, num_roles, num_roles]`` where rows are credited
+        roles and columns are context roles attended to for that credit.
+    """
+
+    def __init__(
+        self,
+        role_feature_dim: int,
+        hidden_dim: int = 128,
+        routing_activation: str = "softmax",
+        routing_floor: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if routing_activation not in {"sigmoid", "softmax"}:
+            raise ValueError(f"Unsupported routing activation: {routing_activation}")
+        if not 0.0 <= float(routing_floor) < 1.0:
+            raise ValueError(f"routing_floor must be in [0, 1), got {routing_floor}")
+        self.role_feature_dim = int(role_feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.routing_activation = routing_activation
+        self.routing_floor = float(routing_floor)
+
+        self.role_encoder = nn.Sequential(
+            nn.Linear(self.role_feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.score_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        role_features: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if role_features.dim() != 3:
+            raise ValueError(f"role_features must be [batch, roles, features], got {tuple(role_features.shape)}")
+        if role_features.shape[2] != self.role_feature_dim:
+            raise ValueError(f"Expected role feature dim {self.role_feature_dim}, got {role_features.shape[2]}")
+
+        hidden = self.role_encoder(role_features)
+        q = self.query(hidden)
+        k = self.key(hidden)
+        v = self.value(hidden)
+        scale = float(self.hidden_dim) ** -0.5
+        routing_logits = torch.matmul(q, k.transpose(-1, -2)) * scale
+        if attention_bias is not None:
+            while attention_bias.dim() < routing_logits.dim():
+                attention_bias = attention_bias.unsqueeze(0)
+            routing_logits = routing_logits + attention_bias.to(
+                device=routing_logits.device,
+                dtype=routing_logits.dtype,
+            )
+        if attention_mask is not None:
+            while attention_mask.dim() < routing_logits.dim():
+                attention_mask = attention_mask.unsqueeze(0)
+            attention_mask = attention_mask.to(device=routing_logits.device, dtype=routing_logits.dtype)
+            if self.routing_activation == "softmax":
+                routing_logits = routing_logits.masked_fill(attention_mask <= 0, -1e9)
+
+        if self.routing_activation == "softmax":
+            routing = torch.softmax(routing_logits, dim=-1)
+        else:
+            routing = torch.sigmoid(routing_logits)
+            if self.routing_floor > 0.0:
+                routing = self.routing_floor + (1.0 - self.routing_floor) * routing
+        if attention_mask is not None and self.routing_activation != "softmax":
+            routing = routing * attention_mask
+
+        context = torch.matmul(routing, v)
+        role_scores = self.score_head(torch.cat([hidden, context], dim=-1)).squeeze(-1)
+        return {"role_scores": role_scores, "routing": routing, "routing_logits": routing_logits}
+
+    def checkpoint_payload(
+        self,
+        *,
+        role_feature_names: Sequence[str] = ROLE_PRD_FEATURE_NAMES,
+    ) -> Dict[str, object]:
+        return {
+            "state_dict": self.state_dict(),
+            "model_type": "role",
+            "role_feature_dim": self.role_feature_dim,
+            "hidden_dim": self.hidden_dim,
+            "routing_activation": self.routing_activation,
+            "routing_floor": self.routing_floor,
+            "role_feature_names": list(role_feature_names),
+        }
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str, map_location: str | torch.device = "cpu") -> "RolePRDCreditRouter":
+        payload = torch.load(checkpoint_path, map_location=map_location)
+        model = cls(
+            role_feature_dim=int(payload["role_feature_dim"]),
+            hidden_dim=int(payload.get("hidden_dim", 128)),
+            routing_activation=str(payload.get("routing_activation", "softmax")),
             routing_floor=float(payload.get("routing_floor", 0.0)),
         )
         model.load_state_dict(payload["state_dict"])

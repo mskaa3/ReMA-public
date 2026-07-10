@@ -274,14 +274,21 @@ algorithm:
       graph_prior_reverse_distance_penalty: 3.0
       online:
         enable: False
+        # "source" keeps the original source-to-role composer.
+        # "role" uses the experimental role-to-role credit router.
+        model_type: role
         init_checkpoint_path: null
         lr: 3.0e-4
         weight_decay: 0.0
         hidden_dim: 128
         source_embed_dim: 32
         global_context_dim: null
-        routing_activation: sigmoid
+        # Null chooses a safe default: softmax for role router, sigmoid for source composer.
+        routing_activation: null
         routing_floor: 0.05
+        role_rank_loss_weight: 0.2
+        role_activity_margin: 0.05
+        role_rank_temperature: 1.0
         warmup_steps: 200
         blend_alpha: 0.05
         blend_alpha_max: 0.05

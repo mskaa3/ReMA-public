@@ -178,10 +178,13 @@ from verl.utils.torch_functional import masked_mean
 from verl.workers.reward_manager.prd_composer import (
     PRD_REWARD_SOURCE_NAMES,
     PRD_ROLE_FEATURE_NAMES,
+    ROLE_PRD_FEATURE_NAMES,
     PRDRewardComposer,
+    RolePRDCreditRouter,
     build_prd_graph_prior_tensors,
     build_prd_role_feature_tensor,
     build_prd_source_tensor,
+    build_role_prd_graph_prior_tensors,
 )
 from verl.workers.reward_manager.rema import _build_prd_reward_sources
 
@@ -454,14 +457,28 @@ class RayReMASeparatedTrainer(object):
         if not self.online_prd_enabled:
             return
 
+        self.online_prd_model_type = str(online_config.get('model_type', 'source'))
         hidden_dim = int(online_config.get('hidden_dim', 128))
         source_embed_dim = int(online_config.get('source_embed_dim', 32))
         global_context_dim = online_config.get('global_context_dim', None)
-        routing_activation = str(online_config.get('routing_activation', 'sigmoid'))
+        routing_activation_value = online_config.get('routing_activation', None)
+        routing_activation = str(
+            routing_activation_value
+            or ('softmax' if self.online_prd_model_type == 'role' else 'sigmoid')
+        )
         routing_floor = float(online_config.get('routing_floor', 0.0))
         init_checkpoint_path = online_config.get('init_checkpoint_path')
-        if init_checkpoint_path:
+        if init_checkpoint_path and self.online_prd_model_type == 'role':
+            self.online_prd_train = RolePRDCreditRouter.from_checkpoint(init_checkpoint_path, map_location='cpu')
+        elif init_checkpoint_path:
             self.online_prd_train = PRDRewardComposer.from_checkpoint(init_checkpoint_path, map_location='cpu')
+        elif self.online_prd_model_type == 'role':
+            self.online_prd_train = RolePRDCreditRouter(
+                role_feature_dim=len(ROLE_PRD_FEATURE_NAMES),
+                hidden_dim=hidden_dim,
+                routing_activation=routing_activation,
+                routing_floor=routing_floor,
+            )
         else:
             self.online_prd_train = PRDRewardComposer(
                 num_sources=len(PRD_REWARD_SOURCE_NAMES),
@@ -507,13 +524,140 @@ class RayReMASeparatedTrainer(object):
             for name, active_tensor in active_state.items():
                 active_tensor.copy_(ema_beta * active_tensor + (1.0 - ema_beta) * train_state[name])
 
+    @staticmethod
+    def _reward_scalar(reward_tensor_map: Dict[str, torch.Tensor], name: str, batch_idx: int, default: float = 0.0) -> float:
+        tensor = reward_tensor_map.get(name)
+        if tensor is None:
+            return float(default)
+        return float(tensor[batch_idx].item())
+
+    def _build_role_prd_features_for_sample(
+        self,
+        reward_tensor_map: Dict[str, torch.Tensor],
+        batch_idx: int,
+        agent_roles,
+        score_role,
+        worker_roles,
+    ):
+        worker_roles = set(worker_roles)
+        denom = max(len(agent_roles) - 1, 1)
+        rows = []
+        activities = []
+
+        decomposer_activity = (
+            self._reward_scalar(reward_tensor_map, 'decomposer_plan_parseable_gate', batch_idx)
+            * max(
+                self._reward_scalar(reward_tensor_map, 'hierarchy_utilization_gate', batch_idx),
+                self._reward_scalar(reward_tensor_map, 'decomposer_dependency_usage_rate', batch_idx),
+            )
+        )
+        selector_activity = (
+            self._reward_scalar(reward_tensor_map, 'selector_assignment_completeness', batch_idx)
+            * self._reward_scalar(reward_tensor_map, 'selector_assignment_precision', batch_idx)
+            * self._reward_scalar(reward_tensor_map, 'selector_assignment_final_present', batch_idx)
+            * (1.0 - self._reward_scalar(reward_tensor_map, 'selector_empty_output', batch_idx))
+        )
+        worker_activity = (
+            self._reward_scalar(reward_tensor_map, 'worker_unique_local_result_rate', batch_idx)
+            * self._reward_scalar(reward_tensor_map, 'worker_downstream_used_rate', batch_idx)
+            * (1.0 - self._reward_scalar(reward_tensor_map, 'worker_duplicate_result_penalty_applied', batch_idx))
+        )
+        final_activity = (
+            self._reward_scalar(reward_tensor_map, 'final_worker_result_usage_rate', batch_idx)
+            * self._reward_scalar(reward_tensor_map, 'final_consistency_with_worker_results', batch_idx)
+            * (1.0 - self._reward_scalar(reward_tensor_map, 'final_ignores_worker_results_penalty_applied', batch_idx))
+        )
+
+        for idx, role in enumerate(agent_roles):
+            is_decomposer = 1.0 if role == 'decomposer' else 0.0
+            is_selector = 1.0 if role == 'selector' else 0.0
+            is_worker = 1.0 if role in worker_roles else 0.0
+            is_final = 1.0 if role == score_role else 0.0
+
+            if is_decomposer:
+                activity = decomposer_activity
+            elif is_selector:
+                activity = selector_activity
+            elif is_final:
+                activity = final_activity
+            else:
+                activity = worker_activity
+            activities.append(float(max(0.0, min(1.0, activity))))
+
+            rows.append([
+                is_decomposer,
+                is_selector,
+                is_worker,
+                is_final,
+                float(idx) / float(denom),
+                self._reward_scalar(reward_tensor_map, 'decomposer_plan_parseable_gate', batch_idx) if is_decomposer else 0.0,
+                self._reward_scalar(reward_tensor_map, 'hierarchy_utilization_gate', batch_idx) if is_decomposer else 0.0,
+                self._reward_scalar(reward_tensor_map, 'decomposer_dependency_usage_rate', batch_idx) if is_decomposer else 0.0,
+                self._reward_scalar(reward_tensor_map, 'decomposer_repair_success', batch_idx) if is_decomposer else 0.0,
+                self._reward_scalar(reward_tensor_map, 'planner_repeat_penalty_applied', batch_idx) if is_decomposer else 0.0,
+                self._reward_scalar(reward_tensor_map, 'planner_excess_subtask_penalty_applied', batch_idx) if is_decomposer else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_assignment_completeness', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_assignment_precision', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_assignment_recall', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_assignment_final_present', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_empty_output', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_extra_assignment_penalty_applied', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_missing_assignment_penalty_applied', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'selector_missing_final_penalty_applied', batch_idx) if is_selector else 0.0,
+                self._reward_scalar(reward_tensor_map, 'worker_unique_local_result_rate', batch_idx) if is_worker else 0.0,
+                self._reward_scalar(reward_tensor_map, 'worker_downstream_used_rate', batch_idx) if is_worker else 0.0,
+                self._reward_scalar(reward_tensor_map, 'worker_later_worker_used_rate', batch_idx) if is_worker else 0.0,
+                self._reward_scalar(reward_tensor_map, 'worker_missing_local_result_penalty_applied', batch_idx) if is_worker else 0.0,
+                self._reward_scalar(reward_tensor_map, 'worker_duplicate_result_penalty_applied', batch_idx) if is_worker else 0.0,
+                self._reward_scalar(reward_tensor_map, 'worker_subtask_overreach_penalty_applied', batch_idx) if is_worker else 0.0,
+                self._reward_scalar(reward_tensor_map, 'final_worker_result_usage_rate', batch_idx) if is_final else 0.0,
+                self._reward_scalar(reward_tensor_map, 'final_consistency_with_worker_results', batch_idx) if is_final else 0.0,
+                self._reward_scalar(reward_tensor_map, 'final_ignores_worker_results_penalty_applied', batch_idx) if is_final else 0.0,
+            ])
+        return (
+            torch.tensor(rows, dtype=torch.float32),
+            torch.tensor(activities, dtype=torch.float32),
+        )
+
     def _build_online_prd_batch(self, data_batch: DataProto, reward_tensor_map: Dict[str, torch.Tensor]):
         hierarchy_config = self._get_hierarchy_config()
         agent_roles = hierarchy_config.get('agent_roles', self._get_rollout_agent_roles())
         score_role = hierarchy_config.get('score_role', agent_roles[-1] if agent_roles else None)
         worker_roles = set(hierarchy_config.get('stage_roles', []))
         worker_roles.update(set(hierarchy_config.get('worker_roles', [])).intersection(set(agent_roles)))
+        if score_role is not None:
+            worker_roles.discard(score_role)
         use_manual_role_features = bool(self.online_prd_config.get('use_manual_role_features', False))
+        model_type = str(self.online_prd_config.get('model_type', 'source'))
+
+        if model_type == 'role':
+            role_feature_rows = []
+            role_activity_rows = []
+            for i_bsz in range(len(data_batch)):
+                role_features, role_activity = self._build_role_prd_features_for_sample(
+                    reward_tensor_map,
+                    i_bsz,
+                    agent_roles,
+                    score_role,
+                    worker_roles,
+                )
+                role_feature_rows.append(role_features)
+                role_activity_rows.append(role_activity)
+            return {
+                'model_type': 'role',
+                'role_features': torch.stack(role_feature_rows, dim=0),
+                'role_activity': torch.stack(role_activity_rows, dim=0),
+                'agent_roles': agent_roles,
+                'score_role': score_role,
+                'graph_prior': build_role_prd_graph_prior_tensors(
+                    agent_roles,
+                    score_role,
+                    worker_roles,
+                    mode=str(self.online_prd_config.get('graph_prior_mode', 'none')),
+                    soft_distance_penalty=float(self.online_prd_config.get('graph_prior_soft_distance_penalty', 1.0)),
+                    reverse_distance_penalty=float(self.online_prd_config.get('graph_prior_reverse_distance_penalty', 3.0)),
+                ),
+            }
 
         source_rows = []
         role_feature_rows = []
@@ -540,6 +684,7 @@ class RayReMASeparatedTrainer(object):
                 )
             )
         return {
+            'model_type': 'source',
             'source_values': torch.stack(source_rows, dim=0),
             'role_features': torch.stack(role_feature_rows, dim=0),
             'agent_roles': agent_roles,
@@ -566,6 +711,50 @@ class RayReMASeparatedTrainer(object):
             return rollout_scores.sum() * 0.0
         target = positive / positive.sum().clamp_min(1e-8)
         return -(target * torch.log_softmax(rollout_scores, dim=0)).sum()
+
+    @staticmethod
+    def _online_prd_role_activity_ranking_loss(
+        role_scores: torch.Tensor,
+        raw_scores: torch.Tensor,
+        role_activity: torch.Tensor,
+        uid_list,
+        *,
+        activity_margin: float = 0.05,
+        temperature: float = 1.0,
+    ):
+        uid_to_indices = defaultdict(list)
+        for idx, uid in enumerate(uid_list):
+            uid_to_indices[uid].append(idx)
+
+        losses = []
+        pair_count = 0
+        eps = float(activity_margin)
+        temp = max(float(temperature), 1e-6)
+        for indices in uid_to_indices.values():
+            if len(indices) < 2:
+                continue
+            idx_tensor = torch.tensor(indices, dtype=torch.long, device=role_scores.device)
+            group_raw = raw_scores.to(role_scores.device)[idx_tensor]
+            pos_idx = idx_tensor[group_raw > 0]
+            neg_idx = idx_tensor[group_raw <= 0]
+            if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+                continue
+
+            pos_scores = role_scores[pos_idx]
+            neg_scores = role_scores[neg_idx]
+            pos_activity = role_activity.to(role_scores.device)[pos_idx]
+            neg_activity = role_activity.to(role_scores.device)[neg_idx]
+            score_diff = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)
+            activity_diff = pos_activity.unsqueeze(1) - neg_activity.unsqueeze(0)
+            mask = activity_diff > eps
+            if not bool(mask.any().item()):
+                continue
+            losses.append(-torch.nn.functional.logsigmoid(score_diff[mask] / temp).mean())
+            pair_count += int(mask.sum().item())
+
+        if not losses:
+            return role_scores.sum() * 0.0, 0
+        return torch.stack(losses).mean(), pair_count
 
     @staticmethod
     def _safe_tensor_std(values: torch.Tensor) -> float:
@@ -607,19 +796,27 @@ class RayReMASeparatedTrainer(object):
         if not self.online_prd_enabled:
             return reward_tensor_map
         prd_batch = self._build_online_prd_batch(data_batch, reward_tensor_map)
-        source_values = prd_batch['source_values']
+        model_type = prd_batch.get('model_type', 'source')
+        source_values = prd_batch.get('source_values')
         role_features = prd_batch['role_features']
         agent_roles = prd_batch['agent_roles']
         routing_bias, routing_mask = prd_batch['graph_prior']
 
         # Train PRD_train from current rollout groups.
         self.online_prd_train.train()
-        train_output = self.online_prd_train(
-            source_values,
-            role_features,
-            routing_bias=routing_bias,
-            routing_mask=routing_mask,
-        )
+        if model_type == 'role':
+            train_output = self.online_prd_train(
+                role_features,
+                attention_bias=routing_bias,
+                attention_mask=routing_mask,
+            )
+        else:
+            train_output = self.online_prd_train(
+                source_values,
+                role_features,
+                routing_bias=routing_bias,
+                routing_mask=routing_mask,
+            )
         raw_scores = reward_tensor_map['acc'].float()
         uid_list = list(data_batch.non_tensor_batch['uid'])
         uid_to_indices = defaultdict(list)
@@ -649,8 +846,25 @@ class RayReMASeparatedTrainer(object):
                 )
             )
 
-        if losses:
-            prd_loss = torch.stack(losses).mean()
+        role_rank_loss = None
+        role_rank_pair_count = 0
+        if model_type == 'role' and float(self.online_prd_config.get('role_rank_loss_weight', 0.0)) > 0.0:
+            role_rank_loss, role_rank_pair_count = self._online_prd_role_activity_ranking_loss(
+                train_output['role_scores'],
+                raw_scores,
+                prd_batch['role_activity'],
+                uid_list,
+                activity_margin=float(self.online_prd_config.get('role_activity_margin', 0.05)),
+                temperature=float(self.online_prd_config.get('role_rank_temperature', 1.0)),
+            )
+
+        if losses or role_rank_loss is not None:
+            prd_loss = torch.stack(losses).mean() if losses else train_output['role_scores'].sum() * 0.0
+            if role_rank_loss is not None:
+                role_rank_weight = float(self.online_prd_config.get('role_rank_loss_weight', 0.0))
+                prd_loss = prd_loss + role_rank_weight * role_rank_loss
+                metrics['reward/prd_online/role_rank_loss'] = float(role_rank_loss.item())
+                metrics['reward/prd_online/role_rank_pair_count'] = role_rank_pair_count
             self.online_prd_optimizer.zero_grad(set_to_none=True)
             prd_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -667,6 +881,7 @@ class RayReMASeparatedTrainer(object):
         metrics['reward/prd_online/mixed_group_count'] = mixed_group_count
         metrics['reward/prd_online/skipped_group_count'] = skipped_group_count
         metrics['reward/prd_online/group_count'] = len(uid_to_indices)
+        metrics['reward/prd_online/model_type_id'] = 1.0 if model_type == 'role' else 0.0
         metrics['reward/prd_online/graph_prior_mode_id'] = {
             'none': 0.0,
             'soft': 1.0,
@@ -696,6 +911,14 @@ class RayReMASeparatedTrainer(object):
             metrics[f'reward/prd_online/roles/{role}/train_score_std'] = self._safe_tensor_std(
                 train_role_scores[:, role_idx]
             )
+            if model_type == 'role':
+                role_activity = prd_batch['role_activity']
+                metrics[f'reward/prd_online/roles/{role}/activity_mean'] = float(
+                    role_activity[:, role_idx].mean().item()
+                )
+                metrics[f'reward/prd_online/roles/{role}/activity_std'] = self._safe_tensor_std(
+                    role_activity[:, role_idx]
+                )
 
         self._sync_online_prd_active()
 
@@ -706,12 +929,19 @@ class RayReMASeparatedTrainer(object):
 
         self.online_prd_active.eval()
         with torch.no_grad():
-            active_output = self.online_prd_active(
-                source_values,
-                role_features,
-                routing_bias=routing_bias,
-                routing_mask=routing_mask,
-            )
+            if model_type == 'role':
+                active_output = self.online_prd_active(
+                    role_features,
+                    attention_bias=routing_bias,
+                    attention_mask=routing_mask,
+                )
+            else:
+                active_output = self.online_prd_active(
+                    source_values,
+                    role_features,
+                    routing_bias=routing_bias,
+                    routing_mask=routing_mask,
+                )
         prd_role_scores = active_output['role_scores']
         active_routing = active_output['routing']
         active_rollout_scores = prd_role_scores.sum(dim=1)
