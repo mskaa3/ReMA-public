@@ -492,6 +492,11 @@ if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
     fi
 fi
 
+PYTHON_BOOTSTRAP="export PYTHONPATH=/verl/verl:\$PYTHONPATH;"
+if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
+    PYTHON_BOOTSTRAP="mkdir -p ${TMPDIR}/gfam_pydeps; export PYTHONPATH=${TMPDIR}/gfam_pydeps:/verl/verl:\$PYTHONPATH; python3 -c \"import sentence_transformers\" >/dev/null 2>&1 || python3 -m pip install --no-cache-dir --target ${TMPDIR}/gfam_pydeps sentence-transformers;"
+fi
+
 MULTINODE_RAY_ENABLED=0
 if [[ "$BACKEND" == "vllm" && "${RAY_NNODES:-1}" -gt 1 ]]; then
     MULTINODE_RAY_ENABLED=1
@@ -1285,7 +1290,7 @@ if [[ "$RUN_KIND" == "rollout" ]]; then
     COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
-export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
+${PYTHON_BOOTSTRAP} \
 unset PYTORCH_CUDA_ALLOC_CONF; \
 export OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF='${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF}'; \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
@@ -1342,7 +1347,7 @@ else
     COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export HF_HOME=$TMPDIR/hf_home; \
 export PYTHONUNBUFFERED=1; \
-export PYTHONPATH=/verl/verl:\$PYTHONPATH; \
+${PYTHON_BOOTSTRAP} \
 unset PYTORCH_CUDA_ALLOC_CONF; \
 export OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF='${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF}'; \
 export TMPDIR=${RAY_LOCAL_TMPDIR}; \
