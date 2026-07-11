@@ -494,7 +494,7 @@ fi
 
 PYTHON_BOOTSTRAP="export PYTHONPATH=/verl/verl:\$PYTHONPATH;"
 if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
-    PYTHON_BOOTSTRAP="mkdir -p ${TMPDIR}/gfam_pydeps; export PYTHONPATH=${TMPDIR}/gfam_pydeps:/verl/verl:\$PYTHONPATH; python3 -c \"import sentence_transformers\" >/dev/null 2>&1 || python3 -m pip install --no-cache-dir --target ${TMPDIR}/gfam_pydeps sentence-transformers;"
+    PYTHON_BOOTSTRAP="mkdir -p ${TMPDIR}/gfam_sentence_transformers; export PYTHONPATH=${TMPDIR}/gfam_sentence_transformers:/verl/verl:\$PYTHONPATH; python3 -c \"import sentence_transformers\" >/dev/null 2>&1 || python3 -m pip install --no-cache-dir --no-deps --target ${TMPDIR}/gfam_sentence_transformers sentence-transformers;"
 fi
 
 MULTINODE_RAY_ENABLED=0
