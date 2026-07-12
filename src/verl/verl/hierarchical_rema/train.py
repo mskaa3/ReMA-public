@@ -2294,7 +2294,7 @@ def main() -> None:
                                 if execution.reward_model_reward is not None
                                 else float(selection.reward.total_reward)
                             )
-                            for decomposition in batch_rollout.decompositions
+                            for decomposition in rollout.decompositions
                             for selection in decomposition.selections
                             for execution in selection.executions
                         ]
