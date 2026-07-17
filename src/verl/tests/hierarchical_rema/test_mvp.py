@@ -1046,6 +1046,107 @@ def test_worker_output_rejects_text_outside_worker_blocks() -> None:
     assert extract_worker_result_text("4\n<worker_result>\n4\n</worker_result>") == ""
 
 
+def test_final_worker_output_recovers_worker_result_with_outer_text() -> None:
+    task = make_task("algebra", "Find the integer solution.", "4", "5")
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="single-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(
+                node_id="1",
+                instruction="Return the final answer.",
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="1",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="4\n<worker_result>\n4\n</worker_result>",
+        )
+    )
+
+    assert normalized_output == "4"
+    assert invalid_reason == "recovered_worker_result_with_outer_text"
+    assert final_answer_leak is False
+    assert answer_containment is False
+    assert success is True
+
+
+def test_final_worker_output_recovers_plain_text_answer() -> None:
+    task = make_task("algebra", "Find the integer solution.", "1", "2")
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="single-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(
+                node_id="1",
+                instruction="Return the final answer.",
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="1",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="1",
+        )
+    )
+
+    assert normalized_output == "1"
+    assert invalid_reason == "recovered_plain_text_final_answer"
+    assert final_answer_leak is False
+    assert answer_containment is False
+    assert success is True
+
+
+def test_non_final_worker_output_stays_strict_when_text_sits_outside_tags() -> None:
+    task = make_task("algebra", "Find the integer solution.", "4", "5")
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step plan",
+        target_quantity="integer solution",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(node_id="1", instruction="Analyze the cases.", output_key="1_output"),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+
+    normalized_output, invalid_reason, final_answer_leak, answer_containment, success = (
+        _postprocess_worker_output(
+            task=task,
+            decomposition=decomposition,
+            node=decomposition.nodes[0],
+            raw_output_text="4\n<worker_result>\n4\n</worker_result>",
+        )
+    )
+
+    assert normalized_output == ""
+    assert invalid_reason == "missing_worker_result"
+    assert final_answer_leak is False
+    assert answer_containment is False
+    assert success is False
+
+
 def test_non_final_worker_output_blanks_explicit_final_answer_clause() -> None:
     task = make_task(
         "algebra",

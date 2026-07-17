@@ -27,6 +27,7 @@ DECOMPOSER_LABELS = (
     "D_dependency_correct",
     "D_subtasks_solvable",
     "D_role_drift",
+    "D_under_decomposition",
 )
 SELECTOR_LABELS = (
     "S_worker_match",
@@ -40,12 +41,14 @@ WORKER_LABELS = (
     "W_reasoning_or_fact_error",
     "W_role_drift",
     "W_nonfinal_solved_final",
+    "W_trivial_finalization",
     "W_contaminated_by_upstream",
     "W_contaminates_downstream",
 )
 FINAL_LABELS = (
     "F_aggregation_error",
     "F_verification_error",
+    "F_answer_missing_or_invalid",
 )
 EDGE_LABELS = (
     "E_actual_use",
@@ -61,6 +64,19 @@ PRIMARY_FAILURE_STAGES = (
     "none",
     "unclear",
 )
+MISSINGISH_ANSWER_TEXTS = {
+    "",
+    "none",
+    "null",
+    "n/a",
+    "na",
+    "unknown",
+    "no answer",
+    "no final answer",
+    "final answer",
+    "produce the final answer",
+    "return the final answer",
+}
 NODE_TYPES = (
     "question",
     "decomposer",
@@ -102,6 +118,47 @@ def normalize_text(value: Any) -> str:
     text = text.replace("\r\n", "\n")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def yes_strength_from_centered(value: float) -> float:
+    return clamp01((float(value) + 1.0) / 2.0)
+
+
+def absence_strength_from_centered(value: float) -> float:
+    return clamp01((1.0 - float(value)) / 2.0)
+
+
+def is_missingish_text(value: Any) -> bool:
+    normalized = normalize_text(value).lower()
+    if not normalized:
+        return True
+    if normalized in MISSINGISH_ANSWER_TEXTS:
+        return True
+    if normalized.startswith("final answer:"):
+        suffix = normalized.split(":", 1)[1].strip()
+        return suffix in MISSINGISH_ANSWER_TEXTS or not suffix
+    return False
+
+
+def get_final_worker_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    final_node_id = record.get("trajectory", {}).get("final_node_id")
+    for worker in record.get("workers", []):
+        if worker.get("node_id") == final_node_id or worker.get("is_final_node"):
+            return worker
+    return None
+
+
+def record_missing_final_answer_signal(record: dict[str, Any]) -> float:
+    final_answer_missing = is_missingish_text(record.get("trajectory", {}).get("final_answer"))
+    final_worker = get_final_worker_record(record)
+    worker_output_missing = True
+    if final_worker is not None:
+        worker_output_missing = is_missingish_text(final_worker.get("output_text"))
+    return 1.0 if final_answer_missing or worker_output_missing else 0.0
 
 
 def canonical_json(value: Any) -> str:
@@ -520,6 +577,11 @@ def expected_score_from_probs(probabilities: Tensor) -> Tensor:
     return (probabilities * values).sum(dim=-1) / 2.0
 
 
+def centered_score_from_probs(probabilities: Tensor) -> Tensor:
+    values = torch.tensor([-1.0, 0.0, 1.0], dtype=probabilities.dtype, device=probabilities.device)
+    return (probabilities * values).sum(dim=-1)
+
+
 def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, Any]:
     example: GraphExample = compiler_inputs["example"]
     graph_scores = compiler_inputs["graph_scores"]
@@ -529,65 +591,109 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     final_scores = compiler_inputs["final_scores"]
     edge_scores = compiler_inputs["edge_scores"]
     final_anchor_score = float(compiler_inputs["final_anchor_score"])
+    record = example.source_record
+    final_worker_id = record["trajectory"]["final_node_id"]
+
+    def success(score_map: dict[str, float], key: str) -> float:
+        return float(score_map.get(key, 0.0))
+
+    def error(score_map: dict[str, float], key: str) -> float:
+        return yes_strength_from_centered(float(score_map.get(key, 0.0)))
+
+    def lack(score_map: dict[str, float], key: str) -> float:
+        return absence_strength_from_centered(float(score_map.get(key, 0.0)))
+
+    observed_missing_final = record_missing_final_answer_signal(record)
+    label_missing_final = error(final_scores, "F_answer_missing_or_invalid")
+    missing_final_signal = max(observed_missing_final, label_missing_final)
 
     q_decomposer = (
-        +0.35 * decomposer_scores.get("D_coverage", 0.0)
-        + 0.30 * decomposer_scores.get("D_dependency_correct", 0.0)
-        + 0.25 * decomposer_scores.get("D_subtasks_solvable", 0.0)
-        - 0.25 * decomposer_scores.get("D_role_drift", 0.0)
+        +0.40 * success(decomposer_scores, "D_coverage")
+        + 0.30 * success(decomposer_scores, "D_dependency_correct")
+        + 0.25 * success(decomposer_scores, "D_subtasks_solvable")
+        - 0.25 * error(decomposer_scores, "D_role_drift")
+        - 0.35 * error(decomposer_scores, "D_under_decomposition")
     )
     q_selector = (
-        +0.45 * selector_scores.get("S_worker_match", 0.0)
-        + 0.30 * selector_scores.get("S_dependency_readiness", 0.0)
-        - 0.35 * selector_scores.get("S_bad_routing_caused_failure", 0.0)
+        +0.50 * success(selector_scores, "S_worker_match")
+        + 0.35 * success(selector_scores, "S_dependency_readiness")
+        - 0.40 * error(selector_scores, "S_bad_routing_caused_failure")
     )
 
     worker_local: dict[str, dict[str, float]] = {}
     for node_id, scores in worker_scores.items():
+        subtask_solved = success(scores, "W_subtask_solved")
+        used_dependencies = success(scores, "W_used_dependencies")
+        format_correct = success(scores, "W_format_correct")
+        reasoning_error = error(scores, "W_reasoning_or_fact_error")
+        role_drift = error(scores, "W_role_drift")
+        nonfinal_solved_final = error(scores, "W_nonfinal_solved_final")
+        trivial_finalization = error(scores, "W_trivial_finalization")
+        contaminated = error(scores, "W_contaminated_by_upstream")
+        contaminates_downstream = error(scores, "W_contaminates_downstream")
+
         q_worker = (
-            +0.45 * scores.get("W_subtask_solved", 0.0)
-            + 0.25 * scores.get("W_used_dependencies", 0.0)
-            + 0.15 * scores.get("W_format_correct", 0.0)
-            - 0.30 * scores.get("W_reasoning_or_fact_error", 0.0)
-            - 0.25 * scores.get("W_role_drift", 0.0)
-            - 0.25 * scores.get("W_nonfinal_solved_final", 0.0)
+            +0.50 * subtask_solved
+            + 0.25 * used_dependencies
+            + 0.15 * format_correct
+            - 0.35 * reasoning_error
+            - 0.25 * role_drift
+            - 0.20 * nonfinal_solved_final
+            - 0.35 * trivial_finalization
+            - 0.10 * contaminates_downstream
         )
-        protect = scores.get("W_contaminated_by_upstream", 0.0)
         own_fault = max(
-            scores.get("W_reasoning_or_fact_error", 0.0),
-            scores.get("W_role_drift", 0.0),
-            1.0 - scores.get("W_subtask_solved", 0.0),
+            reasoning_error,
+            role_drift,
+            absence_strength_from_centered(subtask_solved),
+            nonfinal_solved_final,
+            trivial_finalization,
         )
-        fault_weight = own_fault * (1.0 - 0.7 * protect)
+        fault_weight = own_fault * (1.0 - 0.70 * contaminated)
         badness = max(
             0.0,
-            0.55 * (1.0 - scores.get("W_subtask_solved", 0.0))
-            + 0.25 * scores.get("W_reasoning_or_fact_error", 0.0)
-            + 0.20 * scores.get("W_role_drift", 0.0),
+            0.60 * absence_strength_from_centered(subtask_solved)
+            + 0.20 * reasoning_error
+            + 0.15 * role_drift
+            + 0.20 * trivial_finalization
+            + 0.15 * nonfinal_solved_final,
         )
         worker_local[node_id] = {
             "quality": q_worker,
-            "protect": protect,
+            "protect": contaminated,
             "fault_weight": fault_weight,
             "badness": badness,
+            "trivial_finalization": trivial_finalization,
         }
 
+    aggregation_error = error(final_scores, "F_aggregation_error")
+    verification_error = error(final_scores, "F_verification_error")
+    final_answer_missing_or_invalid = missing_final_signal
     final_badness = max(
         0.0,
-        0.6 * final_scores.get("F_aggregation_error", 0.0)
-        + 0.4 * final_scores.get("F_verification_error", 0.0),
+        0.45 * aggregation_error
+        + 0.30 * verification_error
+        + 0.45 * final_answer_missing_or_invalid,
     )
     final_quality = (
-        0.35 * graph_scores.get("G_final_correct", 0.0)
-        - 0.35 * final_scores.get("F_aggregation_error", 0.0)
-        - 0.30 * final_scores.get("F_verification_error", 0.0)
+        0.45 * success(graph_scores, "G_final_correct")
+        - 0.35 * aggregation_error
+        - 0.25 * verification_error
+        - 0.40 * final_answer_missing_or_invalid
+    )
+    final_fault = max(
+        aggregation_error,
+        verification_error,
+        final_answer_missing_or_invalid,
     )
 
     transition_weights: dict[tuple[str, str], float] = {}
     for key, scores in edge_scores.items():
         from_node_id, to_node_id = key.split("->", 1)
         transition_weights[(from_node_id, to_node_id)] = (
-            0.70 * scores.get("E_actual_use", 0.0) * scores.get("E_failure_propagated", 0.0)
+            0.75
+            * yes_strength_from_centered(scores.get("E_actual_use", 0.0))
+            * yes_strength_from_centered(scores.get("E_failure_propagated", 0.0))
         )
 
     downstream_graph: dict[str, list[tuple[str, float]]] = {}
@@ -624,23 +730,21 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
                 continue
             numerator += weight * worker_local[target_id]["badness"]
             denominator += weight
-        final_worker_id = example.source_record["trajectory"]["final_node_id"]
         final_weight = max_path_weight(node_id, final_worker_id)
         if final_weight > 0:
+            final_weight *= 1.35
             numerator += final_weight * final_badness
             denominator += final_weight
         if denominator <= 0:
             return 0.0
         return numerator / denominator
 
-    final_worker_id = example.source_record["trajectory"]["final_node_id"]
-    reach_to_final: dict[str, float] = {}
-    for node_id in worker_local:
-        reach_to_final[node_id] = max_path_weight(node_id, final_worker_id)
+    reach_to_final = {node_id: max_path_weight(node_id, final_worker_id) for node_id in worker_local}
 
     graph_anchor = (
-        0.2 * graph_scores.get("G_final_correct", 0.0)
-        - 0.1 * graph_scores.get("G_cascade_present", 0.0)
+        0.15 * success(graph_scores, "G_final_correct")
+        - 0.10 * error(graph_scores, "G_cascade_present")
+        - 0.10 * error(graph_scores, "G_hierarchy_bypassed")
     )
 
     node_rewards: dict[str, Any] = {
@@ -651,14 +755,33 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     }
 
     decomposer_fault = max(
-        decomposer_scores.get("D_role_drift", 0.0),
-        1.0 - decomposer_scores.get("D_subtasks_solvable", 0.0),
-        1.0 - decomposer_scores.get("D_dependency_correct", 0.0),
+        error(decomposer_scores, "D_role_drift"),
+        lack(decomposer_scores, "D_subtasks_solvable"),
+        lack(decomposer_scores, "D_dependency_correct"),
+        error(decomposer_scores, "D_under_decomposition"),
     )
     selector_fault = max(
-        selector_scores.get("S_bad_routing_caused_failure", 0.0),
-        1.0 - selector_scores.get("S_worker_match", 0.0),
+        error(selector_scores, "S_bad_routing_caused_failure"),
+        lack(selector_scores, "S_worker_match"),
+        lack(selector_scores, "S_dependency_readiness"),
     )
+
+    final_failure_severity = clamp01((1.0 - final_anchor_score) / 2.0)
+
+    def positive_cap(min_cap: float, failure_weight: float, invalid_weight: float = 0.0) -> float:
+        return clamp01(
+            max(
+                min_cap,
+                1.0
+                - failure_weight * final_failure_severity
+                - invalid_weight * final_answer_missing_or_invalid,
+            )
+        )
+
+    def apply_positive_cap(value: float, cap: float) -> float:
+        if value <= 0.0:
+            return value
+        return cap * value
 
     node_rewards["decomposer"]["quality"] = q_decomposer
     node_rewards["selector"]["quality"] = q_selector
@@ -669,42 +792,69 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
         [downstream_consequence(node_id) for node_id in worker_local]
     )
 
-    node_rewards["decomposer"]["reward_raw"] = (
-        0.65 * q_decomposer
-        + 0.25 * node_rewards["decomposer"]["downstream_consequence"]
-        + 0.10 * final_anchor_score * decomposer_fault
+    decomposer_pre_cap = (
+        0.80 * q_decomposer
+        - 0.25 * node_rewards["decomposer"]["downstream_consequence"]
+        - 0.20 * final_failure_severity * decomposer_fault
         + graph_anchor
     )
-    node_rewards["selector"]["reward_raw"] = (
-        0.65 * q_selector
-        + 0.25 * node_rewards["selector"]["downstream_consequence"]
-        + 0.10 * final_anchor_score * selector_fault
+    selector_pre_cap = (
+        0.75 * q_selector
+        - 0.30 * node_rewards["selector"]["downstream_consequence"]
+        - 0.25 * final_failure_severity * selector_fault
         + graph_anchor
     )
 
+    decomposer_cap = positive_cap(0.30, 0.70, 0.05)
+    selector_cap = positive_cap(0.10, 0.90, 0.10)
+    node_rewards["decomposer"]["reward_pre_cap"] = decomposer_pre_cap
+    node_rewards["decomposer"]["positive_cap"] = decomposer_cap
+    node_rewards["decomposer"]["reward_raw"] = apply_positive_cap(decomposer_pre_cap, decomposer_cap)
+    node_rewards["selector"]["reward_pre_cap"] = selector_pre_cap
+    node_rewards["selector"]["positive_cap"] = selector_cap
+    node_rewards["selector"]["reward_raw"] = apply_positive_cap(selector_pre_cap, selector_cap)
+
     for node_id, stats in worker_local.items():
-        final_anchor_term = 0.10 * final_anchor_score * reach_to_final.get(node_id, 0.0) * stats["fault_weight"]
         d_u = downstream_consequence(node_id)
-        reward_raw = 0.65 * stats["quality"] + 0.25 * d_u + final_anchor_term
+        final_worker_penalty = 0.0
+        if node_id == final_worker_id:
+            final_worker_penalty = 0.40 * max(final_badness, final_answer_missing_or_invalid) * (
+                1.0 - 0.50 * stats["protect"]
+            )
+        reward_pre_cap = (
+            0.80 * stats["quality"]
+            - 0.30 * d_u
+            - 0.20 * final_failure_severity * reach_to_final.get(node_id, 0.0) * stats["fault_weight"]
+            - final_worker_penalty
+        )
+        worker_cap = (
+            positive_cap(0.08, 0.92, 0.20)
+            if node_id == final_worker_id
+            else positive_cap(0.25, 0.75, 0.05)
+        )
         node_rewards["workers"][node_id] = {
             "node_id": node_id,
             "quality": stats["quality"],
             "downstream_consequence": d_u,
             "inherited_protection": stats["protect"],
             "fault_weight": stats["fault_weight"],
-            "reward_raw": reward_raw,
+            "final_stage_penalty": final_worker_penalty,
+            "is_final_worker": node_id == final_worker_id,
+            "reward_pre_cap": reward_pre_cap,
+            "positive_cap": worker_cap,
+            "reward_raw": apply_positive_cap(reward_pre_cap, worker_cap),
         }
 
-    final_fault = max(
-        final_scores.get("F_aggregation_error", 0.0),
-        final_scores.get("F_verification_error", 0.0),
+    final_pre_cap = (
+        0.85 * final_quality
+        - 0.35 * final_failure_severity * final_fault
     )
+    final_cap = positive_cap(0.05, 0.95, 0.25)
     node_rewards["final"]["quality"] = final_quality
     node_rewards["final"]["downstream_consequence"] = 0.0
-    node_rewards["final"]["reward_raw"] = (
-        0.75 * final_quality
-        + 0.25 * final_anchor_score * final_fault
-    )
+    node_rewards["final"]["reward_pre_cap"] = final_pre_cap
+    node_rewards["final"]["positive_cap"] = final_cap
+    node_rewards["final"]["reward_raw"] = apply_positive_cap(final_pre_cap, final_cap)
 
     node_rewards["decomposer"]["reward"] = node_rewards["decomposer"]["reward_raw"]
     node_rewards["selector"]["reward"] = node_rewards["selector"]["reward_raw"]
@@ -717,7 +867,10 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
         "graph_summary": {
             "graph_final_correct_score": graph_scores.get("G_final_correct", 0.0),
             "cascade_score": graph_scores.get("G_cascade_present", 0.0),
+            "hierarchy_bypass_score": graph_scores.get("G_hierarchy_bypassed", 0.0),
             "final_anchor_score": final_anchor_score,
+            "final_failure_severity": final_failure_severity,
+            "final_answer_missing_or_invalid_score": final_answer_missing_or_invalid,
         },
     }
 
@@ -725,7 +878,7 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
 def compile_rewards_from_predictions(example: GraphExample, outputs: dict[str, Any]) -> dict[str, Any]:
     def probs_to_scores(logits: Tensor, label_names: tuple[str, ...]) -> dict[str, float]:
         probabilities = torch.softmax(logits, dim=-1)
-        scores = expected_score_from_probs(probabilities).detach().cpu().tolist()
+        scores = centered_score_from_probs(probabilities).detach().cpu().tolist()
         return {name: float(score) for name, score in zip(label_names, scores)}
 
     graph_scores = probs_to_scores(outputs["graph_label_logits"], GRAPH_LABELS)

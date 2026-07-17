@@ -60,11 +60,44 @@ _STRICT_WORKER_RESULT_BLOCK_PATTERN = re.compile(
     r"<worker_result>\s*(.*?)\s*</worker_result>",
     flags=re.DOTALL | re.IGNORECASE,
 )
+_RECOVERABLE_WORKER_RESULT_BLOCK_PATTERNS = tuple(
+    re.compile(
+        rf"<{tag}>\s*(.*?)\s*</{tag}>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    for tag in KNOWN_WORKER_TAGS
+)
 _STRICT_WORKER_OUTPUT_PATTERN = re.compile(
     r"\A\s*(?:<worker_scratchpad>\s*.*?\s*</worker_scratchpad>\s*)?"
     r"<worker_result>\s*.*?\s*</worker_result>\s*\Z",
     flags=re.DOTALL | re.IGNORECASE,
 )
+
+
+def _normalize_worker_result_lines(normalized: str) -> str:
+    nested_worker_tags = {
+        match.group(1).lower()
+        for match in _WORKER_TAG_PATTERN.finditer(normalized)
+    }
+    if nested_worker_tags & _WORKER_ALLOWED_TAGS:
+        return ""
+
+    result_lines: List[str] = []
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        upper_line = line.upper()
+        if upper_line.startswith("OUTPUT_KEY:"):
+            continue
+        if upper_line.startswith("RESULT:"):
+            first_result_line = line.split(":", 1)[1].strip()
+            if first_result_line:
+                result_lines.append(first_result_line)
+            continue
+        result_lines.append(line)
+
+    return "\n".join(result_lines).strip()
 
 def _extract_tagged_content(text: str, tags: tuple[str, ...] = KNOWN_CONTROLLER_TAGS) -> str:
     for tag in tags:
@@ -101,34 +134,12 @@ def extract_worker_result_payload(text: str) -> Dict[str, str] | None:
     result_match = _STRICT_WORKER_RESULT_BLOCK_PATTERN.search(stripped)
     if result_match is None:
         return None
-    normalized = result_match.group(1).strip()
-    nested_worker_tags = {
-        match.group(1).lower()
-        for match in _WORKER_TAG_PATTERN.finditer(normalized)
-    }
-    if nested_worker_tags & _WORKER_ALLOWED_TAGS:
-        return None
-
-    result_lines: List[str] = []
-    for raw_line in normalized.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        upper_line = line.upper()
-        if upper_line.startswith("OUTPUT_KEY:"):
-            continue
-        if upper_line.startswith("RESULT:"):
-            first_result_line = line.split(":", 1)[1].strip()
-            if first_result_line:
-                result_lines.append(first_result_line)
-            continue
-        result_lines.append(line)
-
-    if not result_lines:
+    result_text = _normalize_worker_result_lines(result_match.group(1).strip())
+    if not result_text:
         return None
 
     return {
-        "result_text": "\n".join(result_lines).strip(),
+        "result_text": result_text,
     }
 
 
@@ -141,6 +152,63 @@ def extract_worker_result_text(text: str) -> str:
     if not result_text:
         return ""
     return result_text
+
+
+def recover_worker_result_payload(text: str) -> Dict[str, str] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    payload = extract_worker_result_payload(stripped)
+    if payload is not None:
+        return payload
+
+    tag_names = {match.group(1).lower() for match in _WORKER_TAG_PATTERN.finditer(stripped)}
+    if tag_names and not tag_names.issubset(_WORKER_ALLOWED_TAGS):
+        return None
+
+    for pattern in _RECOVERABLE_WORKER_RESULT_BLOCK_PATTERNS:
+        result_match = pattern.search(stripped)
+        if result_match is None:
+            continue
+        result_text = _normalize_worker_result_lines(result_match.group(1).strip())
+        if result_text:
+            return {
+                "result_text": result_text,
+                "repair_reason": "recovered_worker_result_with_outer_text",
+            }
+
+    open_worker_result_match = re.search(
+        r"<worker_result>\s*(.*)\Z",
+        stripped,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if open_worker_result_match is not None and "</worker_result>" not in stripped.lower():
+        result_text = _normalize_worker_result_lines(open_worker_result_match.group(1).strip())
+        if result_text:
+            return {
+                "result_text": result_text,
+                "repair_reason": "recovered_unclosed_worker_result",
+            }
+
+    if not tag_names:
+        non_empty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        if len(non_empty_lines) == 1:
+            result_text = _normalize_worker_result_lines(non_empty_lines[0])
+            if result_text:
+                return {
+                    "result_text": result_text,
+                    "repair_reason": "recovered_plain_text_final_answer",
+                }
+
+    return None
+
+
+def recover_worker_result_text(text: str) -> str:
+    payload = recover_worker_result_payload(text)
+    if payload is None:
+        return ""
+    return payload["result_text"].strip()
 
 
 def _parse_csv_field(raw_value: Any) -> List[str]:

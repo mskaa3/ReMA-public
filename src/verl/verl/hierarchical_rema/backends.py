@@ -45,6 +45,7 @@ from .structured import (
     extract_decomposition_payload,
     extract_selection_payload,
     format_decomposition_plan,
+    recover_worker_result_payload,
     format_selection_plan,
     salvage_decomposition_payload,
     validate_decomposition_payload,
@@ -94,8 +95,16 @@ def _postprocess_worker_output(
     answer_containment = False
 
     if not normalized_output:
-        invalid_reason = "missing_worker_result"
-        return "", invalid_reason, final_answer_leak, answer_containment, False
+        if node.node_id == decomposition.final_node_id:
+            repaired_payload = recover_worker_result_payload(raw_output_text)
+            if repaired_payload is not None:
+                normalized_output = repaired_payload["result_text"].strip()
+                invalid_reason = str(
+                    repaired_payload.get("repair_reason") or "recovered_worker_result"
+                )
+        if not normalized_output:
+            invalid_reason = "missing_worker_result"
+            return "", invalid_reason, final_answer_leak, answer_containment, False
 
     if "i don't know" in raw_output_text.lower():
         invalid_reason = "explicit_unknown"
