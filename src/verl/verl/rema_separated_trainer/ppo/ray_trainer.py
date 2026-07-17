@@ -757,6 +757,228 @@ class RayReMASeparatedTrainer(object):
         return torch.stack(losses).mean(), pair_count
 
     @staticmethod
+    def _online_prd_implicit_counterfactual_loss(
+        role_scores: torch.Tensor,
+        raw_scores: torch.Tensor,
+        role_features: torch.Tensor,
+        uid_list,
+        *,
+        role_distance_margin: float = 0.05,
+        huber_delta: float = 1.0,
+    ):
+        """Estimate a separate implicit counterfactual baseline per role.
+
+        For each factual rollout and role, other rollouts of the same prompt
+        form a weighted counterfactual baseline. A candidate receives high
+        weight when the target role changed while the remaining roles stayed
+        similar. The predicted role-score effect is regressed toward the
+        resulting role-specific raw-score effect.
+        """
+
+        uid_to_indices = defaultdict(list)
+        for idx, uid in enumerate(uid_list):
+            uid_to_indices[uid].append(idx)
+
+        num_roles = role_scores.shape[1]
+        # Identity flags and role position are constant across rollouts and do
+        # not describe behavioral changes, so exclude the first five fields.
+        dynamic_features = role_features[..., 5:].to(role_scores.device)
+        raw_scores = raw_scores.to(role_scores.device)
+        margin = max(float(role_distance_margin), 0.0)
+        delta = max(float(huber_delta), 1e-6)
+
+        prompt_losses = []
+        target_confidences = []
+        selected_role_distances = []
+        selected_other_distances = []
+        candidate_pair_count = 0
+        matched_pair_count = 0
+        candidate_target_count = 0
+        target_count = 0
+        per_role_pair_count = [0 for _ in range(num_roles)]
+        per_role_weight_sum = [0.0 for _ in range(num_roles)]
+        per_role_target_count = [0 for _ in range(num_roles)]
+        per_role_confidence_sum = [0.0 for _ in range(num_roles)]
+        per_role_target_effect_sum = [0.0 for _ in range(num_roles)]
+        per_role_target_effect_abs_sum = [0.0 for _ in range(num_roles)]
+        target_effects = []
+
+        for indices in uid_to_indices.values():
+            if len(indices) < 2:
+                continue
+            idx_tensor = torch.tensor(indices, dtype=torch.long, device=role_scores.device)
+            group_raw = raw_scores[idx_tensor]
+            if not bool(((group_raw > 0).any() & (group_raw <= 0).any()).item()):
+                continue
+            group_size = int(idx_tensor.numel())
+            candidate_pair_count += group_size * (group_size - 1) * num_roles
+            candidate_target_count += group_size * num_roles
+
+            group_features = dynamic_features[idx_tensor]
+            # [factual, candidate, role]: behavioral distance of each role.
+            role_distances = (
+                group_features.unsqueeze(1) - group_features.unsqueeze(0)
+            ).abs().sum(dim=-1)
+            if num_roles > 1:
+                other_distances = (
+                    role_distances.sum(dim=-1, keepdim=True) - role_distances
+                ) / float(num_roles - 1)
+            else:
+                other_distances = torch.zeros_like(role_distances)
+
+            role_dominance = role_distances / (
+                role_distances + other_distances + 1e-8
+            )
+            other_similarity = 1.0 / (1.0 + other_distances)
+            weights = role_dominance * other_similarity
+            diagonal = torch.eye(
+                group_size,
+                dtype=torch.bool,
+                device=role_scores.device,
+            ).unsqueeze(-1)
+            valid_pairs = (role_distances > margin) & ~diagonal
+            weights = weights * valid_pairs.to(weights.dtype)
+            if not bool(valid_pairs.any().item()):
+                continue
+            matched_pair_count += int(valid_pairs.sum().item())
+
+            weight_sums = weights.sum(dim=1)
+            valid_targets = weight_sums > 1e-8
+            if not bool(valid_targets.any().item()):
+                continue
+            normalized_weights = weights / weight_sums.unsqueeze(1).clamp_min(1e-8)
+
+            # Each (factual rollout, role) gets its own counterfactual outcome
+            # and role-score baseline, averaged over matched candidate rollouts.
+            counterfactual_raw = (
+                normalized_weights * group_raw.view(1, group_size, 1)
+            ).sum(dim=1)
+            group_role_scores = role_scores[idx_tensor]
+            counterfactual_role_scores = (
+                normalized_weights * group_role_scores.unsqueeze(0)
+            ).sum(dim=1)
+            target_effect = group_raw.unsqueeze(-1) - counterfactual_raw
+            predicted_effect = group_role_scores - counterfactual_role_scores
+            target_losses = torch.nn.functional.huber_loss(
+                predicted_effect,
+                target_effect,
+                reduction='none',
+                delta=delta,
+            )
+
+            # The best available match determines confidence, while all valid
+            # candidates contribute to the role-specific baseline.
+            confidence = weights.max(dim=1).values
+            prompt_loss = (
+                target_losses[valid_targets] * confidence[valid_targets]
+            ).sum() / confidence[valid_targets].sum().clamp_min(1e-8)
+            prompt_losses.append(prompt_loss)
+            target_confidences.append(confidence[valid_targets].detach())
+            target_effects.append(target_effect[valid_targets].detach())
+            selected_role_distances.append(role_distances[valid_pairs].detach())
+            selected_other_distances.append(other_distances[valid_pairs].detach())
+            target_count += int(valid_targets.sum().item())
+
+            for role_idx in range(num_roles):
+                role_pair_valid = valid_pairs[..., role_idx]
+                role_pair_count = int(role_pair_valid.sum().item())
+                if role_pair_count > 0:
+                    per_role_pair_count[role_idx] += role_pair_count
+                    per_role_weight_sum[role_idx] += float(
+                        weights[..., role_idx][role_pair_valid].sum().detach().item()
+                    )
+                role_target_valid = valid_targets[..., role_idx]
+                role_target_count = int(role_target_valid.sum().item())
+                if role_target_count > 0:
+                    per_role_target_count[role_idx] += role_target_count
+                    per_role_confidence_sum[role_idx] += float(
+                        confidence[..., role_idx][role_target_valid].sum().detach().item()
+                    )
+                    role_effects = target_effect[..., role_idx][role_target_valid]
+                    per_role_target_effect_sum[role_idx] += float(
+                        role_effects.sum().detach().item()
+                    )
+                    per_role_target_effect_abs_sum[role_idx] += float(
+                        role_effects.abs().sum().detach().item()
+                    )
+
+        if not prompt_losses:
+            return role_scores.sum() * 0.0, {
+                'pair_count': 0,
+                'candidate_pair_count': candidate_pair_count,
+                'pair_coverage': 0.0,
+                'target_count': 0,
+                'candidate_target_count': candidate_target_count,
+                'target_coverage': 0.0,
+                'weight_sum': 0.0,
+                'weight_mean': 0.0,
+                'confidence_mean': 0.0,
+                'target_effect_mean': 0.0,
+                'target_effect_abs_mean': 0.0,
+                'role_distance_mean': 0.0,
+                'other_distance_mean': 0.0,
+                'per_role_pair_count': per_role_pair_count,
+                'per_role_weight_mean': [0.0 for _ in range(num_roles)],
+                'per_role_target_count': per_role_target_count,
+                'per_role_confidence_mean': [0.0 for _ in range(num_roles)],
+                'per_role_target_effect_mean': [0.0 for _ in range(num_roles)],
+                'per_role_target_effect_abs_mean': [0.0 for _ in range(num_roles)],
+            }
+
+        loss = torch.stack(prompt_losses).mean()
+        all_target_confidences = torch.cat(target_confidences)
+        all_target_effects = torch.cat(target_effects)
+        all_role_distances = torch.cat(selected_role_distances)
+        all_other_distances = torch.cat(selected_other_distances)
+        per_role_weight_mean = [
+            per_role_weight_sum[idx] / per_role_pair_count[idx]
+            if per_role_pair_count[idx] > 0 else 0.0
+            for idx in range(num_roles)
+        ]
+        per_role_confidence_mean = [
+            per_role_confidence_sum[idx] / per_role_target_count[idx]
+            if per_role_target_count[idx] > 0 else 0.0
+            for idx in range(num_roles)
+        ]
+        per_role_target_effect_mean = [
+            per_role_target_effect_sum[idx] / per_role_target_count[idx]
+            if per_role_target_count[idx] > 0 else 0.0
+            for idx in range(num_roles)
+        ]
+        per_role_target_effect_abs_mean = [
+            per_role_target_effect_abs_sum[idx] / per_role_target_count[idx]
+            if per_role_target_count[idx] > 0 else 0.0
+            for idx in range(num_roles)
+        ]
+        return loss, {
+            'pair_count': matched_pair_count,
+            'candidate_pair_count': candidate_pair_count,
+            'pair_coverage': (
+                float(matched_pair_count) / float(candidate_pair_count)
+                if candidate_pair_count > 0 else 0.0
+            ),
+            'target_count': target_count,
+            'candidate_target_count': candidate_target_count,
+            'target_coverage': (
+                float(target_count) / float(candidate_target_count)
+                if candidate_target_count > 0 else 0.0
+            ),
+            'weight_sum': float(all_target_confidences.sum().item()),
+            'weight_mean': float(all_target_confidences.mean().item()),
+            'confidence_mean': float(all_target_confidences.mean().item()),
+            'target_effect_mean': float(all_target_effects.mean().item()),
+            'target_effect_abs_mean': float(all_target_effects.abs().mean().item()),
+            'role_distance_mean': float(all_role_distances.mean().item()),
+            'other_distance_mean': float(all_other_distances.mean().item()),
+            'per_role_pair_count': per_role_pair_count,
+            'per_role_weight_mean': per_role_weight_mean,
+            'per_role_target_count': per_role_target_count,
+            'per_role_confidence_mean': per_role_confidence_mean,
+            'per_role_target_effect_mean': per_role_target_effect_mean,
+            'per_role_target_effect_abs_mean': per_role_target_effect_abs_mean,
+        }
+
+    @staticmethod
     def _safe_tensor_std(values: torch.Tensor) -> float:
         if values.numel() <= 1:
             return 0.0
@@ -858,13 +1080,83 @@ class RayReMASeparatedTrainer(object):
                 temperature=float(self.online_prd_config.get('role_rank_temperature', 1.0)),
             )
 
-        if losses or role_rank_loss is not None:
+        implicit_cf_loss = None
+        implicit_cf_stats = None
+        implicit_cf_weight = float(self.online_prd_config.get('implicit_cf_loss_weight', 0.0))
+        if model_type == 'role' and implicit_cf_weight > 0.0:
+            implicit_cf_loss, implicit_cf_stats = self._online_prd_implicit_counterfactual_loss(
+                train_output['role_scores'],
+                raw_scores,
+                role_features,
+                uid_list,
+                role_distance_margin=float(
+                    self.online_prd_config.get('implicit_cf_role_distance_margin', 0.05)
+                ),
+                huber_delta=float(self.online_prd_config.get('implicit_cf_huber_delta', 1.0)),
+            )
+
+        if losses or role_rank_loss is not None or implicit_cf_loss is not None:
             prd_loss = torch.stack(losses).mean() if losses else train_output['role_scores'].sum() * 0.0
             if role_rank_loss is not None:
                 role_rank_weight = float(self.online_prd_config.get('role_rank_loss_weight', 0.0))
                 prd_loss = prd_loss + role_rank_weight * role_rank_loss
                 metrics['reward/prd_online/role_rank_loss'] = float(role_rank_loss.item())
                 metrics['reward/prd_online/role_rank_pair_count'] = role_rank_pair_count
+            if implicit_cf_loss is not None:
+                prd_loss = prd_loss + implicit_cf_weight * implicit_cf_loss
+                metrics['reward/prd_online/implicit_cf_loss'] = float(implicit_cf_loss.item())
+                metrics['reward/prd_online/implicit_cf_pair_count'] = implicit_cf_stats['pair_count']
+                metrics['reward/prd_online/implicit_cf_candidate_pair_count'] = (
+                    implicit_cf_stats['candidate_pair_count']
+                )
+                metrics['reward/prd_online/implicit_cf_pair_coverage'] = (
+                    implicit_cf_stats['pair_coverage']
+                )
+                metrics['reward/prd_online/implicit_cf_target_count'] = (
+                    implicit_cf_stats['target_count']
+                )
+                metrics['reward/prd_online/implicit_cf_candidate_target_count'] = (
+                    implicit_cf_stats['candidate_target_count']
+                )
+                metrics['reward/prd_online/implicit_cf_target_coverage'] = (
+                    implicit_cf_stats['target_coverage']
+                )
+                metrics['reward/prd_online/implicit_cf_weight_sum'] = implicit_cf_stats['weight_sum']
+                metrics['reward/prd_online/implicit_cf_weight_mean'] = implicit_cf_stats['weight_mean']
+                metrics['reward/prd_online/implicit_cf_confidence_mean'] = (
+                    implicit_cf_stats['confidence_mean']
+                )
+                metrics['reward/prd_online/implicit_cf_target_effect_mean'] = (
+                    implicit_cf_stats['target_effect_mean']
+                )
+                metrics['reward/prd_online/implicit_cf_target_effect_abs_mean'] = (
+                    implicit_cf_stats['target_effect_abs_mean']
+                )
+                metrics['reward/prd_online/implicit_cf_role_distance_mean'] = (
+                    implicit_cf_stats['role_distance_mean']
+                )
+                metrics['reward/prd_online/implicit_cf_other_distance_mean'] = (
+                    implicit_cf_stats['other_distance_mean']
+                )
+                for role_idx, role in enumerate(agent_roles):
+                    metrics[f'reward/prd_online/roles/{role}/implicit_cf_pair_count'] = (
+                        implicit_cf_stats['per_role_pair_count'][role_idx]
+                    )
+                    metrics[f'reward/prd_online/roles/{role}/implicit_cf_weight_mean'] = (
+                        implicit_cf_stats['per_role_weight_mean'][role_idx]
+                    )
+                    metrics[f'reward/prd_online/roles/{role}/implicit_cf_target_count'] = (
+                        implicit_cf_stats['per_role_target_count'][role_idx]
+                    )
+                    metrics[f'reward/prd_online/roles/{role}/implicit_cf_confidence_mean'] = (
+                        implicit_cf_stats['per_role_confidence_mean'][role_idx]
+                    )
+                    metrics[f'reward/prd_online/roles/{role}/implicit_cf_target_effect_mean'] = (
+                        implicit_cf_stats['per_role_target_effect_mean'][role_idx]
+                    )
+                    metrics[f'reward/prd_online/roles/{role}/implicit_cf_target_effect_abs_mean'] = (
+                        implicit_cf_stats['per_role_target_effect_abs_mean'][role_idx]
+                    )
             self.online_prd_optimizer.zero_grad(set_to_none=True)
             prd_loss.backward()
             torch.nn.utils.clip_grad_norm_(

@@ -286,10 +286,18 @@ algorithm:
         # Null chooses a safe default: softmax for role router, sigmoid for source composer.
         routing_activation: null
         routing_floor: 0.05
-        role_rank_loss_weight: 0.2
+        # Legacy activity-only ranking. Keep disabled when matched implicit
+        # counterfactual supervision is active.
+        role_rank_loss_weight: 0.0
         role_activity_margin: 0.05
         role_rank_temperature: 1.0
-        warmup_steps: 200
+        # Build a separate matched counterfactual baseline for every rollout
+        # and role, then regress the role-score effect toward its role-specific
+        # raw-score effect.
+        implicit_cf_loss_weight: 1.0
+        implicit_cf_role_distance_margin: 0.05
+        implicit_cf_huber_delta: 1.0
+        warmup_steps: 150
         blend_alpha: 0.05
         blend_alpha_max: 0.05
         blend_ramp_steps: 200
