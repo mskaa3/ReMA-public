@@ -278,6 +278,92 @@ def test_worker_training_skips_samples_from_fallback_decompositions() -> None:
     assert training_batch.worker_grpo_stats["num_worker_samples_skipped_fallback"] == 1
 
 
+def test_worker_training_skips_non_final_leaked_samples_only() -> None:
+    trainer = HierarchicalGRPOTrainer(
+        train_worker_model=True,
+        min_worker_grpo_group_size=1,
+    )
+    task = make_task("trigonometry", "Compute tan 420 degrees.", "\\sqrt{3}", "0")
+    worker_pool = make_worker_pool()
+    worker_id = worker_pool.workers[0].worker_id
+
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="two-step solve",
+        target_quantity="tan 420 degrees",
+        final_answer_format_hint="exact value",
+        nodes=[
+            SubtaskNode(
+                node_id="1",
+                instruction="Reduce the angle and compute the value.",
+                output_key="1_output",
+            ),
+            SubtaskNode(
+                node_id="2",
+                instruction="Return the final answer.",
+                dependencies=["1"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+    )
+    selection_rollout = SelectionRollout(
+        selection=SelectionCandidate(selection_id="sel-1", assignments=[]),
+        executions=[
+            WorkerExecution(
+                node_id="1",
+                worker_id=worker_id,
+                output_text=REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
+                raw_output_text="<worker_result>$\\sqrt{3}$</worker_result>",
+                worker_prompt="Compute the reduced angle value.",
+                entropy=0.0,
+                confidence_reward=0.0,
+                compatibility=0.0,
+                final_answer_leak=True,
+                invalid_reason="non_final_contains_ground_truth",
+            ),
+            WorkerExecution(
+                node_id="2",
+                worker_id=worker_id,
+                output_text="$\\sqrt{3}$",
+                raw_output_text="<worker_result>$\\sqrt{3}$</worker_result>",
+                worker_prompt="Return the final answer.",
+                entropy=0.0,
+                confidence_reward=0.0,
+                compatibility=0.0,
+            ),
+        ],
+        final_answer="$\\sqrt{3}$",
+        reward=SelectionRewardBreakdown(
+            final_answer_correctness=1.0,
+            confidence_reward=0.0,
+            compatibility_reward=0.0,
+            total_reward=1.0,
+        ),
+    )
+    decomposition.raw_payload["controller_prompt"] = "Decompose the task."
+    selection_rollout.selection.raw_payload["controller_prompt"] = "Assign workers."
+    decomposition_rollout = DecompositionRollout(
+        decomposition=decomposition,
+        selections=[selection_rollout],
+        base_decomposition_reward=1.0,
+        decomposition_reward=1.0,
+    )
+
+    training_batch = trainer.orchestrator._build_training_batch(
+        task=task,
+        worker_pool=worker_pool,
+        policy_config=ControllerPolicyConfig(parameter_sharing=False),
+        schedule=TrainingScheduleConfig(mode=TrainingMode.JOINT),
+        decompositions=[decomposition_rollout],
+    )
+
+    assert training_batch.worker_grpo_stats["num_worker_samples_skipped_final_answer_leak"] == 1
+    assert len(training_batch.worker_samples) == 1
+    assert training_batch.worker_samples[0].metadata["node_id"] == "2"
+    assert training_batch.worker_samples[0].metadata["final_answer_leak"] is False
+
+
 def test_worker_grpo_groups_do_not_cross_decomposition_boundaries() -> None:
     trainer = HierarchicalGRPOTrainer(
         train_worker_model=True,

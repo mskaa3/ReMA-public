@@ -802,6 +802,7 @@ class HierarchicalReMAOrchestrator:
             "num_samples_skipped": 0,
             "num_decompositions_skipped_fallback": 0,
             "num_worker_samples_skipped_fallback": 0,
+            "num_worker_samples_skipped_final_answer_leak": 0,
             "mean_group_size_used": 0.0,
         }
 
@@ -927,6 +928,12 @@ class HierarchicalReMAOrchestrator:
                 node_map = decomposition_rollout.decomposition.nodes_by_id()
                 for selection_rollout in decomposition_rollout.selections:
                     for execution in selection_rollout.executions:
+                        if (
+                            execution.final_answer_leak
+                            and execution.node_id != decomposition_rollout.decomposition.final_node_id
+                        ):
+                            worker_grpo_stats["num_worker_samples_skipped_final_answer_leak"] += 1
+                            continue
                         prompt_text = str(execution.worker_prompt or "").strip()
                         completion_text = str(execution.raw_output_text or "").strip()
                         if not prompt_text or not completion_text:
