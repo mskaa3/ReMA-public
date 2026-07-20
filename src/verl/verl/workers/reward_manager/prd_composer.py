@@ -494,16 +494,20 @@ class RolePRDCreditRouter(nn.Module):
         hidden_dim: int = 128,
         routing_activation: str = "softmax",
         routing_floor: float = 0.0,
+        score_activation: str = "identity",
     ) -> None:
         super().__init__()
         if routing_activation not in {"sigmoid", "softmax"}:
             raise ValueError(f"Unsupported routing activation: {routing_activation}")
+        if score_activation not in {"identity", "tanh"}:
+            raise ValueError(f"Unsupported score activation: {score_activation}")
         if not 0.0 <= float(routing_floor) < 1.0:
             raise ValueError(f"routing_floor must be in [0, 1), got {routing_floor}")
         self.role_feature_dim = int(role_feature_dim)
         self.hidden_dim = int(hidden_dim)
         self.routing_activation = routing_activation
         self.routing_floor = float(routing_floor)
+        self.score_activation = score_activation
 
         self.role_encoder = nn.Sequential(
             nn.Linear(self.role_feature_dim, hidden_dim),
@@ -562,6 +566,8 @@ class RolePRDCreditRouter(nn.Module):
 
         context = torch.matmul(routing, v)
         role_scores = self.score_head(torch.cat([hidden, context], dim=-1)).squeeze(-1)
+        if self.score_activation == "tanh":
+            role_scores = torch.tanh(role_scores)
         return {"role_scores": role_scores, "routing": routing, "routing_logits": routing_logits}
 
     def checkpoint_payload(
@@ -576,6 +582,7 @@ class RolePRDCreditRouter(nn.Module):
             "hidden_dim": self.hidden_dim,
             "routing_activation": self.routing_activation,
             "routing_floor": self.routing_floor,
+            "score_activation": self.score_activation,
             "role_feature_names": list(role_feature_names),
         }
 
@@ -587,6 +594,7 @@ class RolePRDCreditRouter(nn.Module):
             hidden_dim=int(payload.get("hidden_dim", 128)),
             routing_activation=str(payload.get("routing_activation", "softmax")),
             routing_floor=float(payload.get("routing_floor", 0.0)),
+            score_activation=str(payload.get("score_activation", "identity")),
         )
         model.load_state_dict(payload["state_dict"])
         return model

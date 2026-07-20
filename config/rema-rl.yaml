@@ -305,6 +305,9 @@ algorithm:
         # "source" keeps the original source-to-role composer.
         # "role" uses the experimental role-to-role credit router.
         model_type: role
+        # CPCR is the sole teacher. Reliable labels are replayed to amortize
+        # expensive full-suffix scoring; global correctness ranking is diagnostic.
+        training_objective: cpcr_replay
         init_checkpoint_path: null
         lr: 3.0e-4
         weight_decay: 0.0
@@ -314,15 +317,16 @@ algorithm:
         # Null chooses a safe default: softmax for role router, sigmoid for source composer.
         routing_activation: null
         routing_floor: 0.05
+        # A binary global reward gives CPCR advantages in [-1, 1].
+        score_activation: tanh
         # Legacy activity-only ranking. Keep disabled when matched implicit
         # counterfactual supervision is active.
         role_rank_loss_weight: 0.0
         role_activity_margin: 0.05
         role_rank_temperature: 1.0
-        # Build a separate matched counterfactual baseline for every rollout
-        # and role, then regress the role-score effect toward its role-specific
-        # raw-score effect.
-        implicit_cf_loss_weight: 1.0
+        # Legacy feature-distance counterfactual objective, retained only for
+        # ablations. The cpcr_replay objective does not execute this branch.
+        implicit_cf_loss_weight: 0.0
         implicit_cf_role_distance_margin: 0.05
         implicit_cf_huber_delta: 1.0
         warmup_steps: 150
@@ -331,8 +335,19 @@ algorithm:
         blend_ramp_steps: 200
         min_group_size: 2
         mixed_groups_only: True
-        sync_interval: 50
+        # Update the lagged reward network after every PRD optimizer step.
+        sync_interval: 1
         ema_beta: 0.9
+        cpcr_replay:
+          capacity: 8192
+          max_age_steps: 500
+          batch_size: 256
+          min_train_size: 64
+          min_size_for_blend: 64
+          validation_fraction: 0.1
+          validation_min_size: 32
+          validation_batch_size: 512
+          balance_roles: True
         grad_clip: 1.0
         use_manual_role_features: False
         graph_prior_mode: soft

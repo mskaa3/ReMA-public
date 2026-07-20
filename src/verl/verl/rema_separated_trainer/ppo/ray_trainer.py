@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import pdb
 import copy
 import os
+import zlib
 from pathlib import Path
 import uuid
 import jsonlines
@@ -28,7 +29,7 @@ from enum import Enum
 from pprint import pprint
 from typing import Optional, Type, Dict
 from copy import deepcopy
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import ray
 import numpy as np
@@ -1136,6 +1137,7 @@ class RayReMASeparatedTrainer(object):
             )
             role_advantages = torch.zeros_like(raw_scores)
             role_valid = torch.zeros_like(raw_scores, dtype=torch.bool)
+            role_ess = torch.zeros_like(raw_scores)
             baselines = []
             advantages = []
             ess_values = []
@@ -1158,6 +1160,7 @@ class RayReMASeparatedTrainer(object):
                 if not use_fallback_targets:
                     reliable_mask = reliable_mask & ~estimate.fallback_mask
                 role_advantages[idx_tensor] = estimate.advantage
+                role_ess[idx_tensor] = estimate.effective_sample_size
                 role_valid[idx_tensor] = reliable_mask
                 supported = estimate.valid_target_mask
                 if supported.any():
@@ -1210,6 +1213,7 @@ class RayReMASeparatedTrainer(object):
             targets[role] = {
                 'advantage': role_advantages,
                 'valid_mask': role_valid,
+                'effective_sample_size': role_ess,
             }
 
         if total_scored_pairs > 0:
@@ -1230,6 +1234,18 @@ class RayReMASeparatedTrainer(object):
         self.online_prd_train = None
         self.online_prd_active = None
         self.online_prd_optimizer = None
+        self.online_prd_training_objective = str(
+            online_config.get('training_objective', 'group_ranking')
+        )
+        if self.online_prd_training_objective not in {'group_ranking', 'cpcr_replay'}:
+            raise ValueError(
+                f'Unsupported online PRD training objective: '
+                f'{self.online_prd_training_objective}'
+            )
+        self.online_prd_replay_config = dict(online_config.get('cpcr_replay', {}))
+        replay_capacity = int(self.online_prd_replay_config.get('capacity', 8192))
+        self.online_prd_cpcr_train_buffer = deque(maxlen=max(replay_capacity, 1))
+        self.online_prd_cpcr_validation_buffer = deque(maxlen=max(replay_capacity, 1))
         if not self.online_prd_enabled:
             return
 
@@ -1243,9 +1259,22 @@ class RayReMASeparatedTrainer(object):
             or ('softmax' if self.online_prd_model_type == 'role' else 'sigmoid')
         )
         routing_floor = float(online_config.get('routing_floor', 0.0))
+        score_activation = str(online_config.get('score_activation', 'identity'))
+        if self.online_prd_training_objective == 'cpcr_replay':
+            if self.online_prd_model_type != 'role':
+                raise ValueError("training_objective='cpcr_replay' requires model_type='role'")
+            hierarchy_config = self.config.algorithm.get('hierarchy', {})
+            cpcr_config = hierarchy_config.get('cpcr', {}) if hierarchy_config else {}
+            if not bool(cpcr_config.get('enable', False)) or str(
+                cpcr_config.get('mode', 'diagnostic')
+            ) != 'prd_target':
+                raise ValueError(
+                    "training_objective='cpcr_replay' requires CPCR mode='prd_target'"
+                )
         init_checkpoint_path = online_config.get('init_checkpoint_path')
         if init_checkpoint_path and self.online_prd_model_type == 'role':
             self.online_prd_train = RolePRDCreditRouter.from_checkpoint(init_checkpoint_path, map_location='cpu')
+            self.online_prd_train.score_activation = score_activation
         elif init_checkpoint_path:
             self.online_prd_train = PRDRewardComposer.from_checkpoint(init_checkpoint_path, map_location='cpu')
         elif self.online_prd_model_type == 'role':
@@ -1254,6 +1283,7 @@ class RayReMASeparatedTrainer(object):
                 hidden_dim=hidden_dim,
                 routing_activation=routing_activation,
                 routing_floor=routing_floor,
+                score_activation=score_activation,
             )
         else:
             self.online_prd_train = PRDRewardComposer(
@@ -1289,16 +1319,17 @@ class RayReMASeparatedTrainer(object):
 
     def _sync_online_prd_active(self):
         if not self.online_prd_enabled or self.online_prd_active is None:
-            return
-        sync_interval = int(self.online_prd_config.get('sync_interval', 50))
+            return False
+        sync_interval = int(self.online_prd_config.get('sync_interval', 1))
         if sync_interval <= 0 or self.global_steps % sync_interval != 0:
-            return
+            return False
         ema_beta = float(self.online_prd_config.get('ema_beta', 0.0))
         with torch.no_grad():
             active_state = self.online_prd_active.state_dict()
             train_state = self.online_prd_train.state_dict()
             for name, active_tensor in active_state.items():
                 active_tensor.copy_(ema_beta * active_tensor + (1.0 - ema_beta) * train_state[name])
+        return True
 
     @staticmethod
     def _reward_scalar(reward_tensor_map: Dict[str, torch.Tensor], name: str, batch_idx: int, default: float = 0.0) -> float:
@@ -1791,6 +1822,227 @@ class RayReMASeparatedTrainer(object):
         return correct / total
 
     @staticmethod
+    def _cpcr_replay_is_validation(problem_key, validation_fraction):
+        if validation_fraction <= 0.0:
+            return False
+        if validation_fraction >= 1.0:
+            return True
+        # Keep every role, rollout, and round for one problem in one split.
+        split_key = str(problem_key).encode('utf-8')
+        split_value = zlib.crc32(split_key) / float(2**32)
+        return split_value < validation_fraction
+
+    def _append_online_prd_cpcr_records(
+        self,
+        cpcr_targets,
+        role_features,
+        problem_keys,
+        agent_roles,
+    ):
+        """Store reliable CPCR labels for amortized, role-local supervision."""
+
+        validation_fraction = float(
+            self.online_prd_replay_config.get('validation_fraction', 0.1)
+        )
+        added_train = 0
+        added_validation = 0
+        per_role_added = defaultdict(int)
+        for role, target_data in cpcr_targets.items():
+            if role not in agent_roles:
+                continue
+            role_idx = agent_roles.index(role)
+            valid_mask = target_data['valid_mask'].bool()
+            advantages = target_data['advantage'].float()
+            ess_values = target_data.get(
+                'effective_sample_size',
+                torch.zeros_like(advantages),
+            ).float()
+            for sample_idx in torch.where(valid_mask)[0].tolist():
+                target_value = float(advantages[sample_idx].item())
+                if not -1.0001 <= target_value <= 1.0001:
+                    raise ValueError(
+                        f'CPCR advantage outside [-1, 1]: role={role}, value={target_value}'
+                    )
+                record = {
+                    'role_features': role_features[sample_idx].detach().cpu().float().clone(),
+                    'role_idx': role_idx,
+                    'role': role,
+                    'target': max(-1.0, min(1.0, target_value)),
+                    'ess': float(ess_values[sample_idx].item()),
+                    'step': int(getattr(self, 'global_steps', 0)),
+                }
+                if self._cpcr_replay_is_validation(
+                    problem_keys[sample_idx],
+                    validation_fraction,
+                ):
+                    self.online_prd_cpcr_validation_buffer.append(record)
+                    added_validation += 1
+                else:
+                    self.online_prd_cpcr_train_buffer.append(record)
+                    added_train += 1
+                per_role_added[role] += 1
+        return {
+            'train': added_train,
+            'validation': added_validation,
+            'per_role': dict(per_role_added),
+        }
+
+    @staticmethod
+    def _sample_cpcr_replay_records(records, batch_size, seed, balance_roles=True):
+        records = list(records)
+        if not records or batch_size <= 0:
+            return []
+        if len(records) <= batch_size:
+            return records
+
+        rng = np.random.default_rng(seed)
+        if not balance_roles:
+            indices = rng.choice(len(records), size=batch_size, replace=False)
+            return [records[int(idx)] for idx in indices]
+
+        indices_by_role = defaultdict(list)
+        for idx, record in enumerate(records):
+            indices_by_role[int(record['role_idx'])].append(idx)
+        selected = []
+        selected_set = set()
+        per_role_quota = max(batch_size // max(len(indices_by_role), 1), 1)
+        for role_idx in sorted(indices_by_role):
+            role_indices = indices_by_role[role_idx]
+            take = min(per_role_quota, len(role_indices), batch_size - len(selected))
+            if take <= 0:
+                break
+            chosen = rng.choice(role_indices, size=take, replace=False).tolist()
+            selected.extend(int(idx) for idx in chosen)
+            selected_set.update(int(idx) for idx in chosen)
+
+        if len(selected) < batch_size:
+            remaining = [idx for idx in range(len(records)) if idx not in selected_set]
+            take = min(batch_size - len(selected), len(remaining))
+            if take > 0:
+                selected.extend(
+                    int(idx)
+                    for idx in rng.choice(remaining, size=take, replace=False).tolist()
+                )
+        return [records[idx] for idx in selected]
+
+    @staticmethod
+    def _online_prd_cpcr_replay_loss(
+        model,
+        records,
+        agent_roles,
+        routing_bias,
+        routing_mask,
+        *,
+        huber_delta=1.0,
+    ):
+        if not records:
+            return None, {}
+        device = next(model.parameters()).device
+        role_features = torch.stack(
+            [record['role_features'] for record in records],
+            dim=0,
+        ).to(device)
+        role_indices = torch.tensor(
+            [record['role_idx'] for record in records],
+            dtype=torch.long,
+            device=device,
+        )
+        targets = torch.tensor(
+            [record['target'] for record in records],
+            dtype=role_features.dtype,
+            device=device,
+        )
+        output = model(
+            role_features,
+            attention_bias=routing_bias,
+            attention_mask=routing_mask,
+        )
+        row_indices = torch.arange(len(records), device=device)
+        predictions = output['role_scores'][row_indices, role_indices]
+        delta = max(float(huber_delta), 1e-6)
+        loss = torch.nn.functional.huber_loss(
+            predictions,
+            targets,
+            reduction='mean',
+            delta=delta,
+        )
+
+        detached_predictions = predictions.detach().float()
+        detached_targets = targets.detach().float()
+        errors = detached_predictions - detached_targets
+        pred_centered = detached_predictions - detached_predictions.mean()
+        target_centered = detached_targets - detached_targets.mean()
+        corr_denom = torch.sqrt(
+            pred_centered.square().sum() * target_centered.square().sum()
+        )
+        correlation = (
+            float((pred_centered * target_centered).sum().item() / corr_denom.item())
+            if float(corr_denom.item()) > 1e-12 else 0.0
+        )
+        nonzero_targets = detached_targets.abs() > 1e-6
+        sign_accuracy = (
+            float(
+                (
+                    torch.sign(detached_predictions[nonzero_targets])
+                    == torch.sign(detached_targets[nonzero_targets])
+                ).float().mean().item()
+            )
+            if bool(nonzero_targets.any().item()) else 0.0
+        )
+        stats = {
+            'count': len(records),
+            'loss': float(loss.detach().item()),
+            'mae': float(errors.abs().mean().item()),
+            'rmse': float(torch.sqrt(errors.square().mean()).item()),
+            'correlation': correlation,
+            'sign_accuracy': sign_accuracy,
+            'prediction_mean': float(detached_predictions.mean().item()),
+            'prediction_std': RayReMASeparatedTrainer._safe_tensor_std(detached_predictions),
+            'target_mean': float(detached_targets.mean().item()),
+            'target_std': RayReMASeparatedTrainer._safe_tensor_std(detached_targets),
+            'ess_mean': float(np.mean([record['ess'] for record in records])),
+            'per_role': {},
+        }
+        for role_idx, role in enumerate(agent_roles):
+            mask = role_indices == role_idx
+            if not bool(mask.any().item()):
+                continue
+            role_predictions = detached_predictions[mask]
+            role_targets = detached_targets[mask]
+            role_errors = role_predictions - role_targets
+            role_pred_centered = role_predictions - role_predictions.mean()
+            role_target_centered = role_targets - role_targets.mean()
+            role_corr_denom = torch.sqrt(
+                role_pred_centered.square().sum()
+                * role_target_centered.square().sum()
+            )
+            role_nonzero = role_targets.abs() > 1e-6
+            stats['per_role'][role] = {
+                'count': int(mask.sum().item()),
+                'mae': float(role_errors.abs().mean().item()),
+                'rmse': float(torch.sqrt(role_errors.square().mean()).item()),
+                'correlation': (
+                    float(
+                        (role_pred_centered * role_target_centered).sum().item()
+                        / role_corr_denom.item()
+                    )
+                    if float(role_corr_denom.item()) > 1e-12 else 0.0
+                ),
+                'sign_accuracy': (
+                    float(
+                        (
+                            torch.sign(role_predictions[role_nonzero])
+                            == torch.sign(role_targets[role_nonzero])
+                        ).float().mean().item()
+                    )
+                    if bool(role_nonzero.any().item()) else 0.0
+                ),
+                'prediction_mean': float(role_predictions.mean().item()),
+                'target_mean': float(role_targets.mean().item()),
+            }
+        return loss, stats
+
+    @staticmethod
     def _online_prd_cpcr_supervision_loss(
         role_scores,
         cpcr_targets,
@@ -1800,7 +2052,7 @@ class RayReMASeparatedTrainer(object):
         *,
         huber_delta=1.0,
     ):
-        """Fit group-centered PRD role scores to CPCR role advantages."""
+        """Fit PRD role scores to absolute CPCR role advantages."""
 
         boundary_to_indices = defaultdict(list)
         for idx, (uid, turn_count) in enumerate(zip(uid_list, turn_counts)):
@@ -1827,13 +2079,9 @@ class RayReMASeparatedTrainer(object):
                 valid_indices = idx_tensor[group_valid]
                 predicted = role_scores[valid_indices, role_idx]
                 target_values = target_advantage[valid_indices]
-                target_values = target_values - target_values.mean()
                 if float(target_values.abs().max().item()) <= 1e-8:
                     no_contrast_group_count += 1
                     continue
-                # CPCR advantages are zero-centered within a decision boundary.
-                # Regressing the absolute prediction to that target also fixes
-                # the otherwise unidentified score offset left by ranking loss.
                 role_losses.append(torch.nn.functional.huber_loss(
                     predicted,
                     target_values,
@@ -1863,6 +2111,289 @@ class RayReMASeparatedTrainer(object):
             return None, role_stats
         return torch.stack(losses).mean(), role_stats
 
+    def _apply_online_prd_cpcr_replay_rewards(
+        self,
+        data_batch,
+        reward_tensor_map,
+        metrics,
+        cpcr_targets,
+        prd_batch,
+    ):
+        """Train a lagged PRD model only from reliable full-suffix CPCR labels."""
+
+        role_features = prd_batch['role_features']
+        agent_roles = prd_batch['agent_roles']
+        routing_bias, routing_mask = prd_batch['graph_prior']
+        raw_scores = reward_tensor_map['acc'].float()
+        uid_list = list(data_batch.non_tensor_batch['uid'])
+        problem_keys = list(
+            data_batch.non_tensor_batch.get('question', uid_list)
+        )
+        turn_counts = list(data_batch.non_tensor_batch['num_turns'])
+
+        max_age_steps = int(self.online_prd_replay_config.get('max_age_steps', 500))
+        if max_age_steps > 0:
+            oldest_allowed_step = int(getattr(self, 'global_steps', 0)) - max_age_steps
+            for replay_buffer in (
+                self.online_prd_cpcr_train_buffer,
+                self.online_prd_cpcr_validation_buffer,
+            ):
+                while replay_buffer and int(replay_buffer[0]['step']) < oldest_allowed_step:
+                    replay_buffer.popleft()
+
+        added = self._append_online_prd_cpcr_records(
+            cpcr_targets or {},
+            role_features,
+            problem_keys,
+            agent_roles,
+        )
+        replay_prefix = 'reward/prd_online/cpcr_replay'
+        metrics['reward/prd_online/training_objective_id'] = 1.0
+        metrics['reward/prd_online/group_ranking_effective_weight'] = 0.0
+        metrics['reward/prd_online/implicit_cf_effective_weight'] = 0.0
+        metrics['reward/prd_online/cpcr_supervision_configured'] = 1.0
+        metrics[f'{replay_prefix}/added_train_count'] = float(added['train'])
+        metrics[f'{replay_prefix}/added_validation_count'] = float(added['validation'])
+        metrics[f'{replay_prefix}/train_buffer_size'] = float(
+            len(self.online_prd_cpcr_train_buffer)
+        )
+        metrics[f'{replay_prefix}/validation_buffer_size'] = float(
+            len(self.online_prd_cpcr_validation_buffer)
+        )
+        for role in agent_roles:
+            metrics[f'{replay_prefix}/roles/{role}/added_count'] = float(
+                added['per_role'].get(role, 0)
+            )
+            metrics[f'{replay_prefix}/roles/{role}/train_buffer_count'] = float(
+                sum(record['role'] == role for record in self.online_prd_cpcr_train_buffer)
+            )
+            metrics[f'{replay_prefix}/roles/{role}/validation_buffer_count'] = float(
+                sum(record['role'] == role for record in self.online_prd_cpcr_validation_buffer)
+            )
+
+        min_train_size = int(self.online_prd_replay_config.get('min_train_size', 64))
+        replay_batch_size = int(self.online_prd_replay_config.get('batch_size', 256))
+        balance_roles = bool(self.online_prd_replay_config.get('balance_roles', True))
+        train_records = []
+        if len(self.online_prd_cpcr_train_buffer) >= min_train_size:
+            train_records = self._sample_cpcr_replay_records(
+                self.online_prd_cpcr_train_buffer,
+                replay_batch_size,
+                seed=int(getattr(self, 'global_steps', 0)) * 1_000_003 + 29,
+                balance_roles=balance_roles,
+            )
+
+        prd_updated = False
+        train_replay_stats = {}
+        if train_records:
+            self.online_prd_train.train()
+            replay_loss, train_replay_stats = self._online_prd_cpcr_replay_loss(
+                self.online_prd_train,
+                train_records,
+                agent_roles,
+                routing_bias,
+                routing_mask,
+                huber_delta=float(self.cpcr_config.get('prd_huber_delta', 1.0)),
+            )
+            self.online_prd_optimizer.zero_grad(set_to_none=True)
+            replay_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.online_prd_train.parameters(),
+                float(self.online_prd_config.get('grad_clip', 1.0)),
+            )
+            self.online_prd_optimizer.step()
+            prd_updated = True
+            metrics['reward/prd_online/loss'] = float(replay_loss.detach().item())
+            metrics['reward/prd_online/cpcr_supervision_loss'] = float(
+                replay_loss.detach().item()
+            )
+        else:
+            metrics['reward/prd_online/loss'] = 0.0
+        metrics['reward/prd_online/cpcr_supervision_active'] = float(prd_updated)
+        metrics[f'{replay_prefix}/train_batch_size'] = float(len(train_records))
+        metrics[f'{replay_prefix}/optimizer_step'] = float(prd_updated)
+        for name, value in train_replay_stats.items():
+            if name == 'per_role':
+                continue
+            metrics[f'{replay_prefix}/train/{name}'] = float(value)
+        for role, role_stats in train_replay_stats.get('per_role', {}).items():
+            for name, value in role_stats.items():
+                metrics[f'{replay_prefix}/train/roles/{role}/{name}'] = float(value)
+
+        validation_min_size = int(
+            self.online_prd_replay_config.get('validation_min_size', 32)
+        )
+        validation_batch_size = int(
+            self.online_prd_replay_config.get('validation_batch_size', 512)
+        )
+        validation_records = []
+        if len(self.online_prd_cpcr_validation_buffer) >= validation_min_size:
+            validation_records = self._sample_cpcr_replay_records(
+                self.online_prd_cpcr_validation_buffer,
+                validation_batch_size,
+                seed=int(getattr(self, 'global_steps', 0)) * 1_000_003 + 43,
+                balance_roles=balance_roles,
+            )
+        validation_stats = {}
+        if validation_records:
+            self.online_prd_active.eval()
+            with torch.no_grad():
+                _, validation_stats = self._online_prd_cpcr_replay_loss(
+                    self.online_prd_active,
+                    validation_records,
+                    agent_roles,
+                    routing_bias,
+                    routing_mask,
+                    huber_delta=float(self.cpcr_config.get('prd_huber_delta', 1.0)),
+                )
+        metrics[f'{replay_prefix}/validation_batch_size'] = float(len(validation_records))
+        for name, value in validation_stats.items():
+            if name == 'per_role':
+                continue
+            metrics[f'{replay_prefix}/validation/{name}'] = float(value)
+        for role, role_stats in validation_stats.get('per_role', {}).items():
+            for name, value in role_stats.items():
+                metrics[f'{replay_prefix}/validation/roles/{role}/{name}'] = float(value)
+
+        # Log current-batch predictions diagnostically. They do not contribute
+        # to the replay-only loss above.
+        self.online_prd_train.eval()
+        with torch.no_grad():
+            train_output = self.online_prd_train(
+                role_features,
+                attention_bias=routing_bias,
+                attention_mask=routing_mask,
+            )
+        train_role_scores = train_output['role_scores'].detach()
+        train_rollout_scores = train_role_scores.sum(dim=1)
+        train_routing = train_output['routing'].detach()
+        metrics['reward/prd_online/model_type_id'] = 1.0
+        metrics['reward/prd_online/graph_prior_mode_id'] = {
+            'none': 0.0,
+            'soft': 1.0,
+            'hard': 2.0,
+        }.get(str(self.online_prd_config.get('graph_prior_mode', 'none')), -1.0)
+        if routing_bias is not None:
+            metrics['reward/prd_online/graph_prior_bias_mean'] = float(
+                routing_bias.float().mean().item()
+            )
+            metrics['reward/prd_online/graph_prior_bias_std'] = self._safe_tensor_std(
+                routing_bias.float()
+            )
+        if routing_mask is not None:
+            metrics['reward/prd_online/graph_prior_mask_mean'] = float(
+                routing_mask.float().mean().item()
+            )
+        metrics['reward/prd_online/train_routing_mean'] = float(train_routing.mean().item())
+        metrics['reward/prd_online/train_routing_std'] = self._safe_tensor_std(train_routing)
+        metrics['reward/prd_online/train_rollout_score_mean'] = float(
+            train_rollout_scores.mean().item()
+        )
+        metrics['reward/prd_online/train_rollout_score_std'] = self._safe_tensor_std(
+            train_rollout_scores
+        )
+        metrics['reward/prd_online/train_role_score_mean'] = float(
+            train_role_scores.mean().item()
+        )
+        metrics['reward/prd_online/train_role_score_std'] = self._safe_tensor_std(
+            train_role_scores
+        )
+        top1_acc = self._safe_group_top1_accuracy(uid_list, train_rollout_scores, raw_scores)
+        if top1_acc is not None:
+            metrics['reward/prd_online/train_group_top1_acc'] = top1_acc
+        for role_idx, role in enumerate(agent_roles):
+            metrics[f'reward/prd_online/roles/{role}/train_score_mean'] = float(
+                train_role_scores[:, role_idx].mean().item()
+            )
+            metrics[f'reward/prd_online/roles/{role}/train_score_std'] = self._safe_tensor_std(
+                train_role_scores[:, role_idx]
+            )
+
+        configured_alpha = self._get_online_prd_alpha()
+        blend_ready = len(self.online_prd_cpcr_train_buffer) >= int(
+            self.online_prd_replay_config.get('min_size_for_blend', min_train_size)
+        )
+        alpha = configured_alpha if blend_ready else 0.0
+        metrics['reward/prd_online/configured_blend_alpha'] = configured_alpha
+        metrics['reward/prd_online/blend_ready'] = float(blend_ready)
+        metrics['reward/prd_online/blend_alpha'] = alpha
+
+        if alpha > 0.0:
+            self.online_prd_active.eval()
+            with torch.no_grad():
+                active_output = self.online_prd_active(
+                    role_features,
+                    attention_bias=routing_bias,
+                    attention_mask=routing_mask,
+                )
+            prd_role_scores = active_output['role_scores']
+            active_routing = active_output['routing']
+            active_rollout_scores = prd_role_scores.sum(dim=1)
+            metrics['reward/prd_online/active_routing_mean'] = float(
+                active_routing.mean().item()
+            )
+            metrics['reward/prd_online/active_routing_std'] = self._safe_tensor_std(
+                active_routing
+            )
+            metrics['reward/prd_online/active_role_score_mean'] = float(
+                prd_role_scores.mean().item()
+            )
+            metrics['reward/prd_online/active_role_score_std'] = self._safe_tensor_std(
+                prd_role_scores
+            )
+            metrics['reward/prd_online/active_rollout_score_mean'] = float(
+                active_rollout_scores.mean().item()
+            )
+            metrics['reward/prd_online/active_rollout_score_std'] = self._safe_tensor_std(
+                active_rollout_scores
+            )
+
+            last_turn_indices = torch.tensor(
+                [max(int(num_turn) - 1, 0) for num_turn in turn_counts],
+                dtype=torch.long,
+            )
+            for role_idx, role in enumerate(agent_roles):
+                key = f'{role}_turn_level_reward'
+                if key not in reward_tensor_map:
+                    continue
+                reward_tensor = reward_tensor_map[key].clone()
+                batch_indices = torch.arange(reward_tensor.shape[0], dtype=torch.long)
+                turn_indices = last_turn_indices.to(reward_tensor.device)
+                batch_indices_device = batch_indices.to(reward_tensor.device)
+                manual_scores = reward_tensor[
+                    batch_indices_device,
+                    turn_indices,
+                ].detach()
+                prd_scores = prd_role_scores[:, role_idx].to(
+                    device=reward_tensor.device,
+                    dtype=reward_tensor.dtype,
+                )
+                blended_scores = (1.0 - alpha) * manual_scores + alpha * prd_scores
+                reward_tensor[batch_indices_device, turn_indices] = blended_scores
+                reward_tensor_map[key] = reward_tensor
+                blend_delta = (blended_scores - manual_scores).detach()
+                metrics[f'reward/prd_online/roles/{role}/manual_score_mean'] = float(
+                    manual_scores.mean().item()
+                )
+                metrics[f'reward/prd_online/roles/{role}/active_score_mean'] = float(
+                    prd_scores.mean().item()
+                )
+                metrics[f'reward/prd_online/roles/{role}/blended_score_mean'] = float(
+                    blended_scores.mean().item()
+                )
+                metrics[f'reward/prd_online/roles/{role}/blend_delta_mean'] = float(
+                    blend_delta.mean().item()
+                )
+                metrics[f'reward/prd_online/roles/{role}/blend_delta_abs_max'] = float(
+                    blend_delta.abs().max().item()
+                )
+
+        # The current batch always uses the pre-update active network. EMA is
+        # applied only afterwards, preventing same-batch target leakage.
+        ema_updated = self._sync_online_prd_active() if prd_updated else False
+        metrics[f'{replay_prefix}/ema_update_applied'] = float(ema_updated)
+        return reward_tensor_map
+
     def _apply_online_prd_rewards(
         self,
         data_batch: DataProto,
@@ -1873,6 +2404,14 @@ class RayReMASeparatedTrainer(object):
         if not self.online_prd_enabled:
             return reward_tensor_map
         prd_batch = self._build_online_prd_batch(data_batch, reward_tensor_map)
+        if self.online_prd_training_objective == 'cpcr_replay':
+            return self._apply_online_prd_cpcr_replay_rewards(
+                data_batch,
+                reward_tensor_map,
+                metrics,
+                cpcr_targets,
+                prd_batch,
+            )
         model_type = prd_batch.get('model_type', 'source')
         source_values = prd_batch.get('source_values')
         role_features = prd_batch['role_features']
@@ -2820,6 +3359,10 @@ class RayReMASeparatedTrainer(object):
                     'train': self.online_prd_train.checkpoint_payload(),
                     'active': self.online_prd_active.checkpoint_payload(),
                     'optimizer': self.online_prd_optimizer.state_dict(),
+                    'cpcr_train_buffer': list(self.online_prd_cpcr_train_buffer),
+                    'cpcr_validation_buffer': list(
+                        self.online_prd_cpcr_validation_buffer
+                    ),
                     'global_steps': self.global_steps,
                 },
                 prd_local_path,
@@ -2892,6 +3435,12 @@ class RayReMASeparatedTrainer(object):
             self.online_prd_train.load_state_dict(prd_state['train']['state_dict'])
             self.online_prd_active.load_state_dict(prd_state['active']['state_dict'])
             self.online_prd_optimizer.load_state_dict(prd_state['optimizer'])
+            self.online_prd_cpcr_train_buffer.extend(
+                prd_state.get('cpcr_train_buffer', [])
+            )
+            self.online_prd_cpcr_validation_buffer.extend(
+                prd_state.get('cpcr_validation_buffer', [])
+            )
         elif self.online_prd_enabled:
             print(f"Warning: No online PRD composer state found at {prd_local_path}, using initialized PRD state")
 
