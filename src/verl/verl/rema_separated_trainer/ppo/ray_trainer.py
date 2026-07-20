@@ -456,14 +456,13 @@ class RayReMASeparatedTrainer(object):
             return
 
         mode = str(self.cpcr_config.get('mode', 'diagnostic'))
-        estimator = str(self.cpcr_config.get('estimator', 'role_action'))
+        estimator = str(self.cpcr_config.get('estimator', 'full_suffix'))
         outcome_mode = str(self.cpcr_config.get('outcome_mode', 'candidate_factual'))
         if mode not in {'diagnostic', 'prd_target'}:
             raise ValueError(f"Unsupported CPCR mode: {mode}")
-        if estimator != 'role_action':
+        if estimator != 'full_suffix':
             raise ValueError(
-                "Only CPCR estimator='role_action' is implemented. "
-                "Full suffix transport requires deterministic downstream prompt replay."
+                "Only CPCR estimator='full_suffix' is implemented."
             )
         if outcome_mode != 'candidate_factual':
             raise ValueError(
@@ -478,10 +477,22 @@ class RayReMASeparatedTrainer(object):
         rollout_config = self.config.actor_rollout_ref.rollout
         if int(rollout_config.get('n', 1)) < 2:
             raise ValueError("CPCR requires actor_rollout_ref.rollout.n >= 2")
+        if not bool(rollout_config.get('do_sample', True)):
+            raise ValueError("CPCR requires stochastic rollouts with do_sample=True")
+        if float(rollout_config.get('temperature', 1.0)) <= 0.0:
+            raise ValueError("CPCR requires rollout.temperature > 0")
         if float(rollout_config.get('top_p', 1.0)) != 1.0:
             raise ValueError("CPCR likelihood correction currently requires rollout.top_p=1")
         if int(rollout_config.get('top_k', -1)) not in {-1, 0}:
             raise ValueError("CPCR likelihood correction currently requires top_k to be disabled")
+        if float(rollout_config.get('min_p', 0.0)) != 0.0:
+            raise ValueError("CPCR likelihood correction currently requires rollout.min_p=0")
+        if float(rollout_config.get('presence_penalty', 0.0)) != 0.0:
+            raise ValueError("CPCR does not reproduce rollout.presence_penalty")
+        if float(rollout_config.get('frequency_penalty', 0.0)) != 0.0:
+            raise ValueError("CPCR does not reproduce rollout.frequency_penalty")
+        if float(rollout_config.get('repetition_penalty', 1.0)) != 1.0:
+            raise ValueError("CPCR does not reproduce rollout.repetition_penalty")
 
     @staticmethod
     def _cpcr_unpad_messages(messages):
@@ -494,7 +505,7 @@ class RayReMASeparatedTrainer(object):
         ]
 
     @staticmethod
-    def _cpcr_latest_role_output(history, role):
+    def _cpcr_latest_role_message(history, role):
         if isinstance(history, np.ndarray):
             history = history.tolist()
         for message in reversed(history):
@@ -503,14 +514,13 @@ class RayReMASeparatedTrainer(object):
                 and message.get('role') == role
                 and isinstance(message.get('content'), str)
             ):
-                return message['content'], message.get('stop_reason', 'stop')
-        return '', None
+                return dict(message)
+        return None
 
     def _cpcr_encode_prompt_action(
         self,
         chat,
         action_ids,
-        stop_reason,
         prompt_length,
         max_length,
     ):
@@ -525,77 +535,358 @@ class RayReMASeparatedTrainer(object):
         )
         action_ids = [int(token_id) for token_id in action_ids]
         full_ids = list(query_ids) + action_ids
-        if stop_reason == 'stop':
-            final_label = self.tokenizer.eos_token_id
-        elif stop_reason == 'length':
-            final_label = -100
-        else:
-            return None
-        labels = [-100] * (len(query_ids) - 1) + action_ids + [final_label]
+        # The final ignore label keeps tensor lengths aligned. Every token that
+        # vLLM actually returned is still scored exactly once.
+        labels = [-100] * (len(query_ids) - 1) + action_ids + [-100]
         if (
-            self.tokenizer.eos_token_id is None
-            or len(full_ids) != len(labels)
+            len(full_ids) != len(labels)
             or len(full_ids) > max_length
         ):
             return None
         return full_ids, labels
 
-    def _cpcr_score_role_action_pairs(
+    def _cpcr_action_token_ids(
+        self,
+        data_batch,
+        role,
+        sample_idx,
+        turn_idx,
+        stop_reason,
+    ):
+        token_ids_key = f'{role}_action_token_ids'
+        if token_ids_key in data_batch.non_tensor_batch:
+            raw_token_ids = data_batch.non_tensor_batch[token_ids_key][sample_idx]
+            if isinstance(raw_token_ids, np.ndarray):
+                raw_token_ids = raw_token_ids.tolist()
+            if isinstance(raw_token_ids, (list, tuple)) and raw_token_ids:
+                return [int(token_id) for token_id in raw_token_ids]
+
+        # Compatibility fallback for trajectories produced before raw sampled
+        # token ids were stored in history.
+        labels_key = f'{role}_labels'
+        step_ids_key = f'{role}_step_ids'
+        if labels_key not in data_batch.batch or step_ids_key not in data_batch.batch:
+            return None
+        action_labels = data_batch.batch[labels_key][sample_idx][
+            data_batch.batch[step_ids_key][sample_idx] == turn_idx
+        ]
+        action_labels = action_labels[action_labels != -100]
+        if stop_reason == 'stop':
+            if (
+                self.tokenizer.eos_token_id is None
+                or action_labels.numel() == 0
+                or int(action_labels[-1].item()) != self.tokenizer.eos_token_id
+            ):
+                return None
+            action_labels = action_labels[:-1]
+        elif stop_reason != 'length':
+            return None
+        if action_labels.numel() == 0:
+            return None
+        return action_labels.tolist()
+
+    @staticmethod
+    def _cpcr_replace_last_user_message(chat, content):
+        if not chat or chat[-1].get('role') != 'user':
+            return None
+        return chat[:-1] + [{'role': 'user', 'content': content}]
+
+    def _cpcr_build_stitched_suffix(
+        self,
+        data_batch,
+        target_idx,
+        candidate_idx,
+        start_role,
+    ):
+        """Replay one hierarchical suffix using existing candidate actions.
+
+        The first role receives its exact target-rollout prompt. Later prompts
+        are rebuilt deterministically from the target prefix and the transported
+        candidate outputs. No model decoding happens here.
+        """
+
+        agent_roles = list(data_batch.meta_info['agent_roles'])
+        hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
+        system_prompts = dict(data_batch.meta_info.get('system_prompts', {}))
+        if start_role not in agent_roles:
+            return None
+        if str(data_batch.non_tensor_batch['question'][target_idx]) != str(
+            data_batch.non_tensor_batch['question'][candidate_idx]
+        ):
+            return None
+
+        decomposer_role = hierarchy.get('decomposer_role', 'decomposer')
+        selector_role = hierarchy.get('selector_role', 'selector')
+        stage_roles = list(hierarchy.get('stage_roles', []))
+        worker_types = list(hierarchy.get('worker_roles', []))
+        if not stage_roles or decomposer_role not in agent_roles or selector_role not in agent_roles:
+            return None
+        default_worker = hierarchy.get(
+            'default_worker',
+            worker_types[-1] if worker_types else selector_role,
+        )
+        worker_specs = hierarchy.get('worker_specs', {})
+        worker_spec_text = MultiAgentRollout._format_worker_specs(worker_specs, worker_types)
+        worker_context_mode = hierarchy.get(
+            'worker_context_mode',
+            'full_question' if hierarchy.get('pass_question_to_workers', False) else 'subtask_context',
+        )
+        pass_question_to_workers = worker_context_mode in {'full_question', 'question', 'full'}
+        final_context_mode = hierarchy.get('final_context_mode', 'full_question')
+
+        history_batch = data_batch.non_tensor_batch['history']
+        target_history = history_batch[target_idx]
+        candidate_history = history_batch[candidate_idx]
+        target_messages = {
+            role: self._cpcr_latest_role_message(target_history, role)
+            for role in agent_roles
+        }
+        candidate_messages = {
+            role: self._cpcr_latest_role_message(candidate_history, role)
+            for role in agent_roles
+        }
+        start_position = agent_roles.index(start_role)
+        target_start = target_messages.get(start_role)
+        candidate_start = candidate_messages.get(start_role)
+        if (
+            target_start is None
+            or candidate_start is None
+            or not target_start['content'].strip()
+            or not candidate_start['content'].strip()
+        ):
+            return None
+
+        stitched_outputs = {}
+        for position, role in enumerate(agent_roles):
+            message = candidate_messages[role] if position >= start_position else target_messages[role]
+            stitched_outputs[role] = message['content'] if message is not None else ''
+
+        final_stage_role = stage_roles[-1]
+
+        def parse_execution_stages(plan_text, selector_text):
+            parsed_subtasks = MultiAgentRollout._extract_subtasks(plan_text)
+            parsed_stages = MultiAgentRollout._parse_ordered_worker_stages(
+                selector_text,
+                parsed_subtasks,
+                stage_roles,
+                worker_types,
+                default_worker,
+            )
+            if all(stage_role != final_stage_role for stage_role, _, _ in parsed_stages):
+                parsed_stages.append((final_stage_role, default_worker, []))
+            return parsed_stages
+
+        plan = stitched_outputs.get(decomposer_role, '')
+        assignments = stitched_outputs.get(selector_role, '')
+        ordered_stages = parse_execution_stages(plan, assignments)
+
+        candidate_plan = (
+            candidate_messages.get(decomposer_role, {}).get('content', '')
+            if candidate_messages.get(decomposer_role) is not None else ''
+        )
+        candidate_assignments = (
+            candidate_messages.get(selector_role, {}).get('content', '')
+            if candidate_messages.get(selector_role) is not None else ''
+        )
+        candidate_stages = parse_execution_stages(candidate_plan, candidate_assignments)
+
+        execution_roles = [decomposer_role, selector_role] + [
+            stage_role for stage_role, _, _ in ordered_stages
+        ]
+        candidate_execution_roles = [decomposer_role, selector_role] + [
+            stage_role for stage_role, _, _ in candidate_stages
+        ]
+        if start_role not in execution_roles or start_role not in candidate_execution_roles:
+            return None
+        suffix_roles = execution_roles[execution_roles.index(start_role):]
+        candidate_suffix_roles = candidate_execution_roles[
+            candidate_execution_roles.index(start_role):
+        ]
+        # MIS requires candidate l to denote one fixed suffix in every row k.
+        # A changed activation path is therefore unsupported, not a new suffix.
+        if suffix_roles != candidate_suffix_roles:
+            return None
+        stage_specs = {
+            stage_role: (stage_idx, worker_type, assigned_subtasks)
+            for stage_idx, (stage_role, worker_type, assigned_subtasks) in enumerate(ordered_stages)
+        }
+
+        target_chats = {}
+        for role in agent_roles:
+            key = f'{role}_conversation_history'
+            if key not in data_batch.non_tensor_batch:
+                return None
+            target_chats[role] = self._cpcr_unpad_messages(
+                data_batch.non_tensor_batch[key][target_idx]
+            )
+        if not target_chats.get(start_role):
+            return None
+
+        question = str(data_batch.non_tensor_batch['question'][target_idx])
+        completed_results = []
+        if start_role in stage_specs:
+            start_stage_idx = stage_specs[start_role][0]
+            for stage_role, worker_type, assigned_subtasks in ordered_stages[:start_stage_idx]:
+                output = stitched_outputs.get(stage_role, '')
+                if output.strip():
+                    subtask_ids = ', '.join(subtask_id for subtask_id, _ in assigned_subtasks)
+                    completed_results.append((stage_role, worker_type, subtask_ids, output))
+
+        suffix_steps = []
+        for role in suffix_roles:
+            candidate_message = candidate_messages.get(role)
+            if candidate_message is None or not candidate_message['content'].strip():
+                return None
+
+            if role == start_role:
+                chat = target_chats[role]
+            elif role == selector_role:
+                selector_content = (
+                    f"Question:\n{question}\n\n"
+                    f"Plan:\n{plan}\n\n"
+                    f"Available workers:\n{worker_spec_text}"
+                )
+                chat = self._cpcr_replace_last_user_message(
+                    target_chats[selector_role],
+                    selector_content,
+                )
+            elif role in stage_specs:
+                stage_idx, worker_type, assigned_subtasks = stage_specs[role]
+                is_final_stage = stage_idx == len(ordered_stages) - 1
+                if is_final_stage:
+                    question_block = (
+                        ''
+                        if final_context_mode in {'notes_only', 'notes', 'no_question'}
+                        else f"Question:\n{question}\n\n"
+                    )
+                elif pass_question_to_workers:
+                    question_block = (
+                        f"Reference problem:\n{question}\n\n"
+                        "Use the reference problem only to recover facts needed for the assigned subtask.\n\n"
+                    )
+                else:
+                    question_block = (
+                        "The assigned subtask is your task context and should contain the needed facts. "
+                        "Use previous LOCAL_RESULTs when they help.\n\n"
+                    )
+
+                if is_final_stage:
+                    if final_context_mode in {'worker_results_only', 'workers_only', 'local_results_only'}:
+                        work_so_far = MultiAgentRollout._format_worker_results_for_final(
+                            completed_results
+                        )
+                    else:
+                        work_so_far = MultiAgentRollout._format_final_notes(
+                            plan,
+                            MultiAgentRollout._format_work_so_far(completed_results),
+                        )
+                else:
+                    work_so_far = MultiAgentRollout._format_work_so_far(completed_results)
+
+                assigned_subtasks_text = MultiAgentRollout._format_subtasks(assigned_subtasks)
+                if is_final_stage:
+                    stage_instruction = (
+                        "Synthesize the final answer from the worker results. "
+                        "Check the worker results, repair mistakes if needed, and end with the final answer in \\boxed{}."
+                    )
+                    if not assigned_subtasks_text:
+                        assigned_subtasks_text = "- Use the work above to synthesize the final answer."
+                else:
+                    stage_instruction = (
+                        "Work on the assigned subtask above. "
+                        "Reason step by step with concrete calculations, transformations, or checks. "
+                        "Verify dependencies, warnings, boundary cases, signs, domains, units, and repair instructions. "
+                        "Finish with one concise LOCAL_RESULT for this subtask. "
+                        "Output exactly:\n"
+                        "REASONING:\n"
+                        "<step-by-step reasoning for this subtask>\n\n"
+                        "LOCAL_RESULT: \\boxed{<useful result of this subtask>}"
+                    )
+                work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ''
+                dependency_instruction = (
+                    "Use previous LOCAL_RESULTs from the work above when they are relevant. "
+                    "Check earlier subtasks when an inconsistency matters.\n\n"
+                    if work_so_far and not is_final_stage else ''
+                )
+                user_content = (
+                    f"{question_block}"
+                    f"{work_so_far_block}"
+                    f"{dependency_instruction}"
+                    f"{assigned_subtasks_text}\n\n"
+                    f"{stage_instruction}\n\n"
+                )
+                system_prompt = (
+                    system_prompts.get('finalizer')
+                    if is_final_stage else None
+                ) or system_prompts.get(worker_type, system_prompts.get(role, ''))
+                chat = [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_content},
+                ]
+            else:
+                return None
+
+            if not chat:
+                return None
+            suffix_steps.append((role, chat, candidate_message))
+            if role in stage_specs:
+                _, worker_type, assigned_subtasks = stage_specs[role]
+                subtask_ids = ', '.join(subtask_id for subtask_id, _ in assigned_subtasks)
+                completed_results.append((
+                    role,
+                    worker_type,
+                    subtask_ids,
+                    candidate_message['content'],
+                ))
+
+        return suffix_steps
+
+    def _cpcr_score_full_suffix_pairs(
         self,
         data_batch,
         role,
         selected_uids=None,
     ):
-        """Score all within-prompt action/prefix pairs for one role.
-
-        This is the no-decoding role-action approximation: the terminal outcome
-        is inherited from the candidate rollout. It does not claim to be exact
-        full-suffix replay.
-        """
+        """Score transported hierarchical suffixes without decoding."""
 
         uid_to_indices = defaultdict(list)
         for idx, uid in enumerate(data_batch.non_tensor_batch['uid']):
             uid_to_indices[uid].append(idx)
 
-        history_batch = data_batch.non_tensor_batch['history']
-        conversation_key = f'{role}_conversation_history'
-        labels_key = f'{role}_labels'
-        step_ids_key = f'{role}_step_ids'
-        if (
-            conversation_key not in data_batch.non_tensor_batch
-            or labels_key not in data_batch.batch
-            or step_ids_key not in data_batch.batch
-        ):
-            return {}, 0, 0, 0, 0
-        conversation_batch = data_batch.non_tensor_batch[conversation_key]
-        role_labels = data_batch.batch[labels_key]
-        role_step_ids = data_batch.batch[step_ids_key]
         turn_counts = [int(value) for value in data_batch.non_tensor_batch['num_turns']]
         prompt_length = int(self.config.actor_rollout_ref.rollout.prompt_length)
         max_length = prompt_length + int(
             self.config.actor_rollout_ref.rollout.response_length
         )
 
-        encoded_pairs = []
-        pair_locations = []
+        encoded_by_role = defaultdict(list)
+        expected_steps = {}
         skipped_pair_count = 0
+        factual_prompt_check_count = 0
+        factual_prompt_match_count = 0
+        active_target_count = 0
         group_specs = {}
         for group_idx, (uid, indices) in enumerate(uid_to_indices.items()):
             if len(indices) < 2 or (selected_uids is not None and uid not in selected_uids):
                 continue
             group_specs[uid] = indices
-            chats = [
-                self._cpcr_unpad_messages(conversation_batch[idx])
-                for idx in indices
-            ]
-            actions_and_stops = [
-                self._cpcr_latest_role_output(history_batch[idx], role)
-                for idx in indices
-            ]
             candidate_limit = int(self.cpcr_config.get('max_candidates_per_group', 0))
             positions_by_turn = defaultdict(list)
             for position, global_idx in enumerate(indices):
-                positions_by_turn[turn_counts[global_idx]].append(position)
+                factual_suffix = self._cpcr_build_stitched_suffix(
+                    data_batch,
+                    global_idx,
+                    global_idx,
+                    role,
+                )
+                if factual_suffix:
+                    positions_by_turn[turn_counts[global_idx]].append(position)
+            active_positions = {
+                position
+                for positions in positions_by_turn.values()
+                for position in positions
+            }
+            active_target_count += len(active_positions)
             candidates_by_turn = {}
             for turn_count, positions in positions_by_turn.items():
                 if candidate_limit <= 0 or len(positions) <= candidate_limit:
@@ -612,104 +903,145 @@ class RayReMASeparatedTrainer(object):
                 candidates_by_turn[turn_count] = sorted(
                     rng.choice(positions, size=candidate_limit, replace=False).tolist()
                 )
-            for target_pos, chat in enumerate(chats):
+            for target_pos, target_idx in enumerate(indices):
+                if target_pos not in active_positions:
+                    continue
                 target_turn = turn_counts[indices[target_pos]]
-                for candidate_pos in candidates_by_turn[target_turn]:
-                    action, stop_reason = actions_and_stops[candidate_pos]
-                    if not chat or not action.strip():
+                for candidate_pos in candidates_by_turn.get(target_turn, []):
+                    candidate_idx = indices[candidate_pos]
+                    suffix_steps = self._cpcr_build_stitched_suffix(
+                        data_batch,
+                        target_idx,
+                        candidate_idx,
+                        role,
+                    )
+                    if not suffix_steps:
                         skipped_pair_count += 1
                         continue
-                    candidate_idx = indices[candidate_pos]
+                    if target_idx == candidate_idx:
+                        for suffix_role, chat, _ in suffix_steps:
+                            factual_prompt_check_count += 1
+                            factual_chat = self._cpcr_unpad_messages(
+                                data_batch.non_tensor_batch[
+                                    f'{suffix_role}_conversation_history'
+                                ][candidate_idx]
+                            )
+                            factual_prompt_match_count += int(chat == factual_chat)
                     candidate_turn = turn_counts[candidate_idx] - 1
                     if candidate_turn < 0:
                         skipped_pair_count += 1
                         continue
-                    action_labels = role_labels[candidate_idx][
-                        role_step_ids[candidate_idx] == candidate_turn
-                    ]
-                    action_labels = action_labels[action_labels != -100]
-                    if stop_reason == 'stop':
-                        if (
-                            self.tokenizer.eos_token_id is None
-                            or action_labels.numel() == 0
-                            or int(action_labels[-1].item()) != self.tokenizer.eos_token_id
-                        ):
-                            skipped_pair_count += 1
-                            continue
-                        action_token_ids = action_labels[:-1].tolist()
-                    elif stop_reason == 'length':
-                        action_token_ids = action_labels.tolist()
-                    else:
+                    pair_key = (uid, target_pos, candidate_pos)
+                    pair_encoded = []
+                    for suffix_role, chat, candidate_message in suffix_steps:
+                        stop_reason = candidate_message.get('stop_reason', 'stop')
+                        action_token_ids = self._cpcr_action_token_ids(
+                            data_batch,
+                            suffix_role,
+                            candidate_idx,
+                            candidate_turn,
+                            stop_reason,
+                        )
+                        if action_token_ids is None:
+                            pair_encoded = []
+                            break
+                        encoded = self._cpcr_encode_prompt_action(
+                            chat,
+                            action_token_ids,
+                            prompt_length,
+                            max_length,
+                        )
+                        if encoded is None:
+                            pair_encoded = []
+                            break
+                        pair_encoded.append((suffix_role, encoded))
+                    if not pair_encoded:
                         skipped_pair_count += 1
                         continue
-                    if not action_token_ids:
-                        skipped_pair_count += 1
-                        continue
-                    encoded = self._cpcr_encode_prompt_action(
-                        chat,
-                        action_token_ids,
-                        stop_reason,
-                        prompt_length,
-                        max_length,
-                    )
-                    if encoded is None:
-                        skipped_pair_count += 1
-                        continue
-                    encoded_pairs.append(encoded)
-                    pair_locations.append((uid, target_pos, candidate_pos))
+                    expected_steps[pair_key] = len(pair_encoded)
+                    for suffix_role, encoded in pair_encoded:
+                        encoded_by_role[suffix_role].append((pair_key, encoded))
 
-        if not encoded_pairs:
+        if factual_prompt_match_count != factual_prompt_check_count:
+            raise RuntimeError(
+                "CPCR full-suffix replay diverged from factual rollout prompts "
+                f"for role={role}: matched {factual_prompt_match_count}/"
+                f"{factual_prompt_check_count}"
+            )
+
+        if not expected_steps:
             return {
                 uid: torch.full((len(indices), len(indices)), -torch.inf)
                 for uid, indices in group_specs.items()
-            }, skipped_pair_count, 0, 0, 0
+            }, skipped_pair_count, 0, 0, 0, 0, factual_prompt_match_count, factual_prompt_check_count, active_target_count
 
-        sequence_length = max(len(input_ids) for input_ids, _ in encoded_pairs)
-        batch_size = len(encoded_pairs)
-        input_ids = torch.full(
-            (batch_size, sequence_length),
-            self.tokenizer.pad_token_id,
-            dtype=torch.long,
-        )
-        labels = torch.full((batch_size, sequence_length), -100, dtype=torch.long)
-        attention_mask = torch.zeros((batch_size, sequence_length), dtype=torch.long)
-        for idx, (pair_input_ids, pair_labels) in enumerate(encoded_pairs):
-            length = len(pair_input_ids)
-            input_ids[idx, :length] = torch.tensor(pair_input_ids, dtype=torch.long)
-            labels[idx, :length] = torch.tensor(pair_labels, dtype=torch.long)
-            attention_mask[idx, :length] = 1
+        pair_log_probs = defaultdict(float)
+        scored_steps_per_pair = defaultdict(int)
+        scored_action_tokens = 0
+        scored_input_tokens = 0
+        scored_suffix_actions = 0
+        for suffix_role, role_items in encoded_by_role.items():
+            encoded_actions = [encoded for _, encoded in role_items]
+            sequence_length = max(len(input_ids) for input_ids, _ in encoded_actions)
+            batch_size = len(encoded_actions)
+            input_ids = torch.full(
+                (batch_size, sequence_length),
+                self.tokenizer.pad_token_id,
+                dtype=torch.long,
+            )
+            labels = torch.full((batch_size, sequence_length), -100, dtype=torch.long)
+            attention_mask = torch.zeros((batch_size, sequence_length), dtype=torch.long)
+            for idx, (pair_input_ids, pair_labels) in enumerate(encoded_actions):
+                length = len(pair_input_ids)
+                input_ids[idx, :length] = torch.tensor(pair_input_ids, dtype=torch.long)
+                labels[idx, :length] = torch.tensor(pair_labels, dtype=torch.long)
+                attention_mask[idx, :length] = 1
 
-        scoring_batch = DataProto.from_dict({
-            'input_ids': input_ids,
-            'labels': labels,
-            'attention_mask': attention_mask,
-            'position_ids': compute_position_id_with_mask(attention_mask),
-        })
-        worker_group = self.actor_rollout_wg[role]
-        scoring_batch, pad_size = pad_dataproto_to_divisor(
-            scoring_batch,
-            worker_group.world_size,
-        )
-        scored = worker_group.compute_log_prob(scoring_batch)
-        scored = unpad_dataproto(scored, pad_size=pad_size)
-        token_log_probs = scored.batch['old_log_probs']
-        label_mask = labels != -100
-        sequence_log_probs = token_log_probs.float().masked_fill(~label_mask, 0.0).sum(dim=1)
-        scored_action_tokens = int(label_mask.sum().item())
-        scored_input_tokens = int(attention_mask.sum().item())
+            scoring_batch = DataProto.from_dict({
+                'input_ids': input_ids,
+                'labels': labels,
+                'attention_mask': attention_mask,
+                'position_ids': compute_position_id_with_mask(attention_mask),
+            })
+            worker_group = self.actor_rollout_wg[suffix_role]
+            scoring_batch, pad_size = pad_dataproto_to_divisor(
+                scoring_batch,
+                worker_group.world_size,
+            )
+            scored = worker_group.compute_log_prob(scoring_batch)
+            scored = unpad_dataproto(scored, pad_size=pad_size)
+            token_log_probs = scored.batch['old_log_probs']
+            label_mask = labels != -100
+            sequence_log_probs = token_log_probs.float().masked_fill(~label_mask, 0.0).sum(dim=1)
+            scored_action_tokens += int(label_mask.sum().item())
+            scored_input_tokens += int(attention_mask.sum().item())
+            scored_suffix_actions += len(role_items)
+            for item_idx, (pair_key, _) in enumerate(role_items):
+                pair_log_probs[pair_key] = pair_log_probs[pair_key] + sequence_log_probs[item_idx]
+                scored_steps_per_pair[pair_key] += 1
 
         matrices = {
             uid: torch.full((len(indices), len(indices)), -torch.inf)
             for uid, indices in group_specs.items()
         }
-        for pair_idx, (uid, target_pos, candidate_pos) in enumerate(pair_locations):
-            matrices[uid][target_pos, candidate_pos] = sequence_log_probs[pair_idx]
+        scored_pair_count = 0
+        for pair_key, expected_count in expected_steps.items():
+            if scored_steps_per_pair[pair_key] != expected_count:
+                skipped_pair_count += 1
+                continue
+            uid, target_pos, candidate_pos = pair_key
+            matrices[uid][target_pos, candidate_pos] = pair_log_probs[pair_key]
+            scored_pair_count += 1
         return (
             matrices,
             skipped_pair_count,
-            len(encoded_pairs),
+            scored_pair_count,
+            scored_suffix_actions,
             scored_action_tokens,
             scored_input_tokens,
+            factual_prompt_match_count,
+            factual_prompt_check_count,
+            active_target_count,
         )
 
     def _compute_cpcr_targets(self, data_batch, reward_tensor_map, metrics):
@@ -791,9 +1123,13 @@ class RayReMASeparatedTrainer(object):
                 matrices,
                 skipped_pairs,
                 scored_pairs,
+                scored_suffix_actions,
                 scored_action_tokens,
                 scored_input_tokens,
-            ) = self._cpcr_score_role_action_pairs(
+                factual_prompt_matches,
+                factual_prompt_checks,
+                active_targets,
+            ) = self._cpcr_score_full_suffix_pairs(
                 data_batch,
                 role,
                 selected_uids=selected_uids,
@@ -838,6 +1174,21 @@ class RayReMASeparatedTrainer(object):
             total_scored_pairs += scored_pairs
             metrics[f'{prefix}/pairs_scored'] = float(scored_pairs)
             metrics[f'{prefix}/pairs_skipped'] = float(skipped_pairs)
+            metrics[f'{prefix}/active_target_count'] = float(active_targets)
+            metrics[f'{prefix}/suffix_actions_scored'] = float(scored_suffix_actions)
+            metrics[f'{prefix}/mean_suffix_length'] = (
+                float(scored_suffix_actions) / float(scored_pairs)
+                if scored_pairs > 0 else 0.0
+            )
+            metrics[f'{prefix}/pair_coverage'] = (
+                float(scored_pairs) / float(scored_pairs + skipped_pairs)
+                if scored_pairs + skipped_pairs > 0 else 0.0
+            )
+            metrics[f'{prefix}/factual_prompt_check_count'] = float(factual_prompt_checks)
+            metrics[f'{prefix}/factual_prompt_match_rate'] = (
+                float(factual_prompt_matches) / float(factual_prompt_checks)
+                if factual_prompt_checks > 0 else 0.0
+            )
             metrics[f'{prefix}/action_tokens_scored'] = float(scored_action_tokens)
             metrics[f'{prefix}/input_tokens_scored'] = float(scored_input_tokens)
             metrics[f'{prefix}/supported_target_count'] = float(supported_target_count)

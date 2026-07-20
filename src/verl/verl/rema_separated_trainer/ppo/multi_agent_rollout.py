@@ -393,6 +393,12 @@ class MultiAgentRollout:
         unpad_output = unpad_dataproto(output, pad_size=pad_size)
         resp_lens = (unpad_output.batch["attention_mask"][:, -response_length:].sum(
             dim=1).tolist())
+        response_ids = unpad_output.batch["input_ids"][:, -response_length:]
+        response_mask = unpad_output.batch["attention_mask"][:, -response_length:].bool()
+        response_token_ids = [
+            token_row[mask_row].tolist()
+            for token_row, mask_row in zip(response_ids, response_mask)
+        ]
         vllm_output_text = unpad_output.non_tensor_batch["text"].tolist()
 
         # output_text = tokenizer.batch_decode(
@@ -417,7 +423,7 @@ class MultiAgentRollout:
         stop_reasons = unpad_output.non_tensor_batch["stop_reasons"].tolist()
 
         # return output_text_clean, num_gen_tokens, stop_reasons, resp_lens
-        return vllm_output_text, num_gen_tokens, stop_reasons, resp_lens
+        return vllm_output_text, num_gen_tokens, stop_reasons, resp_lens, response_token_ids
 
     def _update_history_and_check_finish(
         self,
@@ -431,6 +437,7 @@ class MultiAgentRollout:
         agent_roles: List[str],
         num_gen_tokens: List[int],
         stop_reasons: List[Optional[str]],
+        response_token_ids: List[List[int]],
         questions: List[str],
         conversation_history: Dict[str, List[List[Dict[str, str]]]],
         system_prompts: Dict[str, str],
@@ -447,6 +454,7 @@ class MultiAgentRollout:
                 "content": current_outputs[i],
                 "num_gen_tokens": num_gen_tokens[i],
                 "stop_reason": stop_reasons[i],
+                "token_ids": response_token_ids[i],
             })
 
         # Update finish flags
@@ -494,6 +502,8 @@ class MultiAgentRollout:
                             0,
                             "stop_reason":
                             "stop_when_truncated",
+                            "token_ids":
+                            [],
                         })
 
     def _run_multi_turn_conversation(
@@ -564,7 +574,7 @@ class MultiAgentRollout:
                     conversation_history[role][idx] = chat
 
                 # Generate responses for current role
-                current_outputs, num_gen_tokens, stop_reasons, resp_lens = (
+                current_outputs, num_gen_tokens, stop_reasons, resp_lens, response_token_ids = (
                     self._generate_role_responses(
                         rollout=self.rollout_wg_dict[role],
                         prompt_proto=prompt_proto,
@@ -592,6 +602,7 @@ class MultiAgentRollout:
                     agent_roles,
                     num_gen_tokens,
                     stop_reasons,
+                    response_token_ids,
                     questions,
                     conversation_history,
                     system_prompts,
@@ -907,12 +918,13 @@ class MultiAgentRollout:
         previous_feedback = [None for _ in range(batch_size)]
         latest_outputs = ["" for _ in range(batch_size)]
 
-        def append_history(idx, role, content, num_gen_tokens, stop_reason):
+        def append_history(idx, role, content, num_gen_tokens, stop_reason, token_ids):
             history[idx].append({
                 "role": role,
                 "content": content,
                 "num_gen_tokens": num_gen_tokens,
                 "stop_reason": stop_reason,
+                "token_ids": token_ids,
             })
 
         def build_prompt(role, idx, content):
@@ -922,9 +934,17 @@ class MultiAgentRollout:
             system_prompt = system_prompt_override or system_prompts.get(worker_type, system_prompts[stage_role])
             return [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
 
-        def record_prompt_and_output(idx, role, chat, output, num_gen_tokens, stop_reason):
+        def record_prompt_and_output(
+            idx,
+            role,
+            chat,
+            output,
+            num_gen_tokens,
+            stop_reason,
+            token_ids,
+        ):
             conversation_history[role][idx] = chat
-            append_history(idx, role, output, num_gen_tokens, stop_reason)
+            append_history(idx, role, output, num_gen_tokens, stop_reason, token_ids)
             running_conversation[role][idx] = chat + [{"role": "assistant", "content": output}]
 
         for i_turn in range(max_num_turns):
@@ -941,7 +961,13 @@ class MultiAgentRollout:
                 if previous_feedback[idx]:
                     content += f"\n\n{previous_feedback[idx]}"
                 decomposer_chats.append(build_prompt(decomposer_role, idx, content))
-            decomposer_outputs, decomposer_tokens, decomposer_stops, _ = self._generate_from_chat_list(
+            (
+                decomposer_outputs,
+                decomposer_tokens,
+                decomposer_stops,
+                _,
+                decomposer_token_ids,
+            ) = self._generate_from_chat_list(
                 decomposer_role, decomposer_chats, tokenizers, prompts.meta_info, response_length)
             current_plan = {}
             for local_idx, idx in enumerate(unfinished_indices):
@@ -949,7 +975,8 @@ class MultiAgentRollout:
                 current_plan[idx] = output
                 record_prompt_and_output(
                     idx, decomposer_role, decomposer_chats[local_idx], output,
-                    decomposer_tokens[local_idx], decomposer_stops[local_idx])
+                    decomposer_tokens[local_idx], decomposer_stops[local_idx],
+                    decomposer_token_ids[local_idx])
 
             # 2. Select workers for each subtask.
             selector_chats = []
@@ -966,7 +993,13 @@ class MultiAgentRollout:
                         f"Available workers:\n{worker_spec_text}"
                     ),
                 ))
-            selector_outputs, selector_tokens, selector_stops, _ = self._generate_from_chat_list(
+            (
+                selector_outputs,
+                selector_tokens,
+                selector_stops,
+                _,
+                selector_token_ids,
+            ) = self._generate_from_chat_list(
                 selector_role, selector_chats, tokenizers, prompts.meta_info, response_length)
             ordered_stages_by_idx = {}
             selector_output_by_idx = {}
@@ -975,7 +1008,8 @@ class MultiAgentRollout:
                 selector_output_by_idx[idx] = output
                 record_prompt_and_output(
                     idx, selector_role, selector_chats[local_idx], output,
-                    selector_tokens[local_idx], selector_stops[local_idx])
+                    selector_tokens[local_idx], selector_stops[local_idx],
+                    selector_token_ids[local_idx])
                 ordered_stages_by_idx[idx] = self._parse_ordered_worker_stages(
                     output, parsed_subtasks[idx], stage_roles, worker_types, default_worker)
                 if stage_roles:
@@ -1087,7 +1121,7 @@ class MultiAgentRollout:
                         )
                         worker_chats.append(chat)
                         worker_chats_by_idx[idx] = chat
-                    outputs, tokens, stops, _ = self._generate_from_chat_list(
+                    outputs, tokens, stops, _, output_token_ids = self._generate_from_chat_list(
                         stage_role, worker_chats, tokenizers, prompts.meta_info, response_length)
                     for local_idx, idx in enumerate(stage_indices):
                         output = outputs[local_idx]
@@ -1097,6 +1131,7 @@ class MultiAgentRollout:
                             output,
                             tokens[local_idx],
                             stops[local_idx],
+                            output_token_ids[local_idx],
                             [subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]],
                         )
                         subtask_ids = ", ".join([subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]])
@@ -1122,10 +1157,25 @@ class MultiAgentRollout:
                     record = worker_records[idx].get(stage_role)
                     if record is None:
                         chat = build_prompt(stage_role, idx, "No subtasks were assigned to this worker stage.")
-                        record_prompt_and_output(idx, stage_role, chat, "", 0, "stop")
+                        record_prompt_and_output(idx, stage_role, chat, "", 0, "stop", [])
                     else:
-                        chat, output, num_gen_tokens, stop_reason, assigned_subtask_ids = record
-                        record_prompt_and_output(idx, stage_role, chat, output, num_gen_tokens, stop_reason)
+                        (
+                            chat,
+                            output,
+                            num_gen_tokens,
+                            stop_reason,
+                            token_ids,
+                            assigned_subtask_ids,
+                        ) = record
+                        record_prompt_and_output(
+                            idx,
+                            stage_role,
+                            chat,
+                            output,
+                            num_gen_tokens,
+                            stop_reason,
+                            token_ids,
+                        )
                         if history[idx] and history[idx][-1].get("role") == stage_role:
                             history[idx][-1]["assigned_subtasks"] = assigned_subtask_ids
 
@@ -1315,9 +1365,34 @@ class MultiAgentRollout:
         ]
         non_tensor_batch["response"] = latest_outputs
 
+        for role in agent_roles:
+            role_action_token_ids = np.empty(len(history), dtype=object)
+            role_action_token_ids[:] = [
+                next(
+                    (
+                        list(message.get("token_ids", []))
+                        for message in reversed(sample_history)
+                        if isinstance(message, dict) and message.get("role") == role
+                    ),
+                    [],
+                )
+                for sample_history in history
+            ]
+            non_tensor_batch[f"{role}_action_token_ids"] = role_action_token_ids
+
+        # Keep raw sampled token ids out of the verbose public history. CPCR
+        # receives them through the dedicated per-role arrays above.
+        clean_history = [
+            [
+                {key: value for key, value in message.items() if key != "token_ids"}
+                for message in sample_history
+            ]
+            for sample_history in history
+        ]
+
         max_history_length = max(2 * self.config.max_num_turns,
                                  len(agent_roles) * self.config.max_num_turns)
-        padded_history = _pad_history(history, max_history_length)
+        padded_history = _pad_history(clean_history, max_history_length)
         padded_conversation_history = {
             role:
             _pad_history(conversation_history[role],
