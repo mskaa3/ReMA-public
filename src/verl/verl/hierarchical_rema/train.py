@@ -695,7 +695,22 @@ def _relay_offline_metrics_to_tracking(
             f"{tracking_prefix}train/final_steps": int(summary.get("steps", 0)),
             f"{tracking_prefix}train/skipped_empty_batches": int(summary.get("skipped_empty_batches", 0)),
             f"{tracking_prefix}train/skipped_non_finite_batches": int(summary.get("skipped_non_finite_batches", 0)),
+            f"{tracking_prefix}train/empty_due_to_truncation": int(summary.get("empty_due_to_truncation", 0)),
+            f"{tracking_prefix}train/empty_due_to_empty_completion": int(summary.get("empty_due_to_empty_completion", 0)),
+            f"{tracking_prefix}train/empty_after_filtering": int(summary.get("empty_after_filtering", 0)),
         }
+        train_dataset_diagnostics = summary.get("train_dataset_diagnostics")
+        if isinstance(train_dataset_diagnostics, dict):
+            for field in (
+                "retained_response_tokens",
+                "truncated_prompt_tokens",
+                "truncated_response_tokens",
+                "zero_loss_rows",
+            ):
+                if field in train_dataset_diagnostics:
+                    final_metrics[f"{tracking_prefix}train_dataset/{field}"] = int(
+                        train_dataset_diagnostics[field]
+                    )
         if "val_loss" in summary:
             final_metrics[f"{tracking_prefix}val/final_loss"] = float(summary["val_loss"])
         if summary.get("best_val_loss") is not None:

@@ -365,7 +365,38 @@ class ControllerReplayDataset:
         self.max_length = max_length
         self.truncation = truncation
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        self.rows = [self._tokenize_sample(sample_index, sample) for sample_index, sample in enumerate(self.samples)]
+        self.stats = {
+            "retained_response_tokens": 0,
+            "truncated_prompt_tokens": 0,
+            "truncated_response_tokens": 0,
+            "zero_loss_rows": 0,
+            "empty_due_to_truncation": 0,
+            "empty_due_to_empty_completion": 0,
+        }
+        self.rows = []
+        for sample_index, sample in enumerate(self.samples):
+            row = self._tokenize_sample(sample_index, sample)
+            self.rows.append(row)
+            self._update_stats(row)
+
+    def _update_stats(self, row: Dict) -> None:
+        for field in (
+            "retained_response_tokens",
+            "truncated_prompt_tokens",
+            "truncated_response_tokens",
+            "zero_loss_row",
+            "zero_loss_due_to_truncation",
+            "zero_loss_due_to_empty_completion",
+        ):
+            value = row.get(field)
+            if value is None:
+                continue
+            stat_key = {
+                "zero_loss_row": "zero_loss_rows",
+                "zero_loss_due_to_truncation": "empty_due_to_truncation",
+                "zero_loss_due_to_empty_completion": "empty_due_to_empty_completion",
+            }.get(field, field)
+            self.stats[stat_key] += int(value.item())
 
     def _tokenize_sample(self, sample_index: int, sample: ControllerReplaySample) -> Dict:
         torch = _lazy_torch()
@@ -381,33 +412,61 @@ class ControllerReplayDataset:
         response_input_ids = response_ids["input_ids"][0]
         response_attention_mask = response_ids["attention_mask"][0]
 
-        input_ids = torch.cat((prompt_input_ids, response_input_ids), dim=-1)
-        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
+        full_input_ids = torch.cat((prompt_input_ids, response_input_ids), dim=-1)
+        full_attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
         prompt_length = prompt_input_ids.shape[0]
         response_length = response_input_ids.shape[0]
+        total_length = full_input_ids.shape[0]
 
-        if input_ids.shape[0] > self.max_length:
+        # Build the loss mask on the full prompt+response sequence first, then
+        # slice it with the exact same truncation window as the tokens.
+        loss_mask = full_attention_mask.clone()
+        if prompt_length > 1:
+            loss_mask[: prompt_length - 1] = 0
+        if loss_mask.numel() > 0:
+            loss_mask[-1] = 0
+
+        slice_start = 0
+        slice_end = total_length
+        if total_length > self.max_length:
             if self.truncation == "left":
-                input_ids = input_ids[-self.max_length :]
-                attention_mask = attention_mask[-self.max_length :]
-                prompt_length = min(prompt_length, self.max_length)
+                slice_start = total_length - self.max_length
             elif self.truncation == "right":
-                input_ids = input_ids[: self.max_length]
-                attention_mask = attention_mask[: self.max_length]
+                slice_end = self.max_length
             else:
                 raise ValueError(
-                    f"Sequence length {input_ids.shape[0]} exceeds max_length={self.max_length}"
+                    f"Sequence length {total_length} exceeds max_length={self.max_length}"
                 )
+
+        input_ids = full_input_ids[slice_start:slice_end]
+        attention_mask = full_attention_mask[slice_start:slice_end]
+        loss_mask = loss_mask[slice_start:slice_end]
+
+        retained_prompt_tokens = max(
+            0,
+            min(slice_end, prompt_length) - max(slice_start, 0),
+        )
+        response_start = prompt_length
+        response_end = prompt_length + response_length
+        retained_response_tokens = max(
+            0,
+            min(slice_end, response_end) - max(slice_start, response_start),
+        )
+        truncated_prompt_tokens = max(prompt_length - retained_prompt_tokens, 0)
+        truncated_response_tokens = max(response_length - retained_response_tokens, 0)
+        empty_completion = int(not str(sample.completion_text or "").strip())
 
         position_ids = attention_mask.long().cumsum(dim=-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 0)
 
-        loss_mask = attention_mask.clone()
-        if prompt_length > 1:
-            loss_mask[: min(prompt_length, loss_mask.size(0)) - 1] = 0
-        last_idx = min(prompt_length + response_length, loss_mask.size(0)) - 1
-        if last_idx >= 0:
-            loss_mask[last_idx] = 0
+        valid_loss_tokens = int(loss_mask[:-1].sum().item()) if loss_mask.numel() > 1 else 0
+        zero_loss_row = int(valid_loss_tokens == 0)
+        zero_loss_due_to_truncation = int(
+            zero_loss_row and truncated_response_tokens > 0 and retained_response_tokens == 0
+        )
+        zero_loss_due_to_empty_completion = int(
+            zero_loss_row and empty_completion and not zero_loss_due_to_truncation
+        )
 
         return {
             "sample_index": sample_index,
@@ -421,6 +480,15 @@ class ControllerReplayDataset:
             "role": sample.role,
             "policy_id": sample.policy_id,
             "pad_token_id": self.pad_token_id,
+            "retained_response_tokens": torch.tensor(retained_response_tokens, dtype=torch.int32),
+            "truncated_prompt_tokens": torch.tensor(truncated_prompt_tokens, dtype=torch.int32),
+            "truncated_response_tokens": torch.tensor(truncated_response_tokens, dtype=torch.int32),
+            "zero_loss_row": torch.tensor(zero_loss_row, dtype=torch.int32),
+            "zero_loss_due_to_truncation": torch.tensor(zero_loss_due_to_truncation, dtype=torch.int32),
+            "zero_loss_due_to_empty_completion": torch.tensor(
+                zero_loss_due_to_empty_completion,
+                dtype=torch.int32,
+            ),
         }
 
     def __len__(self) -> int:
@@ -445,6 +513,12 @@ def _collate_rows(rows: Sequence[Dict]) -> Dict:
         "group_id": [],
         "role": [],
         "policy_id": [],
+        "retained_response_tokens": [],
+        "truncated_prompt_tokens": [],
+        "truncated_response_tokens": [],
+        "zero_loss_row": [],
+        "zero_loss_due_to_truncation": [],
+        "zero_loss_due_to_empty_completion": [],
     }
 
     for row in rows:
@@ -485,6 +559,12 @@ def _collate_rows(rows: Sequence[Dict]) -> Dict:
         batch["group_id"].append(row["group_id"])
         batch["role"].append(row["role"])
         batch["policy_id"].append(row["policy_id"])
+        batch["retained_response_tokens"].append(row["retained_response_tokens"])
+        batch["truncated_prompt_tokens"].append(row["truncated_prompt_tokens"])
+        batch["truncated_response_tokens"].append(row["truncated_response_tokens"])
+        batch["zero_loss_row"].append(row["zero_loss_row"])
+        batch["zero_loss_due_to_truncation"].append(row["zero_loss_due_to_truncation"])
+        batch["zero_loss_due_to_empty_completion"].append(row["zero_loss_due_to_empty_completion"])
 
     return {
         "sample_index": list(batch["sample_index"]),
@@ -497,6 +577,15 @@ def _collate_rows(rows: Sequence[Dict]) -> Dict:
         "group_id": list(batch["group_id"]),
         "role": list(batch["role"]),
         "policy_id": list(batch["policy_id"]),
+        "retained_response_tokens": torch.stack(batch["retained_response_tokens"], dim=0),
+        "truncated_prompt_tokens": torch.stack(batch["truncated_prompt_tokens"], dim=0),
+        "truncated_response_tokens": torch.stack(batch["truncated_response_tokens"], dim=0),
+        "zero_loss_row": torch.stack(batch["zero_loss_row"], dim=0),
+        "zero_loss_due_to_truncation": torch.stack(batch["zero_loss_due_to_truncation"], dim=0),
+        "zero_loss_due_to_empty_completion": torch.stack(
+            batch["zero_loss_due_to_empty_completion"],
+            dim=0,
+        ),
     }
 
 
@@ -776,6 +865,8 @@ def run_offline_policy_training(
         "num_train_samples": len(train_samples),
         "num_val_samples": len(val_samples),
         "objective": "grpo",
+        "train_dataset_diagnostics": dict(train_dataset.stats),
+        "val_dataset_diagnostics": dict(val_dataset.stats),
         **_count_parameters(model),
     }
     if is_primary:
@@ -799,6 +890,9 @@ def run_offline_policy_training(
     global_step = 0
     skipped_empty_batches = 0
     skipped_non_finite_batches = 0
+    empty_due_to_truncation = 0
+    empty_due_to_empty_completion = 0
+    empty_after_filtering = 0
     optimizer.zero_grad(set_to_none=True)
     best_val_loss = None
     best_val_step = 0
@@ -813,6 +907,16 @@ def run_offline_policy_training(
             print(f"[hierarchical-rema][grpo] epoch {epoch + 1}/{config.epochs}")
         for batch_idx, batch in enumerate(train_loader):
             valid_row_mask = batch["loss_mask"][:, :-1].sum(dim=1) > 0
+            invalid_row_mask = ~valid_row_mask
+            invalid_row_count = int(invalid_row_mask.sum().item())
+            if invalid_row_count > 0:
+                empty_after_filtering += invalid_row_count
+                empty_due_to_truncation += int(
+                    batch["zero_loss_due_to_truncation"][invalid_row_mask].sum().item()
+                )
+                empty_due_to_empty_completion += int(
+                    batch["zero_loss_due_to_empty_completion"][invalid_row_mask].sum().item()
+                )
             local_has_valid_rows = bool(valid_row_mask.any().item())
             if _distributed_any_true(not local_has_valid_rows, device, distributed_context):
                 skipped_empty_batches += 1
@@ -1176,6 +1280,16 @@ def run_offline_policy_training(
         selected_model_path = mirrored_selected_model_path
         selected_model_source = f"{selected_model_source}_mirrored"
 
+    empty_due_to_truncation_total = int(
+        round(_all_reduce_sum(empty_due_to_truncation, device, distributed_context))
+    )
+    empty_due_to_empty_completion_total = int(
+        round(_all_reduce_sum(empty_due_to_empty_completion, device, distributed_context))
+    )
+    empty_after_filtering_total = int(
+        round(_all_reduce_sum(empty_after_filtering, device, distributed_context))
+    )
+
     summary = {
         "output_dir": str(output_dir),
         "steps": global_step,
@@ -1184,6 +1298,11 @@ def run_offline_policy_training(
         "objective": "grpo",
         "skipped_empty_batches": skipped_empty_batches,
         "skipped_non_finite_batches": skipped_non_finite_batches,
+        "empty_due_to_truncation": empty_due_to_truncation_total,
+        "empty_due_to_empty_completion": empty_due_to_empty_completion_total,
+        "empty_after_filtering": empty_after_filtering_total,
+        "train_dataset_diagnostics": dict(train_dataset.stats),
+        "val_dataset_diagnostics": dict(val_dataset.stats),
         "save_final_checkpoint": config.save_final_checkpoint,
         "save_best_checkpoint": config.save_best_checkpoint,
         "save_intermediate_checkpoints": config.save_intermediate_checkpoints,
@@ -1207,6 +1326,9 @@ def run_offline_policy_training(
             f"steps={global_step} output_dir={output_dir} "
             f"skipped_empty_batches={skipped_empty_batches} "
             f"skipped_non_finite_batches={skipped_non_finite_batches} "
+            f"empty_due_to_truncation={empty_due_to_truncation_total} "
+            f"empty_due_to_empty_completion={empty_due_to_empty_completion_total} "
+            f"empty_after_filtering={empty_after_filtering_total} "
             f"selected_model_source={selected_model_source}"
         )
         if tracking is not None:
@@ -1216,7 +1338,22 @@ def run_offline_policy_training(
                 f"{tracking_prefix}train/num_val_samples": len(val_samples),
                 f"{tracking_prefix}train/skipped_empty_batches": skipped_empty_batches,
                 f"{tracking_prefix}train/skipped_non_finite_batches": skipped_non_finite_batches,
+                f"{tracking_prefix}train/empty_due_to_truncation": empty_due_to_truncation_total,
+                f"{tracking_prefix}train/empty_due_to_empty_completion": empty_due_to_empty_completion_total,
+                f"{tracking_prefix}train/empty_after_filtering": empty_after_filtering_total,
             }
+            train_dataset_diagnostics = summary.get("train_dataset_diagnostics", {})
+            if isinstance(train_dataset_diagnostics, dict):
+                for field in (
+                    "retained_response_tokens",
+                    "truncated_prompt_tokens",
+                    "truncated_response_tokens",
+                    "zero_loss_rows",
+                ):
+                    if field in train_dataset_diagnostics:
+                        final_metrics[f"{tracking_prefix}train_dataset/{field}"] = int(
+                            train_dataset_diagnostics[field]
+                        )
             if "val_loss" in summary:
                 final_metrics[f"{tracking_prefix}val/final_loss"] = summary["val_loss"]
             if best_val_loss is not None:
