@@ -486,13 +486,17 @@ class RayReMASeparatedTrainer(object):
             raise ValueError("CPCR likelihood correction currently requires rollout.top_p=1")
         if int(rollout_config.get('top_k', -1)) not in {-1, 0}:
             raise ValueError("CPCR likelihood correction currently requires top_k to be disabled")
-        if float(rollout_config.get('min_p', 0.0)) != 0.0:
+        min_p = rollout_config.get('min_p', 0.0)
+        if min_p is not None and float(min_p) != 0.0:
             raise ValueError("CPCR likelihood correction currently requires rollout.min_p=0")
-        if float(rollout_config.get('presence_penalty', 0.0)) != 0.0:
+        presence_penalty = rollout_config.get('presence_penalty', 0.0)
+        if presence_penalty is not None and float(presence_penalty) != 0.0:
             raise ValueError("CPCR does not reproduce rollout.presence_penalty")
-        if float(rollout_config.get('frequency_penalty', 0.0)) != 0.0:
+        frequency_penalty = rollout_config.get('frequency_penalty', 0.0)
+        if frequency_penalty is not None and float(frequency_penalty) != 0.0:
             raise ValueError("CPCR does not reproduce rollout.frequency_penalty")
-        if float(rollout_config.get('repetition_penalty', 1.0)) != 1.0:
+        repetition_penalty = rollout_config.get('repetition_penalty', 1.0)
+        if repetition_penalty is not None and float(repetition_penalty) != 1.0:
             raise ValueError("CPCR does not reproduce rollout.repetition_penalty")
 
     @staticmethod
