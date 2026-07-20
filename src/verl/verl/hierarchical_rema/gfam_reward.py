@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
+import statistics
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -31,7 +34,6 @@ DECOMPOSER_LABELS = (
 )
 SELECTOR_LABELS = (
     "S_worker_match",
-    "S_dependency_readiness",
     "S_bad_routing_caused_failure",
 )
 WORKER_LABELS = (
@@ -43,17 +45,11 @@ WORKER_LABELS = (
     "W_nonfinal_solved_final",
     "W_trivial_finalization",
     "W_contaminated_by_upstream",
-    "W_contaminates_downstream",
 )
 FINAL_LABELS = (
     "F_aggregation_error",
     "F_verification_error",
     "F_answer_missing_or_invalid",
-)
-EDGE_LABELS = (
-    "E_actual_use",
-    "E_failure_propagated",
-    "E_target_should_have_detected",
 )
 PRIMARY_FAILURE_STAGES = (
     "decomposition",
@@ -64,6 +60,7 @@ PRIMARY_FAILURE_STAGES = (
     "none",
     "unclear",
 )
+NODE_HEAD_CONTEXTS = ("center", "ego")
 MISSINGISH_ANSWER_TEXTS = {
     "",
     "none",
@@ -292,7 +289,16 @@ class GraphExample:
     selector_index: int
     final_index: int
     worker_indices_by_node_id: dict[str, int]
-    edge_key_to_position: dict[str, tuple[int, int]]
+
+
+@dataclass
+class LoadedRewardModel:
+    checkpoint_path: Path
+    checkpoint: dict[str, Any]
+    encoder: BaseSentenceEncoder
+    model: GFAMSmallModel
+    worker_bucket_count: int
+    device: torch.device
 
 
 def build_metadata_vector(
@@ -547,14 +553,6 @@ def build_graph_example_for_inference(
         dtype=torch.long,
     )
 
-    labeled_edge_positions: dict[str, tuple[int, int]] = {}
-    for key in sorted(used_edges):
-        from_node_id, to_node_id = key.split("->", 1)
-        src_index = worker_indices_by_node_id.get(from_node_id)
-        dst_index = worker_indices_by_node_id.get(to_node_id)
-        if src_index is not None and dst_index is not None:
-            labeled_edge_positions[key] = (src_index, dst_index)
-
     return GraphExample(
         source_record=record,
         text_embeddings=encoder.encode_texts(node_texts),
@@ -568,7 +566,6 @@ def build_graph_example_for_inference(
         selector_index=selector_index,
         final_index=final_index,
         worker_indices_by_node_id=worker_indices_by_node_id,
-        edge_key_to_position=labeled_edge_positions,
     )
 
 
@@ -589,7 +586,6 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     selector_scores = compiler_inputs["selector_scores"]
     worker_scores = compiler_inputs["worker_scores"]
     final_scores = compiler_inputs["final_scores"]
-    edge_scores = compiler_inputs["edge_scores"]
     final_anchor_score = float(compiler_inputs["final_anchor_score"])
     record = example.source_record
     final_worker_id = record["trajectory"]["final_node_id"]
@@ -616,7 +612,6 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     )
     q_selector = (
         +0.50 * success(selector_scores, "S_worker_match")
-        + 0.35 * success(selector_scores, "S_dependency_readiness")
         - 0.40 * error(selector_scores, "S_bad_routing_caused_failure")
     )
 
@@ -630,7 +625,6 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
         nonfinal_solved_final = error(scores, "W_nonfinal_solved_final")
         trivial_finalization = error(scores, "W_trivial_finalization")
         contaminated = error(scores, "W_contaminated_by_upstream")
-        contaminates_downstream = error(scores, "W_contaminates_downstream")
 
         q_worker = (
             +0.50 * subtask_solved
@@ -640,7 +634,6 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
             - 0.25 * role_drift
             - 0.20 * nonfinal_solved_final
             - 0.35 * trivial_finalization
-            - 0.10 * contaminates_downstream
         )
         own_fault = max(
             reasoning_error,
@@ -688,18 +681,16 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     )
 
     transition_weights: dict[tuple[str, str], float] = {}
-    for key, scores in edge_scores.items():
-        from_node_id, to_node_id = key.split("->", 1)
-        transition_weights[(from_node_id, to_node_id)] = (
-            0.75
-            * yes_strength_from_centered(scores.get("E_actual_use", 0.0))
-            * yes_strength_from_centered(scores.get("E_failure_propagated", 0.0))
-        )
+    for edge in record.get("graph", {}).get("used_dependency_edges", []):
+        from_node_id = str(edge.get("from_node_id") or "")
+        to_node_id = str(edge.get("to_node_id") or "")
+        if from_node_id and to_node_id:
+            transition_weights[(from_node_id, to_node_id)] = 0.75
 
-    downstream_graph: dict[str, list[tuple[str, float]]] = {}
+    downstream_graph: dict[str, list[tuple[str, float]]] = defaultdict(list)
     for (src, dst), weight in transition_weights.items():
         if weight > 0:
-            downstream_graph.setdefault(src, []).append((dst, weight))
+            downstream_graph[src].append((dst, weight))
 
     def max_path_weight(start: str, goal: str) -> float:
         if start == goal:
@@ -763,7 +754,6 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     selector_fault = max(
         error(selector_scores, "S_bad_routing_caused_failure"),
         lack(selector_scores, "S_worker_match"),
-        lack(selector_scores, "S_dependency_readiness"),
     )
 
     final_failure_severity = clamp01((1.0 - final_anchor_score) / 2.0)
@@ -889,23 +879,17 @@ def compile_rewards_from_predictions(example: GraphExample, outputs: dict[str, A
         node_id: probs_to_scores(logits, WORKER_LABELS)
         for node_id, logits in outputs["worker_logits"].items()
     }
-    edge_scores = {
-        key: probs_to_scores(logits, EDGE_LABELS)
-        for key, logits in outputs["edge_logits"].items()
-    }
     final_anchor_prob = float(torch.sigmoid(outputs["final_anchor_logit"]).detach().cpu())
-    return compile_rewards_from_scores(
-        {
-            "graph_scores": graph_scores,
-            "decomposer_scores": decomposer_scores,
-            "selector_scores": selector_scores,
-            "worker_scores": worker_scores,
-            "final_scores": final_scores,
-            "edge_scores": edge_scores,
-            "final_anchor_score": 2.0 * final_anchor_prob - 1.0,
-            "example": example,
-        }
-    )
+    compiler_inputs = {
+        "graph_scores": graph_scores,
+        "decomposer_scores": decomposer_scores,
+        "selector_scores": selector_scores,
+        "worker_scores": worker_scores,
+        "final_scores": final_scores,
+        "final_anchor_score": 2.0 * final_anchor_prob - 1.0,
+        "example": example,
+    }
+    return compile_rewards_from_scores(compiler_inputs)
 
 
 class RelationalMessagePassingLayer(nn.Module):
@@ -950,8 +934,14 @@ class GFAMSmallModel(nn.Module):
         message_passing_layers: int,
         dropout: float,
         worker_bucket_count: int,
+        node_head_context: str = "ego",
     ) -> None:
         super().__init__()
+        if node_head_context not in NODE_HEAD_CONTEXTS:
+            raise ValueError(
+                f"Unsupported node_head_context={node_head_context!r}; "
+                f"expected one of {NODE_HEAD_CONTEXTS}."
+            )
         self.text_proj = nn.Linear(text_dim, hidden_dim)
         self.meta_proj = nn.Sequential(
             nn.Linear(metadata_dim, hidden_dim),
@@ -966,22 +956,47 @@ class GFAMSmallModel(nn.Module):
             for _ in range(message_passing_layers)
         )
         self.dropout = nn.Dropout(dropout)
+        self.node_head_context = node_head_context
         self.graph_pool_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.local_pool_proj = (
+            nn.Linear(hidden_dim * 3, hidden_dim) if node_head_context == "ego" else None
+        )
         self.graph_label_head = nn.Linear(hidden_dim, len(GRAPH_LABELS) * 3)
         self.decomposer_head = nn.Linear(hidden_dim, len(DECOMPOSER_LABELS) * 3)
         self.selector_head = nn.Linear(hidden_dim, len(SELECTOR_LABELS) * 3)
         self.worker_head = nn.Linear(hidden_dim, len(WORKER_LABELS) * 3)
         self.final_head = nn.Linear(hidden_dim, len(FINAL_LABELS) * 3)
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, len(EDGE_LABELS) * 3),
-        )
-        self.edge_type_embedding = nn.Embedding(len(EDGE_TYPES), hidden_dim)
         self.primary_stage_head = nn.Linear(hidden_dim, len(PRIMARY_FAILURE_STAGES))
         self.final_anchor_head = nn.Linear(hidden_dim, 1)
         self.ranking_head = nn.Linear(hidden_dim, 1)
+
+    def node_head_representation(
+        self,
+        hidden: Tensor,
+        edge_index: Tensor,
+        node_index: int,
+    ) -> Tensor:
+        center = hidden[node_index]
+        if self.node_head_context != "ego" or self.local_pool_proj is None or edge_index.numel() == 0:
+            return center
+
+        src_matches = edge_index[0] == node_index
+        dst_matches = edge_index[1] == node_index
+        neighbor_indices = torch.cat(
+            [edge_index[1, src_matches], edge_index[0, dst_matches]],
+            dim=0,
+        )
+        if neighbor_indices.numel() == 0:
+            return center
+        neighbor_indices = torch.unique(neighbor_indices)
+        neighbor_indices = neighbor_indices[neighbor_indices != node_index]
+        if neighbor_indices.numel() == 0:
+            return center
+
+        ego_hidden = hidden[neighbor_indices]
+        mean_pool = ego_hidden.mean(dim=0)
+        max_pool = ego_hidden.max(dim=0).values
+        return F.gelu(self.local_pool_proj(torch.cat([center, mean_pool, max_pool], dim=-1)))
 
     def forward(self, example: GraphExample, device: torch.device) -> dict[str, Any]:
         text = example.text_embeddings.to(device)
@@ -1006,29 +1021,28 @@ class GFAMSmallModel(nn.Module):
         mean_pool = hidden.mean(dim=0)
         max_pool = hidden.max(dim=0).values
         graph_embedding = F.gelu(self.graph_pool_proj(torch.cat([mean_pool, max_pool], dim=-1)))
+        decomposer_repr = self.node_head_representation(hidden, edge_index, example.decomposer_index)
+        selector_repr = self.node_head_representation(hidden, edge_index, example.selector_index)
+        final_repr = self.node_head_representation(hidden, edge_index, example.final_index)
 
         graph_label_logits = self.graph_label_head(graph_embedding).view(len(GRAPH_LABELS), 3)
-        decomposer_logits = self.decomposer_head(hidden[example.decomposer_index]).view(len(DECOMPOSER_LABELS), 3)
-        selector_logits = self.selector_head(hidden[example.selector_index]).view(len(SELECTOR_LABELS), 3)
-        final_logits = self.final_head(hidden[example.final_index]).view(len(FINAL_LABELS), 3)
+        decomposer_logits = self.decomposer_head(decomposer_repr).view(len(DECOMPOSER_LABELS), 3)
+        selector_logits = self.selector_head(selector_repr).view(len(SELECTOR_LABELS), 3)
+        final_logits = self.final_head(final_repr).view(len(FINAL_LABELS), 3)
 
         worker_logits: dict[str, Tensor] = {}
         for node_id, index in example.worker_indices_by_node_id.items():
-            worker_logits[node_id] = self.worker_head(hidden[index]).view(len(WORKER_LABELS), 3)
-
-        edge_logits: dict[str, Tensor] = {}
-        for key, (src_index, dst_index) in example.edge_key_to_position.items():
-            relation_embedding = self.edge_type_embedding.weight[EDGE_TYPE_TO_ID["uses_output"]]
-            features = torch.cat([hidden[src_index], hidden[dst_index], relation_embedding], dim=-1)
-            edge_logits[key] = self.edge_mlp(features).view(len(EDGE_LABELS), 3)
+            worker_repr = self.node_head_representation(hidden, edge_index, index)
+            worker_logits[node_id] = self.worker_head(worker_repr).view(len(WORKER_LABELS), 3)
 
         return {
+            "hidden": hidden,
+            "graph_embedding": graph_embedding,
             "graph_label_logits": graph_label_logits,
             "decomposer_logits": decomposer_logits,
             "selector_logits": selector_logits,
             "worker_logits": worker_logits,
             "final_logits": final_logits,
-            "edge_logits": edge_logits,
             "primary_stage_logits": self.primary_stage_head(graph_embedding),
             "final_anchor_logit": self.final_anchor_head(graph_embedding).squeeze(-1),
             "ranking_score": self.ranking_head(graph_embedding).squeeze(-1),
@@ -1060,6 +1074,63 @@ def build_encoder_from_checkpoint(
     return encoder
 
 
+def current_label_schema() -> dict[str, tuple[str, ...]]:
+    return {
+        "graph": GRAPH_LABELS,
+        "decomposer": DECOMPOSER_LABELS,
+        "selector": SELECTOR_LABELS,
+        "worker": WORKER_LABELS,
+        "final": FINAL_LABELS,
+        "primary_failure_stages": PRIMARY_FAILURE_STAGES,
+    }
+
+
+def current_head_dimensions() -> dict[str, int]:
+    return {
+        "graph_label_head": len(GRAPH_LABELS) * 3,
+        "decomposer_head": len(DECOMPOSER_LABELS) * 3,
+        "selector_head": len(SELECTOR_LABELS) * 3,
+        "worker_head": len(WORKER_LABELS) * 3,
+        "final_head": len(FINAL_LABELS) * 3,
+        "primary_stage_head": len(PRIMARY_FAILURE_STAGES),
+    }
+
+
+def current_scoring_contract() -> dict[str, Any]:
+    return {
+        "checkpoint_schema_changes": {
+            "added_decomposer_labels": ["D_under_decomposition"],
+            "added_worker_labels": ["W_trivial_finalization"],
+            "added_final_labels": ["F_answer_missing_or_invalid"],
+            "removed_selector_labels": ["S_dependency_readiness"],
+            "removed_worker_labels": ["W_contaminates_downstream"],
+            "removed_edge_label_family": True,
+        },
+        "reward_probability_mapping": {
+            "type": "centered",
+            "formula": "centered_score = p(class=2) - p(class=0)",
+        },
+        "graph_edges": {
+            "supervision": "structural_only",
+            "note": "Used dependency edges remain as graph structure for message passing and propagation.",
+        },
+        "reward_export": {
+            "raw_field": "reward_raw",
+            "normalized_field": "reward_normalized",
+            "default_reward_field_before_normalization": "reward",
+        },
+        "node_head_context": {
+            "default": "ego",
+            "available": list(NODE_HEAD_CONTEXTS),
+            "legacy_checkpoint_fallback": "center",
+        },
+    }
+
+
+def resolved_node_head_context_from_checkpoint(checkpoint: dict[str, Any]) -> str:
+    return str(checkpoint.get("config", {}).get("node_head_context", "center"))
+
+
 def instantiate_model_from_checkpoint(
     checkpoint: dict[str, Any],
     device: torch.device,
@@ -1075,10 +1146,250 @@ def instantiate_model_from_checkpoint(
         message_passing_layers=int(config["message_passing_layers"]),
         dropout=float(config["dropout"]),
         worker_bucket_count=int(config["worker_bucket_count"]),
+        node_head_context=resolved_node_head_context_from_checkpoint(checkpoint),
     ).to(device)
-    model.load_state_dict(state_dict)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        expected_dims = current_head_dimensions()
+        checkpoint_dims = {
+            "graph_label_head": int(state_dict["graph_label_head.weight"].shape[0]),
+            "decomposer_head": int(state_dict["decomposer_head.weight"].shape[0]),
+            "selector_head": int(state_dict["selector_head.weight"].shape[0]),
+            "worker_head": int(state_dict["worker_head.weight"].shape[0]),
+            "final_head": int(state_dict["final_head.weight"].shape[0]),
+            "primary_stage_head": int(state_dict["primary_stage_head.weight"].shape[0]),
+        }
+        mismatch_hints = []
+        for head_name, expected_dim in expected_dims.items():
+            observed_dim = checkpoint_dims.get(head_name)
+            if observed_dim is None or observed_dim == expected_dim:
+                continue
+            if head_name.endswith("_head") and observed_dim % 3 == 0 and expected_dim % 3 == 0:
+                mismatch_hints.append(
+                    f"{head_name}: checkpoint has {observed_dim // 3} labels, "
+                    f"current code expects {expected_dim // 3}"
+                )
+            else:
+                mismatch_hints.append(
+                    f"{head_name}: checkpoint dim={observed_dim}, current code expects dim={expected_dim}"
+                )
+        raise RuntimeError(
+            "Checkpoint/schema mismatch while loading GFAMSmallModel.\n"
+            "This usually means the inference code still uses an older GFAM label schema.\n"
+            f"Current label schema:\n{json.dumps(current_label_schema(), ensure_ascii=True, indent=2)}\n"
+            "Observed head mismatches:\n"
+            + "\n".join(f"  - {item}" for item in mismatch_hints)
+            + f"\nOriginal load_state_dict error:\n{exc}"
+        ) from exc
     model.eval()
     return model
+
+
+def latest_checkpoint_path() -> Path:
+    alias_candidates = sorted(Path("processed/gfam_runs").glob("**/best_overall_model.pkl"))
+    if alias_candidates:
+        return max(alias_candidates, key=lambda path: path.stat().st_mtime)
+    candidates = sorted(Path("processed/gfam_runs").glob("**/best_model.pkl"))
+    if not candidates:
+        raise FileNotFoundError("No GFAM checkpoint found under processed/gfam_runs.")
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def load_reward_model_bundle(
+    *,
+    model_pkl: str | Path | None = None,
+    device_name: str = "auto",
+    encoder_backend: str | None = None,
+    encoder_model: str | None = None,
+) -> LoadedRewardModel:
+    device = resolve_device(device_name)
+    checkpoint_path = Path(model_pkl).expanduser() if model_pkl else latest_checkpoint_path()
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    encoder = build_encoder_from_checkpoint(
+        checkpoint=checkpoint,
+        device=device,
+        backend_override=encoder_backend,
+        model_override=encoder_model,
+    )
+    model = instantiate_model_from_checkpoint(checkpoint=checkpoint, device=device)
+    return LoadedRewardModel(
+        checkpoint_path=checkpoint_path,
+        checkpoint=checkpoint,
+        encoder=encoder,
+        model=model,
+        worker_bucket_count=int(checkpoint["config"]["worker_bucket_count"]),
+        device=device,
+    )
+
+
+def tensor_label_prediction(logits: torch.Tensor, label_names: tuple[str, ...]) -> dict[str, Any]:
+    probabilities = torch.softmax(logits, dim=-1)
+    centered_scores = centered_score_from_probs(probabilities).detach().cpu().tolist()
+    yes_probabilities = probabilities[:, 2].detach().cpu().tolist()
+    hard_labels = logits.argmax(dim=-1).detach().cpu().tolist()
+    return {
+        "hard_labels": {name: int(value) for name, value in zip(label_names, hard_labels)},
+        "centered_label_scores": {
+            name: float(value) for name, value in zip(label_names, centered_scores)
+        },
+        "label_truth_scores": {
+            name: float(value) for name, value in zip(label_names, centered_scores)
+        },
+        "yes_probabilities": {
+            name: float(value) for name, value in zip(label_names, yes_probabilities)
+        },
+    }
+
+
+def summarize_predictions(example: GraphExample, outputs: dict[str, Any]) -> dict[str, Any]:
+    del example
+    summary = {
+        "graph": tensor_label_prediction(outputs["graph_label_logits"], GRAPH_LABELS),
+        "decomposer": tensor_label_prediction(outputs["decomposer_logits"], DECOMPOSER_LABELS),
+        "selector": tensor_label_prediction(outputs["selector_logits"], SELECTOR_LABELS),
+        "final": tensor_label_prediction(outputs["final_logits"], FINAL_LABELS),
+        "workers": {},
+    }
+    summary["graph"]["primary_failure_stage"] = PRIMARY_FAILURE_STAGES[
+        int(outputs["primary_stage_logits"].argmax().detach().cpu())
+    ]
+    summary["graph"]["final_correct_probability"] = float(
+        torch.sigmoid(outputs["final_anchor_logit"]).detach().cpu()
+    )
+    summary["graph"]["ranking_score"] = float(outputs["ranking_score"].detach().cpu())
+
+    for node_id, logits in outputs["worker_logits"].items():
+        summary["workers"][node_id] = tensor_label_prediction(logits, WORKER_LABELS)
+    return summary
+
+
+def flatten_compiled_rewards(compiled_rewards: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+
+    def add_row(role: str, payload: dict[str, Any]) -> None:
+        rows.append({"role": role, **payload})
+
+    add_row("decomposer", compiled_rewards["decomposer"])
+    add_row("selector", compiled_rewards["selector"])
+    for node_id in sorted(compiled_rewards["workers"]):
+        add_row("worker", compiled_rewards["workers"][node_id])
+    add_row("final", compiled_rewards["final"])
+    return rows
+
+
+def build_scored_row(
+    record: dict[str, Any],
+    compiled: dict[str, Any],
+    predicted_labels: dict[str, Any],
+) -> dict[str, Any]:
+    row = {
+        "trajectory_id": record.get("trajectory_id"),
+        "task_id": record.get("task", {}).get("task_id"),
+        "metadata": {
+            "folder_filename_id": record.get("metadata", {}).get("folder_filename_id"),
+        },
+        "graph_summary": compiled["graph_summary"],
+        "compiled_rewards": compiled["node_rewards"],
+        "predicted_labels": predicted_labels,
+    }
+    row["compiled_rewards_flat"] = flatten_compiled_rewards(row["compiled_rewards"])
+    return row
+
+
+def score_rollout_record(
+    bundle: LoadedRewardModel,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    example = build_graph_example_for_inference(
+        record=record,
+        encoder=bundle.encoder,
+        worker_bucket_count=bundle.worker_bucket_count,
+    )
+    with torch.no_grad():
+        outputs = bundle.model(example, device=bundle.device)
+    compiled = compile_rewards_from_predictions(example, outputs)
+    predicted_labels = summarize_predictions(example, outputs)
+    return build_scored_row(record, compiled, predicted_labels)
+
+
+def normalize_reward_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    task_role_values: dict[tuple[str, str], list[float]] = defaultdict(list)
+    global_role_values: dict[str, list[float]] = defaultdict(list)
+
+    for row in rows:
+        task_id = row["task_id"]
+        rewards = row["compiled_rewards"]
+        for role in ("decomposer", "selector", "final"):
+            raw = float(rewards[role]["reward_raw"])
+            task_role_values[(task_id, role)].append(raw)
+            global_role_values[role].append(raw)
+        for payload in rewards["workers"].values():
+            raw = float(payload["reward_raw"])
+            task_role_values[(task_id, "worker")].append(raw)
+            global_role_values["worker"].append(raw)
+
+    def stats(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 1.0
+        if len(values) == 1:
+            return values[0], 1.0
+        mean_value = statistics.fmean(values)
+        std_value = max(statistics.pstdev(values), 1e-6)
+        return mean_value, std_value
+
+    task_role_stats = {key: stats(values) for key, values in task_role_values.items()}
+    global_role_stats = {role: stats(values) for role, values in global_role_values.items()}
+
+    normalized_rows = []
+    for row in rows:
+        copied = copy.deepcopy(row)
+        task_id = copied["task_id"]
+        rewards = copied["compiled_rewards"]
+
+        for role in ("decomposer", "selector", "final"):
+            payload = rewards[role]
+            raw = float(payload["reward_raw"])
+            if len(task_role_values[(task_id, role)]) >= 2:
+                mean_value, std_value = task_role_stats[(task_id, role)]
+                scope = "task_role"
+            else:
+                mean_value, std_value = global_role_stats[role]
+                scope = "global_role"
+            payload["reward_normalized"] = max(-3.0, min(3.0, (raw - mean_value) / std_value))
+            payload["reward"] = payload["reward_normalized"]
+            payload["normalization_scope"] = scope
+
+        for payload in rewards["workers"].values():
+            raw = float(payload["reward_raw"])
+            if len(task_role_values[(task_id, "worker")]) >= 2:
+                mean_value, std_value = task_role_stats[(task_id, "worker")]
+                scope = "task_role"
+            else:
+                mean_value, std_value = global_role_stats["worker"]
+                scope = "global_role"
+            payload["reward_normalized"] = max(-3.0, min(3.0, (raw - mean_value) / std_value))
+            payload["reward"] = payload["reward_normalized"]
+            payload["normalization_scope"] = scope
+
+        normalized_rows.append(copied)
+    return normalized_rows
+
+
+def score_rollout_records(
+    bundle: LoadedRewardModel,
+    records: list[dict[str, Any]],
+    *,
+    normalize_rewards: bool = False,
+    show_progress: bool = False,
+) -> list[dict[str, Any]]:
+    del show_progress
+    exported_rows = [score_rollout_record(bundle, record) for record in records]
+    if normalize_rewards:
+        exported_rows = normalize_reward_rows(exported_rows)
+        for row in exported_rows:
+            row["compiled_rewards_flat"] = flatten_compiled_rewards(row["compiled_rewards"])
+    return exported_rows
 
 
 def _dependency_was_used(execution: WorkerExecution, dependency_output: str) -> bool:
@@ -1237,27 +1548,18 @@ class GFAMRewardScorer:
     encoder_model: Optional[str] = None
 
     def __post_init__(self) -> None:
-        resolved_path = Path(self.checkpoint_path).expanduser()
-        if not resolved_path.is_file():
-            raise FileNotFoundError(f"GFAM checkpoint not found: {resolved_path}")
-        self.device_obj = resolve_device(self.device)
-        self.checkpoint = torch.load(
-            resolved_path,
-            map_location=self.device_obj,
-            weights_only=False,
+        self.bundle = load_reward_model_bundle(
+            model_pkl=self.checkpoint_path,
+            device_name=self.device,
+            encoder_backend=self.encoder_backend,
+            encoder_model=self.encoder_model,
         )
-        self.encoder = build_encoder_from_checkpoint(
-            checkpoint=self.checkpoint,
-            device=self.device_obj,
-            backend_override=self.encoder_backend,
-            model_override=self.encoder_model,
-        )
-        self.model = instantiate_model_from_checkpoint(
-            checkpoint=self.checkpoint,
-            device=self.device_obj,
-        )
-        self.worker_bucket_count = int(self.checkpoint["config"]["worker_bucket_count"])
-        self.checkpoint_path = str(resolved_path)
+        self.device_obj = self.bundle.device
+        self.checkpoint = self.bundle.checkpoint
+        self.encoder = self.bundle.encoder
+        self.model = self.bundle.model
+        self.worker_bucket_count = self.bundle.worker_bucket_count
+        self.checkpoint_path = str(self.bundle.checkpoint_path)
 
     def score_rollout(
         self,
@@ -1275,17 +1577,9 @@ class GFAMRewardScorer:
             executions=executions,
             final_answer=final_answer,
         )
-        example = build_graph_example_for_inference(
-            record=record,
-            encoder=self.encoder,
-            worker_bucket_count=self.worker_bucket_count,
-        )
-        with torch.no_grad():
-            outputs = self.model(example, device=self.device_obj)
-        compiled = compile_rewards_from_predictions(example, outputs)
+        scored = score_rollout_record(self.bundle, record)
         return {
             "source": "gfam_v1",
             "record": record,
-            "compiled_rewards": compiled["node_rewards"],
-            "graph_summary": compiled["graph_summary"],
+            **scored,
         }

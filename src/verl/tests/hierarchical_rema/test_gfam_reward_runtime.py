@@ -8,11 +8,13 @@ try:
     from verl.hierarchical_rema.gfam_reward import (
         DECOMPOSER_LABELS,
         FINAL_LABELS,
+        flatten_compiled_rewards,
         GRAPH_LABELS,
         GFAMSmallModel,
         GraphExample,
         PRIMARY_FAILURE_STAGES,
         SELECTOR_LABELS,
+        summarize_predictions,
         WORKER_LABELS,
         compile_rewards_from_predictions,
     )
@@ -20,11 +22,13 @@ except ModuleNotFoundError:
     from hierarchical_rema.gfam_reward import (
         DECOMPOSER_LABELS,
         FINAL_LABELS,
+        flatten_compiled_rewards,
         GRAPH_LABELS,
         GFAMSmallModel,
         GraphExample,
         PRIMARY_FAILURE_STAGES,
         SELECTOR_LABELS,
+        summarize_predictions,
         WORKER_LABELS,
         compile_rewards_from_predictions,
     )
@@ -56,7 +60,6 @@ def _make_example(*, final_answer: str = "42", final_worker_output: str = "42") 
         selector_index=0,
         final_index=0,
         worker_indices_by_node_id={"1": 0},
-        edge_key_to_position={},
     )
 
 
@@ -68,6 +71,10 @@ def test_gfam_runtime_label_schema_matches_new_checkpoint() -> None:
         "D_role_drift",
         "D_under_decomposition",
     )
+    assert SELECTOR_LABELS == (
+        "S_worker_match",
+        "S_bad_routing_caused_failure",
+    )
     assert WORKER_LABELS == (
         "W_subtask_solved",
         "W_used_dependencies",
@@ -77,7 +84,6 @@ def test_gfam_runtime_label_schema_matches_new_checkpoint() -> None:
         "W_nonfinal_solved_final",
         "W_trivial_finalization",
         "W_contaminated_by_upstream",
-        "W_contaminates_downstream",
     )
     assert FINAL_LABELS == (
         "F_aggregation_error",
@@ -94,8 +100,10 @@ def test_gfam_runtime_label_schema_matches_new_checkpoint() -> None:
         worker_bucket_count=8,
     )
     assert model.decomposer_head.out_features == len(DECOMPOSER_LABELS) * 3 == 15
-    assert model.worker_head.out_features == len(WORKER_LABELS) * 3 == 27
+    assert model.selector_head.out_features == len(SELECTOR_LABELS) * 3 == 6
+    assert model.worker_head.out_features == len(WORKER_LABELS) * 3 == 24
     assert model.final_head.out_features == len(FINAL_LABELS) * 3 == 9
+    assert not hasattr(model, "edge_mlp")
 
 
 def test_gfam_runtime_prediction_compiler_uses_centered_scores_and_new_outputs() -> None:
@@ -112,7 +120,6 @@ def test_gfam_runtime_prediction_compiler_uses_centered_scores_and_new_outputs()
         "worker_logits": {
             "1": neutral_logits(WORKER_LABELS),
         },
-        "edge_logits": {},
         "primary_stage_logits": torch.zeros(len(PRIMARY_FAILURE_STAGES), dtype=torch.float32),
         "final_anchor_logit": torch.tensor(0.0, dtype=torch.float32),
         "ranking_score": torch.tensor(0.0, dtype=torch.float32),
@@ -131,3 +138,11 @@ def test_gfam_runtime_prediction_compiler_uses_centered_scores_and_new_outputs()
     assert "positive_cap" in final_payload
     assert "final_stage_penalty" in worker_payload
     assert "is_final_worker" in worker_payload
+
+    predicted = summarize_predictions(example, outputs)
+    assert predicted["graph"]["primary_failure_stage"] == PRIMARY_FAILURE_STAGES[0]
+    assert "final_correct_probability" in predicted["graph"]
+    assert "centered_label_scores" in predicted["workers"]["1"]
+
+    flat_rows = flatten_compiled_rewards(compiled["node_rewards"])
+    assert [row["role"] for row in flat_rows] == ["decomposer", "selector", "worker", "final"]
