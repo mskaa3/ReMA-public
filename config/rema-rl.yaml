@@ -253,6 +253,34 @@ algorithm:
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
     final_raw_score_usage_floor: 0.5
+    # Cross-prefix credit from existing rollout groups. The initial
+    # implementation transports one role action at a time and scores it under
+    # every same-prompt prefix with teacher forcing; it performs no decoding.
+    cpcr:
+      enable: True
+      # "diagnostic" only logs; "prd_target" supervises the online PRD router.
+      mode: prd_target
+      estimator: role_action
+      outcome_mode: candidate_factual
+      roles: current
+      prd_loss_weight: 1.0
+      prd_huber_delta: 1.0
+      # The legacy feature-distance counterfactual loss is disabled when CPCR
+      # supervises PRD unless this ablation flag is enabled.
+      combine_with_implicit_cf: False
+      # Cost controls. Set a limit to 0 for all groups/candidates.
+      # Score every N visits of each trained role, not every N global steps;
+      # this avoids aliasing with round-robin role switching.
+      score_interval: 5
+      mixed_groups_only: True
+      max_groups_per_step: 4
+      max_candidates_per_group: 4
+      min_effective_sample_size: 2.0
+      # A low-ESS group falls back to uniform LOO over the available support
+      # for diagnostics, but that fallback is not a PRD target by default.
+      use_fallback_targets: False
+      log_weight_clip: 20.0
+      fallback: group_loo
     reward_composer:
       enable: False
       checkpoint_path: null
@@ -273,7 +301,7 @@ algorithm:
       graph_prior_soft_distance_penalty: 1.0
       graph_prior_reverse_distance_penalty: 3.0
       online:
-        enable: False
+        enable: True
         # "source" keeps the original source-to-role composer.
         # "role" uses the experimental role-to-role credit router.
         model_type: role

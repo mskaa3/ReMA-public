@@ -48,6 +48,8 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils import torch_functional as verl_F
+from verl.utils.model import compute_position_id_with_mask
+from verl.rema_separated_trainer.ppo.cpcr import estimate_cpcr
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
 
 
@@ -440,6 +442,429 @@ class RayReMASeparatedTrainer(object):
         
         self._create_dataloader()
         self._init_online_prd_composer()
+        self._init_cpcr()
+
+    def _init_cpcr(self):
+        hierarchy_config = self.config.algorithm.get('hierarchy', {})
+        cpcr_config = hierarchy_config.get('cpcr', {}) if hierarchy_config else {}
+        self.cpcr_config = OmegaConf.to_container(cpcr_config, resolve=True) if cpcr_config else {}
+        self.cpcr_enabled = bool(self.cpcr_config.get('enable', False))
+        self._cpcr_last_scored_step = None
+        self._cpcr_role_visit_counts = defaultdict(int)
+        self._cpcr_role_last_visit_step = {}
+        if not self.cpcr_enabled:
+            return
+
+        mode = str(self.cpcr_config.get('mode', 'diagnostic'))
+        estimator = str(self.cpcr_config.get('estimator', 'role_action'))
+        outcome_mode = str(self.cpcr_config.get('outcome_mode', 'candidate_factual'))
+        if mode not in {'diagnostic', 'prd_target'}:
+            raise ValueError(f"Unsupported CPCR mode: {mode}")
+        if estimator != 'role_action':
+            raise ValueError(
+                "Only CPCR estimator='role_action' is implemented. "
+                "Full suffix transport requires deterministic downstream prompt replay."
+            )
+        if outcome_mode != 'candidate_factual':
+            raise ValueError(
+                "Only CPCR outcome_mode='candidate_factual' is implemented. "
+                "Reverified stitched outcomes require a verifier replay backend."
+            )
+        if mode == 'prd_target':
+            if not self.online_prd_enabled:
+                raise ValueError("CPCR prd_target mode requires reward_composer.online.enable=True")
+            if self.online_prd_model_type != 'role':
+                raise ValueError("CPCR prd_target mode requires online PRD model_type='role'")
+        rollout_config = self.config.actor_rollout_ref.rollout
+        if int(rollout_config.get('n', 1)) < 2:
+            raise ValueError("CPCR requires actor_rollout_ref.rollout.n >= 2")
+        if float(rollout_config.get('top_p', 1.0)) != 1.0:
+            raise ValueError("CPCR likelihood correction currently requires rollout.top_p=1")
+        if int(rollout_config.get('top_k', -1)) not in {-1, 0}:
+            raise ValueError("CPCR likelihood correction currently requires top_k to be disabled")
+
+    @staticmethod
+    def _cpcr_unpad_messages(messages):
+        if isinstance(messages, np.ndarray):
+            messages = messages.tolist()
+        return [
+            dict(message)
+            for message in messages
+            if isinstance(message, dict) and message.get('role') != 'padding'
+        ]
+
+    @staticmethod
+    def _cpcr_latest_role_output(history, role):
+        if isinstance(history, np.ndarray):
+            history = history.tolist()
+        for message in reversed(history):
+            if (
+                isinstance(message, dict)
+                and message.get('role') == role
+                and isinstance(message.get('content'), str)
+            ):
+                return message['content'], message.get('stop_reason', 'stop')
+        return '', None
+
+    def _cpcr_encode_prompt_action(
+        self,
+        chat,
+        action_ids,
+        stop_reason,
+        prompt_length,
+        max_length,
+    ):
+        """Attach an already sampled token action to a stored role prompt."""
+
+        query_ids = self.tokenizer.apply_chat_template(
+            chat,
+            add_generation_prompt=True,
+            tokenize=True,
+            truncation=True,
+            max_length=prompt_length,
+        )
+        action_ids = [int(token_id) for token_id in action_ids]
+        full_ids = list(query_ids) + action_ids
+        if stop_reason == 'stop':
+            final_label = self.tokenizer.eos_token_id
+        elif stop_reason == 'length':
+            final_label = -100
+        else:
+            return None
+        labels = [-100] * (len(query_ids) - 1) + action_ids + [final_label]
+        if (
+            self.tokenizer.eos_token_id is None
+            or len(full_ids) != len(labels)
+            or len(full_ids) > max_length
+        ):
+            return None
+        return full_ids, labels
+
+    def _cpcr_score_role_action_pairs(
+        self,
+        data_batch,
+        role,
+        selected_uids=None,
+    ):
+        """Score all within-prompt action/prefix pairs for one role.
+
+        This is the no-decoding role-action approximation: the terminal outcome
+        is inherited from the candidate rollout. It does not claim to be exact
+        full-suffix replay.
+        """
+
+        uid_to_indices = defaultdict(list)
+        for idx, uid in enumerate(data_batch.non_tensor_batch['uid']):
+            uid_to_indices[uid].append(idx)
+
+        history_batch = data_batch.non_tensor_batch['history']
+        conversation_key = f'{role}_conversation_history'
+        labels_key = f'{role}_labels'
+        step_ids_key = f'{role}_step_ids'
+        if (
+            conversation_key not in data_batch.non_tensor_batch
+            or labels_key not in data_batch.batch
+            or step_ids_key not in data_batch.batch
+        ):
+            return {}, 0, 0, 0, 0
+        conversation_batch = data_batch.non_tensor_batch[conversation_key]
+        role_labels = data_batch.batch[labels_key]
+        role_step_ids = data_batch.batch[step_ids_key]
+        turn_counts = [int(value) for value in data_batch.non_tensor_batch['num_turns']]
+        prompt_length = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        max_length = prompt_length + int(
+            self.config.actor_rollout_ref.rollout.response_length
+        )
+
+        encoded_pairs = []
+        pair_locations = []
+        skipped_pair_count = 0
+        group_specs = {}
+        for group_idx, (uid, indices) in enumerate(uid_to_indices.items()):
+            if len(indices) < 2 or (selected_uids is not None and uid not in selected_uids):
+                continue
+            group_specs[uid] = indices
+            chats = [
+                self._cpcr_unpad_messages(conversation_batch[idx])
+                for idx in indices
+            ]
+            actions_and_stops = [
+                self._cpcr_latest_role_output(history_batch[idx], role)
+                for idx in indices
+            ]
+            candidate_limit = int(self.cpcr_config.get('max_candidates_per_group', 0))
+            positions_by_turn = defaultdict(list)
+            for position, global_idx in enumerate(indices):
+                positions_by_turn[turn_counts[global_idx]].append(position)
+            candidates_by_turn = {}
+            for turn_count, positions in positions_by_turn.items():
+                if candidate_limit <= 0 or len(positions) <= candidate_limit:
+                    candidates_by_turn[turn_count] = positions
+                    continue
+                # Uniform sampling is independent of outcome, so the common
+                # inclusion probability cancels in the self-normalized MIS ratio.
+                seed = (
+                    int(getattr(self, 'global_steps', 0)) * 1_000_003
+                    + group_idx * 10_007
+                    + turn_count * 101
+                ) % (2**32)
+                rng = np.random.default_rng(seed)
+                candidates_by_turn[turn_count] = sorted(
+                    rng.choice(positions, size=candidate_limit, replace=False).tolist()
+                )
+            for target_pos, chat in enumerate(chats):
+                target_turn = turn_counts[indices[target_pos]]
+                for candidate_pos in candidates_by_turn[target_turn]:
+                    action, stop_reason = actions_and_stops[candidate_pos]
+                    if not chat or not action.strip():
+                        skipped_pair_count += 1
+                        continue
+                    candidate_idx = indices[candidate_pos]
+                    candidate_turn = turn_counts[candidate_idx] - 1
+                    if candidate_turn < 0:
+                        skipped_pair_count += 1
+                        continue
+                    action_labels = role_labels[candidate_idx][
+                        role_step_ids[candidate_idx] == candidate_turn
+                    ]
+                    action_labels = action_labels[action_labels != -100]
+                    if stop_reason == 'stop':
+                        if (
+                            self.tokenizer.eos_token_id is None
+                            or action_labels.numel() == 0
+                            or int(action_labels[-1].item()) != self.tokenizer.eos_token_id
+                        ):
+                            skipped_pair_count += 1
+                            continue
+                        action_token_ids = action_labels[:-1].tolist()
+                    elif stop_reason == 'length':
+                        action_token_ids = action_labels.tolist()
+                    else:
+                        skipped_pair_count += 1
+                        continue
+                    if not action_token_ids:
+                        skipped_pair_count += 1
+                        continue
+                    encoded = self._cpcr_encode_prompt_action(
+                        chat,
+                        action_token_ids,
+                        stop_reason,
+                        prompt_length,
+                        max_length,
+                    )
+                    if encoded is None:
+                        skipped_pair_count += 1
+                        continue
+                    encoded_pairs.append(encoded)
+                    pair_locations.append((uid, target_pos, candidate_pos))
+
+        if not encoded_pairs:
+            return {
+                uid: torch.full((len(indices), len(indices)), -torch.inf)
+                for uid, indices in group_specs.items()
+            }, skipped_pair_count, 0, 0, 0
+
+        sequence_length = max(len(input_ids) for input_ids, _ in encoded_pairs)
+        batch_size = len(encoded_pairs)
+        input_ids = torch.full(
+            (batch_size, sequence_length),
+            self.tokenizer.pad_token_id,
+            dtype=torch.long,
+        )
+        labels = torch.full((batch_size, sequence_length), -100, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, sequence_length), dtype=torch.long)
+        for idx, (pair_input_ids, pair_labels) in enumerate(encoded_pairs):
+            length = len(pair_input_ids)
+            input_ids[idx, :length] = torch.tensor(pair_input_ids, dtype=torch.long)
+            labels[idx, :length] = torch.tensor(pair_labels, dtype=torch.long)
+            attention_mask[idx, :length] = 1
+
+        scoring_batch = DataProto.from_dict({
+            'input_ids': input_ids,
+            'labels': labels,
+            'attention_mask': attention_mask,
+            'position_ids': compute_position_id_with_mask(attention_mask),
+        })
+        worker_group = self.actor_rollout_wg[role]
+        scoring_batch, pad_size = pad_dataproto_to_divisor(
+            scoring_batch,
+            worker_group.world_size,
+        )
+        scored = worker_group.compute_log_prob(scoring_batch)
+        scored = unpad_dataproto(scored, pad_size=pad_size)
+        token_log_probs = scored.batch['old_log_probs']
+        label_mask = labels != -100
+        sequence_log_probs = token_log_probs.float().masked_fill(~label_mask, 0.0).sum(dim=1)
+        scored_action_tokens = int(label_mask.sum().item())
+        scored_input_tokens = int(attention_mask.sum().item())
+
+        matrices = {
+            uid: torch.full((len(indices), len(indices)), -torch.inf)
+            for uid, indices in group_specs.items()
+        }
+        for pair_idx, (uid, target_pos, candidate_pos) in enumerate(pair_locations):
+            matrices[uid][target_pos, candidate_pos] = sequence_log_probs[pair_idx]
+        return (
+            matrices,
+            skipped_pair_count,
+            len(encoded_pairs),
+            scored_action_tokens,
+            scored_input_tokens,
+        )
+
+    def _compute_cpcr_targets(self, data_batch, reward_tensor_map, metrics):
+        if not self.cpcr_enabled:
+            return {}
+
+        role_setting = self.cpcr_config.get('roles', 'current')
+        if role_setting == 'current':
+            roles = [self._current_train_agent]
+        elif role_setting == 'all':
+            roles = list(data_batch.meta_info['agent_roles'])
+        elif isinstance(role_setting, str):
+            roles = [role_setting] if role_setting in data_batch.meta_info['agent_roles'] else []
+        else:
+            roles = [role for role in role_setting if role in data_batch.meta_info['agent_roles']]
+        roles = [role for role in roles if role is not None and role in self.actor_rollout_wg]
+
+        current_step = int(getattr(self, 'global_steps', 0))
+        score_interval = max(int(self.cpcr_config.get('score_interval', 1)), 1)
+        due_roles = []
+        for role in roles:
+            if self._cpcr_role_last_visit_step.get(role) != current_step:
+                self._cpcr_role_visit_counts[role] += 1
+                self._cpcr_role_last_visit_step[role] = current_step
+            metrics[f'reward/cpcr/roles/{role}/visit_count'] = float(
+                self._cpcr_role_visit_counts[role]
+            )
+            if self._cpcr_role_visit_counts[role] % score_interval == 0:
+                due_roles.append(role)
+        roles = due_roles
+        if not roles:
+            metrics['reward/cpcr/enabled'] = 1.0
+            metrics['reward/cpcr/scored_this_step'] = 0.0
+            return {}
+
+        uid_to_indices = defaultdict(list)
+        for idx, uid in enumerate(data_batch.non_tensor_batch['uid']):
+            uid_to_indices[uid].append(idx)
+        raw_scores = reward_tensor_map['acc'].float()
+        min_ess = float(self.cpcr_config.get('min_effective_sample_size', 2.0))
+        log_weight_clip = self.cpcr_config.get('log_weight_clip', 20.0)
+        fallback = str(self.cpcr_config.get('fallback', 'group_loo'))
+
+        metrics['reward/cpcr/enabled'] = 1.0
+        mode = str(self.cpcr_config.get('mode', 'diagnostic'))
+        metrics['reward/cpcr/prd_target_mode'] = float(
+            mode == 'prd_target'
+        )
+        targets = {}
+        selected_uids = []
+        mixed_groups_only = bool(self.cpcr_config.get('mixed_groups_only', True))
+        for uid, indices in uid_to_indices.items():
+            if len(indices) < 2:
+                continue
+            group_scores = raw_scores[torch.tensor(indices, dtype=torch.long)]
+            is_mixed = bool((group_scores > 0).any() and (group_scores <= 0).any())
+            if mixed_groups_only and not is_mixed:
+                continue
+            selected_uids.append(uid)
+        group_limit = int(self.cpcr_config.get('max_groups_per_step', 0))
+        if group_limit > 0 and len(selected_uids) > group_limit:
+            rng = np.random.default_rng((current_step * 1_000_003 + 17) % (2**32))
+            selected_positions = sorted(
+                rng.choice(len(selected_uids), size=group_limit, replace=False).tolist()
+            )
+            selected_uids = [selected_uids[position] for position in selected_positions]
+        selected_uids = set(selected_uids)
+        metrics['reward/cpcr/selected_group_count'] = float(len(selected_uids))
+        selected_target_count = sum(
+            len(indices) for uid, indices in uid_to_indices.items() if uid in selected_uids
+        )
+        if not selected_uids or self._cpcr_last_scored_step == current_step:
+            metrics['reward/cpcr/scored_this_step'] = 0.0
+            return {}
+        metrics['reward/cpcr/scored_this_step'] = 0.0
+        total_scored_pairs = 0
+        for role in roles:
+            (
+                matrices,
+                skipped_pairs,
+                scored_pairs,
+                scored_action_tokens,
+                scored_input_tokens,
+            ) = self._cpcr_score_role_action_pairs(
+                data_batch,
+                role,
+                selected_uids=selected_uids,
+            )
+            role_advantages = torch.zeros_like(raw_scores)
+            role_valid = torch.zeros_like(raw_scores, dtype=torch.bool)
+            baselines = []
+            advantages = []
+            ess_values = []
+            fallback_values = []
+            max_weights = []
+            supported_target_count = 0
+            for uid, indices in uid_to_indices.items():
+                if uid not in matrices or len(indices) < 2:
+                    continue
+                idx_tensor = torch.tensor(indices, dtype=torch.long)
+                estimate = estimate_cpcr(
+                    matrices[uid],
+                    raw_scores[idx_tensor],
+                    min_effective_sample_size=min_ess,
+                    log_weight_clip=log_weight_clip,
+                    fallback=fallback,
+                )
+                use_fallback_targets = bool(self.cpcr_config.get('use_fallback_targets', False))
+                reliable_mask = estimate.valid_target_mask
+                if not use_fallback_targets:
+                    reliable_mask = reliable_mask & ~estimate.fallback_mask
+                role_advantages[idx_tensor] = estimate.advantage
+                role_valid[idx_tensor] = reliable_mask
+                supported = estimate.valid_target_mask
+                if supported.any():
+                    supported_target_count += int(supported.sum().item())
+                    baselines.append(estimate.baseline[supported])
+                    advantages.append(estimate.advantage[supported])
+                    ess_values.append(estimate.effective_sample_size[supported])
+                    fallback_values.append(estimate.fallback_mask[supported].float())
+                    max_weights.append(
+                        estimate.normalized_weights.max(dim=1).values[supported]
+                    )
+
+            prefix = f'reward/cpcr/roles/{role}'
+            total_scored_pairs += scored_pairs
+            metrics[f'{prefix}/pairs_scored'] = float(scored_pairs)
+            metrics[f'{prefix}/pairs_skipped'] = float(skipped_pairs)
+            metrics[f'{prefix}/action_tokens_scored'] = float(scored_action_tokens)
+            metrics[f'{prefix}/input_tokens_scored'] = float(scored_input_tokens)
+            metrics[f'{prefix}/supported_target_count'] = float(supported_target_count)
+            metrics[f'{prefix}/reliable_target_count'] = float(role_valid.sum().item())
+            metrics[f'{prefix}/target_coverage'] = float(role_valid.float().mean().item())
+            metrics[f'{prefix}/selected_target_coverage'] = (
+                float(role_valid.sum().item()) / float(selected_target_count)
+                if selected_target_count > 0 else 0.0
+            )
+            if baselines:
+                metrics[f'{prefix}/baseline_mean'] = float(torch.cat(baselines).mean().item())
+                metrics[f'{prefix}/advantage_mean'] = float(torch.cat(advantages).mean().item())
+                metrics[f'{prefix}/advantage_std'] = self._safe_tensor_std(torch.cat(advantages))
+                metrics[f'{prefix}/ess_mean'] = float(torch.cat(ess_values).mean().item())
+                metrics[f'{prefix}/ess_min'] = float(torch.cat(ess_values).min().item())
+                metrics[f'{prefix}/fallback_rate'] = float(torch.cat(fallback_values).mean().item())
+                metrics[f'{prefix}/max_weight_mean'] = float(torch.cat(max_weights).mean().item())
+
+            targets[role] = {
+                'advantage': role_advantages,
+                'valid_mask': role_valid,
+            }
+
+        if total_scored_pairs > 0:
+            self._cpcr_last_scored_step = current_step
+            metrics['reward/cpcr/scored_this_step'] = 1.0
+        return targets
 
     def _get_reward_composer_config(self) -> Dict:
         hierarchy_config = self.config.algorithm.get('hierarchy', {})
@@ -1014,7 +1439,86 @@ class RayReMASeparatedTrainer(object):
             return None
         return correct / total
 
-    def _apply_online_prd_rewards(self, data_batch: DataProto, reward_tensor_map: Dict[str, torch.Tensor], metrics: Dict):
+    @staticmethod
+    def _online_prd_cpcr_supervision_loss(
+        role_scores,
+        cpcr_targets,
+        uid_list,
+        agent_roles,
+        turn_counts,
+        *,
+        huber_delta=1.0,
+    ):
+        """Fit group-centered PRD role scores to CPCR role advantages."""
+
+        boundary_to_indices = defaultdict(list)
+        for idx, (uid, turn_count) in enumerate(zip(uid_list, turn_counts)):
+            boundary_to_indices[(uid, int(turn_count))].append(idx)
+
+        losses = []
+        role_stats = {}
+        delta = max(float(huber_delta), 1e-6)
+        for role, target in cpcr_targets.items():
+            if role not in agent_roles:
+                continue
+            role_idx = agent_roles.index(role)
+            target_advantage = target['advantage'].to(role_scores.device).detach()
+            valid_mask = target['valid_mask'].to(role_scores.device)
+            role_losses = []
+            target_count = 0
+            group_count = 0
+            no_contrast_group_count = 0
+            for indices in boundary_to_indices.values():
+                idx_tensor = torch.tensor(indices, dtype=torch.long, device=role_scores.device)
+                group_valid = valid_mask[idx_tensor]
+                if int(group_valid.sum().item()) < 2:
+                    continue
+                valid_indices = idx_tensor[group_valid]
+                predicted = role_scores[valid_indices, role_idx]
+                target_values = target_advantage[valid_indices]
+                target_values = target_values - target_values.mean()
+                if float(target_values.abs().max().item()) <= 1e-8:
+                    no_contrast_group_count += 1
+                    continue
+                # CPCR advantages are zero-centered within a decision boundary.
+                # Regressing the absolute prediction to that target also fixes
+                # the otherwise unidentified score offset left by ranking loss.
+                role_losses.append(torch.nn.functional.huber_loss(
+                    predicted,
+                    target_values,
+                    reduction='mean',
+                    delta=delta,
+                ))
+                target_count += int(valid_indices.numel())
+                group_count += 1
+            if role_losses:
+                role_loss = torch.stack(role_losses).mean()
+                losses.append(role_loss)
+                role_stats[role] = {
+                    'loss': float(role_loss.detach().item()),
+                    'target_count': target_count,
+                    'group_count': group_count,
+                    'no_contrast_group_count': no_contrast_group_count,
+                }
+            elif no_contrast_group_count > 0:
+                role_stats[role] = {
+                    'loss': 0.0,
+                    'target_count': 0,
+                    'group_count': 0,
+                    'no_contrast_group_count': no_contrast_group_count,
+                }
+
+        if not losses:
+            return None, role_stats
+        return torch.stack(losses).mean(), role_stats
+
+    def _apply_online_prd_rewards(
+        self,
+        data_batch: DataProto,
+        reward_tensor_map: Dict[str, torch.Tensor],
+        metrics: Dict,
+        cpcr_targets=None,
+    ):
         if not self.online_prd_enabled:
             return reward_tensor_map
         prd_batch = self._build_online_prd_batch(data_batch, reward_tensor_map)
@@ -1080,9 +1584,20 @@ class RayReMASeparatedTrainer(object):
                 temperature=float(self.online_prd_config.get('role_rank_temperature', 1.0)),
             )
 
+        cpcr_targets = cpcr_targets or {}
+        cpcr_mode = str(self.cpcr_config.get('mode', 'diagnostic')) if self.cpcr_enabled else 'diagnostic'
+        cpcr_supervision_configured = cpcr_mode == 'prd_target'
+        use_cpcr_supervision = bool(cpcr_targets) and cpcr_supervision_configured
+        metrics['reward/prd_online/cpcr_supervision_configured'] = float(
+            cpcr_supervision_configured
+        )
+
         implicit_cf_loss = None
         implicit_cf_stats = None
         implicit_cf_weight = float(self.online_prd_config.get('implicit_cf_loss_weight', 0.0))
+        if cpcr_supervision_configured and not bool(self.cpcr_config.get('combine_with_implicit_cf', False)):
+            implicit_cf_weight = 0.0
+        metrics['reward/prd_online/implicit_cf_effective_weight'] = implicit_cf_weight
         if model_type == 'role' and implicit_cf_weight > 0.0:
             implicit_cf_loss, implicit_cf_stats = self._online_prd_implicit_counterfactual_loss(
                 train_output['role_scores'],
@@ -1095,7 +1610,20 @@ class RayReMASeparatedTrainer(object):
                 huber_delta=float(self.online_prd_config.get('implicit_cf_huber_delta', 1.0)),
             )
 
-        if losses or role_rank_loss is not None or implicit_cf_loss is not None:
+        cpcr_loss = None
+        cpcr_role_stats = {}
+        if model_type == 'role' and use_cpcr_supervision:
+            cpcr_loss, cpcr_role_stats = self._online_prd_cpcr_supervision_loss(
+                train_output['role_scores'],
+                cpcr_targets,
+                uid_list,
+                agent_roles,
+                data_batch.non_tensor_batch['num_turns'],
+                huber_delta=float(self.cpcr_config.get('prd_huber_delta', 1.0)),
+            )
+        metrics['reward/prd_online/cpcr_supervision_active'] = float(cpcr_loss is not None)
+
+        if losses or role_rank_loss is not None or implicit_cf_loss is not None or cpcr_loss is not None:
             prd_loss = torch.stack(losses).mean() if losses else train_output['role_scores'].sum() * 0.0
             if role_rank_loss is not None:
                 role_rank_weight = float(self.online_prd_config.get('role_rank_loss_weight', 0.0))
@@ -1156,6 +1684,18 @@ class RayReMASeparatedTrainer(object):
                     )
                     metrics[f'reward/prd_online/roles/{role}/implicit_cf_target_effect_abs_mean'] = (
                         implicit_cf_stats['per_role_target_effect_abs_mean'][role_idx]
+                    )
+            if cpcr_loss is not None:
+                cpcr_loss_weight = float(self.cpcr_config.get('prd_loss_weight', 1.0))
+                prd_loss = prd_loss + cpcr_loss_weight * cpcr_loss
+                metrics['reward/prd_online/cpcr_supervision_loss'] = float(cpcr_loss.item())
+                metrics['reward/prd_online/cpcr_supervision_weight'] = cpcr_loss_weight
+                for role, stats in cpcr_role_stats.items():
+                    metrics[f'reward/prd_online/roles/{role}/cpcr_loss'] = stats['loss']
+                    metrics[f'reward/prd_online/roles/{role}/cpcr_target_count'] = stats['target_count']
+                    metrics[f'reward/prd_online/roles/{role}/cpcr_group_count'] = stats['group_count']
+                    metrics[f'reward/prd_online/roles/{role}/cpcr_no_contrast_group_count'] = (
+                        stats['no_contrast_group_count']
                     )
             self.online_prd_optimizer.zero_grad(set_to_none=True)
             prd_loss.backward()
@@ -2257,10 +2797,16 @@ class RayReMASeparatedTrainer(object):
                         #     "reasoning_turn_level_reward": tensor([...], device='cuda:0'),
                         # }
                         reward_tensor_map = self.reward_fn(new_batch)
+                        cpcr_targets = self._compute_cpcr_targets(
+                            new_batch,
+                            reward_tensor_map,
+                            metrics,
+                        )
                         reward_tensor_map = self._apply_online_prd_rewards(
                             new_batch,
                             reward_tensor_map,
                             metrics,
+                            cpcr_targets=cpcr_targets,
                         )
                         penalty_names = sorted({
                             key[:-len('_applied')]
