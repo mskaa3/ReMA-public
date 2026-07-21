@@ -88,6 +88,7 @@ EDGE_TYPES_BASE = (
     "decomposes_to",
     "declared_dep",
     "decomposition_available_to_selector",
+    "selects_for_subtask",
     "assigned_to",
     "task_input",
     "uses_output",
@@ -286,8 +287,8 @@ class GraphExample:
     edge_index: torch.Tensor
     edge_type_ids: torch.Tensor
     decomposer_index: int
-    selector_index: int
     final_index: int
+    selector_indices_by_node_id: dict[str, int]
     worker_indices_by_node_id: dict[str, int]
 
 
@@ -333,23 +334,27 @@ def edge_key(from_node_id: str, to_node_id: str) -> str:
     return f"{from_node_id}->{to_node_id}"
 
 
+def selector_assignment_node_ids(record: dict[str, Any]) -> list[str]:
+    node_ids: list[str] = []
+    seen: set[str] = set()
+    for item in record.get("selection", {}).get("assignments", []):
+        node_id = str(item.get("node_id") or "").strip()
+        if not node_id or node_id in seen:
+            continue
+        node_ids.append(node_id)
+        seen.add(node_id)
+    return node_ids
+
+
 def _build_role_texts(record: dict[str, Any]) -> dict[str, str]:
     question_text = normalize_text(record["task"]["prompt"])
     decomposition_text = normalize_text(
         record["decomposition"].get("raw_text") or record["decomposition"].get("summary")
     )
-    selector_text = normalize_text(
-        record["selection"].get("raw_text")
-        or canonical_json(record["selection"].get("assignments", []))
-    )
-    final_text = normalize_text(
-        f"final_answer={record['trajectory'].get('final_answer')} "
-        f"ground_truth={record['task'].get('ground_truth')}"
-    )
+    final_text = normalize_text(f"final_answer={record['trajectory'].get('final_answer')}")
     return {
         "question": question_text,
         "decomposer": decomposition_text,
-        "selector": selector_text,
         "final": final_text,
     }
 
@@ -372,6 +377,7 @@ def build_graph_example_for_inference(
     worker_buckets: list[int] = []
     metadata_rows: list[list[float]] = []
     subtask_indices_by_node_id: dict[str, int] = {}
+    selector_indices_by_node_id: dict[str, int] = {}
     worker_indices_by_node_id: dict[str, int] = {}
 
     question_index = len(node_texts)
@@ -438,22 +444,52 @@ def build_graph_example_for_inference(
             )
         )
 
-    selector_index = len(node_texts)
-    node_texts.append(shared_texts["selector"])
-    node_type_ids.append(NODE_TYPE_TO_ID["selector"])
-    role_ids.append(ROLE_TYPE_TO_ID["selector"])
-    worker_buckets.append(0)
-    metadata_rows.append(
-        build_metadata_vector(
-            node_type="selector",
-            depth=2,
-            indegree=1,
-            outdegree=len(record["workers"]),
-            is_final_node=False,
-            dependency_count=0,
-            downstream_count=len(record["workers"]),
-        )
+    assignment_map = {
+        str(item.get("node_id")): item
+        for item in record.get("selection", {}).get("assignments", [])
+        if str(item.get("node_id") or "").strip()
+    }
+    selector_node_ids = sorted(
+        assignment_map,
+        key=lambda node_id: (
+            0,
+            int(node_id),
+        ) if node_id.isdigit() else (1, node_id),
     )
+    if not selector_node_ids and record.get("selection", {}).get("raw_text"):
+        selector_node_ids = ["__aggregate__"]
+
+    for selector_node_id in selector_node_ids:
+        idx = len(node_texts)
+        selector_indices_by_node_id[selector_node_id] = idx
+        assignment = assignment_map.get(selector_node_id, {})
+        subtask = subtask_map.get(selector_node_id, {})
+        selector_text = normalize_text(
+            " ".join(
+                [
+                    f"subtask={subtask.get('instruction') or selector_node_id}",
+                    f"required_skills={','.join(subtask.get('required_skills', []))}",
+                    f"dependencies={','.join(subtask.get('dependencies', []))}",
+                    f"chosen_worker={assignment.get('worker_id')}",
+                    f"selection_plan={record.get('selection', {}).get('raw_text') if selector_node_id == '__aggregate__' else ''}",
+                ]
+            )
+        )
+        node_texts.append(selector_text)
+        node_type_ids.append(NODE_TYPE_TO_ID["selector"])
+        role_ids.append(ROLE_TYPE_TO_ID["selector"])
+        worker_buckets.append(0)
+        metadata_rows.append(
+            build_metadata_vector(
+                node_type="selector",
+                depth=3,
+                indegree=2 if selector_node_id in subtask_indices_by_node_id else 1,
+                outdegree=1 if selector_node_id in assignment_map else 0,
+                is_final_node=False,
+                dependency_count=len(subtask.get("dependencies", [])),
+                downstream_count=1 if selector_node_id in assignment_map else 0,
+            )
+        )
 
     ordered_workers = sorted(record["workers"], key=lambda item: item["node_id"])
     for worker in ordered_workers:
@@ -481,7 +517,7 @@ def build_graph_example_for_inference(
         metadata_rows.append(
             build_metadata_vector(
                 node_type="worker",
-                depth=3,
+                depth=4,
                 indegree=len(worker.get("declared_dependencies", [])) + 2,
                 outdegree=len(worker.get("downstream_used_by", [])) + int(worker.get("is_final_node", False)),
                 is_final_node=bool(worker.get("is_final_node")),
@@ -498,7 +534,7 @@ def build_graph_example_for_inference(
     metadata_rows.append(
         build_metadata_vector(
             node_type="final",
-            depth=4,
+            depth=5,
             indegree=1,
             outdegree=0,
             is_final_node=True,
@@ -514,7 +550,6 @@ def build_graph_example_for_inference(
         edge_rows.append((dst, src, EDGE_TYPE_TO_ID[f"{edge_type}_rev"]))
 
     add_directed_edge(question_index, decomposer_index, "question_to_decomposer")
-    add_directed_edge(decomposer_index, selector_index, "decomposition_available_to_selector")
 
     for subtask in ordered_subtasks:
         subtask_index = subtask_indices_by_node_id[subtask["node_id"]]
@@ -523,11 +558,23 @@ def build_graph_example_for_inference(
             dependency_index = subtask_indices_by_node_id.get(dependency)
             if dependency_index is not None:
                 add_directed_edge(dependency_index, subtask_index, "declared_dep")
+        selector_index = selector_indices_by_node_id.get(subtask["node_id"])
+        if selector_index is not None:
+            add_directed_edge(decomposer_index, selector_index, "decomposition_available_to_selector")
+            add_directed_edge(subtask_index, selector_index, "selects_for_subtask")
+
+    aggregate_selector_index = selector_indices_by_node_id.get("__aggregate__")
+    if aggregate_selector_index is not None:
+        add_directed_edge(decomposer_index, aggregate_selector_index, "decomposition_available_to_selector")
 
     for worker in ordered_workers:
         worker_index = worker_indices_by_node_id[worker["node_id"]]
         subtask_index = subtask_indices_by_node_id[worker["node_id"]]
-        add_directed_edge(selector_index, worker_index, "assigned_to")
+        selector_index = selector_indices_by_node_id.get(worker["node_id"])
+        if selector_index is None:
+            selector_index = aggregate_selector_index
+        if selector_index is not None:
+            add_directed_edge(selector_index, worker_index, "assigned_to")
         add_directed_edge(subtask_index, worker_index, "task_input")
         for dependency in worker.get("declared_dependencies", []):
             dependency_index = worker_indices_by_node_id.get(dependency)
@@ -563,8 +610,8 @@ def build_graph_example_for_inference(
         edge_index=edge_index_tensor,
         edge_type_ids=edge_type_tensor,
         decomposer_index=decomposer_index,
-        selector_index=selector_index,
         final_index=final_index,
+        selector_indices_by_node_id=selector_indices_by_node_id,
         worker_indices_by_node_id=worker_indices_by_node_id,
     )
 
@@ -583,12 +630,29 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     example: GraphExample = compiler_inputs["example"]
     graph_scores = compiler_inputs["graph_scores"]
     decomposer_scores = compiler_inputs["decomposer_scores"]
-    selector_scores = compiler_inputs["selector_scores"]
+    raw_selector_scores = compiler_inputs["selector_scores"]
     worker_scores = compiler_inputs["worker_scores"]
     final_scores = compiler_inputs["final_scores"]
     final_anchor_score = float(compiler_inputs["final_anchor_score"])
     record = example.source_record
     final_worker_id = record["trajectory"]["final_node_id"]
+    selector_node_ids = selector_assignment_node_ids(record)
+
+    if raw_selector_scores and all(label_name in raw_selector_scores for label_name in SELECTOR_LABELS):
+        selector_scores_by_node_id = {
+            node_id: dict(raw_selector_scores)
+            for node_id in (selector_node_ids or ["__aggregate__"])
+        }
+    else:
+        selector_scores_by_node_id = {
+            str(node_id): dict(score_map)
+            for node_id, score_map in raw_selector_scores.items()
+        }
+    if not selector_scores_by_node_id:
+        selector_scores_by_node_id = {
+            node_id: {label_name: 0.0 for label_name in SELECTOR_LABELS}
+            for node_id in (selector_node_ids or ["__aggregate__"])
+        }
 
     def success(score_map: dict[str, float], key: str) -> float:
         return float(score_map.get(key, 0.0))
@@ -609,10 +673,6 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
         + 0.25 * success(decomposer_scores, "D_subtasks_solvable")
         - 0.25 * error(decomposer_scores, "D_role_drift")
         - 0.35 * error(decomposer_scores, "D_under_decomposition")
-    )
-    q_selector = (
-        +0.50 * success(selector_scores, "S_worker_match")
-        - 0.40 * error(selector_scores, "S_bad_routing_caused_failure")
     )
 
     worker_local: dict[str, dict[str, float]] = {}
@@ -732,15 +792,10 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
 
     reach_to_final = {node_id: max_path_weight(node_id, final_worker_id) for node_id in worker_local}
 
-    graph_anchor = (
-        0.15 * success(graph_scores, "G_final_correct")
-        - 0.10 * error(graph_scores, "G_cascade_present")
-        - 0.10 * error(graph_scores, "G_hierarchy_bypassed")
-    )
-
     node_rewards: dict[str, Any] = {
         "decomposer": {"node_id": "d"},
         "selector": {"node_id": "s"},
+        "selector_decisions": {},
         "workers": {},
         "final": {"node_id": "f"},
     }
@@ -751,12 +806,22 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
         lack(decomposer_scores, "D_dependency_correct"),
         error(decomposer_scores, "D_under_decomposition"),
     )
-    selector_fault = max(
-        error(selector_scores, "S_bad_routing_caused_failure"),
-        lack(selector_scores, "S_worker_match"),
-    )
 
     final_failure_severity = clamp01((1.0 - final_anchor_score) / 2.0)
+
+    def controller_branch_weight(node_id: str) -> float:
+        return max(0.25, float(reach_to_final.get(node_id, 0.0)))
+
+    worker_branch_consequences = {
+        node_id: downstream_consequence(node_id) * controller_branch_weight(node_id)
+        for node_id in worker_local
+    }
+
+    selector_assignment_nodes = [
+        node_id for node_id in selector_node_ids if node_id in worker_local
+    ]
+    if not selector_assignment_nodes:
+        selector_assignment_nodes = list(worker_local)
 
     def positive_cap(min_cap: float, failure_weight: float, invalid_weight: float = 0.0) -> float:
         return clamp01(
@@ -774,35 +839,104 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
         return cap * value
 
     node_rewards["decomposer"]["quality"] = q_decomposer
-    node_rewards["selector"]["quality"] = q_selector
-    node_rewards["decomposer"]["downstream_consequence"] = mean_or_zero(
-        [downstream_consequence(node_id) for node_id in worker_local]
+    decomposer_branch_consequence = mean_or_zero(list(worker_branch_consequences.values()))
+
+    decomposer_global_penalty = (
+        0.10 * final_failure_severity
+        + 0.06 * final_answer_missing_or_invalid
     )
-    node_rewards["selector"]["downstream_consequence"] = mean_or_zero(
-        [downstream_consequence(node_id) for node_id in worker_local]
-    )
+    decomposer_traceable_penalty = 0.18 * decomposer_fault * decomposer_branch_consequence
+    decomposer_success_bonus = 0.05 * success(graph_scores, "G_final_correct")
+
+    node_rewards["decomposer"]["downstream_consequence"] = decomposer_branch_consequence
+    node_rewards["decomposer"]["global_failure_penalty"] = decomposer_global_penalty
+    node_rewards["decomposer"]["traceable_branch_penalty"] = decomposer_traceable_penalty
 
     decomposer_pre_cap = (
-        0.80 * q_decomposer
-        - 0.25 * node_rewards["decomposer"]["downstream_consequence"]
-        - 0.20 * final_failure_severity * decomposer_fault
-        + graph_anchor
-    )
-    selector_pre_cap = (
-        0.75 * q_selector
-        - 0.30 * node_rewards["selector"]["downstream_consequence"]
-        - 0.25 * final_failure_severity * selector_fault
-        + graph_anchor
+        0.85 * q_decomposer
+        - decomposer_global_penalty
+        - decomposer_traceable_penalty
+        + decomposer_success_bonus
     )
 
-    decomposer_cap = positive_cap(0.30, 0.70, 0.05)
-    selector_cap = positive_cap(0.10, 0.90, 0.10)
+    decomposer_cap = positive_cap(0.45, 0.35, 0.03)
     node_rewards["decomposer"]["reward_pre_cap"] = decomposer_pre_cap
     node_rewards["decomposer"]["positive_cap"] = decomposer_cap
     node_rewards["decomposer"]["reward_raw"] = apply_positive_cap(decomposer_pre_cap, decomposer_cap)
-    node_rewards["selector"]["reward_pre_cap"] = selector_pre_cap
-    node_rewards["selector"]["positive_cap"] = selector_cap
-    node_rewards["selector"]["reward_raw"] = apply_positive_cap(selector_pre_cap, selector_cap)
+
+    assignment_worker_map = {
+        str(item.get("node_id")): item.get("worker_id")
+        for item in record.get("selection", {}).get("assignments", [])
+    }
+    selector_payloads: list[dict[str, Any]] = []
+    for selector_node_id, selector_scores in selector_scores_by_node_id.items():
+        q_selector = (
+            +0.50 * success(selector_scores, "S_worker_match")
+            - 0.40 * error(selector_scores, "S_bad_routing_caused_failure")
+        )
+        selector_fault = max(
+            error(selector_scores, "S_bad_routing_caused_failure"),
+            lack(selector_scores, "S_worker_match"),
+        )
+        selector_branch_consequence = worker_branch_consequences.get(selector_node_id, 0.0)
+        selector_global_penalty = (
+            0.07 * final_failure_severity
+            + 0.04 * final_answer_missing_or_invalid
+        )
+        selector_traceable_penalty = 0.24 * selector_fault * selector_branch_consequence
+        selector_success_bonus = 0.04 * success(graph_scores, "G_final_correct")
+        selector_pre_cap = (
+            0.85 * q_selector
+            - selector_global_penalty
+            - selector_traceable_penalty
+            + selector_success_bonus
+        )
+        selector_cap = positive_cap(0.35, 0.45, 0.05)
+        selector_reward_raw = apply_positive_cap(selector_pre_cap, selector_cap)
+        payload = {
+            "node_id": selector_node_id,
+            "assigned_worker_id": assignment_worker_map.get(selector_node_id),
+            "quality": q_selector,
+            "downstream_consequence": selector_branch_consequence,
+            "global_failure_penalty": selector_global_penalty,
+            "traceable_branch_penalty": selector_traceable_penalty,
+            "reward_pre_cap": selector_pre_cap,
+            "positive_cap": selector_cap,
+            "reward_raw": selector_reward_raw,
+        }
+        node_rewards["selector_decisions"][selector_node_id] = payload
+        selector_payloads.append(payload)
+
+    if selector_payloads:
+        node_rewards["selector"]["decision_count"] = len(selector_payloads)
+        node_rewards["selector"]["quality"] = mean_or_zero([item["quality"] for item in selector_payloads])
+        node_rewards["selector"]["downstream_consequence"] = mean_or_zero(
+            [item["downstream_consequence"] for item in selector_payloads]
+        )
+        node_rewards["selector"]["global_failure_penalty"] = mean_or_zero(
+            [item["global_failure_penalty"] for item in selector_payloads]
+        )
+        node_rewards["selector"]["traceable_branch_penalty"] = mean_or_zero(
+            [item["traceable_branch_penalty"] for item in selector_payloads]
+        )
+        node_rewards["selector"]["reward_pre_cap"] = mean_or_zero(
+            [item["reward_pre_cap"] for item in selector_payloads]
+        )
+        node_rewards["selector"]["positive_cap"] = mean_or_zero(
+            [item["positive_cap"] for item in selector_payloads]
+        )
+        node_rewards["selector"]["reward_raw"] = mean_or_zero(
+            [item["reward_raw"] for item in selector_payloads]
+        )
+    else:
+        node_rewards["selector"]["decision_count"] = 0
+        node_rewards["selector"]["quality"] = 0.0
+        node_rewards["selector"]["downstream_consequence"] = 0.0
+        node_rewards["selector"]["global_failure_penalty"] = 0.0
+        node_rewards["selector"]["traceable_branch_penalty"] = 0.0
+        node_rewards["selector"]["reward_pre_cap"] = 0.0
+        node_rewards["selector"]["positive_cap"] = 1.0
+        node_rewards["selector"]["reward_raw"] = 0.0
 
     for node_id, stats in worker_local.items():
         d_u = downstream_consequence(node_id)
@@ -848,6 +982,8 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
 
     node_rewards["decomposer"]["reward"] = node_rewards["decomposer"]["reward_raw"]
     node_rewards["selector"]["reward"] = node_rewards["selector"]["reward_raw"]
+    for payload in node_rewards["selector_decisions"].values():
+        payload["reward"] = payload["reward_raw"]
     node_rewards["final"]["reward"] = node_rewards["final"]["reward_raw"]
     for payload in node_rewards["workers"].values():
         payload["reward"] = payload["reward_raw"]
@@ -873,7 +1009,10 @@ def compile_rewards_from_predictions(example: GraphExample, outputs: dict[str, A
 
     graph_scores = probs_to_scores(outputs["graph_label_logits"], GRAPH_LABELS)
     decomposer_scores = probs_to_scores(outputs["decomposer_logits"], DECOMPOSER_LABELS)
-    selector_scores = probs_to_scores(outputs["selector_logits"], SELECTOR_LABELS)
+    selector_scores = {
+        node_id: probs_to_scores(logits, SELECTOR_LABELS)
+        for node_id, logits in outputs["selector_logits"].items()
+    }
     final_scores = probs_to_scores(outputs["final_logits"], FINAL_LABELS)
     worker_scores = {
         node_id: probs_to_scores(logits, WORKER_LABELS)
@@ -1022,13 +1161,16 @@ class GFAMSmallModel(nn.Module):
         max_pool = hidden.max(dim=0).values
         graph_embedding = F.gelu(self.graph_pool_proj(torch.cat([mean_pool, max_pool], dim=-1)))
         decomposer_repr = self.node_head_representation(hidden, edge_index, example.decomposer_index)
-        selector_repr = self.node_head_representation(hidden, edge_index, example.selector_index)
         final_repr = self.node_head_representation(hidden, edge_index, example.final_index)
 
         graph_label_logits = self.graph_label_head(graph_embedding).view(len(GRAPH_LABELS), 3)
         decomposer_logits = self.decomposer_head(decomposer_repr).view(len(DECOMPOSER_LABELS), 3)
-        selector_logits = self.selector_head(selector_repr).view(len(SELECTOR_LABELS), 3)
         final_logits = self.final_head(final_repr).view(len(FINAL_LABELS), 3)
+
+        selector_logits: dict[str, Tensor] = {}
+        for node_id, index in example.selector_indices_by_node_id.items():
+            selector_repr = self.node_head_representation(hidden, edge_index, index)
+            selector_logits[node_id] = self.selector_head(selector_repr).view(len(SELECTOR_LABELS), 3)
 
         worker_logits: dict[str, Tensor] = {}
         for node_id, index in example.worker_indices_by_node_id.items():
@@ -1247,7 +1389,7 @@ def summarize_predictions(example: GraphExample, outputs: dict[str, Any]) -> dic
     summary = {
         "graph": tensor_label_prediction(outputs["graph_label_logits"], GRAPH_LABELS),
         "decomposer": tensor_label_prediction(outputs["decomposer_logits"], DECOMPOSER_LABELS),
-        "selector": tensor_label_prediction(outputs["selector_logits"], SELECTOR_LABELS),
+        "selectors": {},
         "final": tensor_label_prediction(outputs["final_logits"], FINAL_LABELS),
         "workers": {},
     }
@@ -1259,6 +1401,8 @@ def summarize_predictions(example: GraphExample, outputs: dict[str, Any]) -> dic
     )
     summary["graph"]["ranking_score"] = float(outputs["ranking_score"].detach().cpu())
 
+    for node_id, logits in outputs["selector_logits"].items():
+        summary["selectors"][node_id] = tensor_label_prediction(logits, SELECTOR_LABELS)
     for node_id, logits in outputs["worker_logits"].items():
         summary["workers"][node_id] = tensor_label_prediction(logits, WORKER_LABELS)
     return summary
@@ -1272,6 +1416,8 @@ def flatten_compiled_rewards(compiled_rewards: dict[str, Any]) -> list[dict[str,
 
     add_row("decomposer", compiled_rewards["decomposer"])
     add_row("selector", compiled_rewards["selector"])
+    for node_id in sorted(compiled_rewards.get("selector_decisions", {})):
+        add_row("selector_decision", compiled_rewards["selector_decisions"][node_id])
     for node_id in sorted(compiled_rewards["workers"]):
         add_row("worker", compiled_rewards["workers"][node_id])
     add_row("final", compiled_rewards["final"])
@@ -1320,10 +1466,20 @@ def normalize_reward_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         task_id = row["task_id"]
         rewards = row["compiled_rewards"]
-        for role in ("decomposer", "selector", "final"):
+        for role in ("decomposer", "final"):
             raw = float(rewards[role]["reward_raw"])
             task_role_values[(task_id, role)].append(raw)
             global_role_values[role].append(raw)
+        selector_decision_rewards = rewards.get("selector_decisions", {})
+        if selector_decision_rewards:
+            for payload in selector_decision_rewards.values():
+                raw = float(payload["reward_raw"])
+                task_role_values[(task_id, "selector")].append(raw)
+                global_role_values["selector"].append(raw)
+        else:
+            raw = float(rewards["selector"]["reward_raw"])
+            task_role_values[(task_id, "selector")].append(raw)
+            global_role_values["selector"].append(raw)
         for payload in rewards["workers"].values():
             raw = float(payload["reward_raw"])
             task_role_values[(task_id, "worker")].append(raw)
@@ -1347,7 +1503,7 @@ def normalize_reward_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         task_id = copied["task_id"]
         rewards = copied["compiled_rewards"]
 
-        for role in ("decomposer", "selector", "final"):
+        for role in ("decomposer", "final"):
             payload = rewards[role]
             raw = float(payload["reward_raw"])
             if len(task_role_values[(task_id, role)]) >= 2:
@@ -1355,6 +1511,38 @@ def normalize_reward_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 scope = "task_role"
             else:
                 mean_value, std_value = global_role_stats[role]
+                scope = "global_role"
+            payload["reward_normalized"] = max(-3.0, min(3.0, (raw - mean_value) / std_value))
+            payload["reward"] = payload["reward_normalized"]
+            payload["normalization_scope"] = scope
+
+        selector_payloads = list(rewards.get("selector_decisions", {}).values())
+        if selector_payloads:
+            selector_normalized_values = []
+            for payload in selector_payloads:
+                raw = float(payload["reward_raw"])
+                if len(task_role_values[(task_id, "selector")]) >= 2:
+                    mean_value, std_value = task_role_stats[(task_id, "selector")]
+                    scope = "task_role"
+                else:
+                    mean_value, std_value = global_role_stats["selector"]
+                    scope = "global_role"
+                normalized = max(-3.0, min(3.0, (raw - mean_value) / std_value))
+                payload["reward_normalized"] = normalized
+                payload["reward"] = normalized
+                payload["normalization_scope"] = scope
+                selector_normalized_values.append(normalized)
+            rewards["selector"]["reward_normalized"] = mean_or_zero(selector_normalized_values)
+            rewards["selector"]["reward"] = rewards["selector"]["reward_normalized"]
+            rewards["selector"]["normalization_scope"] = "decision_mean"
+        else:
+            payload = rewards["selector"]
+            raw = float(payload["reward_raw"])
+            if len(task_role_values[(task_id, "selector")]) >= 2:
+                mean_value, std_value = task_role_stats[(task_id, "selector")]
+                scope = "task_role"
+            else:
+                mean_value, std_value = global_role_stats["selector"]
                 scope = "global_role"
             payload["reward_normalized"] = max(-3.0, min(3.0, (raw - mean_value) / std_value))
             payload["reward"] = payload["reward_normalized"]
