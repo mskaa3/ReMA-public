@@ -250,6 +250,12 @@ class vLLMRollout(BaseRollout):
             if prompts.meta_info.get('finish_flag') is not None:
                 kwargs['stop'] = [prompts.meta_info['finish_flag']]
 
+        max_new_tokens = prompts.meta_info.get("max_new_tokens")
+        if max_new_tokens is not None:
+            kwargs["max_tokens"] = max(
+                1,
+                min(int(max_new_tokens), int(self.config.response_length)),
+            )
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):

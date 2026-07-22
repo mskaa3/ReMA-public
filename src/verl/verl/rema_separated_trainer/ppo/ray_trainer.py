@@ -667,9 +667,18 @@ class RayReMASeparatedTrainer(object):
             stitched_outputs[role] = message['content'] if message is not None else ''
 
         final_stage_role = stage_roles[-1]
+        max_planned_subtasks = int(
+            hierarchy.get(
+                'max_planned_subtasks',
+                max(len(stage_roles) - 1, 1),
+            )
+        )
 
         def parse_execution_stages(plan_text, selector_text):
-            parsed_subtasks = MultiAgentRollout._extract_subtasks(plan_text)
+            parsed_subtasks = MultiAgentRollout._extract_subtasks(
+                plan_text,
+                max_subtasks=max_planned_subtasks,
+            )
             parsed_stages = MultiAgentRollout._parse_ordered_worker_stages(
                 selector_text,
                 parsed_subtasks,
@@ -1079,7 +1088,7 @@ class RayReMASeparatedTrainer(object):
         roles = due_roles
         if not roles:
             metrics['reward/cpcr/enabled'] = 1.0
-            metrics['reward/cpcr/scored_this_step'] = 0.0
+            metrics.setdefault('reward/cpcr/scored_this_step', 0.0)
             return {}
 
         uid_to_indices = defaultdict(list)
@@ -1114,14 +1123,17 @@ class RayReMASeparatedTrainer(object):
             )
             selected_uids = [selected_uids[position] for position in selected_positions]
         selected_uids = set(selected_uids)
-        metrics['reward/cpcr/selected_group_count'] = float(len(selected_uids))
+        metrics['reward/cpcr/selected_group_count'] = max(
+            metrics.get('reward/cpcr/selected_group_count', 0.0),
+            float(len(selected_uids)),
+        )
         selected_target_count = sum(
             len(indices) for uid, indices in uid_to_indices.items() if uid in selected_uids
         )
         if not selected_uids or self._cpcr_last_scored_step == current_step:
-            metrics['reward/cpcr/scored_this_step'] = 0.0
+            metrics.setdefault('reward/cpcr/scored_this_step', 0.0)
             return {}
-        metrics['reward/cpcr/scored_this_step'] = 0.0
+        metrics.setdefault('reward/cpcr/scored_this_step', 0.0)
         total_scored_pairs = 0
         for role in roles:
             (
@@ -1250,6 +1262,8 @@ class RayReMASeparatedTrainer(object):
         replay_capacity = int(self.online_prd_replay_config.get('capacity', 8192))
         self.online_prd_cpcr_train_buffer = deque(maxlen=max(replay_capacity, 1))
         self.online_prd_cpcr_validation_buffer = deque(maxlen=max(replay_capacity, 1))
+        self.online_prd_validation_correlation_ema = None
+        self.online_prd_validation_sign_accuracy_ema = None
         if not self.online_prd_enabled:
             return
 
@@ -1836,6 +1850,55 @@ class RayReMASeparatedTrainer(object):
         split_value = zlib.crc32(split_key) / float(2**32)
         return split_value < validation_fraction
 
+    @staticmethod
+    def _cpcr_replay_coverage(records, agent_roles):
+        """Summarize independent replay support instead of only row count."""
+
+        records = list(records)
+        unique_problems = set()
+        unique_probes = set()
+        per_role = {
+            role: {
+                'record_count': 0,
+                'unique_problem_count': 0,
+                'unique_probe_group_count': 0,
+            }
+            for role in agent_roles
+        }
+        role_problems = defaultdict(set)
+        role_probes = defaultdict(set)
+        for record_idx, record in enumerate(records):
+            role = str(record.get('role', ''))
+            step = int(record.get('step', -1))
+            problem_key = record.get('problem_key')
+            if problem_key is None:
+                # Older checkpoints were collected with one selected group per
+                # step and did not persist the problem key. Grouping by step is
+                # conservative and prevents rollout rows from posing as probes.
+                problem_key = (
+                    f'legacy-step-{step}'
+                    if step >= 0 else f'legacy-record-{record_idx}'
+                )
+            problem_key = str(problem_key)
+            probe_key = (problem_key, role, step)
+            unique_problems.add(problem_key)
+            unique_probes.add(probe_key)
+            if role not in per_role:
+                continue
+            per_role[role]['record_count'] += 1
+            role_problems[role].add(problem_key)
+            role_probes[role].add(probe_key)
+
+        for role in agent_roles:
+            per_role[role]['unique_problem_count'] = len(role_problems[role])
+            per_role[role]['unique_probe_group_count'] = len(role_probes[role])
+        return {
+            'record_count': len(records),
+            'unique_problem_count': len(unique_problems),
+            'unique_probe_group_count': len(unique_probes),
+            'per_role': per_role,
+        }
+
     def _append_online_prd_cpcr_records(
         self,
         cpcr_targets,
@@ -1871,6 +1934,7 @@ class RayReMASeparatedTrainer(object):
                     'role_features': role_features[sample_idx].detach().cpu().float().clone(),
                     'role_idx': role_idx,
                     'role': role,
+                    'problem_key': str(problem_keys[sample_idx]),
                     'target': max(-1.0, min(1.0, target_value)),
                     'ess': float(ess_values[sample_idx].item()),
                     'step': int(getattr(self, 'global_steps', 0)),
@@ -2156,30 +2220,77 @@ class RayReMASeparatedTrainer(object):
         metrics['reward/prd_online/group_ranking_effective_weight'] = 0.0
         metrics['reward/prd_online/implicit_cf_effective_weight'] = 0.0
         metrics['reward/prd_online/cpcr_supervision_configured'] = 1.0
-        metrics[f'{replay_prefix}/added_train_count'] = float(added['train'])
-        metrics[f'{replay_prefix}/added_validation_count'] = float(added['validation'])
+        metrics[f'{replay_prefix}/added_train_count'] = (
+            metrics.get(f'{replay_prefix}/added_train_count', 0.0) + float(added['train'])
+        )
+        metrics[f'{replay_prefix}/added_validation_count'] = (
+            metrics.get(f'{replay_prefix}/added_validation_count', 0.0)
+            + float(added['validation'])
+        )
         metrics[f'{replay_prefix}/train_buffer_size'] = float(
             len(self.online_prd_cpcr_train_buffer)
         )
         metrics[f'{replay_prefix}/validation_buffer_size'] = float(
             len(self.online_prd_cpcr_validation_buffer)
         )
+        train_coverage = self._cpcr_replay_coverage(
+            self.online_prd_cpcr_train_buffer,
+            agent_roles,
+        )
+        validation_coverage = self._cpcr_replay_coverage(
+            self.online_prd_cpcr_validation_buffer,
+            agent_roles,
+        )
+        for split, coverage in (
+            ('train', train_coverage),
+            ('validation', validation_coverage),
+        ):
+            metrics[f'{replay_prefix}/{split}/unique_problem_count'] = float(
+                coverage['unique_problem_count']
+            )
+            metrics[f'{replay_prefix}/{split}/unique_probe_group_count'] = float(
+                coverage['unique_probe_group_count']
+            )
         for role in agent_roles:
-            metrics[f'{replay_prefix}/roles/{role}/added_count'] = float(
-                added['per_role'].get(role, 0)
+            added_key = f'{replay_prefix}/roles/{role}/added_count'
+            metrics[added_key] = (
+                metrics.get(added_key, 0.0) + float(added['per_role'].get(role, 0))
             )
             metrics[f'{replay_prefix}/roles/{role}/train_buffer_count'] = float(
-                sum(record['role'] == role for record in self.online_prd_cpcr_train_buffer)
+                train_coverage['per_role'][role]['record_count']
             )
             metrics[f'{replay_prefix}/roles/{role}/validation_buffer_count'] = float(
-                sum(record['role'] == role for record in self.online_prd_cpcr_validation_buffer)
+                validation_coverage['per_role'][role]['record_count']
+            )
+            metrics[f'{replay_prefix}/roles/{role}/train_unique_problem_count'] = float(
+                train_coverage['per_role'][role]['unique_problem_count']
+            )
+            metrics[f'{replay_prefix}/roles/{role}/validation_unique_problem_count'] = float(
+                validation_coverage['per_role'][role]['unique_problem_count']
+            )
+            metrics[f'{replay_prefix}/roles/{role}/train_unique_probe_group_count'] = float(
+                train_coverage['per_role'][role]['unique_probe_group_count']
+            )
+            metrics[f'{replay_prefix}/roles/{role}/validation_unique_probe_group_count'] = float(
+                validation_coverage['per_role'][role]['unique_probe_group_count']
             )
 
         min_train_size = int(self.online_prd_replay_config.get('min_train_size', 64))
+        min_train_probes = int(
+            self.online_prd_replay_config.get(
+                'min_unique_train_probe_groups_for_training',
+                0,
+            )
+        )
         replay_batch_size = int(self.online_prd_replay_config.get('batch_size', 256))
         balance_roles = bool(self.online_prd_replay_config.get('balance_roles', True))
         train_records = []
-        if len(self.online_prd_cpcr_train_buffer) >= min_train_size:
+        train_data_ready = (
+            len(self.online_prd_cpcr_train_buffer) >= min_train_size
+            and train_coverage['unique_probe_group_count'] >= min_train_probes
+        )
+        metrics[f'{replay_prefix}/train_data_ready'] = float(train_data_ready)
+        if train_data_ready:
             train_records = self._sample_cpcr_replay_records(
                 self.online_prd_cpcr_train_buffer,
                 replay_batch_size,
@@ -2259,6 +2370,36 @@ class RayReMASeparatedTrainer(object):
             for name, value in role_stats.items():
                 metrics[f'{replay_prefix}/validation/roles/{role}/{name}'] = float(value)
 
+        quality_ema_beta = float(
+            self.online_prd_replay_config.get('validation_quality_ema_beta', 0.9)
+        )
+        quality_ema_beta = min(max(quality_ema_beta, 0.0), 1.0)
+        if validation_stats:
+            validation_correlation = float(validation_stats.get('correlation', 0.0))
+            validation_sign_accuracy = float(validation_stats.get('sign_accuracy', 0.0))
+            if self.online_prd_validation_correlation_ema is None:
+                self.online_prd_validation_correlation_ema = validation_correlation
+                self.online_prd_validation_sign_accuracy_ema = validation_sign_accuracy
+            else:
+                self.online_prd_validation_correlation_ema = (
+                    quality_ema_beta * self.online_prd_validation_correlation_ema
+                    + (1.0 - quality_ema_beta) * validation_correlation
+                )
+                self.online_prd_validation_sign_accuracy_ema = (
+                    quality_ema_beta * self.online_prd_validation_sign_accuracy_ema
+                    + (1.0 - quality_ema_beta) * validation_sign_accuracy
+                )
+        validation_correlation_ema = (
+            float(self.online_prd_validation_correlation_ema)
+            if self.online_prd_validation_correlation_ema is not None else 0.0
+        )
+        validation_sign_accuracy_ema = (
+            float(self.online_prd_validation_sign_accuracy_ema)
+            if self.online_prd_validation_sign_accuracy_ema is not None else 0.0
+        )
+        metrics[f'{replay_prefix}/validation/correlation_ema'] = validation_correlation_ema
+        metrics[f'{replay_prefix}/validation/sign_accuracy_ema'] = validation_sign_accuracy_ema
+
         # Log current-batch predictions diagnostically. They do not contribute
         # to the replay-only loss above.
         self.online_prd_train.eval()
@@ -2314,13 +2455,116 @@ class RayReMASeparatedTrainer(object):
             )
 
         configured_alpha = self._get_online_prd_alpha()
-        blend_ready = len(self.online_prd_cpcr_train_buffer) >= int(
+        record_count_ready = len(self.online_prd_cpcr_train_buffer) >= int(
             self.online_prd_replay_config.get('min_size_for_blend', min_train_size)
+        )
+        probe_count_ready = train_coverage['unique_probe_group_count'] >= int(
+            self.online_prd_replay_config.get(
+                'min_unique_train_probe_groups_for_blend',
+                0,
+            )
+        )
+        min_train_records_per_role = int(
+            self.online_prd_replay_config.get(
+                'min_train_records_per_role_for_blend',
+                0,
+            )
+        )
+        train_roles_ready = all(
+            train_coverage['per_role'][role]['record_count'] >= min_train_records_per_role
+            for role in agent_roles
+        )
+        min_train_probes_per_role = int(
+            self.online_prd_replay_config.get(
+                'min_train_probe_groups_per_role_for_blend',
+                0,
+            )
+        )
+        train_role_probes_ready = all(
+            train_coverage['per_role'][role]['unique_probe_group_count']
+            >= min_train_probes_per_role
+            for role in agent_roles
+        )
+        min_validation_records_per_role = int(
+            self.online_prd_replay_config.get(
+                'min_validation_records_per_role_for_blend',
+                0,
+            )
+        )
+        validation_roles_ready = all(
+            validation_coverage['per_role'][role]['record_count']
+            >= min_validation_records_per_role
+            for role in agent_roles
+        )
+        min_validation_probes_per_role = int(
+            self.online_prd_replay_config.get(
+                'min_validation_probe_groups_per_role_for_blend',
+                0,
+            )
+        )
+        validation_role_probes_ready = all(
+            validation_coverage['per_role'][role]['unique_probe_group_count']
+            >= min_validation_probes_per_role
+            for role in agent_roles
+        )
+        min_validation_correlation = float(
+            self.online_prd_replay_config.get(
+                'min_validation_correlation_for_blend',
+                -1.0,
+            )
+        )
+        validation_correlation_ready = (
+            min_validation_correlation < 0.0
+            or (
+                bool(validation_stats)
+                and validation_correlation_ema >= min_validation_correlation
+            )
+        )
+        min_validation_sign_accuracy = float(
+            self.online_prd_replay_config.get(
+                'min_validation_sign_accuracy_for_blend',
+                -1.0,
+            )
+        )
+        validation_sign_ready = (
+            min_validation_sign_accuracy < 0.0
+            or (
+                bool(validation_stats)
+                and validation_sign_accuracy_ema >= min_validation_sign_accuracy
+            )
+        )
+        blend_ready = (
+            record_count_ready
+            and probe_count_ready
+            and train_roles_ready
+            and train_role_probes_ready
+            and validation_roles_ready
+            and validation_role_probes_ready
+            and validation_correlation_ready
+            and validation_sign_ready
         )
         alpha = configured_alpha if blend_ready else 0.0
         metrics['reward/prd_online/configured_blend_alpha'] = configured_alpha
         metrics['reward/prd_online/blend_ready'] = float(blend_ready)
         metrics['reward/prd_online/blend_alpha'] = alpha
+        metrics[f'{replay_prefix}/blend_gate/record_count_ready'] = float(record_count_ready)
+        metrics[f'{replay_prefix}/blend_gate/probe_count_ready'] = float(probe_count_ready)
+        metrics[f'{replay_prefix}/blend_gate/train_roles_ready'] = float(train_roles_ready)
+        metrics[f'{replay_prefix}/blend_gate/train_role_probes_ready'] = float(
+            train_role_probes_ready
+        )
+        metrics[f'{replay_prefix}/blend_gate/validation_roles_ready'] = float(
+            validation_roles_ready
+        )
+        metrics[f'{replay_prefix}/blend_gate/validation_role_probes_ready'] = float(
+            validation_role_probes_ready
+        )
+        metrics[f'{replay_prefix}/blend_gate/validation_correlation_ready'] = float(
+            validation_correlation_ready
+        )
+        metrics[f'{replay_prefix}/blend_gate/validation_sign_ready'] = float(
+            validation_sign_ready
+        )
 
         if alpha > 0.0:
             self.online_prd_active.eval()
@@ -3367,6 +3611,12 @@ class RayReMASeparatedTrainer(object):
                     'cpcr_validation_buffer': list(
                         self.online_prd_cpcr_validation_buffer
                     ),
+                    'validation_correlation_ema': (
+                        self.online_prd_validation_correlation_ema
+                    ),
+                    'validation_sign_accuracy_ema': (
+                        self.online_prd_validation_sign_accuracy_ema
+                    ),
                     'global_steps': self.global_steps,
                 },
                 prd_local_path,
@@ -3444,6 +3694,12 @@ class RayReMASeparatedTrainer(object):
             )
             self.online_prd_cpcr_validation_buffer.extend(
                 prd_state.get('cpcr_validation_buffer', [])
+            )
+            self.online_prd_validation_correlation_ema = prd_state.get(
+                'validation_correlation_ema'
+            )
+            self.online_prd_validation_sign_accuracy_ema = prd_state.get(
+                'validation_sign_accuracy_ema'
             )
         elif self.online_prd_enabled:
             print(f"Warning: No online PRD composer state found at {prd_local_path}, using initialized PRD state")

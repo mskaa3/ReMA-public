@@ -242,6 +242,8 @@ algorithm:
     selector_role: selector
     worker_roles: [algebra_worker, functional_analysis_worker, general_math_worker]
     num_worker_stages: 3
+    # Two non-final stages plus one final synthesis stage.
+    max_planned_subtasks: 2
     start_agent: decomposer
     default_worker: general_math_worker
     # Non-final workers see the original problem as reference context, but the
@@ -250,6 +252,10 @@ algorithm:
     worker_context_mode: full_question
     final_context_mode: worker_results_only
     pass_question_to_workers: True
+    # Meta roles need enough space for a useful plan/assignment, but not enough
+    # to enter repetitive S1..S49-style loops that pollute later contexts.
+    decomposer_max_new_tokens: 384
+    selector_max_new_tokens: 128
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
     final_raw_score_usage_floor: 0.5
@@ -273,7 +279,7 @@ algorithm:
       # this avoids aliasing with round-robin role switching.
       score_interval: 5
       mixed_groups_only: True
-      max_groups_per_step: 1
+      max_groups_per_step: 2
       max_candidates_per_group: 4
       min_effective_sample_size: 2.0
       # A low-ESS group falls back to uniform LOO over the available support
@@ -344,9 +350,20 @@ algorithm:
           batch_size: 256
           min_train_size: 64
           min_size_for_blend: 64
+          # Replay rows from one probe are correlated. Train and blend only
+          # after enough independently selected problem-role probes exist.
+          min_unique_train_probe_groups_for_training: 20
+          min_unique_train_probe_groups_for_blend: 50
+          min_train_records_per_role_for_blend: 20
+          min_train_probe_groups_per_role_for_blend: 2
+          min_validation_records_per_role_for_blend: 8
+          min_validation_probe_groups_per_role_for_blend: 1
           validation_fraction: 0.1
           validation_min_size: 32
           validation_batch_size: 512
+          validation_quality_ema_beta: 0.9
+          min_validation_correlation_for_blend: 0.10
+          min_validation_sign_accuracy_for_blend: 0.55
           balance_roles: True
         grad_clip: 1.0
         use_manual_role_features: False

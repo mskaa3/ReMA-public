@@ -295,9 +295,12 @@ class MultiAgentRollout:
         tokenizers: Dict[str, PreTrainedTokenizer],
         meta_info: Dict,
         response_length: int,
+        max_new_tokens: Optional[int] = None,
     ):
         prompt_proto = self._prepare_chat_prompts(role, chat_lst, tokenizers)
         prompt_proto.meta_info.update(meta_info)
+        if max_new_tokens is not None:
+            prompt_proto.meta_info["max_new_tokens"] = max_new_tokens
         return self._generate_role_responses(
             rollout=self.rollout_wg_dict[role],
             prompt_proto=prompt_proto,
@@ -616,7 +619,10 @@ class MultiAgentRollout:
         return latest_outputs, conversation_history
 
     @staticmethod
-    def _extract_subtasks(plan_text: str) -> List[Tuple[str, str]]:
+    def _extract_subtasks(
+        plan_text: str,
+        max_subtasks: Optional[int] = None,
+    ) -> List[Tuple[str, str]]:
         subtasks = []
         seen_subtasks = set()
         for line in plan_text.splitlines():
@@ -631,6 +637,8 @@ class MultiAgentRollout:
                     continue
                 subtasks.append((subtask_id, match.group(2).strip()))
                 seen_subtasks.add(subtask_id)
+                if max_subtasks is not None and len(subtasks) >= max_subtasks:
+                    break
         return subtasks
 
     @staticmethod
@@ -891,6 +899,12 @@ class MultiAgentRollout:
                 f"worker_stage_{idx}"
                 for idx in range(1, int(hierarchy_config.get("num_worker_stages", 0)) + 1)
             ] or worker_types
+        max_planned_subtasks = int(
+            hierarchy_config.get(
+                "max_planned_subtasks",
+                max(len(stage_roles) - 1, 1),
+            )
+        )
         default_worker = hierarchy_config.get("default_worker", worker_types[-1] if worker_types else selector_role)
         worker_specs = hierarchy_config.get("worker_specs", {})
         pass_question_to_workers = hierarchy_config.get("pass_question_to_workers", False)
@@ -899,6 +913,8 @@ class MultiAgentRollout:
             "full_question" if pass_question_to_workers else "subtask_context",
         )
         final_context_mode = hierarchy_config.get("final_context_mode", "full_question")
+        decomposer_max_new_tokens = hierarchy_config.get("decomposer_max_new_tokens")
+        selector_max_new_tokens = hierarchy_config.get("selector_max_new_tokens")
         pass_question_to_workers = worker_context_mode in {
             "full_question",
             "question",
@@ -968,7 +984,13 @@ class MultiAgentRollout:
                 _,
                 decomposer_token_ids,
             ) = self._generate_from_chat_list(
-                decomposer_role, decomposer_chats, tokenizers, prompts.meta_info, response_length)
+                decomposer_role,
+                decomposer_chats,
+                tokenizers,
+                prompts.meta_info,
+                response_length,
+                max_new_tokens=decomposer_max_new_tokens,
+            )
             current_plan = {}
             for local_idx, idx in enumerate(unfinished_indices):
                 output = decomposer_outputs[local_idx]
@@ -982,7 +1004,10 @@ class MultiAgentRollout:
             selector_chats = []
             parsed_subtasks = {}
             for idx in unfinished_indices:
-                subtasks = self._extract_subtasks(current_plan[idx])
+                subtasks = self._extract_subtasks(
+                    current_plan[idx],
+                    max_subtasks=max_planned_subtasks,
+                )
                 parsed_subtasks[idx] = subtasks
                 selector_chats.append(build_prompt(
                     selector_role,
@@ -1000,7 +1025,13 @@ class MultiAgentRollout:
                 _,
                 selector_token_ids,
             ) = self._generate_from_chat_list(
-                selector_role, selector_chats, tokenizers, prompts.meta_info, response_length)
+                selector_role,
+                selector_chats,
+                tokenizers,
+                prompts.meta_info,
+                response_length,
+                max_new_tokens=selector_max_new_tokens,
+            )
             ordered_stages_by_idx = {}
             selector_output_by_idx = {}
             for local_idx, idx in enumerate(unfinished_indices):
