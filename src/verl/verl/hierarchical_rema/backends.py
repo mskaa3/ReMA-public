@@ -1232,12 +1232,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             repair_position = f" item={repair_progress[0]}/{repair_progress[1]}"
         selector_skeleton = render_selector_decision_output_skeleton()
         for attempt in range(self.config.max_format_retries + 1):
-            if repair_progress is not None:
-                print(
-                    f"[hierarchical-rema][generation-repair] role=selector_decision "
-                    f"model={model_path}{repair_position} "
-                    f"attempt={attempt + 1}/{self.config.max_format_retries + 1}"
-                )
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
@@ -1519,12 +1513,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
             repair_position = f" item={repair_progress[0]}/{repair_progress[1]}"
         for attempt in range(self.config.max_format_retries + 1):
             payload: Dict[str, Any] | None = None
-            if repair_progress is not None:
-                print(
-                    f"[hierarchical-rema][generation-repair] role=decomposer "
-                    f"model={model_path}{repair_position} "
-                    f"attempt={attempt + 1}/{self.config.max_format_retries + 1}"
-                )
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
@@ -1634,12 +1622,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         )
         for attempt in range(self.config.max_format_retries + 1):
             payload: Dict[str, Any] | None = None
-            if repair_progress is not None:
-                print(
-                    f"[hierarchical-rema][generation-repair] role=selector "
-                    f"model={model_path}{repair_position} "
-                    f"attempt={attempt + 1}/{self.config.max_format_retries + 1}"
-                )
             last_raw_text, _ = self._generate_text(
                 base_model_path=model_path,
                 prompt_text=repair_prompt,
@@ -1927,12 +1909,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         )
                     else:
                         repair_count += 1
-                        if self._should_log_repair_progress(repair_count, len(grouped_requests)):
-                            print(
-                                f"[hierarchical-rema][generation-repair] role=decomposer "
-                                f"model={model_path} "
-                                f"start_item={repair_count}/{len(grouped_requests)}"
-                            )
                         candidate = self._generate_validated_decomposition(
                             prompt_text=prompt_text,
                             task=request.task,
@@ -1941,12 +1917,6 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                             fallback_id=fallback_id,
                             repair_progress=(repair_count, len(grouped_requests)),
                         )
-                        if self._should_log_repair_progress(repair_count, len(grouped_requests)):
-                            print(
-                                f"[hierarchical-rema][generation-repair] role=decomposer "
-                                f"model={model_path} "
-                                f"done_item={repair_count}/{len(grouped_requests)}"
-                            )
                         candidate.raw_payload.setdefault("validation", {})
                         candidate.raw_payload["validation"].update(
                             {

@@ -465,10 +465,6 @@ class RayVLLMGenerationManager:
         )
         cached = self._bundle_cache.pop(key, None)
         if cached is not None:
-            print(
-                f"[hierarchical-rema][ray-generation] event=bundle_cache_hit "
-                f"model={Path(model_path).name} response_length={key.bundle_response_length}"
-            )
             self._bundle_cache[key] = cached
             return cached
 
