@@ -232,7 +232,7 @@ algorithm:
   switch_agent:
     enable: True
     level: step
-    freq: 10
+    freq: 5
     model_paths:
       - ${actor_rollout_ref.model.path}
       - ${actor_rollout_ref.model.path}
