@@ -53,6 +53,7 @@ def compute_reward_diagnostic_metrics(batch: DataProto) -> Dict[str, Any]:
         'upstream_global_correctness_bonus': 'reward/global/upstream_global_correctness_bonus',
         'upstream_hierarchical_correctness_bonus': 'reward/global/upstream_hierarchical_correctness_bonus',
         'hierarchy_utilization_gate': 'reward/hierarchy/utilization_gate',
+        'distinct_worker_result_gate': 'reward/hierarchy/distinct_worker_result_gate',
         'valid_nonfinal_worker_count': 'reward/hierarchy/valid_nonfinal_worker_count',
         'planned_subtask_count': 'reward/hierarchy/planned_subtask_count',
         'executed_subtask_count': 'reward/hierarchy/executed_subtask_count',
@@ -91,6 +92,18 @@ def compute_reward_diagnostic_metrics(batch: DataProto) -> Dict[str, Any]:
 
     agent_roles = batch.meta_info.get('agent_roles', [])
     for role in agent_roles:
+        _log_tensor_metric(
+            metrics,
+            batch,
+            f'{role}_prompt_truncated',
+            f'rollout/context/{role}/prompt_truncated_rate',
+        )
+        _log_tensor_metric(
+            metrics,
+            batch,
+            f'{role}_response_retokenized_truncated',
+            f'rollout/context/{role}/response_retokenized_truncated_rate',
+        )
         reward_key = f'{role}_turn_level_reward'
         if reward_key not in batch.batch:
             continue

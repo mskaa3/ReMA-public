@@ -318,7 +318,10 @@ def compute_token_level_scores(data: DataProto, dtype=torch.float32)->torch.Tens
     for i_turn in range(max_num_turns):
         last_indices = get_last_index_of_turn(step_ids, i_turn)
         valid_mask = last_indices != -1
-        if (~valid_mask).all(): break
+        # Hierarchical rollouts optimize the latest factual prompt/action pair.
+        # Earlier turn ids can therefore be intentionally absent.
+        if (~valid_mask).all():
+            continue
         batch_indices = torch.arange(bsz)
         token_level_scores[batch_indices[valid_mask], last_indices[valid_mask]] = \
             turn_level_return[:, i_turn][valid_mask]
@@ -453,6 +456,7 @@ class RayReMASeparatedTrainer(object):
         self._cpcr_last_scored_step = None
         self._cpcr_role_visit_counts = defaultdict(int)
         self._cpcr_role_last_visit_step = {}
+        self._cpcr_role_probe_counts = defaultdict(int)
         if not self.cpcr_enabled:
             return
 
@@ -1190,6 +1194,9 @@ class RayReMASeparatedTrainer(object):
                     )
 
             prefix = f'reward/cpcr/roles/{role}'
+            metrics[f'{prefix}/probe_ordinal'] = float(
+                self._cpcr_role_probe_counts[role]
+            )
             total_scored_pairs += scored_pairs
             metrics[f'{prefix}/pairs_scored'] = float(scored_pairs)
             metrics[f'{prefix}/pairs_skipped'] = float(skipped_pairs)
@@ -1230,7 +1237,10 @@ class RayReMASeparatedTrainer(object):
                 'advantage': role_advantages,
                 'valid_mask': role_valid,
                 'effective_sample_size': role_ess,
+                'probe_ordinal': self._cpcr_role_probe_counts[role],
             }
+            if role_valid.any():
+                self._cpcr_role_probe_counts[role] += 1
 
         if total_scored_pairs > 0:
             self._cpcr_last_scored_step = current_step
@@ -1840,11 +1850,26 @@ class RayReMASeparatedTrainer(object):
         return correct / total
 
     @staticmethod
-    def _cpcr_replay_is_validation(problem_key, validation_fraction):
+    def _cpcr_replay_is_validation(
+        problem_key,
+        validation_fraction,
+        role=None,
+        probe_ordinal=None,
+        split_mode='problem_hash',
+    ):
         if validation_fraction <= 0.0:
             return False
         if validation_fraction >= 1.0:
             return True
+        if (
+            split_mode == 'role_probe_stratified'
+            and role is not None
+            and probe_ordinal is not None
+        ):
+            # Keep a complete role/problem probe together while guaranteeing
+            # periodic validation support for every trained role.
+            validation_period = max(int(round(1.0 / validation_fraction)), 1)
+            return int(probe_ordinal) % validation_period == 0
         # Keep every role, rollout, and round for one problem in one split.
         split_key = str(problem_key).encode('utf-8')
         split_value = zlib.crc32(split_key) / float(2**32)
@@ -1911,6 +1936,12 @@ class RayReMASeparatedTrainer(object):
         validation_fraction = float(
             self.online_prd_replay_config.get('validation_fraction', 0.1)
         )
+        validation_split_mode = str(
+            self.online_prd_replay_config.get(
+                'validation_split_mode',
+                'problem_hash',
+            )
+        )
         added_train = 0
         added_validation = 0
         per_role_added = defaultdict(int)
@@ -1924,6 +1955,7 @@ class RayReMASeparatedTrainer(object):
                 'effective_sample_size',
                 torch.zeros_like(advantages),
             ).float()
+            probe_ordinal = target_data.get('probe_ordinal')
             for sample_idx in torch.where(valid_mask)[0].tolist():
                 target_value = float(advantages[sample_idx].item())
                 if not -1.0001 <= target_value <= 1.0001:
@@ -1938,10 +1970,17 @@ class RayReMASeparatedTrainer(object):
                     'target': max(-1.0, min(1.0, target_value)),
                     'ess': float(ess_values[sample_idx].item()),
                     'step': int(getattr(self, 'global_steps', 0)),
+                    'probe_ordinal': (
+                        int(probe_ordinal)
+                        if probe_ordinal is not None else None
+                    ),
                 }
                 if self._cpcr_replay_is_validation(
                     problem_keys[sample_idx],
                     validation_fraction,
+                    role=role,
+                    probe_ordinal=probe_ordinal,
+                    split_mode=validation_split_mode,
                 ):
                     self.online_prd_cpcr_validation_buffer.append(record)
                     added_validation += 1
@@ -2220,6 +2259,18 @@ class RayReMASeparatedTrainer(object):
         metrics['reward/prd_online/group_ranking_effective_weight'] = 0.0
         metrics['reward/prd_online/implicit_cf_effective_weight'] = 0.0
         metrics['reward/prd_online/cpcr_supervision_configured'] = 1.0
+        metrics[f'{replay_prefix}/validation_split_mode_id'] = {
+            'problem_hash': 0.0,
+            'role_probe_stratified': 1.0,
+        }.get(
+            str(
+                self.online_prd_replay_config.get(
+                    'validation_split_mode',
+                    'problem_hash',
+                )
+            ),
+            -1.0,
+        )
         metrics[f'{replay_prefix}/added_train_count'] = (
             metrics.get(f'{replay_prefix}/added_train_count', 0.0) + float(added['train'])
         )
@@ -3611,6 +3662,9 @@ class RayReMASeparatedTrainer(object):
                     'cpcr_validation_buffer': list(
                         self.online_prd_cpcr_validation_buffer
                     ),
+                    'cpcr_role_probe_counts': dict(
+                        self._cpcr_role_probe_counts
+                    ),
                     'validation_correlation_ema': (
                         self.online_prd_validation_correlation_ema
                     ),
@@ -3695,6 +3749,27 @@ class RayReMASeparatedTrainer(object):
             self.online_prd_cpcr_validation_buffer.extend(
                 prd_state.get('cpcr_validation_buffer', [])
             )
+            restored_probe_counts = prd_state.get(
+                'cpcr_role_probe_counts',
+                {},
+            )
+            if restored_probe_counts:
+                self._cpcr_role_probe_counts.update({
+                    str(role): int(count)
+                    for role, count in restored_probe_counts.items()
+                })
+            else:
+                for record in (
+                    list(self.online_prd_cpcr_train_buffer)
+                    + list(self.online_prd_cpcr_validation_buffer)
+                ):
+                    role = str(record.get('role', ''))
+                    probe_ordinal = record.get('probe_ordinal')
+                    if role and probe_ordinal is not None:
+                        self._cpcr_role_probe_counts[role] = max(
+                            self._cpcr_role_probe_counts[role],
+                            int(probe_ordinal) + 1,
+                        )
             self.online_prd_validation_correlation_ema = prd_state.get(
                 'validation_correlation_ema'
             )
@@ -3961,6 +4036,19 @@ class RayReMASeparatedTrainer(object):
                             new_batch,
                             reward_tensor_map,
                             metrics,
+                        )
+                        reliable_cpcr_target_count = sum(
+                            int(target_data['valid_mask'].bool().sum().item())
+                            for target_data in cpcr_targets.values()
+                        )
+                        if reliable_cpcr_target_count > 0:
+                            metrics['reward/cpcr/scored_this_step'] = 1.0
+                        metrics['reward/cpcr/reliable_target_count_this_step'] = max(
+                            float(reliable_cpcr_target_count),
+                            metrics.get(
+                                'reward/cpcr/reliable_target_count_this_step',
+                                0.0,
+                            ),
                         )
                         reward_tensor_map = self._apply_online_prd_rewards(
                             new_batch,

@@ -241,9 +241,10 @@ algorithm:
     decomposer_role: decomposer
     selector_role: selector
     worker_roles: [algebra_worker, functional_analysis_worker, general_math_worker]
-    num_worker_stages: 3
-    # Two non-final stages plus one final synthesis stage.
-    max_planned_subtasks: 2
+    num_worker_stages: 5
+    # Up to four non-final subtasks plus one final synthesis stage. Simpler
+    # problems may still use fewer stages.
+    max_planned_subtasks: 4
     start_agent: decomposer
     default_worker: general_math_worker
     # Non-final workers see the original problem as reference context, but the
@@ -254,8 +255,15 @@ algorithm:
     pass_question_to_workers: True
     # Meta roles need enough space for a useful plan/assignment, but not enough
     # to enter repetitive S1..S49-style loops that pollute later contexts.
-    decomposer_max_new_tokens: 384
-    selector_max_new_tokens: 128
+    decomposer_max_new_tokens: 512
+    selector_max_new_tokens: 192
+    # Local stages should produce checkable partial work, not another full
+    # long-form solution. The final stage retains enough room for synthesis.
+    worker_max_new_tokens: 512
+    final_max_new_tokens: 896
+    # Preserve enough of each worker's reasoning for decomposer backtracking.
+    # Long traces keep their beginning and conclusion plus the full LOCAL_RESULT.
+    feedback_worker_reasoning_max_chars: 2200
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
     final_raw_score_usage_floor: 0.5
@@ -358,7 +366,11 @@ algorithm:
           min_train_probe_groups_per_role_for_blend: 2
           min_validation_records_per_role_for_blend: 8
           min_validation_probe_groups_per_role_for_blend: 1
-          validation_fraction: 0.1
+          # Hold out complete role-probes periodically for every role. This
+          # prevents a random problem hash from starving selector/final credit
+          # validation while keeping correlated rollout rows in one split.
+          validation_split_mode: role_probe_stratified
+          validation_fraction: 0.2
           validation_min_size: 32
           validation_batch_size: 512
           validation_quality_ema_beta: 0.9
@@ -374,7 +386,7 @@ algorithm:
       algebra_worker: algebraic manipulation, equations, identities, simplification, symbolic computation
       functional_analysis_worker: functions, inequalities, limits, continuity, transformations, higher-level reasoning
       general_math_worker: fallback mathematical reasoning and synthesis support
-    train_agent_roles: [decomposer, selector, worker_stage_1, worker_stage_2, worker_stage_3]
+    train_agent_roles: [decomposer, selector, worker_stage_1, worker_stage_2, worker_stage_3, worker_stage_4, worker_stage_5]
 
 trainer:
   debug_mode: False

@@ -148,6 +148,98 @@ def _encode_conversation(
     return input_ids, labels, step_ids
 
 
+def _encode_latest_conversation(
+    conversation: List[Dict[str, str]],
+    tokenizer: PreTrainedTokenizer,
+    stop_reason: Optional[str],
+    turn_idx: int,
+    max_prompt_length: int,
+    max_total_length: int,
+):
+    """Encode the exact latest hierarchical prompt/action pair.
+
+    Hierarchical stages are generated from independent role-specific prompts,
+    so concatenating several rounds into one chat changes the conditioning
+    distribution. Keep the terminal round as one factual PPO action instead.
+    """
+
+    ignore_index = -100
+    assistant_indices = [
+        idx for idx, message in enumerate(conversation)
+        if message.get("role") == "assistant"
+    ]
+    if not assistant_indices:
+        raise ValueError("Latest hierarchical conversation has no assistant response")
+
+    assistant_idx = assistant_indices[-1]
+    prompt_messages = conversation[:assistant_idx]
+    response = conversation[assistant_idx].get("content", "")
+    query = tokenizer.apply_chat_template(
+        prompt_messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    full_query_ids = tokenizer.encode(query, add_special_tokens=True)
+    query_response_ids = tokenizer.encode(
+        query + response,
+        add_special_tokens=True,
+    )
+    response_ids = query_response_ids[len(full_query_ids):]
+
+    prompt_was_truncated = len(full_query_ids) > max_prompt_length
+    if prompt_was_truncated:
+        if tokenizer.truncation_side == "left":
+            query_ids = full_query_ids[-max_prompt_length:]
+        else:
+            query_ids = full_query_ids[:max_prompt_length]
+    else:
+        query_ids = full_query_ids
+
+    max_response_length = max(max_total_length - len(query_ids), 0)
+    response_was_truncated = len(response_ids) > max_response_length
+    response_ids = response_ids[:max_response_length]
+    input_ids = query_ids + response_ids
+    encoded_stop_reason = (
+        "length"
+        if response_was_truncated and stop_reason == "stop"
+        else stop_reason
+    )
+
+    prefix_ignore = [ignore_index] * max(len(query_ids) - 1, 0)
+    if encoded_stop_reason == "stop":
+        labels = prefix_ignore + response_ids + [tokenizer.eos_token_id]
+        step_ids = (
+            [ignore_index] * len(prefix_ignore)
+            + [turn_idx] * (len(response_ids) + 1)
+        )
+        encoded_num_gen_tokens = len(response_ids) + 1
+    elif encoded_stop_reason == "length":
+        labels = prefix_ignore + response_ids + [ignore_index]
+        step_ids = (
+            [ignore_index] * len(prefix_ignore)
+            + [turn_idx] * len(response_ids)
+            + [ignore_index]
+        )
+        encoded_num_gen_tokens = len(response_ids)
+    elif encoded_stop_reason in {"stop_when_truncated", "completion_token_exceeded"}:
+        labels = [ignore_index] * len(input_ids)
+        step_ids = [ignore_index] * len(input_ids)
+        encoded_num_gen_tokens = 0
+    else:
+        raise ValueError(f"Unknown hierarchical stop reason: {encoded_stop_reason}")
+
+    assert len(input_ids) == len(labels), f"{len(input_ids)} != {len(labels)}"
+    return (
+        input_ids,
+        labels,
+        step_ids,
+        encoded_num_gen_tokens,
+        encoded_stop_reason,
+        prompt_was_truncated,
+        response_was_truncated,
+    )
+
+
 class MultiAgentRollout:
 
     def __init__(
@@ -840,6 +932,21 @@ class MultiAgentRollout:
             return match.group(1).strip()
         return output.strip()
 
+    @staticmethod
+    def _compact_feedback_text(text: str, max_chars: int) -> str:
+        if not text or max_chars <= 0:
+            return ""
+        text = text.strip()
+        if len(text) <= max_chars:
+            return text
+        head_chars = max(int(max_chars * 0.65), 1)
+        tail_chars = max(max_chars - head_chars, 1)
+        return (
+            text[:head_chars].rstrip()
+            + "\n...[middle omitted]...\n"
+            + text[-tail_chars:].lstrip()
+        )
+
     def _format_hierarchical_feedback(
         self,
         plan: str,
@@ -847,6 +954,7 @@ class MultiAgentRollout:
         worker_results: Dict[str, str],
         last_worker_output: str,
         worker_roles: List[str],
+        worker_reasoning_max_chars: int = 2200,
     ) -> str:
         sections = []
         if plan and plan.strip():
@@ -859,12 +967,32 @@ class MultiAgentRollout:
         for worker_role in nonfinal_worker_roles:
             output = worker_results.get(worker_role, "")
             if output and output.strip():
-                worker_sections.append(f"{worker_role}:\n{output.strip()}")
+                reasoning = self._compact_feedback_text(
+                    self._extract_reasoning(output),
+                    worker_reasoning_max_chars,
+                )
+                local_result = self._extract_local_result(output)
+                worker_parts = [f"{worker_role}:"]
+                if reasoning:
+                    worker_parts.append(f"REASONING:\n{reasoning}")
+                if local_result:
+                    worker_parts.append(f"LOCAL_RESULT:\n{local_result}")
+                worker_sections.append("\n".join(worker_parts))
         if worker_sections:
             sections.append("PREVIOUS WORKER RESULTS:\n" + "\n\n".join(worker_sections))
 
         if last_worker_output and last_worker_output.strip():
-            sections.append(f"PREVIOUS FINAL ATTEMPT:\n{last_worker_output.strip()}")
+            compact_final = last_worker_output.strip()
+            boxed_matches = re.findall(
+                r"\\boxed\s*\{(?:[^{}]|\{[^{}]*\})*\}",
+                compact_final,
+                re.DOTALL,
+            )
+            if boxed_matches:
+                compact_final = boxed_matches[-1]
+            else:
+                compact_final = compact_final[-600:]
+            sections.append(f"PREVIOUS FINAL ATTEMPT:\n{compact_final}")
 
         if not sections:
             return ""
@@ -915,6 +1043,14 @@ class MultiAgentRollout:
         final_context_mode = hierarchy_config.get("final_context_mode", "full_question")
         decomposer_max_new_tokens = hierarchy_config.get("decomposer_max_new_tokens")
         selector_max_new_tokens = hierarchy_config.get("selector_max_new_tokens")
+        worker_max_new_tokens = hierarchy_config.get("worker_max_new_tokens")
+        final_max_new_tokens = hierarchy_config.get(
+            "final_max_new_tokens",
+            worker_max_new_tokens,
+        )
+        feedback_worker_reasoning_max_chars = int(
+            hierarchy_config.get("feedback_worker_reasoning_max_chars", 2200)
+        )
         pass_question_to_workers = worker_context_mode in {
             "full_question",
             "question",
@@ -924,11 +1060,6 @@ class MultiAgentRollout:
 
         conversation_history = {
             role: [None for _ in range(batch_size)]
-            for role in agent_roles
-        }
-        running_conversation = {
-            role: [[{"role": "system", "content": system_prompts[role]}]
-                   for _ in range(batch_size)]
             for role in agent_roles
         }
         previous_feedback = [None for _ in range(batch_size)]
@@ -944,7 +1075,10 @@ class MultiAgentRollout:
             })
 
         def build_prompt(role, idx, content):
-            return running_conversation[role][idx] + [{"role": "user", "content": content}]
+            return [
+                {"role": "system", "content": system_prompts[role]},
+                {"role": "user", "content": content},
+            ]
 
         def build_selected_worker_prompt(stage_role, worker_type, idx, content, system_prompt_override=None):
             system_prompt = system_prompt_override or system_prompts.get(worker_type, system_prompts[stage_role])
@@ -961,7 +1095,6 @@ class MultiAgentRollout:
         ):
             conversation_history[role][idx] = chat
             append_history(idx, role, output, num_gen_tokens, stop_reason, token_ids)
-            running_conversation[role][idx] = chat + [{"role": "assistant", "content": output}]
 
         for i_turn in range(max_num_turns):
             unfinished_indices = np.where(~finish_flags)[0]
@@ -1153,7 +1286,20 @@ class MultiAgentRollout:
                         worker_chats.append(chat)
                         worker_chats_by_idx[idx] = chat
                     outputs, tokens, stops, _, output_token_ids = self._generate_from_chat_list(
-                        stage_role, worker_chats, tokenizers, prompts.meta_info, response_length)
+                        stage_role,
+                        worker_chats,
+                        tokenizers,
+                        prompts.meta_info,
+                        response_length,
+                        max_new_tokens=(
+                            final_max_new_tokens
+                            if all(
+                                stage_idx == len(ordered_stages_by_idx[idx]) - 1
+                                for idx in stage_indices
+                            )
+                            else worker_max_new_tokens
+                        ),
+                    )
                     for local_idx, idx in enumerate(stage_indices):
                         output = outputs[local_idx]
                         worker_results[idx][stage_role] = output
@@ -1213,7 +1359,9 @@ class MultiAgentRollout:
             for idx in unfinished_indices:
                 previous_feedback[idx] = self._format_hierarchical_feedback(
                     current_plan[idx], selector_output_by_idx[idx], worker_results[idx],
-                    latest_outputs[idx], stage_roles)
+                    latest_outputs[idx], stage_roles,
+                    worker_reasoning_max_chars=feedback_worker_reasoning_max_chars,
+                )
 
         return latest_outputs, conversation_history
 
@@ -1233,6 +1381,7 @@ class MultiAgentRollout:
         stop_reason_lst: Dict[str, List[List[Optional[str]]]],
         max_num_turns: int,
         finish_reason: List[Optional[str]],
+        latest_round_only: bool = False,
     ):
         # add last round output to make full conversation
         for i_batch in range(len(last_round_responses)):
@@ -1247,21 +1396,76 @@ class MultiAgentRollout:
         input_ids_lst = {role: [] for role in conversation_history.keys()}
         labels_lst = {role: [] for role in conversation_history.keys()}
         step_ids_lst = {role: [] for role in conversation_history.keys()}
+        encoded_num_gen_token_lst = {
+            role: [] for role in conversation_history.keys()
+        }
+        encoded_stop_reason_lst = {
+            role: [] for role in conversation_history.keys()
+        }
+        prompt_truncated_lst = {
+            role: [] for role in conversation_history.keys()
+        }
+        response_truncated_lst = {
+            role: [] for role in conversation_history.keys()
+        }
 
         # build tensors for training
         for i_batch in range(len(last_round_responses)):
             for role in conversation_history.keys():
-                # encode conversation into input_ids, labels, step_ids
-                # XXX(ziyu): need to consider stop reason here ?
-                input_ids, labels, step_ids = _encode_conversation(
-                    conversation_history[role][i_batch],
-                    tokenizers[role],
-                    num_gen_token_lst[role][i_batch],
-                    stop_reason_lst[role][i_batch],
-                )
+                if latest_round_only:
+                    role_num_gen_tokens = num_gen_token_lst[role][i_batch]
+                    role_stop_reasons = stop_reason_lst[role][i_batch]
+                    latest_turn_idx = max(len(role_num_gen_tokens) - 1, 0)
+                    latest_stop_reason = (
+                        role_stop_reasons[-1] if role_stop_reasons else "stop"
+                    )
+                    (
+                        input_ids,
+                        labels,
+                        step_ids,
+                        encoded_num_gen_tokens,
+                        encoded_stop_reason,
+                        prompt_was_truncated,
+                        response_was_truncated,
+                    ) = _encode_latest_conversation(
+                        conversation_history[role][i_batch],
+                        tokenizers[role],
+                        latest_stop_reason,
+                        latest_turn_idx,
+                        self.config.prompt_length,
+                        self.config.response_length + self.config.prompt_length,
+                    )
+                    if latest_turn_idx >= max_num_turns:
+                        raise ValueError(
+                            f"Latest turn index {latest_turn_idx} exceeds "
+                            f"configured max_num_turns={max_num_turns}"
+                        )
+                    sparse_num_gen_tokens = [0] * max_num_turns
+                    sparse_stop_reasons = ["not_encoded"] * max_num_turns
+                    sparse_num_gen_tokens[latest_turn_idx] = encoded_num_gen_tokens
+                    sparse_stop_reasons[latest_turn_idx] = encoded_stop_reason
+                else:
+                    input_ids, labels, step_ids = _encode_conversation(
+                        conversation_history[role][i_batch],
+                        tokenizers[role],
+                        num_gen_token_lst[role][i_batch],
+                        stop_reason_lst[role][i_batch],
+                    )
+                    sparse_num_gen_tokens = list(
+                        num_gen_token_lst[role][i_batch]
+                    )
+                    sparse_stop_reasons = list(
+                        stop_reason_lst[role][i_batch]
+                    )
+                    prompt_was_truncated = False
+                    response_was_truncated = False
                 input_ids_lst[role].append(input_ids)
                 labels_lst[role].append(labels)
                 step_ids_lst[role].append(step_ids)
+                encoded_num_gen_token_lst[role].append(sparse_num_gen_tokens)
+                encoded_stop_reason_lst[role].append(sparse_stop_reasons)
+                prompt_truncated_lst[role].append(prompt_was_truncated)
+                response_truncated_lst[role].append(response_was_truncated)
 
         # Apply padding to create tensors
         batch_size = len(last_round_responses)
@@ -1329,14 +1533,14 @@ class MultiAgentRollout:
             padded_num_gen_tokens = torch.full((batch_size, max_num_turns),
                                                0,
                                                dtype=torch.long)
-            for i, num_gen_tokens in enumerate(num_gen_token_lst[role]):
+            for i, num_gen_tokens in enumerate(encoded_num_gen_token_lst[role]):
                 padded_num_gen_tokens[i, :len(num_gen_tokens)] = torch.tensor(
                     num_gen_tokens, dtype=torch.long)
             padded_stop_reasons = torch.full((batch_size, max_num_turns),
                                              0,
                                              dtype=torch.bool)
 
-            for i, stop_reasons in enumerate(stop_reason_lst[role]):
+            for i, stop_reasons in enumerate(encoded_stop_reason_lst[role]):
                 stop_reason_array = np.array(
                     [0 if r == "stop" else 1 for r in stop_reasons])
                 padded_stop_reasons[i, :len(stop_reason_array)] = torch.tensor(
@@ -1353,6 +1557,14 @@ class MultiAgentRollout:
                     "num_gen_tokens": padded_num_gen_tokens,
                     "stop_reasons": padded_stop_reasons,
                     "turn_finished": torch.tensor(finish_reason_array),
+                    "prompt_truncated": torch.tensor(
+                        prompt_truncated_lst[role],
+                        dtype=torch.bool,
+                    ),
+                    "response_retokenized_truncated": torch.tensor(
+                        response_truncated_lst[role],
+                        dtype=torch.bool,
+                    ),
                 }, )
 
         # remove side effect
@@ -1619,6 +1831,7 @@ class MultiAgentRollout:
             stop_reason_lst,
             max_num_turns,
             finish_reason,
+            latest_round_only=hierarchy_config.get("enable", False),
         )
 
         # Prepare return results

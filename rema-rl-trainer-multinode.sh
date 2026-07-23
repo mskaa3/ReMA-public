@@ -192,7 +192,6 @@ python3 -m verl.rema_separated_trainer.main_ppo \
 	  actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
 	  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
 	  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
-	  algorithm.hierarchy.num_worker_stages=3 \
       ${PRD_ONLINE_OVERRIDES} \
       ${PRD_EXPORT_OVERRIDES}"
 

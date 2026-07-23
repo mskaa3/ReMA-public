@@ -240,9 +240,19 @@ def _compute_turn_worker_metrics(turn_history, worker_roles):
 
     valid_signatures = [worker['signature'] for worker in active_workers if worker['signature']]
     unique_signatures = set(valid_signatures)
-    unique_local_result_rate = (
-        len(unique_signatures) / len(valid_signatures)
-        if valid_signatures else 0.0
+    if not valid_signatures:
+        unique_local_result_rate = 0.0
+    elif len(valid_signatures) == 1:
+        unique_local_result_rate = 1.0
+    else:
+        # The first result is not evidence of diversity. Measure how many
+        # additional workers contribute a genuinely new result.
+        unique_local_result_rate = (
+            (len(unique_signatures) - 1) / (len(valid_signatures) - 1)
+        )
+    duplicate_result_count = max(
+        len(valid_signatures) - len(unique_signatures),
+        0,
     )
 
     dependency_hits = 0
@@ -252,7 +262,14 @@ def _compute_turn_worker_metrics(turn_history, worker_roles):
         normalized_content = _normalize_role_output(worker['content'])
         if previous_signatures:
             dependency_checks += 1
-            if any(signature in normalized_content for signature in previous_signatures):
+            if (
+                worker['signature']
+                and worker['signature'] not in previous_signatures
+                and any(
+                    signature in normalized_content
+                    for signature in previous_signatures
+                )
+            ):
                 dependency_hits += 1
         if worker['signature']:
             previous_signatures.append(worker['signature'])
@@ -267,7 +284,10 @@ def _compute_turn_worker_metrics(turn_history, worker_roles):
         'valid_local_result_count': len(valid_signatures),
         'unique_local_result_rate': unique_local_result_rate,
         'dependency_usage_rate': dependency_usage_rate,
-        'duplicate_result_count': max(len(valid_signatures) - len(unique_signatures), 0),
+        'duplicate_result_count': duplicate_result_count,
+        'distinct_worker_result_gate': (
+            1.0 if valid_signatures and duplicate_result_count == 0 else 0.0
+        ),
         'missing_local_result_count': sum(1 for worker in active_workers if not worker['signature']),
         'empty_assigned_count': sum(1 for worker in active_workers if not worker['content'].strip()),
     }
@@ -540,7 +560,13 @@ def _compute_turn_worker_role_bonus_stats(turn_history, worker_roles, score_role
                 for previous_worker in active_workers[:idx]
                 if previous_worker['signature']
             ]
-            if any(previous_signature in current_content for previous_signature in previous_signatures):
+            if (
+                signature not in previous_signatures
+                and any(
+                    previous_signature in current_content
+                    for previous_signature in previous_signatures
+                )
+            ):
                 dependency_used = 1.0
             later_contents = [
                 _normalize_role_output(later_worker['content'])
@@ -732,6 +758,7 @@ class ReMARewardManager:
         reward_tensor_map['decomposer_repair_success'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_plan_parseable_gate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['hierarchy_utilization_gate'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['distinct_worker_result_gate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['valid_nonfinal_worker_count'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['planned_subtask_count'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['executed_subtask_count'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -828,6 +855,7 @@ class ReMARewardManager:
                 valid_history[i_turn * len(agent_roles):(i_turn + 1) * len(agent_roles)]
                 for i_turn in range(num_turns)
             ]
+            current_turn_history = turn_histories[-1] if turn_histories else []
             meta_roles = {'meta_thinking', 'decomposer'}
             role_penalties = {role: 0.0 for role in agent_roles}
             role_bonuses = {role: 0.0 for role in agent_roles}
@@ -842,9 +870,11 @@ class ReMARewardManager:
             )
             upstream_hierarchical_correctness_bonus = 0.0
             hierarchy_bonus_gates = None
+            current_turn_worker_metrics = None
             worker_bonus_stats = None
             final_bonus_stats = None
             final_worker_usage_gate = 0.0
+            distinct_worker_result_gate = 0.0
             final_raw_score_usage_floor = float(
                 hierarchy_config.get(
                     'final_raw_score_usage_floor',
@@ -854,6 +884,16 @@ class ReMARewardManager:
             final_raw_score_usage_floor = max(0.0, min(1.0, final_raw_score_usage_floor))
             final_raw_score_usage_multiplier = 1.0
             if turn_histories:
+                current_turn_worker_metrics = _compute_turn_worker_metrics(
+                    turn_histories[-1],
+                    worker_roles,
+                )
+                distinct_worker_result_gate = current_turn_worker_metrics[
+                    'distinct_worker_result_gate'
+                ]
+                reward_tensor_map['distinct_worker_result_gate'][i_bsz] = (
+                    distinct_worker_result_gate
+                )
                 hierarchy_bonus_gates = _compute_hierarchy_bonus_gates(
                     turn_histories[-1], worker_roles, score_role
                 )
@@ -878,7 +918,9 @@ class ReMARewardManager:
                     float(raw_score) * final_raw_score_usage_multiplier
                 )
                 upstream_hierarchical_correctness_bonus = (
-                    UPSTREAM_HIERARCHICAL_CORRECTNESS_BONUS * final_worker_usage_gate
+                    UPSTREAM_HIERARCHICAL_CORRECTNESS_BONUS
+                    * final_worker_usage_gate
+                    * distinct_worker_result_gate
                 )
                 reward_tensor_map['upstream_hierarchical_correctness_bonus'][i_bsz] = (
                     upstream_hierarchical_correctness_bonus
@@ -888,7 +930,7 @@ class ReMARewardManager:
                 float(raw_score) * final_raw_score_usage_multiplier
             )
             if 'decomposer' in agent_roles and turn_histories:
-                current_turn_metrics = _compute_turn_worker_metrics(turn_histories[-1], worker_roles)
+                current_turn_metrics = current_turn_worker_metrics
                 previous_turn_metrics = (
                     _compute_turn_worker_metrics(turn_histories[-2], worker_roles)
                     if len(turn_histories) >= 2 else None
@@ -907,6 +949,7 @@ class ReMARewardManager:
                 decomposer_local_bonus *= hierarchy_bonus_gates['decomposer_plan_parseable_gate']
                 decomposer_local_bonus *= hierarchy_bonus_gates['hierarchy_utilization_gate']
                 decomposer_local_bonus *= final_worker_usage_gate
+                decomposer_local_bonus *= distinct_worker_result_gate
                 reward_tensor_map['decomposer_unique_local_result_rate'][i_bsz] = decomposer_unique_local_result_rate
                 reward_tensor_map['decomposer_dependency_usage_rate'][i_bsz] = decomposer_dependency_usage_rate
                 reward_tensor_map['decomposer_repair_success'][i_bsz] = decomposer_repair_success
@@ -926,6 +969,7 @@ class ReMARewardManager:
                     * positive_role_bonus_gate
                     * final_worker_usage_gate
                     * hierarchy_bonus_gates['decomposer_plan_parseable_gate']
+                    * distinct_worker_result_gate
                 )
                 reward_tensor_map['decomposer_global_correctness_bonus'][i_bsz] = (
                     decomposer_global_correctness_bonus
@@ -945,7 +989,11 @@ class ReMARewardManager:
                     + SELECTOR_WORKER_VALID_LOCAL_RESULT_BONUS * selector_stats['worker_valid_local_result_rate']
                 )
                 selector_local_bonus_raw *= hierarchy_bonus_gates['hierarchy_utilization_gate']
-                selector_local_bonus = selector_local_bonus_raw * final_worker_usage_gate
+                selector_local_bonus = (
+                    selector_local_bonus_raw
+                    * final_worker_usage_gate
+                    * distinct_worker_result_gate
+                )
                 reward_tensor_map['selector_assignment_completeness'][i_bsz] = selector_stats['assignment_completeness']
                 reward_tensor_map['selector_assignment_precision'][i_bsz] = selector_stats['assignment_precision']
                 reward_tensor_map['selector_assignment_recall'][i_bsz] = selector_stats['assignment_recall']
@@ -961,6 +1009,7 @@ class ReMARewardManager:
                     upstream_global_correctness_bonus
                     * final_worker_usage_gate
                     * selector_stats['assignment_completeness']
+                    * distinct_worker_result_gate
                 )
                 reward_tensor_map['selector_global_correctness_bonus'][i_bsz] = (
                     selector_global_correctness_bonus
@@ -1062,7 +1111,7 @@ class ReMARewardManager:
                 and msg.get('role') in meta_roles
                 and isinstance(msg.get('content'), str)
                 and 'boxed' in msg.get('content').lower()
-                for msg in valid_history
+                for msg in current_turn_history
             )
             if meta_has_boxed:
                 reward_tensor_map['meta_boxed_penalty_applied'][i_bsz] = 1.0
@@ -1071,7 +1120,7 @@ class ReMARewardManager:
 
             worker_boxed_roles = set()
             if ENABLE_WORKER_BOXED_PENALTY:
-                for msg in valid_history:
+                for msg in current_turn_history:
                     content = msg.get('content') if isinstance(msg, dict) else None
                     if (
                         isinstance(msg, dict)
@@ -1092,7 +1141,7 @@ class ReMARewardManager:
             finish_flag = data.meta_info.get('finish_flag')
             worker_finish_roles = set()
             if finish_flag:
-                for msg in valid_history:
+                for msg in current_turn_history:
                     content = msg.get('content') if isinstance(msg, dict) else None
                     if (
                         isinstance(msg, dict)
@@ -1111,30 +1160,31 @@ class ReMARewardManager:
                     role_penalties[role] += WORKER_FINISH_PENALTY
 
             repeated_planner_roles = set()
+            previous_turn_history = turn_histories[-2] if len(turn_histories) >= 2 else []
+            previous_planner_outputs = {
+                msg.get('role'): _normalize_role_output(msg.get('content', ''))
+                for msg in previous_turn_history
+                if isinstance(msg, dict) and msg.get('role') in planner_roles
+            }
+            current_planner_outputs = {
+                msg.get('role'): _normalize_role_output(msg.get('content', ''))
+                for msg in current_turn_history
+                if isinstance(msg, dict) and msg.get('role') in planner_roles
+            }
             for role in planner_roles.intersection(agent_roles):
-                role_outputs = [
-                    _normalize_role_output(msg.get('content', ''))
-                    for msg in valid_history
-                    if isinstance(msg, dict) and msg.get('role') == role
-                ]
-                role_outputs = [output for output in role_outputs if output]
-                if len(role_outputs) > len(set(role_outputs)):
+                if (
+                    current_planner_outputs.get(role)
+                    and current_planner_outputs.get(role)
+                    == previous_planner_outputs.get(role)
+                ):
                     repeated_planner_roles.add(role)
             if {'decomposer', 'selector'}.issubset(set(agent_roles)):
-                for i_turn in range(num_turns):
-                    turn_history = valid_history[
-                        i_turn * len(agent_roles):(i_turn + 1) * len(agent_roles)
-                    ]
-                    planner_outputs = {
-                        msg.get('role'): _normalize_role_output(msg.get('content', ''))
-                        for msg in turn_history
-                        if isinstance(msg, dict) and msg.get('role') in {'decomposer', 'selector'}
-                    }
-                    if (
-                        planner_outputs.get('decomposer')
-                        and planner_outputs.get('decomposer') == planner_outputs.get('selector')
-                    ):
-                        repeated_planner_roles.update({'decomposer', 'selector'})
+                if (
+                    current_planner_outputs.get('decomposer')
+                    and current_planner_outputs.get('decomposer')
+                    == current_planner_outputs.get('selector')
+                ):
+                    repeated_planner_roles.update({'decomposer', 'selector'})
             if repeated_planner_roles:
                 reward_tensor_map['planner_repeat_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['planner_repeat_penalty_value'][i_bsz] = PLANNER_REPEAT_PENALTY
@@ -1146,7 +1196,7 @@ class ReMARewardManager:
                     len(stage_roles or []) - 1,
                     1,
                 )
-                for msg in valid_history:
+                for msg in current_turn_history:
                     if not (
                         isinstance(msg, dict)
                         and msg.get('role') == 'decomposer'
@@ -1164,7 +1214,7 @@ class ReMARewardManager:
 
             subtask_count_penalty = 0.0
             if ENABLE_PLANNER_SUBTASK_COUNT_PENALTY and 'decomposer' in agent_roles:
-                for msg in valid_history:
+                for msg in current_turn_history:
                     if not (
                         isinstance(msg, dict)
                         and msg.get('role') == 'decomposer'
@@ -1199,7 +1249,7 @@ class ReMARewardManager:
             empty_assigned_roles = set()
             missing_local_result_roles = set()
             overreach_roles = set()
-            for msg in valid_history:
+            for msg in current_turn_history:
                 if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
                     continue
                 assigned_subtasks = msg.get('assigned_subtasks') or []
@@ -1236,21 +1286,19 @@ class ReMARewardManager:
                     role_penalties[role] += WORKER_SUBTASK_OVERREACH_PENALTY
 
             duplicate_worker_roles = set()
-            for i_turn in range(num_turns):
-                turn_history = valid_history[
-                    i_turn * len(agent_roles):(i_turn + 1) * len(agent_roles)
-                ]
-                signature_to_roles = {}
-                for msg in turn_history:
-                    if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
-                        continue
-                    signature = _extract_worker_local_result_signature(msg.get('content', ''))
-                    if not signature:
-                        continue
-                    signature_to_roles.setdefault(signature, set()).add(msg.get('role'))
-                for roles_with_same_signature in signature_to_roles.values():
-                    if len(roles_with_same_signature) > 1:
-                        duplicate_worker_roles.update(roles_with_same_signature)
+            signature_to_roles = {}
+            for msg in current_turn_history:
+                if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
+                    continue
+                signature = _extract_worker_local_result_signature(msg.get('content', ''))
+                if not signature:
+                    continue
+                signature_to_roles.setdefault(signature, []).append(msg.get('role'))
+            for roles_with_same_signature in signature_to_roles.values():
+                if len(roles_with_same_signature) > 1:
+                    # The first contributor keeps credit; only later copies
+                    # are treated as duplicate actions.
+                    duplicate_worker_roles.update(roles_with_same_signature[1:])
             if duplicate_worker_roles:
                 reward_tensor_map['worker_duplicate_result_penalty_applied'][i_bsz] = 1.0
                 reward_tensor_map['worker_duplicate_result_penalty_value'][i_bsz] = WORKER_DUPLICATE_RESULT_PENALTY
@@ -1262,7 +1310,7 @@ class ReMARewardManager:
             if score_role in worker_roles:
                 previous_local_results = []
                 final_output = ""
-                for msg in valid_history:
+                for msg in current_turn_history:
                     if not isinstance(msg, dict) or msg.get('role') not in worker_roles:
                         continue
                     content = msg.get('content') if isinstance(msg.get('content'), str) else ''
@@ -1462,6 +1510,7 @@ class ReMARewardManager:
                         'repair_success': float(reward_tensor_map['decomposer_repair_success'][i_bsz]),
                         'plan_parseable_gate': float(reward_tensor_map['decomposer_plan_parseable_gate'][i_bsz]),
                         'hierarchy_utilization_gate': float(reward_tensor_map['hierarchy_utilization_gate'][i_bsz]),
+                        'distinct_worker_result_gate': float(reward_tensor_map['distinct_worker_result_gate'][i_bsz]),
                         'valid_nonfinal_worker_count': float(reward_tensor_map['valid_nonfinal_worker_count'][i_bsz]),
                         'planned_subtask_count': float(reward_tensor_map['planned_subtask_count'][i_bsz]),
                         'executed_subtask_count': float(reward_tensor_map['executed_subtask_count'][i_bsz]),
