@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -56,6 +57,12 @@ def _path_debug_info(path_str: str, preview_limit: int = 8) -> str:
     if preview_error:
         info.append(f"preview_error={preview_error}")
     return " ".join(info)
+
+
+def _supports_live_progress(stream: object | None = None) -> bool:
+    stream = stream or sys.stdout
+    isatty = getattr(stream, "isatty", None)
+    return bool(callable(isatty) and isatty())
 
 
 def build_vllm_rollout_config_dict(
@@ -526,15 +533,10 @@ class RayVLLMGenerationManager:
         chunk_ranges = list(self._chunk_range(len(prompt_texts), batch_size))
         total_chunks = len(chunk_ranges)
         generation_started_at = time.monotonic()
+        live_progress = log_label is not None and _supports_live_progress()
+        last_progress_width = 0
         for chunk_index, (start, end) in enumerate(chunk_ranges, start=1):
             prompt_chunk = prompt_texts[start:end]
-            if log_label is not None:
-                print(
-                    f"[hierarchical-rema][generation-progress] role={log_label} "
-                    f"model={Path(model_path).name} chunk={chunk_index}/{total_chunks} "
-                    f"prompts={start + 1}-{end}/{len(prompt_texts)} "
-                    f"batch_size={len(prompt_chunk)}"
-                )
             chunk_started_at = time.monotonic()
             prompt_proto = self._encode_prompt_batch(
                 tokenizer=tokenizer,
@@ -587,14 +589,33 @@ class RayVLLMGenerationManager:
                         response_length=response_length_int,
                     )
                 )
-            if log_label is not None:
+            if log_label is not None and live_progress:
                 chunk_elapsed = time.monotonic() - chunk_started_at
                 total_elapsed = time.monotonic() - generation_started_at
-                print(
+                message = (
                     f"[hierarchical-rema][generation-progress] role={log_label} "
-                    f"model={Path(model_path).name} chunk_done={chunk_index}/{total_chunks} "
-                    f"elapsed_s={chunk_elapsed:.1f} total_elapsed_s={total_elapsed:.1f}"
+                    f"model={Path(model_path).name} chunk={chunk_index}/{total_chunks} "
+                    f"prompts={end}/{len(prompt_texts)} batch_size={len(prompt_chunk)} "
+                    f"chunk_elapsed_s={chunk_elapsed:.1f} total_elapsed_s={total_elapsed:.1f}"
                 )
+                padded_message = message.ljust(last_progress_width)
+                sys.stdout.write(f"\r{padded_message}")
+                sys.stdout.flush()
+                last_progress_width = max(last_progress_width, len(message))
+
+        if log_label is not None:
+            total_elapsed = time.monotonic() - generation_started_at
+            final_message = (
+                f"[hierarchical-rema][generation-progress] role={log_label} "
+                f"model={Path(model_path).name} prompts={len(prompt_texts)} "
+                f"chunks={total_chunks} total_elapsed_s={total_elapsed:.1f}"
+            )
+            if live_progress:
+                padded_message = final_message.ljust(last_progress_width)
+                sys.stdout.write(f"\r{padded_message}\n")
+                sys.stdout.flush()
+            else:
+                print(final_message)
 
         return results
 

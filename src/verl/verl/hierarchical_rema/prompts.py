@@ -20,12 +20,12 @@ Break each task into a compact DAG of concrete mathematical steps whose outputs 
 
 
 SELECTOR_SYSTEM_PROMPT = """You are the Selector controller.
-Assign the most suitable worker to each decomposition node using the node requirements and the workers' capabilities and track record.
+Assign the most suitable worker to one decomposition node at a time using the node requirements and the workers' capabilities and track record.
 """
 
 
 SELECTOR_SYSTEM_PROMPT_NO_HISTORY = """You are the Selector controller.
-Assign the most suitable worker to each decomposition node using the node requirements and the workers' capabilities.
+Assign the most suitable worker to one decomposition node at a time using the node requirements and the workers' capabilities.
 """
 
 
@@ -134,6 +134,16 @@ def render_selector_output_skeleton(node_ids: Sequence[str]) -> str:
         lines.append(f"{node_id}: best_worker_id_here")
     lines.append("</selection_plan>")
     return "\n".join(lines)
+
+
+def render_selector_decision_output_skeleton() -> str:
+    return "\n".join(
+        [
+            "<selector_answer>",
+            "WORKER_ID: exact_worker_id_here",
+            "</selector_answer>",
+        ]
+    )
 
 
 def _expected_worker_output_hint(
@@ -311,6 +321,69 @@ def render_selector_prompt(
         "WORKERS_BY_ID:\n"
         f"{chr(10).join(worker_lines)}\n\n"
         "Return ONLY the <selection_plan> block."
+    )
+
+
+def render_selector_decision_prompt(
+    task: TaskExample,
+    decomposition: DecompositionCandidate,
+    node: SubtaskNode,
+    worker_pool: WorkerPoolConfig,
+    worker_performance: Dict[str, WorkerPerformanceSnapshot],
+    track_workers_history: bool = True,
+) -> str:
+    dependencies = ",".join(node.dependencies) if node.dependencies else "none"
+    skills = ",".join(node.required_skills) if node.required_skills else "none"
+    skill_note = (
+        f"\nCURRENT_NODE_REQUIRED_SKILLS_NOTE: {node.required_skills_note}"
+        if node.required_skills_note
+        else ""
+    )
+    worker_lines = []
+    for worker in worker_pool.workers:
+        worker_skills = ",".join(worker.skills) if worker.skills else "none"
+        if track_workers_history:
+            snapshot = worker_performance.get(worker.worker_id)
+            avg_reward = snapshot.average_reward if snapshot is not None else 0.0
+            worker_lines.append(
+                f"- {worker.worker_id} | skills={worker_skills} | avg_reward={avg_reward:.2f} | desc={worker.description}"
+            )
+        else:
+            worker_lines.append(
+                f"- {worker.worker_id} | skills={worker_skills} | desc={worker.description}"
+            )
+
+    worker_preference_line = (
+        "- Prefer the worker whose skills and past performance best match this node.\n"
+        if track_workers_history
+        else "- Prefer the worker whose skills best match this node.\n"
+    )
+    selector_skeleton = render_selector_decision_output_skeleton()
+    allowed_worker_ids = ", ".join(worker.worker_id for worker in worker_pool.workers)
+    return (
+        "OUTPUT CONTRACT:\n"
+        "- You are choosing a worker for exactly one decomposition node.\n"
+        "- You may optionally think inside <selector_scratchpad>...</selector_scratchpad>.\n"
+        "- You must end with exactly one <selector_answer> block.\n"
+        "- Inside <selector_answer>, write exactly one line in the form: `WORKER_ID: actual_worker_id`.\n"
+        f"- Allowed worker IDs: {allowed_worker_ids}.\n"
+        f"- Use this skeleton:\n{selector_skeleton}\n"
+        "- Do not output a full selection plan, JSON, bullets, or prose outside the allowed tags.\n"
+        f"{worker_preference_line}"
+        "- Choose based on this node's requirements, not by worker list position or a repeated pattern.\n\n"
+        f"TASK_ID: {task.task_id}\n"
+        f"TASK: {task.prompt}\n"
+        f"TARGET_QUANTITY: {decomposition.target_quantity}\n"
+        f"FINAL_ANSWER_FORMAT_HINT: {decomposition.final_answer_format_hint}\n"
+        f"FINAL_NODE_ID: {decomposition.final_node_id}\n"
+        f"CURRENT_NODE_ID: {node.node_id}\n"
+        f"CURRENT_NODE_DEPENDENCIES: {dependencies}\n"
+        f"CURRENT_NODE_REQUIRED_SKILLS: {skills}"
+        f"{skill_note}\n"
+        f"CURRENT_NODE_INSTRUCTION: {node.instruction}\n"
+        "WORKERS_BY_ID:\n"
+        f"{chr(10).join(worker_lines)}\n\n"
+        "Return ONLY the optional <selector_scratchpad> block followed by the required <selector_answer> block."
     )
 
 

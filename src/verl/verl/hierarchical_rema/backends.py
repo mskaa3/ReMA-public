@@ -10,6 +10,8 @@ from .prompts import (
     DECOMPOSER_SYSTEM_PROMPT,
     SELECTOR_SYSTEM_PROMPT,
     SELECTOR_SYSTEM_PROMPT_NO_HISTORY,
+    render_selector_decision_output_skeleton,
+    render_selector_decision_prompt,
     render_decomposer_prompt,
     render_selector_output_skeleton,
     render_selector_prompt,
@@ -41,6 +43,8 @@ from .ray_generation import RayVLLMGenerationManager
 from .structured import (
     build_fallback_decomposition,
     build_fallback_selection,
+    extract_selector_decision_payload,
+    extract_selector_decision_payload_strict,
     extract_worker_result_text,
     extract_decomposition_payload,
     extract_selection_payload,
@@ -81,6 +85,73 @@ class WorkerExecutionRequest:
     worker: WorkerSpec
     dependency_outputs: Dict[str, str]
     compatibility: float
+
+
+def _best_worker_for_node(
+    node: SubtaskNode,
+    worker_pool: WorkerPoolConfig,
+    worker_performance: Dict[str, WorkerPerformanceSnapshot],
+) -> tuple[float, WorkerSpec]:
+    scored_workers = [
+        (
+            compatibility_score(node.required_skills, worker, worker_performance),
+            -index,
+            worker,
+        )
+        for index, worker in enumerate(worker_pool.workers)
+    ]
+    best_score, _, best_worker = max(scored_workers)
+    return float(best_score), best_worker
+
+
+def _resolve_selector_worker_id(
+    raw_worker_id: Any,
+    worker_pool: WorkerPoolConfig,
+) -> str | None:
+    worker_id = str(raw_worker_id or "").strip()
+    ordered_worker_ids = [worker.worker_id for worker in worker_pool.workers]
+    if worker_id in ordered_worker_ids:
+        return worker_id
+    if worker_id.isdigit():
+        worker_index = int(worker_id)
+        if 0 < worker_index <= len(ordered_worker_ids):
+            return ordered_worker_ids[worker_index - 1]
+    return None
+
+
+def _build_selector_assignment(
+    *,
+    node: SubtaskNode,
+    worker_id: str,
+    worker_pool: WorkerPoolConfig,
+    worker_performance: Dict[str, WorkerPerformanceSnapshot],
+    prompt_text: str,
+    rationale: str,
+    raw_payload: Dict[str, Any] | None = None,
+) -> WorkerAssignment:
+    worker_map = worker_pool.workers_by_id()
+    worker = worker_map[worker_id]
+    return WorkerAssignment(
+        node_id=node.node_id,
+        worker_id=worker_id,
+        rationale=rationale,
+        compatibility=round(
+            compatibility_score(node.required_skills, worker, worker_performance),
+            4,
+        ),
+        prompt_text=prompt_text,
+        raw_payload=dict(raw_payload or {}),
+    )
+
+
+def _selector_decision_completion_text(worker_id: str) -> str:
+    return "\n".join(
+        [
+            "<selector_answer>",
+            f"WORKER_ID: {worker_id}",
+            "</selector_answer>",
+        ]
+    )
 
 
 def _postprocess_worker_output(
@@ -150,6 +221,10 @@ def _canonicalize_selection_candidate(
                     compatibility_score(node.required_skills, worker, worker_performance),
                     4,
                 ),
+                reward_model_reward=assignment.reward_model_reward,
+                selector_advantage=assignment.selector_advantage,
+                prompt_text=assignment.prompt_text,
+                raw_payload=dict(assignment.raw_payload),
             )
         )
     candidate.assignments = normalized_assignments
@@ -623,34 +698,32 @@ class MockHierarchicalBackend(HierarchicalBackend):
         worker_performance: Dict[str, WorkerPerformanceSnapshot],
     ) -> SelectionCandidate:
         del policy_config
-        worker_map = worker_pool.workers_by_id()
-        prompt_text = render_selector_prompt(
-            task,
-            decomposition,
-            worker_pool,
-            worker_performance,
-            track_workers_history=bool(worker_performance),
-        )
         assignments: List[WorkerAssignment] = []
-        all_workers = list(worker_map.values())
         for node_position, node in enumerate(decomposition.nodes):
-            scored_workers = sorted(
-                (
+            prompt_text = render_selector_decision_prompt(
+                task,
+                decomposition,
+                node,
+                worker_pool,
+                worker_performance,
+                track_workers_history=bool(worker_performance),
+            )
+            ranked_workers = sorted(
+                [
                     (
                         compatibility_score(node.required_skills, worker, worker_performance),
                         worker,
                     )
-                    for worker in all_workers
-                ),
+                    for worker in worker_pool.workers
+                ],
                 key=lambda item: (-item[0], item[1].worker_id),
             )
-
-            if selection_index % 2 == 0 or len(scored_workers) == 1:
-                chosen_score, chosen_worker = scored_workers[0]
+            if selection_index % 2 == 0 or len(ranked_workers) == 1:
+                chosen_score, chosen_worker = ranked_workers[0]
             else:
                 # On alternate rollouts, flip one assignment to create a weaker selector branch.
-                pick_index = 1 if node_position == 0 and len(scored_workers) > 1 else 0
-                chosen_score, chosen_worker = scored_workers[pick_index]
+                pick_index = 1 if node_position == 0 and len(ranked_workers) > 1 else 0
+                chosen_score, chosen_worker = ranked_workers[pick_index]
 
             rationale = (
                 f"Selected {chosen_worker.worker_id} for node {node.node_id} "
@@ -662,24 +735,49 @@ class MockHierarchicalBackend(HierarchicalBackend):
                     worker_id=chosen_worker.worker_id,
                     rationale=rationale,
                     compatibility=round(chosen_score, 4),
+                    prompt_text=prompt_text,
+                    raw_payload={
+                        "validation": {
+                            "backend": "mock",
+                            "attempt": 0,
+                            "fallback_used": False,
+                        },
+                        "selection_generation_mode": "sequential_selector_decision",
+                    },
                 )
             )
 
-        raw_payload = {
+        payload = {
             "selection_id": f"{decomposition.decomposition_id}-sel-{selection_index}",
-            "assignments": [assignment.to_dict() for assignment in assignments],
-            "controller_prompt": prompt_text,
+            "assignments": [
+                {
+                    "node_id": assignment.node_id,
+                    "worker_id": assignment.worker_id,
+                    "rationale": assignment.rationale,
+                    "compatibility": assignment.compatibility,
+                }
+                for assignment in assignments
+            ],
         }
         candidate = validate_selection_payload(
-            payload=raw_payload,
+            payload=payload,
             decomposition=decomposition,
             worker_pool=worker_pool,
         )
-        raw_payload["validation"] = {
-            "backend": "mock",
-            "fallback_used": False,
+        candidate.assignments = assignments
+        candidate.raw_payload = {
+            "selection": {
+                "selection_id": candidate.selection_id,
+                "assignments": [assignment.to_dict() for assignment in assignments],
+            },
+            "validation": {
+                "backend": "mock",
+                "fallback_used": False,
+                "mode": "sequential_selector_decisions",
+                "num_decisions": len(assignments),
+            },
+            "selection_generation_mode": "sequential_selector_decisions",
         }
-        candidate.raw_payload = raw_payload
         candidate.raw_text = format_selection_plan(
             candidate,
             node_order=[node.node_id for node in decomposition.nodes],
@@ -861,6 +959,32 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
     ) -> List[str]:
         return [node.node_id for node in decomposition.nodes]
 
+    @staticmethod
+    def _selector_validation_summary(
+        assignments: Sequence[WorkerAssignment],
+    ) -> Dict[str, Any]:
+        validations = [
+            assignment.raw_payload.get("validation")
+            for assignment in assignments
+            if isinstance(assignment.raw_payload, dict)
+            and isinstance(assignment.raw_payload.get("validation"), dict)
+        ]
+        attempts = []
+        for validation in validations:
+            try:
+                attempts.append(max(int(validation.get("attempt", 0)), 0))
+            except (TypeError, ValueError):
+                continue
+        return {
+            "mode": "sequential_selector_decisions",
+            "num_decisions": len(assignments),
+            "fallback_used": any(bool(validation.get("fallback_used")) for validation in validations),
+            "partial_completion_used": any(
+                bool(validation.get("partial_completion_used")) for validation in validations
+            ),
+            "attempt": max(attempts, default=0),
+        }
+
     def _format_selection_completion_text(
         self,
         *,
@@ -883,13 +1007,29 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         worker_ids: Sequence[str] | None = None,
     ) -> Dict[str, Any]:
         overrides: Dict[str, Any] = {}
-        stop_tag = "</decomposition_plan>" if role == "decomposer" else "</selection_plan>"
+        if role == "decomposer":
+            stop_tag = "</decomposition_plan>"
+        elif role == "selector_decision":
+            stop_tag = "</selector_answer>"
+        else:
+            stop_tag = "</selection_plan>"
         overrides["stop"] = [stop_tag]
         overrides["include_stop_str_in_output"] = True
 
         if getattr(self.config, "controller_constrained_decoding", False):
             if role == "decomposer":
                 regex = r"(?s)<decomposition_plan>.*?</decomposition_plan>"
+            elif role == "selector_decision":
+                worker_id_pattern = "|".join(
+                    re.escape(str(worker_id))
+                    for worker_id in (worker_ids or ())
+                ) or r"[A-Za-z0-9_.-]+"
+                regex = (
+                    r"(?s)\s*(?:<selector_scratchpad>.*?</selector_scratchpad>\s*)?"
+                    r"<selector_answer>\s*WORKER_ID\s*:\s*(?:"
+                    + worker_id_pattern
+                    + r")\s*</selector_answer>\s*"
+                )
             else:
                 regex = r"(?s)<selection_plan>\s*(?:\d+\s*:\s*[A-Za-z0-9_.-]+\s*)+</selection_plan>"
                 if node_order and worker_ids:
@@ -1069,6 +1209,285 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         else:
             candidate.raw_text = format_selection_plan(candidate)
         return candidate
+
+    def _generate_validated_selector_decision(
+        self,
+        *,
+        prompt_text: str,
+        node: SubtaskNode,
+        worker_pool: WorkerPoolConfig,
+        policy_config: ControllerPolicyConfig,
+        worker_performance: Dict[str, WorkerPerformanceSnapshot],
+        repair_progress: Tuple[int, int] | None = None,
+    ) -> WorkerAssignment:
+        model_path = policy_config.model_for_role("selector")
+        if not model_path:
+            raise ValueError(f"No selector model path configured for {type(self).__name__}")
+
+        repair_prompt = prompt_text
+        errors: List[str] = []
+        last_raw_text = ""
+        repair_position = ""
+        if repair_progress is not None:
+            repair_position = f" item={repair_progress[0]}/{repair_progress[1]}"
+        selector_skeleton = render_selector_decision_output_skeleton()
+        for attempt in range(self.config.max_format_retries + 1):
+            if repair_progress is not None:
+                print(
+                    f"[hierarchical-rema][generation-repair] role=selector_decision "
+                    f"model={model_path}{repair_position} "
+                    f"attempt={attempt + 1}/{self.config.max_format_retries + 1}"
+                )
+            last_raw_text, _ = self._generate_text(
+                base_model_path=model_path,
+                prompt_text=repair_prompt,
+                system_prompt=(
+                    SELECTOR_SYSTEM_PROMPT
+                    if worker_performance
+                    else SELECTOR_SYSTEM_PROMPT_NO_HISTORY
+                ),
+                max_new_tokens=self._controller_max_new_tokens("selector"),
+                temperature=self._controller_temperature(),
+                sampling_overrides=self._controller_sampling_overrides(
+                    "selector_decision",
+                    worker_ids=[worker.worker_id for worker in worker_pool.workers],
+                ),
+            )
+            try:
+                partial_completion_used = False
+                try:
+                    payload = extract_selector_decision_payload_strict(last_raw_text)
+                except Exception:
+                    payload = extract_selector_decision_payload(last_raw_text)
+                    partial_completion_used = True
+                worker_id = _resolve_selector_worker_id(payload.get("worker_id"), worker_pool)
+                if worker_id is None:
+                    raise ValueError(
+                        f"Selector decision referenced unknown worker_id '{payload.get('worker_id')}'"
+                    )
+                return _build_selector_assignment(
+                    node=node,
+                    worker_id=worker_id,
+                    worker_pool=worker_pool,
+                    worker_performance=worker_performance,
+                    prompt_text=prompt_text,
+                    rationale=f"Selected for node {node.node_id}.",
+                    raw_payload={
+                        "validation": {
+                            "backend": self.backend_name,
+                            "attempt": attempt,
+                            "errors_before_success": list(errors),
+                            "fallback_used": False,
+                            **(
+                                {"partial_completion_used": True}
+                                if partial_completion_used
+                                else {}
+                            ),
+                        },
+                        "raw_model_text": last_raw_text,
+                        "selection_generation_mode": "sequential_selector_decision",
+                    },
+                )
+            except Exception as exc:
+                errors.append(str(exc))
+                repair_prompt = (
+                    f"{prompt_text}\n\nYour previous answer did not match the required selector-decision format. "
+                    f"Error: {exc}\nReturn ONLY the corrected optional <selector_scratchpad> block followed by the required "
+                    f"<selector_answer> block. The valid answer shape is:\n{selector_skeleton}\n"
+                    "Choose exactly one valid worker ID from WORKERS_BY_ID."
+                )
+
+        if repair_progress is not None:
+            print(
+                f"[hierarchical-rema][generation-repair] role=selector_decision "
+                f"model={model_path}{repair_position} "
+                f"exhausted_attempts=true last_error={errors[-1] if errors else 'unknown'}"
+            )
+        _, fallback_worker = _best_worker_for_node(node, worker_pool, worker_performance)
+        return _build_selector_assignment(
+            node=node,
+            worker_id=fallback_worker.worker_id,
+            worker_pool=worker_pool,
+            worker_performance=worker_performance,
+            prompt_text=prompt_text,
+            rationale="Fallback selector decision due to invalid controller output.",
+            raw_payload={
+                "validation": {
+                    "backend": self.backend_name,
+                    "fallback_used": True,
+                    "errors": list(errors),
+                },
+                "raw_model_text": last_raw_text,
+                "selection_generation_mode": "sequential_selector_decision",
+            },
+        )
+
+    def _sample_selections_sequential(
+        self,
+        requests: Sequence[SelectionRequest],
+    ) -> List[SelectionCandidate]:
+        if not requests:
+            return []
+
+        grouped: Dict[Tuple[str, Tuple[str, ...], bool], List[Tuple[int, SelectionRequest]]] = {}
+        for index, request in enumerate(requests):
+            model_path = request.policy_config.model_for_role("selector")
+            if not model_path:
+                raise ValueError(f"No selector model path configured for {type(self).__name__}")
+            worker_ids = tuple(worker.worker_id for worker in request.worker_pool.workers)
+            grouped.setdefault(
+                (model_path, worker_ids, bool(request.worker_performance)),
+                [],
+            ).append((index, request))
+
+        results: List[SelectionCandidate | None] = [None] * len(requests)
+        for (model_path, worker_ids, has_history), grouped_requests in grouped.items():
+            assignments_by_index: Dict[int, List[WorkerAssignment]] = {
+                result_index: []
+                for result_index, _ in grouped_requests
+            }
+            max_nodes = max(
+                (len(request.decomposition.nodes) for _, request in grouped_requests),
+                default=0,
+            )
+            first_pass_failure_count = 0
+            local_completion_count = 0
+            model_repair_count = 0
+            for node_position in range(max_nodes):
+                active_items: List[Tuple[int, SelectionRequest, SubtaskNode, str]] = []
+                for result_index, request in grouped_requests:
+                    if node_position >= len(request.decomposition.nodes):
+                        continue
+                    node = request.decomposition.nodes[node_position]
+                    prompt_text = render_selector_decision_prompt(
+                        request.task,
+                        request.decomposition,
+                        node,
+                        request.worker_pool,
+                        request.worker_performance,
+                        track_workers_history=bool(request.worker_performance),
+                    )
+                    active_items.append((result_index, request, node, prompt_text))
+                if not active_items:
+                    continue
+
+                generated = self._generate_text_batch(
+                    base_model_path=model_path,
+                    prompt_texts=[prompt_text for _, _, _, prompt_text in active_items],
+                    system_prompt=(
+                        SELECTOR_SYSTEM_PROMPT
+                        if has_history
+                        else SELECTOR_SYSTEM_PROMPT_NO_HISTORY
+                    ),
+                    max_new_tokens=self._controller_max_new_tokens("selector"),
+                    batch_size=self.config.controller_batch_size,
+                    temperature=self._controller_temperature(),
+                    sampling_overrides=self._controller_sampling_overrides(
+                        "selector_decision",
+                        worker_ids=worker_ids,
+                    ),
+                    log_label="selector_decision",
+                )
+
+                for (result_index, request, node, prompt_text), (raw_text, _entropy) in zip(active_items, generated):
+                    partial_completion_used = False
+                    try:
+                        try:
+                            payload = extract_selector_decision_payload_strict(raw_text)
+                        except Exception:
+                            payload = extract_selector_decision_payload(raw_text)
+                            partial_completion_used = True
+                        worker_id = _resolve_selector_worker_id(payload.get("worker_id"), request.worker_pool)
+                        if worker_id is None:
+                            raise ValueError(
+                                f"Selector decision referenced unknown worker_id '{payload.get('worker_id')}'"
+                            )
+                        assignments_by_index[result_index].append(
+                            _build_selector_assignment(
+                                node=node,
+                                worker_id=worker_id,
+                                worker_pool=request.worker_pool,
+                                worker_performance=request.worker_performance,
+                                prompt_text=prompt_text,
+                                rationale=f"Selected for node {node.node_id}.",
+                                raw_payload={
+                                    "validation": {
+                                        "backend": self.backend_name,
+                                        "attempt": 0,
+                                        "fallback_used": False,
+                                        **(
+                                            {"partial_completion_used": True}
+                                            if partial_completion_used
+                                            else {}
+                                        ),
+                                    },
+                                    "raw_model_text": raw_text,
+                                    "selection_generation_mode": "sequential_selector_decision",
+                                },
+                            )
+                        )
+                        if partial_completion_used:
+                            local_completion_count += 1
+                    except Exception:
+                        first_pass_failure_count += 1
+                        model_repair_count += 1
+                        assignments_by_index[result_index].append(
+                            self._generate_validated_selector_decision(
+                                prompt_text=prompt_text,
+                                node=node,
+                                worker_pool=request.worker_pool,
+                                policy_config=request.policy_config,
+                                worker_performance=request.worker_performance,
+                                repair_progress=(model_repair_count, len(active_items)),
+                            )
+                        )
+
+            for result_index, request in grouped_requests:
+                assignments = assignments_by_index[result_index]
+                payload = {
+                    "selection_id": f"{request.decomposition.decomposition_id}-sel-{request.selection_index}",
+                    "assignments": [
+                        {
+                            "node_id": assignment.node_id,
+                            "worker_id": assignment.worker_id,
+                            "rationale": assignment.rationale,
+                            "compatibility": assignment.compatibility,
+                        }
+                        for assignment in assignments
+                    ],
+                }
+                candidate = validate_selection_payload(
+                    payload=payload,
+                    decomposition=request.decomposition,
+                    worker_pool=request.worker_pool,
+                )
+                candidate.assignments = assignments
+                candidate = _canonicalize_selection_candidate(
+                    candidate=candidate,
+                    decomposition=request.decomposition,
+                    worker_pool=request.worker_pool,
+                    worker_performance=request.worker_performance,
+                )
+                candidate = self._set_selection_artifacts(
+                    candidate=candidate,
+                    prompt_text="",
+                    validation=self._selector_validation_summary(candidate.assignments),
+                    decomposition=request.decomposition,
+                    worker_pool=request.worker_pool,
+                )
+                candidate.raw_payload["selection_generation_mode"] = "sequential_selector_decisions"
+                results[result_index] = candidate
+
+            if first_pass_failure_count:
+                print(
+                    f"[hierarchical-rema][generation] role=selector_decision "
+                    f"model={model_path} first_pass_failures={first_pass_failure_count} "
+                    f"local_completions={local_completion_count} model_repairs={model_repair_count}"
+                )
+
+        if any(candidate is None for candidate in results):
+            raise RuntimeError("Sequential selector generation did not produce a result for every request")
+        return [candidate for candidate in results if candidate is not None]
 
     @staticmethod
     def _should_log_repair_progress(current: int, total: int) -> bool:
@@ -1370,22 +1789,18 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         selection_index: int,
         worker_performance: Dict[str, WorkerPerformanceSnapshot],
     ) -> SelectionCandidate:
-        prompt_text = render_selector_prompt(
-            task,
-            decomposition,
-            worker_pool,
-            worker_performance,
-            track_workers_history=bool(worker_performance),
-        )
-        return self._generate_validated_selection(
-            prompt_text=prompt_text,
-            task=task,
-            decomposition=decomposition,
-            worker_pool=worker_pool,
-            policy_config=policy_config,
-            worker_performance=worker_performance,
-            fallback_id=f"{decomposition.decomposition_id}-sel-{selection_index}",
-        )
+        return self._sample_selections_sequential(
+            [
+                SelectionRequest(
+                    task=task,
+                    decomposition=decomposition,
+                    worker_pool=worker_pool,
+                    policy_config=policy_config,
+                    selection_index=selection_index,
+                    worker_performance=worker_performance,
+                )
+            ]
+        )[0]
 
     def execute_worker(
         self,
@@ -1555,196 +1970,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         self,
         requests: Sequence[SelectionRequest],
     ) -> List[SelectionCandidate]:
-        if not requests:
-            return []
-
-        grouped: Dict[Tuple[str, Tuple[str, ...], Tuple[str, ...]], List[Tuple[int, SelectionRequest, str]]] = {}
-        for index, request in enumerate(requests):
-            model_path = request.policy_config.model_for_role("selector")
-            if not model_path:
-                raise ValueError(f"No selector model path configured for {type(self).__name__}")
-            prompt_text = render_selector_prompt(
-                request.task,
-                request.decomposition,
-                request.worker_pool,
-                request.worker_performance,
-                track_workers_history=bool(request.worker_performance),
-            )
-            node_order = tuple(node.node_id for node in request.decomposition.nodes)
-            worker_ids = tuple(worker.worker_id for worker in request.worker_pool.workers)
-            grouped.setdefault((model_path, node_order, worker_ids), []).append((index, request, prompt_text))
-
-        results: List[SelectionCandidate | None] = [None] * len(requests)
-        for (model_path, node_order, worker_ids), grouped_requests in grouped.items():
-            prompt_texts = [prompt_text for _, _, prompt_text in grouped_requests]
-            first_request = grouped_requests[0][1]
-            generated = self._generate_text_batch(
-                base_model_path=model_path,
-                prompt_texts=prompt_texts,
-                system_prompt=(
-                    SELECTOR_SYSTEM_PROMPT
-                    if first_request.worker_performance
-                    else SELECTOR_SYSTEM_PROMPT_NO_HISTORY
-                ),
-                max_new_tokens=self._controller_max_new_tokens("selector"),
-                batch_size=self.config.controller_batch_size,
-                temperature=self._controller_temperature(),
-                sampling_overrides=self._controller_sampling_overrides(
-                    "selector",
-                    node_order=node_order,
-                    worker_ids=worker_ids,
-                ),
-                log_label="selector",
-            )
-            first_pass_failure_count = 0
-            local_completion_count = 0
-            model_repair_count = 0
-            for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
-                fallback_id = f"{request.decomposition.decomposition_id}-sel-{request.selection_index}"
-                payload: Dict[str, Any] | None = None
-                try:
-                    payload = extract_selection_payload(raw_text)
-                    payload.setdefault("selection_id", fallback_id)
-                    candidate = validate_selection_payload(
-                        payload=payload,
-                        decomposition=request.decomposition,
-                        worker_pool=request.worker_pool,
-                    )
-                    candidate = _canonicalize_selection_candidate(
-                        candidate=candidate,
-                        decomposition=request.decomposition,
-                        worker_pool=request.worker_pool,
-                        worker_performance=request.worker_performance,
-                    )
-                    candidate = self._set_selection_artifacts(
-                        candidate=candidate,
-                        prompt_text=prompt_text,
-                        validation={
-                            "backend": self.backend_name,
-                            "attempt": 0,
-                            "errors_before_success": [],
-                            "fallback_used": False,
-                            "raw_model_text": raw_text,
-                            "batch_generated": True,
-                            "entropy": entropy,
-                        },
-                        decomposition=request.decomposition,
-                        worker_pool=request.worker_pool,
-                    )
-                except Exception:
-                    first_pass_failure_count += 1
-                    if payload is None:
-                        fallback_candidate = _build_compatibility_fallback_selection_candidate(
-                            decomposition=request.decomposition,
-                            worker_pool=request.worker_pool,
-                            worker_performance=request.worker_performance,
-                            fallback_id=fallback_id,
-                            raw_text=raw_text,
-                            error_message="Could not parse selector output",
-                        )
-                        fallback_candidate = _canonicalize_selection_candidate(
-                            candidate=fallback_candidate,
-                            decomposition=request.decomposition,
-                            worker_pool=request.worker_pool,
-                            worker_performance=request.worker_performance,
-                        )
-                        candidate = self._set_selection_artifacts(
-                            candidate=fallback_candidate,
-                            prompt_text=prompt_text,
-                            validation={
-                                "backend": self.backend_name,
-                                "attempt": 0,
-                                "errors_before_success": [],
-                                "fallback_used": True,
-                                "unparseable_batch_output": True,
-                                "raw_model_text": raw_text,
-                                "batch_generated": True,
-                                "batch_repair_fallback": True,
-                                "entropy": entropy,
-                            },
-                            decomposition=request.decomposition,
-                            worker_pool=request.worker_pool,
-                        )
-                        local_completion_count += 1
-                    else:
-                        partial_candidate = _try_complete_partial_selection_candidate(
-                            payload=payload,
-                            decomposition=request.decomposition,
-                            worker_pool=request.worker_pool,
-                            worker_performance=request.worker_performance,
-                            fallback_id=fallback_id,
-                        )
-                        if partial_candidate is not None:
-                            partial_candidate = _canonicalize_selection_candidate(
-                                candidate=partial_candidate,
-                                decomposition=request.decomposition,
-                                worker_pool=request.worker_pool,
-                                worker_performance=request.worker_performance,
-                            )
-                            candidate = self._set_selection_artifacts(
-                                candidate=partial_candidate,
-                                prompt_text=prompt_text,
-                                validation={
-                                    "backend": self.backend_name,
-                                    "attempt": 0,
-                                    "errors_before_success": [],
-                                    "fallback_used": False,
-                                    "partial_completion_used": True,
-                                    "raw_model_text": raw_text,
-                                    "batch_generated": True,
-                                    "batch_repair_fallback": True,
-                                    "entropy": entropy,
-                                },
-                                decomposition=request.decomposition,
-                                worker_pool=request.worker_pool,
-                            )
-                            local_completion_count += 1
-                        else:
-                            model_repair_count += 1
-                            if self._should_log_repair_progress(model_repair_count, len(grouped_requests)):
-                                print(
-                                    f"[hierarchical-rema][generation-repair] role=selector "
-                                    f"model={model_path} "
-                                    f"start_item={model_repair_count}/{len(grouped_requests)}"
-                                )
-                            candidate = self._generate_validated_selection(
-                                prompt_text=prompt_text,
-                                task=request.task,
-                                decomposition=request.decomposition,
-                                worker_pool=request.worker_pool,
-                                policy_config=request.policy_config,
-                                worker_performance=request.worker_performance,
-                                fallback_id=fallback_id,
-                                repair_progress=(model_repair_count, len(grouped_requests)),
-                            )
-                            if self._should_log_repair_progress(model_repair_count, len(grouped_requests)):
-                                print(
-                                    f"[hierarchical-rema][generation-repair] role=selector "
-                                    f"model={model_path} "
-                                    f"done_item={model_repair_count}/{len(grouped_requests)}"
-                                )
-                            candidate.raw_payload.setdefault("validation", {})
-                            candidate.raw_payload["validation"].update(
-                                {
-                                    "batch_generated": True,
-                                    "batch_repair_fallback": True,
-                                }
-                            )
-                            candidate.raw_text = self._format_selection_completion_text(
-                                candidate=candidate,
-                                decomposition=request.decomposition,
-                            )
-                results[result_index] = candidate
-            if first_pass_failure_count:
-                print(
-                    f"[hierarchical-rema][generation] role=selector "
-                    f"model={model_path} first_pass_failures={first_pass_failure_count}/{len(grouped_requests)} "
-                    f"local_completions={local_completion_count} model_repairs={model_repair_count}"
-                )
-
-        if any(candidate is None for candidate in results):
-            raise RuntimeError("Batched selection generation did not produce a result for every request")
-        return [candidate for candidate in results if candidate is not None]
+        return self._sample_selections_sequential(requests)
 
     def execute_workers_batch(
         self,

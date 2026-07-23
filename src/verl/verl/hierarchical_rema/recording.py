@@ -137,11 +137,17 @@ class RolloutRecorder:
     @staticmethod
     def _gfam_reward_summary(selection_rollout, decomposition_rollout) -> Dict:
         compiled_rewards = selection_rollout.reward_model_outputs.get("compiled_rewards", {})
+        selector_decisions_payload = compiled_rewards.get("selector_decisions", {})
         workers_payload = compiled_rewards.get("workers", {})
         return {
             "source": selection_rollout.reward.reward_model_source,
             "decomposer_reward": decomposition_rollout.decomposition_reward,
             "selector_reward": selection_rollout.reward.total_reward,
+            "selector_reward_mean": selection_rollout.reward.total_reward,
+            "selector_decision_rewards": {
+                node_id: payload.get("reward")
+                for node_id, payload in selector_decisions_payload.items()
+            },
             "final_reward": compiled_rewards.get("final", {}).get("reward"),
             "worker_rewards": {
                 node_id: payload.get("reward")
@@ -303,6 +309,16 @@ class RolloutRecorder:
                     "node_id": assignment.node_id,
                     "worker_id": assignment.worker_id,
                     "compatibility": assignment.compatibility,
+                    **(
+                        {"reward_model_reward": assignment.reward_model_reward}
+                        if assignment.reward_model_reward is not None
+                        else {}
+                    ),
+                    **(
+                        {"selector_advantage": assignment.selector_advantage}
+                        if assignment.selector_advantage != 0.0
+                        else {}
+                    ),
                 }
                 for assignment in selection_rollout.selection.assignments
             ],

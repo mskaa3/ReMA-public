@@ -41,6 +41,7 @@ from .schema import (
     TrainingMode,
     TrainingScheduleConfig,
     VLLMBackendConfig,
+    WorkerAssignment,
     WorkerExecution,
     WorkerPoolConfig,
 )
@@ -121,6 +122,16 @@ class HierarchicalReMAOrchestrator:
         return format_selection_plan(
             candidate,
             node_order=[node.node_id for node in decomposition.nodes],
+        )
+
+    @staticmethod
+    def _canonical_selector_decision_completion(assignment: WorkerAssignment) -> str:
+        return "\n".join(
+            [
+                "<selector_answer>",
+                f"WORKER_ID: {assignment.worker_id}",
+                "</selector_answer>",
+            ]
         )
 
     @staticmethod
@@ -337,8 +348,19 @@ class HierarchicalReMAOrchestrator:
         )
         compiled_rewards = scored.get("compiled_rewards", {})
         selector_payload = compiled_rewards.get("selector", {})
+        selector_decision_payloads = compiled_rewards.get("selector_decisions", {})
         worker_payloads = compiled_rewards.get("workers", {})
-        reward.total_reward = float(selector_payload.get("reward", reward.total_reward))
+        selector_decision_rewards: List[float] = []
+        for assignment in selection.assignments:
+            assignment_payload = selector_decision_payloads.get(assignment.node_id)
+            if assignment_payload is None or "reward" not in assignment_payload:
+                continue
+            assignment.reward_model_reward = float(assignment_payload["reward"])
+            selector_decision_rewards.append(assignment.reward_model_reward)
+        if selector_decision_rewards:
+            reward.total_reward = sum(selector_decision_rewards) / len(selector_decision_rewards)
+        else:
+            reward.total_reward = float(selector_payload.get("reward", reward.total_reward))
         reward.reward_model_source = "gfam_v1"
         for execution in executions:
             worker_payload = worker_payloads.get(execution.node_id)
@@ -484,20 +506,76 @@ class HierarchicalReMAOrchestrator:
                     selection_rollout_map[(task_index, decomposition_index, selection_index)]
                     for selection_index in range(num_selections)
                 ]
-                selector_training_rewards = [
-                    self._format_adjusted_reward(
-                        selection.reward.total_reward,
-                        selection.selection.raw_payload,
-                        role="selector",
-                        upstream_payloads=(decomposition.raw_payload,),
+                uses_action_level_selector_rewards = any(
+                    any(
+                        assignment.prompt_text
+                        or assignment.reward_model_reward is not None
+                        for assignment in selection_rollout.selection.assignments
                     )
-                    for selection in selection_rollouts
-                ]
-                selection_advantages = group_relative_advantages(
-                    selector_training_rewards
+                    for selection_rollout in selection_rollouts
                 )
-                for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
-                    selection_rollout.selector_advantage = advantage
+                if uses_action_level_selector_rewards:
+                    selector_advantages_by_selection: Dict[int, List[float]] = {
+                        id(selection_rollout): []
+                        for selection_rollout in selection_rollouts
+                    }
+                    for node in decomposition.nodes:
+                        grouped_assignments = [
+                            (
+                                selection_rollout,
+                                selection_rollout.selection.assignment_for(node.node_id),
+                            )
+                            for selection_rollout in selection_rollouts
+                        ]
+                        selector_training_rewards = [
+                            self._format_adjusted_reward(
+                                (
+                                    float(assignment.reward_model_reward)
+                                    if assignment.reward_model_reward is not None
+                                    else float(selection_rollout.reward.total_reward)
+                                ),
+                                assignment.raw_payload,
+                                role="selector",
+                                upstream_payloads=(decomposition.raw_payload,),
+                            )
+                            for selection_rollout, assignment in grouped_assignments
+                        ]
+                        selection_advantages = group_relative_advantages(
+                            selector_training_rewards
+                        )
+                        for (selection_rollout, assignment), advantage in zip(
+                            grouped_assignments,
+                            selection_advantages,
+                        ):
+                            assignment.selector_advantage = advantage
+                            selector_advantages_by_selection[id(selection_rollout)].append(
+                                advantage
+                            )
+                    for selection_rollout in selection_rollouts:
+                        grouped_advantages = selector_advantages_by_selection.get(
+                            id(selection_rollout),
+                            [],
+                        )
+                        selection_rollout.selector_advantage = (
+                            sum(grouped_advantages) / len(grouped_advantages)
+                            if grouped_advantages
+                            else 0.0
+                        )
+                else:
+                    selector_training_rewards = [
+                        self._format_adjusted_reward(
+                            selection.reward.total_reward,
+                            selection.selection.raw_payload,
+                            role="selector",
+                            upstream_payloads=(decomposition.raw_payload,),
+                        )
+                        for selection in selection_rollouts
+                    ]
+                    selection_advantages = group_relative_advantages(
+                        selector_training_rewards
+                    )
+                    for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
+                        selection_rollout.selector_advantage = advantage
 
                 decomposer_selection_rewards = [
                     self._decomposer_reward_for_selection(selection_rollout)
@@ -865,51 +943,123 @@ class HierarchicalReMAOrchestrator:
 
         if include_selector:
             for decomposition_rollout in decompositions:
-                for selection_rollout in decomposition_rollout.selections:
-                    adjusted_reward, reward_after_fallback_mask, format_penalty = (
-                        self._controller_training_reward_components(
-                            selection_rollout.reward.total_reward,
-                            selection_rollout.selection.raw_payload,
-                            role="selector",
-                            upstream_payloads=(decomposition_rollout.decomposition.raw_payload,),
+                uses_action_level_selector_samples = any(
+                    assignment.prompt_text
+                    for selection_rollout in decomposition_rollout.selections
+                    for assignment in selection_rollout.selection.assignments
+                )
+                if uses_action_level_selector_samples:
+                    for node in decomposition_rollout.decomposition.nodes:
+                        group_id = (
+                            f"task:{task.task_id}:decomposition:"
+                            f"{decomposition_rollout.decomposition.decomposition_id}:node:{node.node_id}"
                         )
-                    )
-                    fallback_reward_mask = (
-                        selection_rollout.reward.total_reward - reward_after_fallback_mask
-                    )
-                    adjusted_advantage = selection_rollout.selector_advantage
-                    selector_samples.append(
-                        ControllerTrainingSample(
-                            role="selector",
-                            policy_id=policy_config.policy_id("selector"),
-                            group_id=decomposition_rollout.decomposition.decomposition_id,
-                            prompt_text=selection_rollout.selection.raw_payload["controller_prompt"],
-                            completion_text=self._canonical_selection_completion(
-                                selection_rollout.selection,
-                                decomposition_rollout.decomposition,
-                            ),
-                            reward=adjusted_reward,
-                            advantage=adjusted_advantage,
-                            metadata={
-                                "model_path": policy_config.model_for_role("selector"),
-                                "parameter_sharing": policy_config.parameter_sharing,
-                                "reward_before_format_penalty": selection_rollout.reward.total_reward,
-                                "reward_after_fallback_mask_before_format_penalty": reward_after_fallback_mask,
-                                "advantage_used_for_training": adjusted_advantage,
-                                "fallback_reward_mask": fallback_reward_mask,
-                                "fallback_reward_mask_applied": fallback_reward_mask > 0.0,
-                                "fallback_positive_reward_scale": self.controller_fallback_positive_reward_scale,
-                                "format_penalty": format_penalty,
-                                "format_validation": self._controller_validation_info(
-                                    selection_rollout.selection.raw_payload
-                                ),
-                                "decomposition_format_validation": self._controller_validation_info(
-                                    decomposition_rollout.decomposition.raw_payload
-                                ),
-                                "training_target_source": "canonical_selection_plan",
-                            },
+                        for selection_rollout in decomposition_rollout.selections:
+                            assignment = selection_rollout.selection.assignment_for(node.node_id)
+                            assignment_payload = (
+                                assignment.raw_payload
+                                if isinstance(assignment.raw_payload, dict)
+                                else {}
+                            )
+                            reward_before_format_penalty = (
+                                float(assignment.reward_model_reward)
+                                if assignment.reward_model_reward is not None
+                                else float(selection_rollout.reward.total_reward)
+                            )
+                            adjusted_reward, reward_after_fallback_mask, format_penalty = (
+                                self._controller_training_reward_components(
+                                    reward_before_format_penalty,
+                                    assignment_payload,
+                                    role="selector",
+                                    upstream_payloads=(decomposition_rollout.decomposition.raw_payload,),
+                                )
+                            )
+                            fallback_reward_mask = (
+                                reward_before_format_penalty - reward_after_fallback_mask
+                            )
+                            adjusted_advantage = assignment.selector_advantage
+                            selector_samples.append(
+                                ControllerTrainingSample(
+                                    role="selector",
+                                    policy_id=policy_config.policy_id("selector"),
+                                    group_id=group_id,
+                                    prompt_text=assignment.prompt_text,
+                                    completion_text=self._canonical_selector_decision_completion(
+                                        assignment
+                                    ),
+                                    reward=adjusted_reward,
+                                    advantage=adjusted_advantage,
+                                    metadata={
+                                        "model_path": policy_config.model_for_role("selector"),
+                                        "parameter_sharing": policy_config.parameter_sharing,
+                                        "node_id": assignment.node_id,
+                                        "worker_id": assignment.worker_id,
+                                        "selection_id": selection_rollout.selection.selection_id,
+                                        "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
+                                        "reward_model_reward": assignment.reward_model_reward,
+                                        "reward_before_format_penalty": reward_before_format_penalty,
+                                        "reward_after_fallback_mask_before_format_penalty": reward_after_fallback_mask,
+                                        "advantage_used_for_training": adjusted_advantage,
+                                        "fallback_reward_mask": fallback_reward_mask,
+                                        "fallback_reward_mask_applied": fallback_reward_mask > 0.0,
+                                        "fallback_positive_reward_scale": self.controller_fallback_positive_reward_scale,
+                                        "format_penalty": format_penalty,
+                                        "format_validation": self._controller_validation_info(
+                                            assignment_payload
+                                        ),
+                                        "decomposition_format_validation": self._controller_validation_info(
+                                            decomposition_rollout.decomposition.raw_payload
+                                        ),
+                                        "training_target_source": "canonical_selector_decision",
+                                    },
+                                )
+                            )
+                else:
+                    for selection_rollout in decomposition_rollout.selections:
+                        adjusted_reward, reward_after_fallback_mask, format_penalty = (
+                            self._controller_training_reward_components(
+                                selection_rollout.reward.total_reward,
+                                selection_rollout.selection.raw_payload,
+                                role="selector",
+                                upstream_payloads=(decomposition_rollout.decomposition.raw_payload,),
+                            )
                         )
-                    )
+                        fallback_reward_mask = (
+                            selection_rollout.reward.total_reward - reward_after_fallback_mask
+                        )
+                        adjusted_advantage = selection_rollout.selector_advantage
+                        selector_samples.append(
+                            ControllerTrainingSample(
+                                role="selector",
+                                policy_id=policy_config.policy_id("selector"),
+                                group_id=decomposition_rollout.decomposition.decomposition_id,
+                                prompt_text=selection_rollout.selection.raw_payload["controller_prompt"],
+                                completion_text=self._canonical_selection_completion(
+                                    selection_rollout.selection,
+                                    decomposition_rollout.decomposition,
+                                ),
+                                reward=adjusted_reward,
+                                advantage=adjusted_advantage,
+                                metadata={
+                                    "model_path": policy_config.model_for_role("selector"),
+                                    "parameter_sharing": policy_config.parameter_sharing,
+                                    "reward_before_format_penalty": selection_rollout.reward.total_reward,
+                                    "reward_after_fallback_mask_before_format_penalty": reward_after_fallback_mask,
+                                    "advantage_used_for_training": adjusted_advantage,
+                                    "fallback_reward_mask": fallback_reward_mask,
+                                    "fallback_reward_mask_applied": fallback_reward_mask > 0.0,
+                                    "fallback_positive_reward_scale": self.controller_fallback_positive_reward_scale,
+                                    "format_penalty": format_penalty,
+                                    "format_validation": self._controller_validation_info(
+                                        selection_rollout.selection.raw_payload
+                                    ),
+                                    "decomposition_format_validation": self._controller_validation_info(
+                                        decomposition_rollout.decomposition.raw_payload
+                                    ),
+                                    "training_target_source": "canonical_selection_plan",
+                                },
+                            )
+                        )
 
         if include_worker:
             worker_lookup = worker_pool.workers_by_id()

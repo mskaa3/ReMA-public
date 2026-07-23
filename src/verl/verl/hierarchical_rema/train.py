@@ -8,6 +8,7 @@ import json
 import os
 import random
 import shutil
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -43,6 +44,54 @@ from .schema import (
     VLLMBackendConfig,
     WorkerRewardMode,
 )
+
+
+_LIVE_PROGRESS_ACTIVE = False
+_LIVE_PROGRESS_WIDTH = 0
+
+
+def _supports_live_progress(stream: object | None = None) -> bool:
+    stream = stream or sys.stdout
+    isatty = getattr(stream, "isatty", None)
+    return bool(callable(isatty) and isatty())
+
+
+def _clear_live_progress() -> None:
+    global _LIVE_PROGRESS_ACTIVE, _LIVE_PROGRESS_WIDTH
+    if _LIVE_PROGRESS_ACTIVE and _supports_live_progress():
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    _LIVE_PROGRESS_ACTIVE = False
+    _LIVE_PROGRESS_WIDTH = 0
+
+
+def _print_console_line(message: str) -> None:
+    _clear_live_progress()
+    print(message)
+
+
+def _progress_bar(fraction: float, width: int = 24) -> str:
+    clamped_fraction = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(clamped_fraction * width))
+    filled = max(0, min(width, filled))
+    return f"[{'#' * filled}{'-' * (width - filled)}]"
+
+
+def _emit_live_progress(message: str, *, final: bool = False) -> None:
+    global _LIVE_PROGRESS_ACTIVE, _LIVE_PROGRESS_WIDTH
+    if not _supports_live_progress():
+        print(message)
+        return
+    width = max(_LIVE_PROGRESS_WIDTH, len(message))
+    sys.stdout.write(f"\r{message.ljust(width)}")
+    if final:
+        sys.stdout.write("\n")
+        _LIVE_PROGRESS_ACTIVE = False
+        _LIVE_PROGRESS_WIDTH = 0
+    else:
+        _LIVE_PROGRESS_ACTIVE = True
+        _LIVE_PROGRESS_WIDTH = width
+    sys.stdout.flush()
 
 
 def _checkpoint_path_debug_info(path_str: str, preview_limit: int = 8) -> str:
@@ -1329,11 +1378,13 @@ def rollout_workload_estimate(
     num_selections = rollout_config.num_selections_per_decomposition
 
     max_nodes = max(int(rollout_config.max_nodes_per_decomposition), 1)
-    controller_generations_per_task = num_decompositions + (num_decompositions * num_selections)
+    selector_decisions_per_task_upper_bound = num_decompositions * num_selections * max_nodes
+    controller_generations_per_task = num_decompositions + selector_decisions_per_task_upper_bound
     worker_generations_per_task_upper_bound = num_decompositions * num_selections * max_nodes
     return {
         "num_decompositions": num_decompositions,
         "num_selections": num_selections,
+        "selector_decisions_per_task_upper_bound": selector_decisions_per_task_upper_bound,
         "controller_generations_per_task": controller_generations_per_task,
         "worker_generations_per_task_upper_bound": worker_generations_per_task_upper_bound,
         "controller_generations_total": controller_generations_per_task * num_tasks,
@@ -1347,6 +1398,16 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         selection.reward.total_reward
         for decomposition in rollout.decompositions
         for selection in decomposition.selections
+    ]
+    selector_decision_rewards = [
+        (
+            float(assignment.reward_model_reward)
+            if assignment.reward_model_reward is not None
+            else float(selection.reward.total_reward)
+        )
+        for decomposition in rollout.decompositions
+        for selection in decomposition.selections
+        for assignment in selection.selection.assignments
     ]
     worker_rewards = [
         (
@@ -1368,6 +1429,12 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         "best_decomposition_reward": best_decomposition.decomposition_reward,
         "best_selection_reward": max(selection_rewards) if selection_rewards else 0.0,
         "mean_selection_reward": sum(selection_rewards) / max(len(selection_rewards), 1),
+        "best_selector_decision_reward": (
+            max(selector_decision_rewards) if selector_decision_rewards else 0.0
+        ),
+        "mean_selector_decision_reward": (
+            sum(selector_decision_rewards) / max(len(selector_decision_rewards), 1)
+        ),
         "mean_worker_reward": sum(worker_rewards) / max(len(worker_rewards), 1),
         "best_final_correctness": max(selection_correctness) if selection_correctness else 0.0,
     }
@@ -1382,6 +1449,8 @@ def epoch_rollout_summary(
     best_decomposition_rewards = []
     best_selection_rewards = []
     mean_selection_rewards = []
+    best_selector_decision_rewards = []
+    mean_selector_decision_rewards = []
     mean_worker_rewards = []
     best_correctness = []
     subset_metrics: Dict[str, Dict[str, Any]] = {}
@@ -1398,6 +1467,8 @@ def epoch_rollout_summary(
         best_decomposition_rewards.append(metrics["best_decomposition_reward"])
         best_selection_rewards.append(metrics["best_selection_reward"])
         mean_selection_rewards.append(metrics["mean_selection_reward"])
+        best_selector_decision_rewards.append(metrics["best_selector_decision_reward"])
+        mean_selector_decision_rewards.append(metrics["mean_selector_decision_reward"])
         mean_worker_rewards.append(metrics["mean_worker_reward"])
         best_correctness.append(metrics["best_final_correctness"])
         worker_stats = rollout.training_batch.worker_grpo_stats or {}
@@ -1434,6 +1505,8 @@ def epoch_rollout_summary(
                     "best_decomposition_rewards": [],
                     "best_selection_rewards": [],
                     "mean_selection_rewards": [],
+                    "best_selector_decision_rewards": [],
+                    "mean_selector_decision_rewards": [],
                     "mean_worker_rewards": [],
                     "best_correctness": [],
                 },
@@ -1443,6 +1516,8 @@ def epoch_rollout_summary(
             bucket["best_decomposition_rewards"].append(metrics["best_decomposition_reward"])
             bucket["best_selection_rewards"].append(metrics["best_selection_reward"])
             bucket["mean_selection_rewards"].append(metrics["mean_selection_reward"])
+            bucket["best_selector_decision_rewards"].append(metrics["best_selector_decision_reward"])
+            bucket["mean_selector_decision_rewards"].append(metrics["mean_selector_decision_reward"])
             bucket["mean_worker_rewards"].append(metrics["mean_worker_reward"])
             bucket["best_correctness"].append(metrics["best_final_correctness"])
 
@@ -1451,6 +1526,12 @@ def epoch_rollout_summary(
         "mean_best_decomposition_reward": sum(best_decomposition_rewards) / max(len(best_decomposition_rewards), 1),
         "mean_best_selection_reward": sum(best_selection_rewards) / max(len(best_selection_rewards), 1),
         "mean_selection_reward": sum(mean_selection_rewards) / max(len(mean_selection_rewards), 1),
+        "mean_best_selector_decision_reward": (
+            sum(best_selector_decision_rewards) / max(len(best_selector_decision_rewards), 1)
+        ),
+        "mean_selector_decision_reward": (
+            sum(mean_selector_decision_rewards) / max(len(mean_selector_decision_rewards), 1)
+        ),
         "mean_worker_reward": sum(mean_worker_rewards) / max(len(mean_worker_rewards), 1),
         "mean_best_final_correctness": sum(best_correctness) / max(len(best_correctness), 1),
         "worker_grpo_min_group_size": worker_grpo_min_group_size,
@@ -1475,6 +1556,12 @@ def epoch_rollout_summary(
                 "mean_best_decomposition_reward": sum(bucket["best_decomposition_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_best_selection_reward": sum(bucket["best_selection_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_selection_reward": sum(bucket["mean_selection_rewards"]) / max(bucket["num_tasks"], 1),
+                "mean_best_selector_decision_reward": (
+                    sum(bucket["best_selector_decision_rewards"]) / max(bucket["num_tasks"], 1)
+                ),
+                "mean_selector_decision_reward": (
+                    sum(bucket["mean_selector_decision_rewards"]) / max(bucket["num_tasks"], 1)
+                ),
                 "mean_worker_reward": sum(bucket["mean_worker_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_best_final_correctness": sum(bucket["best_correctness"]) / max(bucket["num_tasks"], 1),
             }
@@ -1493,6 +1580,8 @@ def combine_rollout_summaries(
     total_best_decomposition_reward = 0.0
     total_best_selection_reward = 0.0
     total_mean_selection_reward = 0.0
+    total_best_selector_decision_reward = 0.0
+    total_mean_selector_decision_reward = 0.0
     total_mean_worker_reward = 0.0
     total_best_final_correctness = 0.0
     combined_tasks: List[Dict[str, Any]] = []
@@ -1504,6 +1593,12 @@ def combine_rollout_summaries(
         total_best_decomposition_reward += float(summary.get("mean_best_decomposition_reward", 0.0)) * num_tasks
         total_best_selection_reward += float(summary.get("mean_best_selection_reward", 0.0)) * num_tasks
         total_mean_selection_reward += float(summary.get("mean_selection_reward", 0.0)) * num_tasks
+        total_best_selector_decision_reward += (
+            float(summary.get("mean_best_selector_decision_reward", 0.0)) * num_tasks
+        )
+        total_mean_selector_decision_reward += (
+            float(summary.get("mean_selector_decision_reward", 0.0)) * num_tasks
+        )
         total_mean_worker_reward += float(summary.get("mean_worker_reward", 0.0)) * num_tasks
         total_best_final_correctness += float(summary.get("mean_best_final_correctness", 0.0)) * num_tasks
 
@@ -1521,6 +1616,8 @@ def combine_rollout_summaries(
                     "best_decomposition_reward_sum": 0.0,
                     "best_selection_reward_sum": 0.0,
                     "mean_selection_reward_sum": 0.0,
+                    "best_selector_decision_reward_sum": 0.0,
+                    "mean_selector_decision_reward_sum": 0.0,
                     "mean_worker_reward_sum": 0.0,
                     "best_final_correctness_sum": 0.0,
                 },
@@ -1537,6 +1634,12 @@ def combine_rollout_summaries(
             bucket["mean_selection_reward_sum"] += (
                 float(subset_summary.get("mean_selection_reward", 0.0)) * subset_tasks
             )
+            bucket["best_selector_decision_reward_sum"] += (
+                float(subset_summary.get("mean_best_selector_decision_reward", 0.0)) * subset_tasks
+            )
+            bucket["mean_selector_decision_reward_sum"] += (
+                float(subset_summary.get("mean_selector_decision_reward", 0.0)) * subset_tasks
+            )
             bucket["mean_worker_reward_sum"] += (
                 float(subset_summary.get("mean_worker_reward", 0.0)) * subset_tasks
             )
@@ -1549,6 +1652,8 @@ def combine_rollout_summaries(
         "mean_best_decomposition_reward": total_best_decomposition_reward / max(total_tasks, 1),
         "mean_best_selection_reward": total_best_selection_reward / max(total_tasks, 1),
         "mean_selection_reward": total_mean_selection_reward / max(total_tasks, 1),
+        "mean_best_selector_decision_reward": total_best_selector_decision_reward / max(total_tasks, 1),
+        "mean_selector_decision_reward": total_mean_selector_decision_reward / max(total_tasks, 1),
         "mean_worker_reward": total_mean_worker_reward / max(total_tasks, 1),
         "mean_best_final_correctness": total_best_final_correctness / max(total_tasks, 1),
         "tasks": combined_tasks if include_tasks else [],
@@ -1561,6 +1666,12 @@ def combine_rollout_summaries(
                 "mean_best_decomposition_reward": bucket["best_decomposition_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_best_selection_reward": bucket["best_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_selection_reward": bucket["mean_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
+                "mean_best_selector_decision_reward": (
+                    bucket["best_selector_decision_reward_sum"] / max(bucket["num_tasks"], 1.0)
+                ),
+                "mean_selector_decision_reward": (
+                    bucket["mean_selector_decision_reward_sum"] / max(bucket["num_tasks"], 1.0)
+                ),
                 "mean_worker_reward": bucket["mean_worker_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_best_final_correctness": bucket["best_final_correctness_sum"] / max(bucket["num_tasks"], 1.0),
             }
@@ -1976,6 +2087,7 @@ def run_external_validation(
     print(
         f"[hierarchical-rema][validation] epoch={epoch_number} "
         f"mean_best_selection_reward={summary['mean_best_selection_reward']:.4f} "
+        f"mean_selector_decision_reward={summary.get('mean_selector_decision_reward', 0.0):.4f} "
         f"mean_best_decomposition_reward={summary['mean_best_decomposition_reward']:.4f} "
         f"mean_best_final_correctness={summary['mean_best_final_correctness']:.4f}"
     )
@@ -1992,6 +2104,14 @@ def run_external_validation(
     if tracking is not None:
         metrics = {
             "val/mean_best_selection_reward": summary["mean_best_selection_reward"],
+            "val/mean_best_selector_decision_reward": summary.get(
+                "mean_best_selector_decision_reward",
+                0.0,
+            ),
+            "val/mean_selector_decision_reward": summary.get(
+                "mean_selector_decision_reward",
+                0.0,
+            ),
             "val/mean_best_decomposition_reward": summary["mean_best_decomposition_reward"],
             "val/mean_best_final_correctness": summary["mean_best_final_correctness"],
             "val/num_tasks": summary["num_tasks"],
@@ -2140,7 +2260,7 @@ def main() -> None:
         )
         schedule = build_schedule(args.mode, current_phase)
 
-        print(
+        _print_console_line(
             f"[hierarchical-rema][integrated] epoch={epoch_number}/{args.num_epochs} "
             f"phase={schedule.alternating_phase.value} tasks={len(epoch_tasks)}"
         )
@@ -2150,7 +2270,7 @@ def main() -> None:
             or rollout_config.num_selections_per_decomposition
             != base_rollout_config.num_selections_per_decomposition
         ):
-            print(
+            _print_console_line(
                 f"[hierarchical-rema][integrated] adjusted_rollout_counts "
                 f"decompositions={rollout_config.num_decompositions} "
                 f"selections={rollout_config.num_selections_per_decomposition}"
@@ -2160,11 +2280,12 @@ def main() -> None:
             rollout_config=rollout_config,
             schedule=schedule,
         )
-        print(
+        _print_console_line(
             f"[hierarchical-rema][integrated] rollout_budget "
             f"controller_total={workload['controller_generations_total']} "
             f"worker_total_upper_bound={workload['worker_generations_total_upper_bound']} "
             f"controller_per_task={workload['controller_generations_per_task']} "
+            f"selector_decisions_per_task_upper_bound={workload['selector_decisions_per_task_upper_bound']} "
             f"worker_per_task_upper_bound={workload['worker_generations_per_task_upper_bound']} "
             f"task_batch_size={args.rollout_task_batch_size} "
             f"controller_batch_size={args.controller_batch_size} "
@@ -2206,7 +2327,7 @@ def main() -> None:
                     compact_mode=args.rollout_log_detail == "compact",
                 )
 
-            print(
+            _print_console_line(
                 f"[hierarchical-rema][integrated] rollout_update_segment "
                 f"epoch={epoch_number} segment={segment_index} "
                 f"batches={batch_cursor + 1}-{batch_cursor + len(segment_batches)}/{len(task_batches)}"
@@ -2272,7 +2393,7 @@ def main() -> None:
             try:
                 for segment_offset, task_batch in enumerate(segment_batches):
                     batch_index = batch_cursor + segment_offset + 1
-                    print(
+                    _print_console_line(
                         f"[hierarchical-rema][integrated] rollout_batch_start "
                         f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
                         f"tasks_in_batch={len(task_batch)} "
@@ -2346,15 +2467,22 @@ def main() -> None:
                             "avg_mean_worker_reward": running_mean_worker_reward / tasks_completed,
                             "avg_best_final_correctness": running_best_correctness / tasks_completed,
                         }
-                        print(
+                        progress_message = (
                             f"[hierarchical-rema][integrated] rollout_progress "
-                            f"epoch={epoch_number} batch={batch_index}/{len(task_batches)} "
-                            f"task={tasks_completed}/{len(epoch_tasks)} "
-                            f"elapsed_s={elapsed:.1f} eta_s={eta_seconds:.1f} "
-                            f"avg_best_selection_reward={progress_metrics['avg_best_selection_reward']:.4f} "
-                            f"avg_best_decomposition_reward={progress_metrics['avg_best_decomposition_reward']:.4f} "
-                            f"avg_mean_worker_reward={progress_metrics['avg_mean_worker_reward']:.4f} "
-                            f"avg_best_final_correctness={progress_metrics['avg_best_final_correctness']:.4f}"
+                            f"epoch={epoch_number}/{args.num_epochs} "
+                            f"phase={schedule.alternating_phase.value} "
+                            f"segment={segment_index} batch={batch_index}/{len(task_batches)} "
+                            f"{_progress_bar(progress_metrics['progress_fraction'])} "
+                            f"tasks={tasks_completed}/{len(epoch_tasks)} "
+                            f"elapsed={elapsed:.1f}s eta={eta_seconds:.1f}s "
+                            f"sel={progress_metrics['avg_best_selection_reward']:.4f} "
+                            f"dec={progress_metrics['avg_best_decomposition_reward']:.4f} "
+                            f"wrk={progress_metrics['avg_mean_worker_reward']:.4f} "
+                            f"acc={progress_metrics['avg_best_final_correctness']:.4f}"
+                        )
+                        _emit_live_progress(
+                            progress_message,
+                            final=tasks_completed == len(epoch_tasks),
                         )
                         with rollout_progress_path.open("w", encoding="utf-8") as handle:
                             json.dump(progress_metrics, handle, indent=2, sort_keys=True)
@@ -2374,6 +2502,7 @@ def main() -> None:
                                 },
                                 step=rollout_tracking_step,
                             )
+                _clear_live_progress()
                 segment_rollout_summary = epoch_rollout_summary(segment_rollouts)
                 with (segment_train_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
                     json.dump(segment_rollout_summary, handle, indent=2, sort_keys=True)
@@ -2436,7 +2565,7 @@ def main() -> None:
                     experiment_name = (
                         f"{experiment_name}-epoch{epoch_number:04d}-segment{segment_index:04d}-{policy_id}"
                     )
-                    print(
+                    _print_console_line(
                         f"[hierarchical-rema][integrated] training policy={policy_id} "
                         f"segment={segment_index} train_samples={len(split['train'])} "
                         f"val_samples={len(split['val'])} model={model_path} "

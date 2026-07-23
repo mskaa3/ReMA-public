@@ -297,9 +297,25 @@ class WorkerAssignment:
     worker_id: str
     rationale: str
     compatibility: float
+    reward_model_reward: Optional[float] = None
+    selector_advantage: float = 0.0
+    prompt_text: str = ""
+    raw_payload: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = {
+            "node_id": self.node_id,
+            "worker_id": self.worker_id,
+            "rationale": self.rationale,
+            "compatibility": self.compatibility,
+        }
+        if self.reward_model_reward is not None:
+            payload["reward_model_reward"] = self.reward_model_reward
+        if self.selector_advantage != 0.0:
+            payload["selector_advantage"] = self.selector_advantage
+        if self.raw_payload:
+            payload["raw_payload"] = self.raw_payload
+        return payload
 
 
 @dataclass

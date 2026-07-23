@@ -48,6 +48,16 @@ KNOWN_SELECTION_TAGS = (
     "json",
 )
 
+KNOWN_SELECTOR_DECISION_TAGS = (
+    "selector_answer",
+    "selector_decision",
+    "selection",
+    "selection_json",
+    "answer_json",
+    "answer",
+    "json",
+)
+
 KNOWN_WORKER_TAGS = (
     "worker_result",
     "answer",
@@ -829,6 +839,70 @@ def extract_selection_payload(text: str) -> Dict[str, Any]:
         return extract_json_dict(text)
     except StructuredOutputError:
         return _parse_selection_plan(text)
+
+
+def _parse_selector_decision(text: str) -> Dict[str, Any]:
+    answer_match = re.search(
+        r"<selector_answer>\s*(.*?)\s*</selector_answer>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if answer_match:
+        candidate_text = answer_match.group(1).strip()
+    else:
+        candidate_text = _normalize_structured_text(text, tags=KNOWN_SELECTOR_DECISION_TAGS)
+
+    lines = [line.strip() for line in candidate_text.splitlines() if line.strip()]
+    worker_line_pattern = re.compile(
+        r"^(?:WORKER_ID|WORKER)\s*:\s*(?P<worker_id>[A-Za-z0-9_.-]+)\s*$",
+        flags=re.IGNORECASE,
+    )
+    node_assignment_pattern = re.compile(
+        r"^(?:\d+\s*[:>-]\s*)?(?P<worker_id>[A-Za-z0-9_.-]+)\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    for line in lines:
+        match = worker_line_pattern.match(line)
+        if match:
+            return {"worker_id": match.group("worker_id").strip()}
+    for line in lines:
+        if ":" in line and not re.match(r"^\d+\s*[:>-]", line):
+            continue
+        match = node_assignment_pattern.match(line)
+        if match:
+            return {"worker_id": match.group("worker_id").strip()}
+    raise StructuredOutputError("Could not parse a selector decision from controller output")
+
+
+def extract_selector_decision_payload_strict(text: str) -> Dict[str, Any]:
+    strict_match = re.fullmatch(
+        r"\s*(?:<selector_scratchpad>\s*.*?\s*</selector_scratchpad>\s*)?"
+        r"<selector_answer>\s*WORKER_ID\s*:\s*(?P<worker_id>[A-Za-z0-9_.-]+)\s*</selector_answer>\s*",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if strict_match:
+        return {"worker_id": strict_match.group("worker_id").strip()}
+    raise StructuredOutputError("Selector decision did not match the required <selector_answer> format")
+
+
+def extract_selector_decision_payload(text: str) -> Dict[str, Any]:
+    try:
+        payload = extract_json_dict(text)
+        if "worker_id" in payload:
+            return {"worker_id": str(payload["worker_id"]).strip()}
+        assignment = payload.get("assignment")
+        if isinstance(assignment, dict) and "worker_id" in assignment:
+            return {"worker_id": str(assignment["worker_id"]).strip()}
+        assignments = payload.get("assignments")
+        if isinstance(assignments, list) and assignments:
+            first_assignment = assignments[0]
+            if isinstance(first_assignment, dict) and "worker_id" in first_assignment:
+                return {"worker_id": str(first_assignment["worker_id"]).strip()}
+    except StructuredOutputError:
+        pass
+    return _parse_selector_decision(text)
 
 
 def compute_dag_hops(nodes: List[SubtaskNode]) -> int:
