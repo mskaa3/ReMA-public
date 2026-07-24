@@ -842,8 +842,8 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
     decomposer_branch_consequence = mean_or_zero(list(worker_branch_consequences.values()))
 
     decomposer_global_penalty = (
-        0.10 * final_failure_severity
-        + 0.06 * final_answer_missing_or_invalid
+        0.22 * final_failure_severity
+        + 0.12 * final_answer_missing_or_invalid
     )
     decomposer_traceable_penalty = 0.18 * decomposer_fault * decomposer_branch_consequence
     decomposer_success_bonus = 0.05 * success(graph_scores, "G_final_correct")
@@ -880,8 +880,8 @@ def compile_rewards_from_scores(compiler_inputs: dict[str, Any]) -> dict[str, An
         )
         selector_branch_consequence = worker_branch_consequences.get(selector_node_id, 0.0)
         selector_global_penalty = (
-            0.07 * final_failure_severity
-            + 0.04 * final_answer_missing_or_invalid
+            0.15 * final_failure_severity
+            + 0.09 * final_answer_missing_or_invalid
         )
         selector_traceable_penalty = 0.24 * selector_fault * selector_branch_consequence
         selector_success_bonus = 0.04 * success(graph_scores, "G_final_correct")
