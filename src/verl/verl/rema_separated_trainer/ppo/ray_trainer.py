@@ -51,6 +51,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils import torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 from verl.rema_separated_trainer.ppo.cpcr import estimate_cpcr
+from verl.rema_separated_trainer.ppo.direct_scoped_grpo import (
+    build_full_task_scope_counterfactual,
+    estimate_direct_scoped_grpo,
+)
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
 
 
@@ -446,7 +450,54 @@ class RayReMASeparatedTrainer(object):
         
         self._create_dataloader()
         self._init_online_prd_composer()
+        self._init_direct_scoped_grpo()
         self._init_cpcr()
+
+    def _init_direct_scoped_grpo(self):
+        hierarchy_config = self.config.algorithm.get('hierarchy', {})
+        direct_config = (
+            hierarchy_config.get('direct_scoped_grpo', {})
+            if hierarchy_config else {}
+        )
+        self.direct_scoped_grpo_config = (
+            OmegaConf.to_container(direct_config, resolve=True)
+            if direct_config else {}
+        )
+        self.direct_scoped_grpo_enabled = bool(
+            self.direct_scoped_grpo_config.get('enable', False)
+        )
+        if not self.direct_scoped_grpo_enabled:
+            return
+
+        if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+            raise ValueError(
+                "Direct scoped GRPO requires algorithm.adv_estimator='grpo'"
+            )
+        if not bool(hierarchy_config.get('enable', False)):
+            raise ValueError(
+                "Direct scoped GRPO requires algorithm.hierarchy.enable=True"
+            )
+        worker_context_mode = str(
+            hierarchy_config.get('worker_context_mode', 'subtask_context')
+        )
+        if worker_context_mode not in {'full_question', 'question', 'full'}:
+            raise ValueError(
+                "Teacher-forced TSS requires hierarchy.worker_context_mode="
+                "'full_question'"
+            )
+        if self.online_prd_enabled:
+            raise ValueError(
+                "Direct scoped GRPO and online PRD cannot be enabled together"
+            )
+        cpcr_config = hierarchy_config.get('cpcr', {})
+        if (
+            not bool(cpcr_config.get('enable', False))
+            or str(cpcr_config.get('mode', '')) != 'direct_scoped_grpo'
+        ):
+            raise ValueError(
+                "Direct scoped GRPO requires cpcr.enable=True and "
+                "cpcr.mode='direct_scoped_grpo'"
+            )
 
     def _init_cpcr(self):
         hierarchy_config = self.config.algorithm.get('hierarchy', {})
@@ -463,7 +514,7 @@ class RayReMASeparatedTrainer(object):
         mode = str(self.cpcr_config.get('mode', 'diagnostic'))
         estimator = str(self.cpcr_config.get('estimator', 'full_suffix'))
         outcome_mode = str(self.cpcr_config.get('outcome_mode', 'candidate_factual'))
-        if mode not in {'diagnostic', 'prd_target'}:
+        if mode not in {'diagnostic', 'prd_target', 'direct_scoped_grpo'}:
             raise ValueError(f"Unsupported CPCR mode: {mode}")
         if estimator != 'full_suffix':
             raise ValueError(
@@ -479,6 +530,21 @@ class RayReMASeparatedTrainer(object):
                 raise ValueError("CPCR prd_target mode requires reward_composer.online.enable=True")
             if self.online_prd_model_type != 'role':
                 raise ValueError("CPCR prd_target mode requires online PRD model_type='role'")
+        if mode == 'direct_scoped_grpo':
+            if not self.direct_scoped_grpo_enabled:
+                raise ValueError(
+                    "CPCR direct_scoped_grpo mode requires "
+                    "hierarchy.direct_scoped_grpo.enable=True"
+                )
+            if self.cpcr_config.get('roles', 'current') != 'current':
+                raise ValueError(
+                    "Direct scoped GRPO currently requires cpcr.roles='current'"
+                )
+            if int(self.cpcr_config.get('score_interval', 1)) != 1:
+                raise ValueError(
+                    "Direct scoped GRPO requires cpcr.score_interval=1 so every "
+                    "role visit receives a direct training target"
+                )
         rollout_config = self.config.actor_rollout_ref.rollout
         if int(rollout_config.get('n', 1)) < 2:
             raise ValueError("CPCR requires actor_rollout_ref.rollout.n >= 2")
@@ -1108,6 +1174,9 @@ class RayReMASeparatedTrainer(object):
         metrics['reward/cpcr/prd_target_mode'] = float(
             mode == 'prd_target'
         )
+        metrics['reward/cpcr/direct_scoped_grpo_mode'] = float(
+            mode == 'direct_scoped_grpo'
+        )
         targets = {}
         selected_uids = []
         mixed_groups_only = bool(self.cpcr_config.get('mixed_groups_only', True))
@@ -1246,6 +1315,404 @@ class RayReMASeparatedTrainer(object):
             self._cpcr_last_scored_step = current_step
             metrics['reward/cpcr/scored_this_step'] = 1.0
         return targets
+
+    def _direct_scoped_role_requires_tss(self, data_batch, role):
+        hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
+        stage_roles = list(hierarchy.get('stage_roles', []))
+        return role in stage_roles[:-1]
+
+    def _build_direct_scope_prompt_pair(self, data_batch, role, sample_idx):
+        """Return factual and full-task prompts for one non-final worker action."""
+
+        hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
+        decomposer_role = hierarchy.get('decomposer_role', 'decomposer')
+        max_planned_subtasks = int(
+            hierarchy.get(
+                'max_planned_subtasks',
+                max(len(hierarchy.get('stage_roles', [])) - 1, 1),
+            )
+        )
+        history = data_batch.non_tensor_batch['history'][sample_idx]
+        plan_message = self._cpcr_latest_role_message(history, decomposer_role)
+        worker_message = self._cpcr_latest_role_message(history, role)
+        if plan_message is None or worker_message is None:
+            return None
+
+        assigned_subtask_ids = worker_message.get('assigned_subtasks', [])
+        if isinstance(assigned_subtask_ids, np.ndarray):
+            assigned_subtask_ids = assigned_subtask_ids.tolist()
+        if not isinstance(assigned_subtask_ids, (list, tuple)):
+            return None
+        assigned_subtask_ids = [
+            str(subtask_id).upper()
+            for subtask_id in assigned_subtask_ids
+            if str(subtask_id).strip()
+        ]
+        if not assigned_subtask_ids:
+            return None
+
+        parsed_subtasks = MultiAgentRollout._extract_subtasks(
+            plan_message['content'],
+            max_subtasks=max_planned_subtasks,
+        )
+        subtask_map = {
+            str(subtask_id).upper(): description
+            for subtask_id, description in parsed_subtasks
+        }
+        if any(subtask_id not in subtask_map for subtask_id in assigned_subtask_ids):
+            return None
+        assigned_subtasks = [
+            (subtask_id, subtask_map[subtask_id])
+            for subtask_id in assigned_subtask_ids
+        ]
+        assigned_subtasks_text = MultiAgentRollout._format_subtasks(
+            assigned_subtasks
+        )
+
+        chat_key = f'{role}_conversation_history'
+        if chat_key not in data_batch.non_tensor_batch:
+            return None
+        factual_chat = self._cpcr_unpad_messages(
+            data_batch.non_tensor_batch[chat_key][sample_idx]
+        )
+        counterfactual_chat = build_full_task_scope_counterfactual(
+            factual_chat,
+            assigned_subtasks_text,
+        )
+        if counterfactual_chat is None:
+            return None
+        return factual_chat, counterfactual_chat, worker_message
+
+    def _score_direct_scope_tss(self, data_batch, role, candidate_mask, metrics):
+        """Score local-vs-full-task prompt preference for existing actions."""
+
+        batch_size = len(data_batch)
+        margins = torch.zeros(batch_size, dtype=torch.float32)
+        valid_mask = torch.zeros(batch_size, dtype=torch.bool)
+        factual_scores = torch.zeros(batch_size, dtype=torch.float32)
+        full_task_scores = torch.zeros(batch_size, dtype=torch.float32)
+        if not bool(candidate_mask.any().item()):
+            return margins, valid_mask, factual_scores, full_task_scores
+
+        prompt_length = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        max_length = prompt_length + int(
+            self.config.actor_rollout_ref.rollout.response_length
+        )
+        encoded_items = []
+        for sample_idx in torch.nonzero(candidate_mask, as_tuple=False).flatten().tolist():
+            prompt_pair = self._build_direct_scope_prompt_pair(
+                data_batch,
+                role,
+                sample_idx,
+            )
+            if prompt_pair is None:
+                continue
+            factual_chat, counterfactual_chat, worker_message = prompt_pair
+            turn_idx = int(data_batch.non_tensor_batch['num_turns'][sample_idx]) - 1
+            if turn_idx < 0:
+                continue
+            action_token_ids = self._cpcr_action_token_ids(
+                data_batch,
+                role,
+                sample_idx,
+                turn_idx,
+                worker_message.get('stop_reason', 'stop'),
+            )
+            if action_token_ids is None:
+                continue
+            factual_encoded = self._cpcr_encode_prompt_action(
+                factual_chat,
+                action_token_ids,
+                prompt_length,
+                max_length,
+            )
+            counterfactual_encoded = self._cpcr_encode_prompt_action(
+                counterfactual_chat,
+                action_token_ids,
+                prompt_length,
+                max_length,
+            )
+            if factual_encoded is None or counterfactual_encoded is None:
+                continue
+            encoded_items.append((sample_idx, 'factual', factual_encoded))
+            encoded_items.append((sample_idx, 'full_task', counterfactual_encoded))
+
+        if not encoded_items:
+            return margins, valid_mask, factual_scores, full_task_scores
+
+        sequence_length = max(
+            len(input_ids)
+            for _, _, (input_ids, _) in encoded_items
+        )
+        scoring_batch_size = len(encoded_items)
+        input_ids = torch.full(
+            (scoring_batch_size, sequence_length),
+            self.tokenizer.pad_token_id,
+            dtype=torch.long,
+        )
+        labels = torch.full(
+            (scoring_batch_size, sequence_length),
+            -100,
+            dtype=torch.long,
+        )
+        attention_mask = torch.zeros(
+            (scoring_batch_size, sequence_length),
+            dtype=torch.long,
+        )
+        for item_idx, (_, _, (item_input_ids, item_labels)) in enumerate(encoded_items):
+            item_length = len(item_input_ids)
+            input_ids[item_idx, :item_length] = torch.tensor(
+                item_input_ids,
+                dtype=torch.long,
+            )
+            labels[item_idx, :item_length] = torch.tensor(
+                item_labels,
+                dtype=torch.long,
+            )
+            attention_mask[item_idx, :item_length] = 1
+
+        scoring_batch = DataProto.from_dict({
+            'input_ids': input_ids,
+            'labels': labels,
+            'attention_mask': attention_mask,
+            'position_ids': compute_position_id_with_mask(attention_mask),
+        })
+        worker_group = self.actor_rollout_wg[role]
+        scoring_batch, pad_size = pad_dataproto_to_divisor(
+            scoring_batch,
+            worker_group.world_size,
+        )
+        scored = worker_group.compute_log_prob(scoring_batch)
+        scored = unpad_dataproto(scored, pad_size=pad_size)
+        token_log_probs = scored.batch['old_log_probs'].float()
+        label_mask = labels != -100
+        mean_log_probs = (
+            token_log_probs.masked_fill(~label_mask, 0.0).sum(dim=1)
+            / label_mask.sum(dim=1).clamp_min(1)
+        ).cpu()
+
+        seen_kinds = defaultdict(set)
+        for item_idx, (sample_idx, prompt_kind, _) in enumerate(encoded_items):
+            score = mean_log_probs[item_idx]
+            if prompt_kind == 'factual':
+                factual_scores[sample_idx] = score
+            else:
+                full_task_scores[sample_idx] = score
+            seen_kinds[sample_idx].add(prompt_kind)
+        for sample_idx, prompt_kinds in seen_kinds.items():
+            if prompt_kinds == {'factual', 'full_task'}:
+                margins[sample_idx] = (
+                    factual_scores[sample_idx] - full_task_scores[sample_idx]
+                )
+                valid_mask[sample_idx] = True
+
+        valid_margins = margins[valid_mask]
+        prefix = f'reward/direct_scoped_grpo/tss/roles/{role}'
+        metrics[f'{prefix}/candidate_count'] = float(candidate_mask.sum().item())
+        metrics[f'{prefix}/valid_count'] = float(valid_mask.sum().item())
+        metrics[f'{prefix}/coverage'] = (
+            float(valid_mask.sum().item()) / float(candidate_mask.sum().item())
+            if candidate_mask.any() else 0.0
+        )
+        if valid_margins.numel() > 0:
+            threshold = float(
+                self.direct_scoped_grpo_config.get('scope_threshold', 0.0)
+            )
+            metrics[f'{prefix}/margin_mean'] = float(valid_margins.mean().item())
+            metrics[f'{prefix}/margin_std'] = (
+                float(valid_margins.std(unbiased=False).item())
+                if valid_margins.numel() > 1 else 0.0
+            )
+            metrics[f'{prefix}/gate_open_rate'] = float(
+                (valid_margins > threshold).float().mean().item()
+            )
+            metrics[f'{prefix}/factual_log_prob_per_token_mean'] = float(
+                factual_scores[valid_mask].mean().item()
+            )
+            metrics[f'{prefix}/full_task_log_prob_per_token_mean'] = float(
+                full_task_scores[valid_mask].mean().item()
+            )
+        return margins, valid_mask, factual_scores, full_task_scores
+
+    def _attach_direct_scoped_grpo_signals(
+        self,
+        data_batch,
+        cpcr_targets,
+        metrics,
+    ):
+        """Persist CPCR/TSS scalars so filtering and concatenation preserve them."""
+
+        if not self.direct_scoped_grpo_enabled:
+            return
+
+        batch_size = len(data_batch)
+        cpcr_score = torch.zeros(batch_size, dtype=torch.float32)
+        cpcr_valid = torch.zeros(batch_size, dtype=torch.bool)
+        scope_margin = torch.zeros(batch_size, dtype=torch.float32)
+        scope_gate = torch.ones(batch_size, dtype=torch.bool)
+        tss_valid = torch.zeros(batch_size, dtype=torch.bool)
+        role = self._current_train_agent
+
+        target_data = cpcr_targets.get(role)
+        if target_data is not None:
+            cpcr_score = target_data['advantage'].float().cpu()
+            cpcr_valid = target_data['valid_mask'].bool().cpu()
+
+        tss_required = self._direct_scoped_role_requires_tss(data_batch, role)
+        if tss_required:
+            (
+                scope_margin,
+                tss_valid,
+                _,
+                _,
+            ) = self._score_direct_scope_tss(
+                data_batch,
+                role,
+                cpcr_valid,
+                metrics,
+            )
+            threshold = float(
+                self.direct_scoped_grpo_config.get('scope_threshold', 0.0)
+            )
+            scope_gate = tss_valid & (scope_margin > threshold)
+            target_valid = cpcr_valid & tss_valid
+        else:
+            target_valid = cpcr_valid
+
+        data_batch.batch['direct_scoped_cpcr_score'] = cpcr_score
+        data_batch.batch['direct_scoped_cpcr_valid'] = cpcr_valid
+        data_batch.batch['direct_scoped_scope_margin'] = scope_margin
+        data_batch.batch['direct_scoped_scope_gate'] = scope_gate
+        data_batch.batch['direct_scoped_tss_valid'] = tss_valid
+        data_batch.batch['direct_scoped_target_valid'] = target_valid
+
+        prefix = f'reward/direct_scoped_grpo/roles/{role}'
+        metrics['reward/direct_scoped_grpo/enabled'] = 1.0
+        metrics[f'{prefix}/tss_required'] = float(tss_required)
+        metrics[f'{prefix}/cpcr_valid_count'] = max(
+            metrics.get(f'{prefix}/cpcr_valid_count', 0.0),
+            float(cpcr_valid.sum().item()),
+        )
+        metrics[f'{prefix}/target_valid_count'] = max(
+            metrics.get(f'{prefix}/target_valid_count', 0.0),
+            float(target_valid.sum().item()),
+        )
+        metrics[f'{prefix}/target_coverage'] = max(
+            metrics.get(f'{prefix}/target_coverage', 0.0),
+            float(target_valid.float().mean().item()),
+        )
+        if bool(cpcr_valid.any().item()):
+            valid_scores = cpcr_score[cpcr_valid]
+            metrics[f'{prefix}/cpcr_score_mean'] = float(
+                valid_scores.mean().item()
+            )
+            metrics[f'{prefix}/cpcr_score_std'] = (
+                float(valid_scores.std(unbiased=False).item())
+                if valid_scores.numel() > 1 else 0.0
+            )
+
+    def _compute_direct_scoped_grpo_advantage(self, data_batch, metrics):
+        """Group-normalize CPCR, then suppress only out-of-scope positive credit."""
+
+        estimate = estimate_direct_scoped_grpo(
+            data_batch.batch['direct_scoped_cpcr_score'].float(),
+            data_batch.non_tensor_batch['uid'],
+            data_batch.batch['direct_scoped_target_valid'].bool(),
+            data_batch.batch['direct_scoped_scope_gate'].float(),
+            epsilon=float(
+                self.direct_scoped_grpo_config.get('normalization_epsilon', 1e-6)
+            ),
+        )
+        step_mask = data_batch.batch['step_ids'] != -100
+        advantages = (
+            estimate.scoped_advantage.unsqueeze(-1)
+            * step_mask.to(dtype=estimate.scoped_advantage.dtype)
+        )
+        data_batch.batch['advantages'] = advantages
+        data_batch.batch['returns'] = advantages.clone()
+
+        direct_rewards = torch.zeros_like(
+            data_batch.batch['token_level_rewards'],
+            dtype=torch.float32,
+        )
+        sequence_positions = torch.arange(
+            step_mask.shape[1],
+            device=step_mask.device,
+        ).expand_as(step_mask)
+        last_positions = torch.where(
+            step_mask,
+            sequence_positions,
+            torch.full_like(sequence_positions, -1),
+        ).max(dim=1).values
+        reward_rows = torch.nonzero(
+            estimate.effective_mask & (last_positions >= 0),
+            as_tuple=False,
+        ).flatten()
+        if reward_rows.numel() > 0:
+            direct_rewards[
+                reward_rows,
+                last_positions[reward_rows],
+            ] = data_batch.batch['direct_scoped_cpcr_score'][reward_rows]
+        data_batch.batch['token_level_scores'] = direct_rewards
+        data_batch.batch['token_level_rewards'] = direct_rewards
+
+        # Invalid counterfactual estimates must not contribute policy or entropy
+        # gradients. Keeping the rows preserves rollout-group and DP batch shapes.
+        ineffective_rows = ~estimate.effective_mask
+        if ineffective_rows.any():
+            data_batch.batch['labels'][ineffective_rows] = -100
+            data_batch.batch['step_ids'][ineffective_rows] = -100
+            data_batch.batch['advantages'][ineffective_rows] = 0.0
+            data_batch.batch['returns'][ineffective_rows] = 0.0
+
+        role = self._current_train_agent
+        prefix = f'reward/direct_scoped_grpo/roles/{role}'
+        effective = estimate.effective_mask
+        base = estimate.base_advantage
+        scoped = estimate.scoped_advantage
+        gate = data_batch.batch['direct_scoped_scope_gate'].bool()
+        positive = effective & (base > 0)
+        negative = effective & (base < 0)
+        gated_positive = positive & ~gate
+        metrics[f'{prefix}/effective_sample_count'] = float(
+            effective.sum().item()
+        )
+        metrics[f'{prefix}/effective_sample_rate'] = float(
+            effective.float().mean().item()
+        )
+        metrics[f'{prefix}/effective_group_count'] = float(len({
+            str(data_batch.non_tensor_batch['uid'][sample_idx])
+            for sample_idx in torch.nonzero(effective, as_tuple=False).flatten().tolist()
+        }))
+        metrics[f'{prefix}/positive_advantage_count'] = float(
+            positive.sum().item()
+        )
+        metrics[f'{prefix}/negative_advantage_count'] = float(
+            negative.sum().item()
+        )
+        metrics[f'{prefix}/gated_positive_count'] = float(
+            gated_positive.sum().item()
+        )
+        metrics[f'{prefix}/gated_positive_rate'] = (
+            float(gated_positive.sum().item()) / float(positive.sum().item())
+            if bool(positive.any().item()) else 0.0
+        )
+        if bool(effective.any().item()):
+            metrics[f'{prefix}/base_advantage_mean'] = float(
+                base[effective].mean().item()
+            )
+            metrics[f'{prefix}/base_advantage_std'] = (
+                float(base[effective].std(unbiased=False).item())
+                if int(effective.sum().item()) > 1 else 0.0
+            )
+            metrics[f'{prefix}/scoped_advantage_mean'] = float(
+                scoped[effective].mean().item()
+            )
+            metrics[f'{prefix}/scoped_advantage_std'] = (
+                float(scoped[effective].std(unbiased=False).item())
+                if int(effective.sum().item()) > 1 else 0.0
+            )
+        return data_batch
 
     def _get_reward_composer_config(self) -> Dict:
         hierarchy_config = self.config.algorithm.get('hierarchy', {})
@@ -4050,6 +4517,11 @@ class RayReMASeparatedTrainer(object):
                                 0.0,
                             ),
                         )
+                        self._attach_direct_scoped_grpo_signals(
+                            new_batch,
+                            cpcr_targets,
+                            metrics,
+                        )
                         reward_tensor_map = self._apply_online_prd_rewards(
                             new_batch,
                             reward_tensor_map,
@@ -4177,7 +4649,15 @@ class RayReMASeparatedTrainer(object):
                         # assign turn_level scores to the last token of each turn, w/ step_ids
                         #  and then i'll call compute_advantage to distribute the score to all
                         #  tokens of each step.
-                        token_level_scores = compute_token_level_scores(agent_batch)
+                        if self.direct_scoped_grpo_enabled:
+                            token_level_scores = torch.zeros_like(
+                                agent_batch.batch['labels'],
+                                dtype=torch.float32,
+                            )
+                        else:
+                            token_level_scores = compute_token_level_scores(
+                                agent_batch
+                            )
                         agent_batch.batch['token_level_scores'] = token_level_scores
                         batch = agent_batch
                         
@@ -4198,11 +4678,19 @@ class RayReMASeparatedTrainer(object):
                         # to all tokens of each step.
                         # for GRPO, we use turn_level_reward.sum(-1) as the outcome reward and then
                         # assign each label token the normalized advantage.
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma_token_level,
-                                                  lam=self.config.algorithm.lam_token_level,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        if self.direct_scoped_grpo_enabled:
+                            batch = self._compute_direct_scoped_grpo_advantage(
+                                batch,
+                                metrics,
+                            )
+                        else:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma_token_level,
+                                lam=self.config.algorithm.lam_token_level,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            )
 
                     
                     # balance the number of valid tokens on each dp rank.

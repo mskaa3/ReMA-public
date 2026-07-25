@@ -267,13 +267,20 @@ algorithm:
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
     final_raw_score_usage_floor: 0.5
+    # Direct role credit: normalize reliable CPCR estimates within each GRPO
+    # rollout group, then remove only positive non-final-worker credit when the
+    # sampled action fits a full-task prompt better than its assigned subtask.
+    direct_scoped_grpo:
+      enable: True
+      scope_threshold: 0.0
+      normalization_epsilon: 1.0e-6
     # Cross-prefix credit from existing rollout groups. The implementation
     # transports the full suffix from the credited role through the final stage
     # and scores every reused action with teacher forcing; it performs no decoding.
     cpcr:
       enable: True
-      # "diagnostic" only logs; "prd_target" supervises the online PRD router.
-      mode: prd_target
+      # Direct mode supplies role-local scores to GRPO without a learned mixer.
+      mode: direct_scoped_grpo
       estimator: full_suffix
       outcome_mode: candidate_factual
       roles: current
@@ -285,7 +292,7 @@ algorithm:
       # Cost controls. Set a limit to 0 for all groups/candidates.
       # Score every N visits of each trained role, not every N global steps;
       # this avoids aliasing with round-robin role switching.
-      score_interval: 5
+      score_interval: 1
       mixed_groups_only: True
       max_groups_per_step: 2
       max_candidates_per_group: 4
@@ -315,7 +322,7 @@ algorithm:
       graph_prior_soft_distance_penalty: 1.0
       graph_prior_reverse_distance_penalty: 3.0
       online:
-        enable: True
+        enable: False
         # "source" keeps the original source-to-role composer.
         # "role" uses the experimental role-to-role credit router.
         model_type: role

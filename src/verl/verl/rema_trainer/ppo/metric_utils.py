@@ -155,6 +155,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
 
     valid_adv = torch.masked_select(advantages, label_mask)
     valid_returns = torch.masked_select(returns, label_mask)
+    # Direct counterfactual credit can legitimately reject every sample in a
+    # step. Report a zero-valued no-op update instead of reducing empty tensors.
+    if valid_adv.numel() == 0:
+        valid_adv = advantages.new_zeros(1)
+        valid_returns = returns.new_zeros(1)
 
     if use_critic:
         values = batch.batch['values']
