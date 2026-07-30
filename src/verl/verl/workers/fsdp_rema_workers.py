@@ -702,13 +702,24 @@ class ActorRolloutRefWorker(Worker):
 
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
+        static_micro_batch_size = data.meta_info.get(
+            'static_log_prob_micro_batch_size_per_gpu'
+        )
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info[
-            'micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            'micro_batch_size'] = (
+                int(static_micro_batch_size)
+                if static_micro_batch_size is not None
+                else self.config.rollout.log_prob_micro_batch_size_per_gpu
+            )
         data.meta_info[
             'max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info[
-            'use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
+            'use_dynamic_bsz'] = (
+                False
+                if static_micro_batch_size is not None
+                else self.config.rollout.log_prob_use_dynamic_bsz
+            )
         data.meta_info['temperature'] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:

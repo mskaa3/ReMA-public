@@ -267,18 +267,28 @@ algorithm:
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
     final_raw_score_usage_floor: 0.5
-    # Direct role credit: normalize reliable CPCR estimates within each GRPO
-    # rollout group, then remove only positive non-final-worker credit when the
-    # sampled action fits a full-task prompt better than its assigned subtask.
-    direct_scoped_grpo:
+    # Exact fixed-prefix credit. Rollouts for one UID share the hierarchy up to
+    # the currently trained role in the latest turn, branch at that role, and
+    # independently generate the remaining suffix. Non-final worker positives
+    # additionally pass the existing stitched local-vs-full-task TSS gate.
+    scoped_c3_grpo:
       enable: True
+      branch_turn: latest
+      mixed_groups_only: True
+      normalize_advantages: True
+      scope_threshold: 0.0
+      normalization_epsilon: 1.0e-6
+      teacher_forcing_micro_batch_size_per_gpu: 2
+    # Legacy CPCR/TSS direct-credit ablation.
+    direct_scoped_grpo:
+      enable: False
       scope_threshold: 0.0
       normalization_epsilon: 1.0e-6
     # Cross-prefix credit from existing rollout groups. The implementation
     # transports the full suffix from the credited role through the final stage
     # and scores every reused action with teacher forcing; it performs no decoding.
     cpcr:
-      enable: True
+      enable: False
       # Direct mode supplies role-local scores to GRPO without a learned mixer.
       mode: direct_scoped_grpo
       estimator: full_suffix
@@ -296,6 +306,9 @@ algorithm:
       mixed_groups_only: True
       max_groups_per_step: 2
       max_candidates_per_group: 4
+      # CPCR/TSS sequences have highly variable lengths. Score one fixed
+      # microbatch per rank and RPC so every FSDP rank runs identical collectives.
+      teacher_forcing_micro_batch_size_per_gpu: 2
       min_effective_sample_size: 2.0
       # A low-ESS group falls back to uniform LOO over the available support
       # for diagnostics, but that fallback is not a PRD target by default.

@@ -17,7 +17,6 @@ export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 # This trainer creates two GPU pools, so this is GPUs per node per pool.
 export POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
 export RAY_PORT=${RAY_PORT:-6379}
-export RAY_NODE_TMP=${RAY_NODE_TMP:-/tmp/ray-${USER}-${SLURM_JOB_ID}}
 
 export SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
 export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/${SIF_NAME}}
@@ -25,11 +24,14 @@ export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka
 export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/rema}
+# Ray logs and object spilling can exceed the small per-node /tmp filesystem.
+export RAY_NODE_TMP=${RAY_NODE_TMP:-${JOB_TMP}/ray}
 export PRD_EXPORT_ENABLE=${PRD_EXPORT_ENABLE:-0}
 export PRD_EXPORT_MAX_RECORDS=${PRD_EXPORT_MAX_RECORDS:-50000}
 export PRD_EXPORT_LOCAL=${PRD_EXPORT_LOCAL:-${JOB_TMP}/prd_reward_composer/prd_records_${SLURM_JOB_ID}.jsonl}
 export PRD_EXPORT_REMOTE=${PRD_EXPORT_REMOTE:-}
-# This branch trains with direct CPCR/TSS credit; PRD blending must stay off.
+# This branch trains with fixed-prefix C3 plus the stitched TSS scope gate.
+# PRD blending and CPCR must stay off.
 export PRD_ONLINE_ENABLE=0
 export PRD_ONLINE_MODEL_TYPE=${PRD_ONLINE_MODEL_TYPE:-role}
 export PRD_ONLINE_LR=${PRD_ONLINE_LR:-3.0e-4}
@@ -92,6 +94,7 @@ if [[ "${PRD_ONLINE_ENABLE}" == "1" || "${PRD_ONLINE_ENABLE}" == "true" ]]; then
 else
     PRD_ONLINE_OVERRIDES="${PRD_ONLINE_OVERRIDES} algorithm.hierarchy.reward_composer.online.enable=False"
     echo "Online PRD reward composer disabled; rollout.n=${ROLLOUT_N}"
+    echo "Scoped C3-GRPO enabled: exact focal-role branching with worker TSS gating"
 fi
 
 echo "Preparing node-local JOB_TMP at ${JOB_TMP} on all nodes"
@@ -116,6 +119,8 @@ echo "Preparing node-local Ray temp dir at ${RAY_NODE_TMP}"
 srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
     rm -rf "'"${RAY_NODE_TMP}"'"
     mkdir -p "'"${RAY_NODE_TMP}"'"
+    echo "[$(hostname)] Ray temp capacity:"
+    df -h "'"${RAY_NODE_TMP}"'"
 '
 
 COMMON_MOUNTS=(

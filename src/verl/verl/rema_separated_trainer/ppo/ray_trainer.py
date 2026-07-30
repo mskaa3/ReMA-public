@@ -56,6 +56,9 @@ from verl.rema_separated_trainer.ppo.direct_scoped_grpo import (
     estimate_direct_scoped_grpo,
 )
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
+from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
+    estimate_scoped_c3_grpo,
+)
 
 
 
@@ -450,8 +453,116 @@ class RayReMASeparatedTrainer(object):
         
         self._create_dataloader()
         self._init_online_prd_composer()
+        self._init_scoped_c3_grpo()
         self._init_direct_scoped_grpo()
         self._init_cpcr()
+
+    def _init_scoped_c3_grpo(self):
+        hierarchy_config = self.config.algorithm.get('hierarchy', {})
+        scoped_config = (
+            hierarchy_config.get('scoped_c3_grpo', {})
+            if hierarchy_config else {}
+        )
+        self.scoped_c3_grpo_config = (
+            OmegaConf.to_container(scoped_config, resolve=True)
+            if scoped_config else {}
+        )
+        self.scoped_c3_grpo_enabled = bool(
+            self.scoped_c3_grpo_config.get('enable', False)
+        )
+        if not self.scoped_c3_grpo_enabled:
+            return
+
+        if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+            raise ValueError(
+                "Scoped C3 GRPO requires algorithm.adv_estimator='grpo'"
+            )
+        if not bool(hierarchy_config.get('enable', False)):
+            raise ValueError(
+                "Scoped C3 GRPO requires algorithm.hierarchy.enable=True"
+            )
+        if self.online_prd_enabled:
+            raise ValueError(
+                "Scoped C3 GRPO and online PRD cannot be enabled together"
+            )
+        if bool(
+            hierarchy_config.get('direct_scoped_grpo', {}).get(
+                'enable',
+                False,
+            )
+        ):
+            raise ValueError(
+                "Scoped C3 GRPO and direct CPCR scoped GRPO are mutually exclusive"
+            )
+        if bool(hierarchy_config.get('cpcr', {}).get('enable', False)):
+            raise ValueError(
+                "Scoped C3 GRPO uses exact grouped rollouts; disable CPCR"
+            )
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        if int(rollout_config.get('n', 1)) < 2:
+            raise ValueError("Scoped C3 GRPO requires rollout.n >= 2")
+        if not bool(rollout_config.get('do_sample', True)):
+            raise ValueError("Scoped C3 GRPO requires stochastic rollouts")
+        if float(rollout_config.get('temperature', 1.0)) <= 0.0:
+            raise ValueError("Scoped C3 GRPO requires rollout.temperature > 0")
+
+        max_num_turns = int(rollout_config.get('max_num_turns', 1))
+        configured_branch_turn = self.scoped_c3_grpo_config.get(
+            'branch_turn',
+            'latest',
+        )
+        if configured_branch_turn != 'latest':
+            try:
+                branch_turn = int(configured_branch_turn)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Scoped C3 GRPO branch_turn must be 'latest' or an integer"
+                ) from exc
+            if not 0 <= branch_turn < max_num_turns:
+                raise ValueError(
+                    f"Scoped C3 GRPO branch_turn={branch_turn} must be in "
+                    f"[0, {max_num_turns})"
+                )
+
+        stage_roles = list(hierarchy_config.get('stage_roles', []))
+        if not stage_roles:
+            stage_roles = [
+                f"worker_stage_{stage_idx}"
+                for stage_idx in range(
+                    1,
+                    int(hierarchy_config.get('num_worker_stages', 0)) + 1,
+                )
+            ]
+        configured_agent_roles = {
+            hierarchy_config.get('decomposer_role', 'decomposer'),
+            hierarchy_config.get('selector_role', 'selector'),
+            *stage_roles,
+        }
+        train_agent_roles = set(
+            hierarchy_config.get(
+                'train_agent_roles',
+                configured_agent_roles,
+            )
+        )
+        unknown_train_roles = train_agent_roles - configured_agent_roles
+        if unknown_train_roles:
+            raise ValueError(
+                "Scoped C3 GRPO train_agent_roles contains roles absent from "
+                f"the hierarchy: {sorted(unknown_train_roles)}"
+            )
+        tss_roles = train_agent_roles.intersection(stage_roles[:-1])
+        worker_context_mode = str(
+            hierarchy_config.get('worker_context_mode', 'subtask_context')
+        )
+        if (
+            tss_roles
+            and worker_context_mode not in {'full_question', 'question', 'full'}
+        ):
+            raise ValueError(
+                "Scoped C3 TSS requires hierarchy.worker_context_mode="
+                "'full_question' for non-final worker roles"
+            )
 
     def _init_direct_scoped_grpo(self):
         hierarchy_config = self.config.algorithm.get('hierarchy', {})
@@ -468,6 +579,10 @@ class RayReMASeparatedTrainer(object):
         )
         if not self.direct_scoped_grpo_enabled:
             return
+        if self.scoped_c3_grpo_enabled:
+            raise ValueError(
+                "Direct CPCR scoped GRPO and scoped C3 GRPO are mutually exclusive"
+            )
 
         if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
             raise ValueError(
@@ -573,11 +688,17 @@ class RayReMASeparatedTrainer(object):
     def _cpcr_unpad_messages(messages):
         if isinstance(messages, np.ndarray):
             messages = messages.tolist()
-        return [
+        unpadded = [
             dict(message)
             for message in messages
             if isinstance(message, dict) and message.get('role') != 'padding'
         ]
+        # _build_tensor_dict appends the sampled response to every stored
+        # conversation. Counterfactual scoring needs the state before that
+        # action, not a prompt that already contains the action being scored.
+        if unpadded and unpadded[-1].get('role') == 'assistant':
+            unpadded = unpadded[:-1]
+        return unpadded
 
     @staticmethod
     def _cpcr_latest_role_message(history, role):
@@ -925,6 +1046,117 @@ class RayReMASeparatedTrainer(object):
 
         return suffix_steps
 
+    def _score_teacher_forced_actions(self, role, encoded_actions):
+        """Score variable-length actions without diverging FSDP collectives."""
+
+        if not encoded_actions:
+            empty = torch.empty(0, dtype=torch.float32)
+            return empty, empty, 0, 0, 0
+
+        worker_group = self.actor_rollout_wg[role]
+        scoring_config = (
+            self.scoped_c3_grpo_config
+            if self.scoped_c3_grpo_enabled
+            else self.cpcr_config
+        )
+        micro_batch_size = max(
+            int(
+                scoring_config.get(
+                    'teacher_forcing_micro_batch_size_per_gpu',
+                    1,
+                )
+            ),
+            1,
+        )
+        # One RPC contains at most one fixed microbatch per rank. Variable-length
+        # dynamic batching can otherwise give FSDP ranks different forward counts.
+        rpc_batch_size = worker_group.world_size * micro_batch_size
+        expected_call_count = (
+            len(encoded_actions) + rpc_batch_size - 1
+        ) // rpc_batch_size
+        print(
+            'Teacher-forced scoring '
+            f'role={role}, actions={len(encoded_actions)}, '
+            f'actions_per_call={rpc_batch_size}, calls={expected_call_count}'
+        )
+        sum_log_probs = []
+        mean_log_probs = []
+        action_token_count = 0
+        input_token_count = 0
+        scoring_call_count = 0
+
+        for start in range(0, len(encoded_actions), rpc_batch_size):
+            action_chunk = encoded_actions[start:start + rpc_batch_size]
+            sequence_length = max(
+                len(input_ids)
+                for input_ids, _ in action_chunk
+            )
+            batch_size = len(action_chunk)
+            input_ids = torch.full(
+                (batch_size, sequence_length),
+                self.tokenizer.pad_token_id,
+                dtype=torch.long,
+            )
+            labels = torch.full(
+                (batch_size, sequence_length),
+                -100,
+                dtype=torch.long,
+            )
+            attention_mask = torch.zeros(
+                (batch_size, sequence_length),
+                dtype=torch.long,
+            )
+            for item_idx, (item_input_ids, item_labels) in enumerate(action_chunk):
+                item_length = len(item_input_ids)
+                input_ids[item_idx, :item_length] = torch.tensor(
+                    item_input_ids,
+                    dtype=torch.long,
+                )
+                labels[item_idx, :item_length] = torch.tensor(
+                    item_labels,
+                    dtype=torch.long,
+                )
+                attention_mask[item_idx, :item_length] = 1
+
+            scoring_batch = DataProto.from_dict(
+                {
+                    'input_ids': input_ids,
+                    'labels': labels,
+                    'attention_mask': attention_mask,
+                    'position_ids': compute_position_id_with_mask(attention_mask),
+                },
+                meta_info={
+                    'static_log_prob_micro_batch_size_per_gpu': micro_batch_size,
+                },
+            )
+            scoring_batch, pad_size = pad_dataproto_to_divisor(
+                scoring_batch,
+                worker_group.world_size,
+            )
+            scored = worker_group.compute_log_prob(scoring_batch)
+            scored = unpad_dataproto(scored, pad_size=pad_size)
+            token_log_probs = scored.batch['old_log_probs'].float()
+            label_mask = labels != -100
+            sequence_sums = token_log_probs.masked_fill(
+                ~label_mask,
+                0.0,
+            ).sum(dim=1)
+            sum_log_probs.append(sequence_sums)
+            mean_log_probs.append(
+                sequence_sums / label_mask.sum(dim=1).clamp_min(1)
+            )
+            action_token_count += int(label_mask.sum().item())
+            input_token_count += int(attention_mask.sum().item())
+            scoring_call_count += 1
+
+        return (
+            torch.cat(sum_log_probs),
+            torch.cat(mean_log_probs),
+            action_token_count,
+            input_token_count,
+            scoring_call_count,
+        )
+
     def _cpcr_score_full_suffix_pairs(
         self,
         data_batch,
@@ -1057,49 +1289,30 @@ class RayReMASeparatedTrainer(object):
             return {
                 uid: torch.full((len(indices), len(indices)), -torch.inf)
                 for uid, indices in group_specs.items()
-            }, skipped_pair_count, 0, 0, 0, 0, factual_prompt_match_count, factual_prompt_check_count, active_target_count
+            }, skipped_pair_count, 0, 0, 0, 0, 0, factual_prompt_match_count, factual_prompt_check_count, active_target_count
 
         pair_log_probs = defaultdict(float)
         scored_steps_per_pair = defaultdict(int)
         scored_action_tokens = 0
         scored_input_tokens = 0
         scored_suffix_actions = 0
+        teacher_forcing_calls = 0
         for suffix_role, role_items in encoded_by_role.items():
             encoded_actions = [encoded for _, encoded in role_items]
-            sequence_length = max(len(input_ids) for input_ids, _ in encoded_actions)
-            batch_size = len(encoded_actions)
-            input_ids = torch.full(
-                (batch_size, sequence_length),
-                self.tokenizer.pad_token_id,
-                dtype=torch.long,
+            (
+                sequence_log_probs,
+                _,
+                action_token_count,
+                input_token_count,
+                scoring_call_count,
+            ) = self._score_teacher_forced_actions(
+                suffix_role,
+                encoded_actions,
             )
-            labels = torch.full((batch_size, sequence_length), -100, dtype=torch.long)
-            attention_mask = torch.zeros((batch_size, sequence_length), dtype=torch.long)
-            for idx, (pair_input_ids, pair_labels) in enumerate(encoded_actions):
-                length = len(pair_input_ids)
-                input_ids[idx, :length] = torch.tensor(pair_input_ids, dtype=torch.long)
-                labels[idx, :length] = torch.tensor(pair_labels, dtype=torch.long)
-                attention_mask[idx, :length] = 1
-
-            scoring_batch = DataProto.from_dict({
-                'input_ids': input_ids,
-                'labels': labels,
-                'attention_mask': attention_mask,
-                'position_ids': compute_position_id_with_mask(attention_mask),
-            })
-            worker_group = self.actor_rollout_wg[suffix_role]
-            scoring_batch, pad_size = pad_dataproto_to_divisor(
-                scoring_batch,
-                worker_group.world_size,
-            )
-            scored = worker_group.compute_log_prob(scoring_batch)
-            scored = unpad_dataproto(scored, pad_size=pad_size)
-            token_log_probs = scored.batch['old_log_probs']
-            label_mask = labels != -100
-            sequence_log_probs = token_log_probs.float().masked_fill(~label_mask, 0.0).sum(dim=1)
-            scored_action_tokens += int(label_mask.sum().item())
-            scored_input_tokens += int(attention_mask.sum().item())
+            scored_action_tokens += action_token_count
+            scored_input_tokens += input_token_count
             scored_suffix_actions += len(role_items)
+            teacher_forcing_calls += scoring_call_count
             for item_idx, (pair_key, _) in enumerate(role_items):
                 pair_log_probs[pair_key] = pair_log_probs[pair_key] + sequence_log_probs[item_idx]
                 scored_steps_per_pair[pair_key] += 1
@@ -1123,6 +1336,7 @@ class RayReMASeparatedTrainer(object):
             scored_suffix_actions,
             scored_action_tokens,
             scored_input_tokens,
+            teacher_forcing_calls,
             factual_prompt_match_count,
             factual_prompt_check_count,
             active_target_count,
@@ -1216,6 +1430,7 @@ class RayReMASeparatedTrainer(object):
                 scored_suffix_actions,
                 scored_action_tokens,
                 scored_input_tokens,
+                teacher_forcing_calls,
                 factual_prompt_matches,
                 factual_prompt_checks,
                 active_targets,
@@ -1286,6 +1501,9 @@ class RayReMASeparatedTrainer(object):
             )
             metrics[f'{prefix}/action_tokens_scored'] = float(scored_action_tokens)
             metrics[f'{prefix}/input_tokens_scored'] = float(scored_input_tokens)
+            metrics[f'{prefix}/teacher_forcing_call_count'] = float(
+                teacher_forcing_calls
+            )
             metrics[f'{prefix}/supported_target_count'] = float(supported_target_count)
             metrics[f'{prefix}/reliable_target_count'] = float(role_valid.sum().item())
             metrics[f'{prefix}/target_coverage'] = float(role_valid.float().mean().item())
@@ -1383,7 +1601,16 @@ class RayReMASeparatedTrainer(object):
             return None
         return factual_chat, counterfactual_chat, worker_message
 
-    def _score_direct_scope_tss(self, data_batch, role, candidate_mask, metrics):
+    def _score_direct_scope_tss(
+        self,
+        data_batch,
+        role,
+        candidate_mask,
+        metrics,
+        *,
+        metric_namespace='direct_scoped_grpo',
+        scope_threshold=None,
+    ):
         """Score local-vs-full-task prompt preference for existing actions."""
 
         batch_size = len(data_batch)
@@ -1440,56 +1667,16 @@ class RayReMASeparatedTrainer(object):
         if not encoded_items:
             return margins, valid_mask, factual_scores, full_task_scores
 
-        sequence_length = max(
-            len(input_ids)
-            for _, _, (input_ids, _) in encoded_items
+        (
+            _,
+            mean_log_probs,
+            _,
+            _,
+            teacher_forcing_calls,
+        ) = self._score_teacher_forced_actions(
+            role,
+            [encoded for _, _, encoded in encoded_items],
         )
-        scoring_batch_size = len(encoded_items)
-        input_ids = torch.full(
-            (scoring_batch_size, sequence_length),
-            self.tokenizer.pad_token_id,
-            dtype=torch.long,
-        )
-        labels = torch.full(
-            (scoring_batch_size, sequence_length),
-            -100,
-            dtype=torch.long,
-        )
-        attention_mask = torch.zeros(
-            (scoring_batch_size, sequence_length),
-            dtype=torch.long,
-        )
-        for item_idx, (_, _, (item_input_ids, item_labels)) in enumerate(encoded_items):
-            item_length = len(item_input_ids)
-            input_ids[item_idx, :item_length] = torch.tensor(
-                item_input_ids,
-                dtype=torch.long,
-            )
-            labels[item_idx, :item_length] = torch.tensor(
-                item_labels,
-                dtype=torch.long,
-            )
-            attention_mask[item_idx, :item_length] = 1
-
-        scoring_batch = DataProto.from_dict({
-            'input_ids': input_ids,
-            'labels': labels,
-            'attention_mask': attention_mask,
-            'position_ids': compute_position_id_with_mask(attention_mask),
-        })
-        worker_group = self.actor_rollout_wg[role]
-        scoring_batch, pad_size = pad_dataproto_to_divisor(
-            scoring_batch,
-            worker_group.world_size,
-        )
-        scored = worker_group.compute_log_prob(scoring_batch)
-        scored = unpad_dataproto(scored, pad_size=pad_size)
-        token_log_probs = scored.batch['old_log_probs'].float()
-        label_mask = labels != -100
-        mean_log_probs = (
-            token_log_probs.masked_fill(~label_mask, 0.0).sum(dim=1)
-            / label_mask.sum(dim=1).clamp_min(1)
-        ).cpu()
 
         seen_kinds = defaultdict(set)
         for item_idx, (sample_idx, prompt_kind, _) in enumerate(encoded_items):
@@ -1507,16 +1694,26 @@ class RayReMASeparatedTrainer(object):
                 valid_mask[sample_idx] = True
 
         valid_margins = margins[valid_mask]
-        prefix = f'reward/direct_scoped_grpo/tss/roles/{role}'
+        prefix = f'reward/{metric_namespace}/tss/roles/{role}'
         metrics[f'{prefix}/candidate_count'] = float(candidate_mask.sum().item())
         metrics[f'{prefix}/valid_count'] = float(valid_mask.sum().item())
+        metrics[f'{prefix}/teacher_forcing_call_count'] = float(
+            teacher_forcing_calls
+        )
         metrics[f'{prefix}/coverage'] = (
             float(valid_mask.sum().item()) / float(candidate_mask.sum().item())
             if candidate_mask.any() else 0.0
         )
         if valid_margins.numel() > 0:
-            threshold = float(
-                self.direct_scoped_grpo_config.get('scope_threshold', 0.0)
+            threshold = (
+                float(scope_threshold)
+                if scope_threshold is not None
+                else float(
+                    self.direct_scoped_grpo_config.get(
+                        'scope_threshold',
+                        0.0,
+                    )
+                )
             )
             metrics[f'{prefix}/margin_mean'] = float(valid_margins.mean().item())
             metrics[f'{prefix}/margin_std'] = (
@@ -1533,6 +1730,234 @@ class RayReMASeparatedTrainer(object):
                 full_task_scores[valid_mask].mean().item()
             )
         return margins, valid_mask, factual_scores, full_task_scores
+
+    def _c3_action_present_mask(self, data_batch, role):
+        token_key = f'{role}_action_token_ids'
+        batch_size = len(data_batch)
+        present = torch.zeros(batch_size, dtype=torch.bool)
+        if token_key not in data_batch.non_tensor_batch:
+            return present
+        for sample_idx, token_ids in enumerate(
+            data_batch.non_tensor_batch[token_key]
+        ):
+            if isinstance(token_ids, np.ndarray):
+                token_ids = token_ids.tolist()
+            present[sample_idx] = bool(token_ids)
+        return present
+
+    def _c3_exact_prefix_mask(self, data_batch, role, candidate_mask, metrics):
+        """Verify that every C3 action group shares one factual role prefix."""
+
+        batch_size = len(data_batch)
+        exact_mask = torch.zeros(batch_size, dtype=torch.bool)
+        chat_key = f'{role}_conversation_history'
+        if chat_key not in data_batch.non_tensor_batch:
+            return exact_mask
+
+        uid_to_indices = defaultdict(list)
+        for sample_idx, uid in enumerate(data_batch.non_tensor_batch['uid']):
+            if bool(candidate_mask[sample_idx].item()):
+                uid_to_indices[uid].append(sample_idx)
+
+        exact_group_count = 0
+        for indices in uid_to_indices.values():
+            if len(indices) < 2:
+                continue
+            canonical_prompts = []
+            for sample_idx in indices:
+                messages = self._cpcr_unpad_messages(
+                    data_batch.non_tensor_batch[chat_key][sample_idx]
+                )
+                canonical_prompts.append(tuple(
+                    (
+                        str(message.get('role', '')),
+                        str(message.get('content', '')),
+                    )
+                    for message in messages
+                ))
+            if len(set(canonical_prompts)) != 1:
+                continue
+            exact_mask[indices] = True
+            exact_group_count += 1
+
+        prefix = f'reward/scoped_c3_grpo/roles/{role}'
+        group_count = len(uid_to_indices)
+        metrics[f'{prefix}/candidate_group_count'] = float(group_count)
+        metrics[f'{prefix}/exact_prefix_group_count'] = float(
+            exact_group_count
+        )
+        metrics[f'{prefix}/exact_prefix_group_rate'] = (
+            float(exact_group_count) / float(group_count)
+            if group_count else 0.0
+        )
+        return exact_mask
+
+    @staticmethod
+    def _c3_mixed_group_mask(outcome_scores, group_ids, candidate_mask):
+        mixed_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        uid_to_indices = defaultdict(list)
+        for sample_idx, uid in enumerate(group_ids):
+            if bool(candidate_mask[sample_idx].item()):
+                uid_to_indices[uid].append(sample_idx)
+        for indices in uid_to_indices.values():
+            if len(indices) < 2:
+                continue
+            scores = outcome_scores[indices]
+            if (
+                bool(torch.isfinite(scores).all().item())
+                and float(scores.max().item()) > float(scores.min().item())
+            ):
+                mixed_mask[indices] = True
+        return mixed_mask
+
+    @staticmethod
+    def _c3_positive_effect_mask(outcome_scores, group_ids, candidate_mask):
+        """Mark alternatives whose outcome beats their fixed-prefix peers."""
+
+        positive_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        uid_to_indices = defaultdict(list)
+        for sample_idx, uid in enumerate(group_ids):
+            if bool(candidate_mask[sample_idx].item()):
+                uid_to_indices[uid].append(sample_idx)
+        for indices in uid_to_indices.values():
+            if len(indices) < 2:
+                continue
+            scores = outcome_scores[indices]
+            peer_means = (
+                scores.sum() - scores
+            ) / float(len(indices) - 1)
+            positive_mask[indices] = scores > peer_means
+        return positive_mask
+
+    def _attach_scoped_c3_grpo_signals(
+        self,
+        data_batch,
+        reward_tensor_map,
+        metrics,
+    ):
+        """Attach exact fixed-prefix outcomes and the existing stitched TSS."""
+
+        if not self.scoped_c3_grpo_enabled:
+            return
+
+        role = self._current_train_agent
+        batch_size = len(data_batch)
+        outcome_scores = reward_tensor_map['acc'].float().cpu()
+        action_present = self._c3_action_present_mask(data_batch, role)
+        exact_prefix = self._c3_exact_prefix_mask(
+            data_batch,
+            role,
+            action_present,
+            metrics,
+        )
+        causal_valid = action_present & exact_prefix
+        pre_mixed_valid = causal_valid.clone()
+        mixed_mask = torch.ones_like(causal_valid)
+        if bool(
+            self.scoped_c3_grpo_config.get('mixed_groups_only', True)
+        ):
+            mixed_mask = self._c3_mixed_group_mask(
+                outcome_scores,
+                data_batch.non_tensor_batch['uid'],
+                causal_valid,
+            )
+            causal_valid &= mixed_mask
+
+        scope_margin = torch.zeros(batch_size, dtype=torch.float32)
+        scope_gate = torch.ones(batch_size, dtype=torch.bool)
+        tss_valid = torch.zeros(batch_size, dtype=torch.bool)
+        positive_effect = self._c3_positive_effect_mask(
+            outcome_scores,
+            data_batch.non_tensor_batch['uid'],
+            causal_valid,
+        )
+        tss_required = self._direct_scoped_role_requires_tss(data_batch, role)
+        if tss_required:
+            threshold = float(
+                self.scoped_c3_grpo_config.get('scope_threshold', 0.0)
+            )
+            (
+                scope_margin,
+                tss_valid,
+                _,
+                _,
+            ) = self._score_direct_scope_tss(
+                data_batch,
+                role,
+                positive_effect,
+                metrics,
+                metric_namespace='scoped_c3_grpo',
+                scope_threshold=threshold,
+            )
+            scope_gate[positive_effect] = (
+                tss_valid[positive_effect]
+                & (scope_margin[positive_effect] > threshold)
+            )
+            target_valid = causal_valid & (
+                ~positive_effect | tss_valid
+            )
+        else:
+            target_valid = causal_valid
+
+        data_batch.batch['scoped_c3_outcome_score'] = outcome_scores
+        data_batch.batch['scoped_c3_causal_valid'] = causal_valid
+        data_batch.batch['scoped_c3_scope_margin'] = scope_margin
+        data_batch.batch['scoped_c3_scope_gate'] = scope_gate
+        data_batch.batch['scoped_c3_tss_valid'] = tss_valid
+        data_batch.batch['scoped_c3_positive_effect'] = positive_effect
+        data_batch.batch['scoped_c3_target_valid'] = target_valid
+
+        prefix = f'reward/scoped_c3_grpo/roles/{role}'
+        metrics['reward/scoped_c3_grpo/enabled'] = 1.0
+        metrics['reward/scoped_c3_grpo/manual_role_rewards_used'] = 0.0
+        metrics['reward/scoped_c3_grpo/outcome_is_raw_acc'] = 1.0
+        metrics[f'{prefix}/tss_required'] = float(tss_required)
+        metrics[f'{prefix}/action_present_count'] = float(
+            action_present.sum().item()
+        )
+        metrics[f'{prefix}/exact_prefix_sample_count'] = float(
+            exact_prefix.sum().item()
+        )
+        metrics[f'{prefix}/pre_mixed_valid_count'] = float(
+            pre_mixed_valid.sum().item()
+        )
+        metrics[f'{prefix}/mixed_valid_count'] = float(
+            causal_valid.sum().item()
+        )
+        metrics[f'{prefix}/rejected_missing_action_count'] = float(
+            (~action_present).sum().item()
+        )
+        metrics[f'{prefix}/rejected_prefix_mismatch_count'] = float(
+            (action_present & ~exact_prefix).sum().item()
+        )
+        metrics[f'{prefix}/rejected_no_outcome_contrast_count'] = float(
+            (pre_mixed_valid & ~mixed_mask).sum().item()
+        )
+        metrics[f'{prefix}/causal_valid_count'] = float(
+            causal_valid.sum().item()
+        )
+        metrics[f'{prefix}/target_valid_count'] = float(
+            target_valid.sum().item()
+        )
+        metrics[f'{prefix}/target_coverage'] = float(
+            target_valid.float().mean().item()
+        )
+        if bool(causal_valid.any().item()):
+            valid_scores = outcome_scores[causal_valid]
+            metrics[f'{prefix}/outcome_mean'] = float(
+                valid_scores.mean().item()
+            )
+            metrics[f'{prefix}/outcome_std'] = (
+                float(valid_scores.std(unbiased=False).item())
+                if valid_scores.numel() > 1 else 0.0
+            )
+        if tss_required:
+            metrics[f'{prefix}/rejected_tss_unavailable_count'] = float(
+                (positive_effect & ~tss_valid).sum().item()
+            )
+            metrics[f'{prefix}/scope_gate_open_count'] = float(
+                (positive_effect & tss_valid & scope_gate).sum().item()
+            )
 
     def _attach_direct_scoped_grpo_signals(
         self,
@@ -1703,6 +2128,133 @@ class RayReMASeparatedTrainer(object):
             )
             metrics[f'{prefix}/base_advantage_std'] = (
                 float(base[effective].std(unbiased=False).item())
+                if int(effective.sum().item()) > 1 else 0.0
+            )
+            metrics[f'{prefix}/scoped_advantage_mean'] = float(
+                scoped[effective].mean().item()
+            )
+            metrics[f'{prefix}/scoped_advantage_std'] = (
+                float(scoped[effective].std(unbiased=False).item())
+                if int(effective.sum().item()) > 1 else 0.0
+            )
+        return data_batch
+
+    def _compute_scoped_c3_grpo_advantage(self, data_batch, metrics):
+        """Build role-local C3 LOO advantages and apply TSS after comparison."""
+
+        estimate = estimate_scoped_c3_grpo(
+            data_batch.batch['scoped_c3_outcome_score'].float(),
+            data_batch.non_tensor_batch['uid'],
+            data_batch.batch['scoped_c3_causal_valid'].bool(),
+            data_batch.batch['scoped_c3_scope_gate'].float(),
+            update_mask=data_batch.batch['scoped_c3_target_valid'].bool(),
+            normalize=bool(
+                self.scoped_c3_grpo_config.get(
+                    'normalize_advantages',
+                    True,
+                )
+            ),
+            epsilon=float(
+                self.scoped_c3_grpo_config.get(
+                    'normalization_epsilon',
+                    1e-6,
+                )
+            ),
+        )
+        step_mask = data_batch.batch['step_ids'] != -100
+        advantages = (
+            estimate.scoped_advantage.unsqueeze(-1)
+            * step_mask.to(dtype=estimate.scoped_advantage.dtype)
+        )
+        data_batch.batch['advantages'] = advantages
+        data_batch.batch['returns'] = advantages.clone()
+
+        direct_rewards = torch.zeros_like(
+            data_batch.batch['token_level_rewards'],
+            dtype=torch.float32,
+        )
+        sequence_positions = torch.arange(
+            step_mask.shape[1],
+            device=step_mask.device,
+        ).expand_as(step_mask)
+        last_positions = torch.where(
+            step_mask,
+            sequence_positions,
+            torch.full_like(sequence_positions, -1),
+        ).max(dim=1).values
+        reward_rows = torch.nonzero(
+            estimate.effective_mask & (last_positions >= 0),
+            as_tuple=False,
+        ).flatten()
+        if reward_rows.numel() > 0:
+            direct_rewards[
+                reward_rows,
+                last_positions[reward_rows],
+            ] = data_batch.batch['scoped_c3_outcome_score'][reward_rows]
+        data_batch.batch['token_level_scores'] = direct_rewards
+        data_batch.batch['token_level_rewards'] = direct_rewards
+
+        ineffective_rows = ~estimate.effective_mask
+        if ineffective_rows.any():
+            data_batch.batch['labels'][ineffective_rows] = -100
+            data_batch.batch['step_ids'][ineffective_rows] = -100
+            data_batch.batch['advantages'][ineffective_rows] = 0.0
+            data_batch.batch['returns'][ineffective_rows] = 0.0
+
+        role = self._current_train_agent
+        prefix = f'reward/scoped_c3_grpo/roles/{role}'
+        effective = estimate.effective_mask
+        causal = estimate.causal_advantage
+        scoped = estimate.scoped_advantage
+        gate = data_batch.batch['scoped_c3_scope_gate'].bool()
+        causal_valid = data_batch.batch['scoped_c3_causal_valid'].bool()
+        update_valid = data_batch.batch['scoped_c3_target_valid'].bool()
+        candidate_positive = causal_valid & (causal > 0)
+        update_valid_positive = update_valid & (causal > 0)
+        positive = effective & (causal > 0)
+        negative = effective & (causal < 0)
+        gated_positive = candidate_positive & (
+            ~update_valid | ~gate
+        )
+        metrics[f'{prefix}/effective_sample_count'] = float(
+            effective.sum().item()
+        )
+        metrics[f'{prefix}/effective_sample_rate'] = float(
+            effective.float().mean().item()
+        )
+        metrics[f'{prefix}/effective_group_count'] = float(len({
+            str(data_batch.non_tensor_batch['uid'][sample_idx])
+            for sample_idx in torch.nonzero(
+                effective,
+                as_tuple=False,
+            ).flatten().tolist()
+        }))
+        metrics[f'{prefix}/positive_advantage_count'] = float(
+            positive.sum().item()
+        )
+        metrics[f'{prefix}/candidate_positive_count'] = float(
+            candidate_positive.sum().item()
+        )
+        metrics[f'{prefix}/update_valid_positive_count'] = float(
+            update_valid_positive.sum().item()
+        )
+        metrics[f'{prefix}/negative_advantage_count'] = float(
+            negative.sum().item()
+        )
+        metrics[f'{prefix}/gated_positive_count'] = float(
+            gated_positive.sum().item()
+        )
+        metrics[f'{prefix}/gated_positive_rate'] = (
+            float(gated_positive.sum().item())
+            / float(candidate_positive.sum().item())
+            if bool(candidate_positive.any().item()) else 0.0
+        )
+        if bool(effective.any().item()):
+            metrics[f'{prefix}/causal_advantage_mean'] = float(
+                causal[effective].mean().item()
+            )
+            metrics[f'{prefix}/causal_advantage_std'] = (
+                float(causal[effective].std(unbiased=False).item())
                 if int(effective.sum().item()) > 1 else 0.0
             )
             metrics[f'{prefix}/scoped_advantage_mean'] = float(
@@ -4399,6 +4951,8 @@ class RayReMASeparatedTrainer(object):
         all_positive_cnt = 0
         mixed_prompt_cnt = 0
         kept_traj_cnt = 0
+        c3_trainable_prompt_cnt = 0
+        c3_ineligible_prompt_cnt = 0
 
         for epoch in range(self.config.trainer.total_epochs):
             self._update_current_train_agent(epoch)
@@ -4426,10 +4980,12 @@ class RayReMASeparatedTrainer(object):
                     # because verl originally calls this 'chat'
                     gen_batch = new_batch.select(
                         batch_keys=['batch_idx'],
-                        non_tensor_batch_keys=['question'], 
+                        non_tensor_batch_keys=['question', 'uid'],
                         meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'hierarchy'],
                         deepcopy=True
                     )
+                gen_batch.meta_info['c3_focal_role'] = self._current_train_agent
+                gen_batch.meta_info['validate'] = False
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -4499,6 +5055,11 @@ class RayReMASeparatedTrainer(object):
                         #     "reasoning_turn_level_reward": tensor([...], device='cuda:0'),
                         # }
                         reward_tensor_map = self.reward_fn(new_batch)
+                        self._attach_scoped_c3_grpo_signals(
+                            new_batch,
+                            reward_tensor_map,
+                            metrics,
+                        )
                         cpcr_targets = self._compute_cpcr_targets(
                             new_batch,
                             reward_tensor_map,
@@ -4567,12 +5128,17 @@ class RayReMASeparatedTrainer(object):
                         # one_agent_reward_tensor = reward_tensor_map[key_reward]
                         acc_tensor = new_batch.batch['acc']
                         id2acc = defaultdict(list)
+                        id2indices = defaultdict(list)
                         for i_bsz, uid in enumerate(new_batch.non_tensor_batch['uid']):
                             id2acc[uid].append(acc_tensor[i_bsz])
+                            id2indices[uid].append(i_bsz)
 
                         kept_prompt_uids = []
                         for key_uid, acc_this_uid in id2acc.items():
-                            acc_this_uid = torch.tensor(acc_this_uid)
+                            acc_this_uid = torch.stack([
+                                value.detach().float().cpu()
+                                for value in acc_this_uid
+                            ])
                             if (acc_this_uid == 0).all():
                                 all_negative_cnt += 1
                             elif (acc_this_uid == 1).all():
@@ -4582,6 +5148,80 @@ class RayReMASeparatedTrainer(object):
                                 kept_prompt_uids.append(key_uid)
                                 mixed_prompt_cnt += 1
                             total_prompt_cnt += 1
+
+                        if self.scoped_c3_grpo_enabled:
+                            causal_valid = new_batch.batch[
+                                'scoped_c3_causal_valid'
+                            ].bool().cpu()
+                            target_valid = new_batch.batch[
+                                'scoped_c3_target_valid'
+                            ].bool().cpu()
+                            scope_gate = new_batch.batch[
+                                'scoped_c3_scope_gate'
+                            ].bool().cpu()
+                            scoped_kept_prompt_uids = []
+                            for key_uid, sample_indices in id2indices.items():
+                                causal_indices = [
+                                    sample_idx
+                                    for sample_idx in sample_indices
+                                    if bool(causal_valid[sample_idx].item())
+                                ]
+                                if (
+                                    len(causal_indices) < 2
+                                    or not any(
+                                        bool(target_valid[sample_idx].item())
+                                        for sample_idx in sample_indices
+                                    )
+                                ):
+                                    continue
+                                causal_scores = (
+                                    acc_tensor[causal_indices]
+                                    .detach()
+                                    .float()
+                                    .cpu()
+                                )
+                                if (
+                                    bool(torch.isfinite(causal_scores).all().item())
+                                    and float(causal_scores.max().item())
+                                    > float(causal_scores.min().item())
+                                ):
+                                    has_train_signal = False
+                                    for sample_idx in sample_indices:
+                                        if not bool(target_valid[sample_idx].item()):
+                                            continue
+                                        peer_indices = [
+                                            peer_idx
+                                            for peer_idx in causal_indices
+                                            if peer_idx != sample_idx
+                                        ]
+                                        if not peer_indices:
+                                            continue
+                                        causal_delta = float(
+                                            acc_tensor[sample_idx].item()
+                                        ) - float(
+                                            acc_tensor[peer_indices]
+                                            .float()
+                                            .mean()
+                                            .item()
+                                        )
+                                        if (
+                                            causal_delta < 0.0
+                                            or (
+                                                causal_delta > 0.0
+                                                and bool(
+                                                    scope_gate[sample_idx].item()
+                                                )
+                                            )
+                                        ):
+                                            has_train_signal = True
+                                            break
+                                    if has_train_signal:
+                                        scoped_kept_prompt_uids.append(key_uid)
+                            kept_prompt_uids = scoped_kept_prompt_uids
+                            c3_trainable_prompt_cnt += len(kept_prompt_uids)
+                            c3_ineligible_prompt_cnt += (
+                                len(id2indices) - len(kept_prompt_uids)
+                            )
                     
                     if not self.config.algorithm.filter_groups.enable:
                         # if not enable group filter, keep all data
@@ -4631,6 +5271,16 @@ class RayReMASeparatedTrainer(object):
                                 mixed_prompt_cnt / total_prompt_cnt
                                 if total_prompt_cnt > 0 else 0.0
                             ),
+                            'rollout/c3_trainable_prompt_cnt': (
+                                c3_trainable_prompt_cnt
+                            ),
+                            'rollout/c3_ineligible_prompt_cnt': (
+                                c3_ineligible_prompt_cnt
+                            ),
+                            'rollout/c3_trainable_prompt_rate': (
+                                c3_trainable_prompt_cnt / total_prompt_cnt
+                                if total_prompt_cnt > 0 else 0.0
+                            ),
                         })
                     metrics.update(compute_reward_diagnostic_metrics(batch))
                     
@@ -4649,7 +5299,10 @@ class RayReMASeparatedTrainer(object):
                         # assign turn_level scores to the last token of each turn, w/ step_ids
                         #  and then i'll call compute_advantage to distribute the score to all
                         #  tokens of each step.
-                        if self.direct_scoped_grpo_enabled:
+                        if (
+                            self.scoped_c3_grpo_enabled
+                            or self.direct_scoped_grpo_enabled
+                        ):
                             token_level_scores = torch.zeros_like(
                                 agent_batch.batch['labels'],
                                 dtype=torch.float32,
@@ -4678,7 +5331,12 @@ class RayReMASeparatedTrainer(object):
                         # to all tokens of each step.
                         # for GRPO, we use turn_level_reward.sum(-1) as the outcome reward and then
                         # assign each label token the normalized advantage.
-                        if self.direct_scoped_grpo_enabled:
+                        if self.scoped_c3_grpo_enabled:
+                            batch = self._compute_scoped_c3_grpo_advantage(
+                                batch,
+                                metrics,
+                            )
+                        elif self.direct_scoped_grpo_enabled:
                             batch = self._compute_direct_scoped_grpo_advantage(
                                 batch,
                                 metrics,
@@ -4766,6 +5424,8 @@ class RayReMASeparatedTrainer(object):
                 all_positive_cnt = 0
                 mixed_prompt_cnt = 0
                 kept_traj_cnt = 0
+                c3_trainable_prompt_cnt = 0
+                c3_ineligible_prompt_cnt = 0
                 total_prompt_cnt = 0
 
                 if is_last_step:

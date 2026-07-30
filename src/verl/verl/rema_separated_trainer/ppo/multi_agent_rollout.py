@@ -72,6 +72,33 @@ def _pad_history(input_historys: List[List[Dict[str, str]]],
     return padded_history
 
 
+def _select_group_generation_sources(
+    sample_indices,
+    group_ids,
+    coupled_group_ids,
+):
+    """Choose one generation source for each coupled rollout group."""
+
+    coupled_group_ids = set(coupled_group_ids)
+    anchor_by_group = {}
+    generation_indices = []
+    source_by_sample = {}
+    for raw_idx in sample_indices:
+        idx = int(raw_idx)
+        group_id = group_ids[idx]
+        if group_id in coupled_group_ids:
+            source_idx = anchor_by_group.get(group_id)
+            if source_idx is None:
+                source_idx = idx
+                anchor_by_group[group_id] = idx
+                generation_indices.append(idx)
+        else:
+            source_idx = idx
+            generation_indices.append(idx)
+        source_by_sample[idx] = source_idx
+    return generation_indices, source_by_sample
+
+
 def _encode_conversation(
     conversation: List[Dict[str, str]],
     tokenizer: PreTrainedTokenizer,
@@ -399,6 +426,60 @@ class MultiAgentRollout:
             tokenizer=tokenizers[role],
             response_length=response_length,
         )
+
+    def _generate_from_hierarchical_chat_map(
+        self,
+        role: str,
+        sample_indices,
+        chat_by_idx,
+        tokenizers: Dict[str, PreTrainedTokenizer],
+        meta_info: Dict,
+        response_length: int,
+        max_new_tokens: Optional[int],
+        group_ids,
+        coupled_group_ids,
+    ):
+        """Generate once per coupled group and copy the sampled action to peers."""
+
+        generation_indices, source_by_sample = _select_group_generation_sources(
+            sample_indices,
+            group_ids,
+            coupled_group_ids,
+        )
+        if not generation_indices:
+            return {}
+
+        generation_chats = [chat_by_idx[idx] for idx in generation_indices]
+        outputs, tokens, stops, _, output_token_ids = self._generate_from_chat_list(
+            role,
+            generation_chats,
+            tokenizers,
+            meta_info,
+            response_length,
+            max_new_tokens=max_new_tokens,
+        )
+        generated = {
+            idx: (
+                outputs[local_idx],
+                tokens[local_idx],
+                stops[local_idx],
+                list(output_token_ids[local_idx]),
+            )
+            for local_idx, idx in enumerate(generation_indices)
+        }
+        records = {}
+        for raw_idx in sample_indices:
+            idx = int(raw_idx)
+            output, num_tokens, stop_reason, token_ids = generated[
+                source_by_sample[idx]
+            ]
+            records[idx] = (
+                output,
+                num_tokens,
+                stop_reason,
+                list(token_ids),
+            )
+        return records
 
     def _filter_truncated_prompts_before_generation(
         self,
@@ -1051,6 +1132,36 @@ class MultiAgentRollout:
         feedback_worker_reasoning_max_chars = int(
             hierarchy_config.get("feedback_worker_reasoning_max_chars", 2200)
         )
+        scoped_c3_config = hierarchy_config.get("scoped_c3_grpo", {})
+        c3_focal_role = prompts.meta_info.get("c3_focal_role")
+        c3_group_ids = list(
+            prompts.non_tensor_batch.get(
+                "uid",
+                np.arange(batch_size, dtype=object),
+            )
+        )
+        c3_active = bool(
+            scoped_c3_config.get("enable", False)
+            and not prompts.meta_info.get("validate", False)
+            and c3_focal_role in agent_roles
+            and "uid" in prompts.non_tensor_batch
+        )
+        configured_branch_turn = scoped_c3_config.get("branch_turn", "latest")
+        if configured_branch_turn == "latest":
+            c3_branch_turn = max(max_num_turns - 1, 0)
+        else:
+            c3_branch_turn = int(configured_branch_turn)
+            if not 0 <= c3_branch_turn < max_num_turns:
+                raise ValueError(
+                    f"scoped C3 branch_turn={c3_branch_turn} must be in "
+                    f"[0, {max_num_turns})"
+                )
+        if c3_active:
+            print(
+                "scoped C3 rollout: "
+                f"focal_role={c3_focal_role}, "
+                f"branch_turn={c3_branch_turn + 1}/{max_num_turns}"
+            )
         pass_question_to_workers = worker_context_mode in {
             "full_question",
             "question",
@@ -1103,38 +1214,76 @@ class MultiAgentRollout:
             if len(unfinished_indices) == 0:
                 break
 
+            branch_open_group_ids = set()
+
+            def groups_for_indices(indices):
+                return {
+                    c3_group_ids[int(idx)]
+                    for idx in indices
+                }
+
+            def coupled_groups_for(role, indices):
+                if not c3_active:
+                    return set()
+                present_groups = groups_for_indices(indices)
+                if i_turn < c3_branch_turn:
+                    return present_groups
+                if i_turn > c3_branch_turn:
+                    return set()
+                if role == c3_focal_role:
+                    return set()
+                return present_groups - branch_open_group_ids
+
+            def mark_branch_open(role, indices):
+                if (
+                    c3_active
+                    and i_turn == c3_branch_turn
+                    and role == c3_focal_role
+                ):
+                    branch_open_group_ids.update(groups_for_indices(indices))
+
             # 1. Decompose or revise the plan using previous round feedback.
-            decomposer_chats = []
+            decomposer_chats_by_idx = {}
             for idx in unfinished_indices:
                 content = f"Question:\n{questions[idx]}"
                 if previous_feedback[idx]:
                     content += f"\n\n{previous_feedback[idx]}"
-                decomposer_chats.append(build_prompt(decomposer_role, idx, content))
-            (
-                decomposer_outputs,
-                decomposer_tokens,
-                decomposer_stops,
-                _,
-                decomposer_token_ids,
-            ) = self._generate_from_chat_list(
+                decomposer_chats_by_idx[idx] = build_prompt(
+                    decomposer_role,
+                    idx,
+                    content,
+                )
+            decomposer_records = self._generate_from_hierarchical_chat_map(
                 decomposer_role,
-                decomposer_chats,
+                unfinished_indices,
+                decomposer_chats_by_idx,
                 tokenizers,
                 prompts.meta_info,
                 response_length,
                 max_new_tokens=decomposer_max_new_tokens,
+                group_ids=c3_group_ids,
+                coupled_group_ids=coupled_groups_for(
+                    decomposer_role,
+                    unfinished_indices,
+                ),
             )
+            mark_branch_open(decomposer_role, unfinished_indices)
             current_plan = {}
-            for local_idx, idx in enumerate(unfinished_indices):
-                output = decomposer_outputs[local_idx]
+            for idx in unfinished_indices:
+                output, num_tokens, stop_reason, token_ids = decomposer_records[idx]
                 current_plan[idx] = output
                 record_prompt_and_output(
-                    idx, decomposer_role, decomposer_chats[local_idx], output,
-                    decomposer_tokens[local_idx], decomposer_stops[local_idx],
-                    decomposer_token_ids[local_idx])
+                    idx,
+                    decomposer_role,
+                    decomposer_chats_by_idx[idx],
+                    output,
+                    num_tokens,
+                    stop_reason,
+                    token_ids,
+                )
 
             # 2. Select workers for each subtask.
-            selector_chats = []
+            selector_chats_by_idx = {}
             parsed_subtasks = {}
             for idx in unfinished_indices:
                 subtasks = self._extract_subtasks(
@@ -1142,7 +1291,7 @@ class MultiAgentRollout:
                     max_subtasks=max_planned_subtasks,
                 )
                 parsed_subtasks[idx] = subtasks
-                selector_chats.append(build_prompt(
+                selector_chats_by_idx[idx] = build_prompt(
                     selector_role,
                     idx,
                     (
@@ -1150,30 +1299,36 @@ class MultiAgentRollout:
                         f"Plan:\n{current_plan[idx]}\n\n"
                         f"Available workers:\n{worker_spec_text}"
                     ),
-                ))
-            (
-                selector_outputs,
-                selector_tokens,
-                selector_stops,
-                _,
-                selector_token_ids,
-            ) = self._generate_from_chat_list(
+                )
+            selector_records = self._generate_from_hierarchical_chat_map(
                 selector_role,
-                selector_chats,
+                unfinished_indices,
+                selector_chats_by_idx,
                 tokenizers,
                 prompts.meta_info,
                 response_length,
                 max_new_tokens=selector_max_new_tokens,
+                group_ids=c3_group_ids,
+                coupled_group_ids=coupled_groups_for(
+                    selector_role,
+                    unfinished_indices,
+                ),
             )
+            mark_branch_open(selector_role, unfinished_indices)
             ordered_stages_by_idx = {}
             selector_output_by_idx = {}
-            for local_idx, idx in enumerate(unfinished_indices):
-                output = selector_outputs[local_idx]
+            for idx in unfinished_indices:
+                output, num_tokens, stop_reason, token_ids = selector_records[idx]
                 selector_output_by_idx[idx] = output
                 record_prompt_and_output(
-                    idx, selector_role, selector_chats[local_idx], output,
-                    selector_tokens[local_idx], selector_stops[local_idx],
-                    selector_token_ids[local_idx])
+                    idx,
+                    selector_role,
+                    selector_chats_by_idx[idx],
+                    output,
+                    num_tokens,
+                    stop_reason,
+                    token_ids,
+                )
                 ordered_stages_by_idx[idx] = self._parse_ordered_worker_stages(
                     output, parsed_subtasks[idx], stage_roles, worker_types, default_worker)
                 if stage_roles:
@@ -1210,7 +1365,6 @@ class MultiAgentRollout:
                     if not stage_indices:
                         continue
 
-                    worker_chats = []
                     worker_chats_by_idx = {}
                     stage_subtasks_by_idx = {}
                     worker_type_by_idx = {}
@@ -1283,11 +1437,11 @@ class MultiAgentRollout:
                             ),
                             system_prompts.get("finalizer") if is_final_stage else None,
                         )
-                        worker_chats.append(chat)
                         worker_chats_by_idx[idx] = chat
-                    outputs, tokens, stops, _, output_token_ids = self._generate_from_chat_list(
+                    stage_records = self._generate_from_hierarchical_chat_map(
                         stage_role,
-                        worker_chats,
+                        stage_indices,
+                        worker_chats_by_idx,
                         tokenizers,
                         prompts.meta_info,
                         response_length,
@@ -1299,16 +1453,22 @@ class MultiAgentRollout:
                             )
                             else worker_max_new_tokens
                         ),
+                        group_ids=c3_group_ids,
+                        coupled_group_ids=coupled_groups_for(
+                            stage_role,
+                            stage_indices,
+                        ),
                     )
-                    for local_idx, idx in enumerate(stage_indices):
-                        output = outputs[local_idx]
+                    mark_branch_open(stage_role, stage_indices)
+                    for idx in stage_indices:
+                        output, num_tokens, stop_reason, token_ids = stage_records[idx]
                         worker_results[idx][stage_role] = output
                         worker_records[idx][stage_role] = (
                             worker_chats_by_idx[idx],
                             output,
-                            tokens[local_idx],
-                            stops[local_idx],
-                            output_token_ids[local_idx],
+                            num_tokens,
+                            stop_reason,
+                            token_ids,
                             [subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]],
                         )
                         subtask_ids = ", ".join([subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]])
@@ -1318,10 +1478,12 @@ class MultiAgentRollout:
                         latest_outputs[idx] = output
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
-                            if self.config.stop_when_truncated and stops[local_idx] == "length":
+                            if self.config.stop_when_truncated and stop_reason == "length":
                                 finish_flags[idx] = True
                                 finish_reason[idx] = "stop_when_truncated"
                             elif (
+                                (not c3_active or i_turn >= c3_branch_turn)
+                                and
                                 _has_usable_final_boxed_answer(output)
                                 and _final_uses_worker_local_result(output, previous_completed_results)
                             ):
