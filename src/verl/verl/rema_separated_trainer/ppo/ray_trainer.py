@@ -1903,7 +1903,12 @@ class RayReMASeparatedTrainer(object):
             raise ValueError(
                 "Scoped C3 rollout did not return c3_action_turn metadata"
             )
-        action_turns = torch.as_tensor(action_turns, dtype=torch.long)
+        # DataProto concatenation/slicing may preserve scalar metadata in an
+        # object-dtype NumPy array. Normalize values before creating a tensor.
+        action_turns = torch.tensor(
+            [int(value) for value in action_turns],
+            dtype=torch.long,
+        )
         configured_branch_turn = self.scoped_c3_grpo_config.get(
             'branch_turn',
             'latest',
