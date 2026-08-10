@@ -1550,39 +1550,82 @@ class RayReMASeparatedTrainer(object):
                 max(len(hierarchy.get('stage_roles', [])) - 1, 1),
             )
         )
-        history = data_batch.non_tensor_batch['history'][sample_idx]
-        plan_message = self._cpcr_latest_role_message(history, decomposer_role)
-        worker_message = self._cpcr_latest_role_message(history, role)
-        if plan_message is None or worker_message is None:
-            return None
-
-        assigned_subtask_ids = worker_message.get('assigned_subtasks', [])
-        if isinstance(assigned_subtask_ids, np.ndarray):
-            assigned_subtask_ids = assigned_subtask_ids.tolist()
-        if not isinstance(assigned_subtask_ids, (list, tuple)):
-            return None
-        assigned_subtask_ids = [
-            str(subtask_id).upper()
-            for subtask_id in assigned_subtask_ids
-            if str(subtask_id).strip()
-        ]
-        if not assigned_subtask_ids:
-            return None
-
-        parsed_subtasks = MultiAgentRollout._extract_subtasks(
-            plan_message['content'],
-            max_subtasks=max_planned_subtasks,
+        c3_turns = data_batch.non_tensor_batch.get('c3_action_turn')
+        use_c3_snapshot = bool(
+            c3_turns is not None
+            and int(c3_turns[sample_idx]) >= 0
+            and data_batch.meta_info.get('c3_focal_role') == role
         )
-        subtask_map = {
-            str(subtask_id).upper(): description
-            for subtask_id, description in parsed_subtasks
-        }
-        if any(subtask_id not in subtask_map for subtask_id in assigned_subtask_ids):
-            return None
-        assigned_subtasks = [
-            (subtask_id, subtask_map[subtask_id])
-            for subtask_id in assigned_subtask_ids
-        ]
+        if use_c3_snapshot:
+            raw_assigned_subtasks = data_batch.non_tensor_batch[
+                'c3_action_assigned_subtasks'
+            ][sample_idx]
+            if isinstance(raw_assigned_subtasks, np.ndarray):
+                raw_assigned_subtasks = raw_assigned_subtasks.tolist()
+            assigned_subtasks = []
+            for item in raw_assigned_subtasks:
+                if isinstance(item, np.ndarray):
+                    item = item.tolist()
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    return None
+                subtask_id, description = item
+                if str(subtask_id).strip() and str(description).strip():
+                    assigned_subtasks.append(
+                        (str(subtask_id).upper(), str(description))
+                    )
+            if not assigned_subtasks:
+                return None
+            worker_message = {
+                'assigned_subtasks': [
+                    subtask_id for subtask_id, _ in assigned_subtasks
+                ],
+                'stop_reason': data_batch.non_tensor_batch[
+                    'c3_action_stop_reason'
+                ][sample_idx],
+            }
+        else:
+            history = data_batch.non_tensor_batch['history'][sample_idx]
+            plan_message = self._cpcr_latest_role_message(
+                history,
+                decomposer_role,
+            )
+            worker_message = self._cpcr_latest_role_message(history, role)
+            if plan_message is None or worker_message is None:
+                return None
+
+            assigned_subtask_ids = worker_message.get(
+                'assigned_subtasks',
+                [],
+            )
+            if isinstance(assigned_subtask_ids, np.ndarray):
+                assigned_subtask_ids = assigned_subtask_ids.tolist()
+            if not isinstance(assigned_subtask_ids, (list, tuple)):
+                return None
+            assigned_subtask_ids = [
+                str(subtask_id).upper()
+                for subtask_id in assigned_subtask_ids
+                if str(subtask_id).strip()
+            ]
+            if not assigned_subtask_ids:
+                return None
+
+            parsed_subtasks = MultiAgentRollout._extract_subtasks(
+                plan_message['content'],
+                max_subtasks=max_planned_subtasks,
+            )
+            subtask_map = {
+                str(subtask_id).upper(): description
+                for subtask_id, description in parsed_subtasks
+            }
+            if any(
+                subtask_id not in subtask_map
+                for subtask_id in assigned_subtask_ids
+            ):
+                return None
+            assigned_subtasks = [
+                (subtask_id, subtask_map[subtask_id])
+                for subtask_id in assigned_subtask_ids
+            ]
         assigned_subtasks_text = MultiAgentRollout._format_subtasks(
             assigned_subtasks
         )
@@ -1635,7 +1678,18 @@ class RayReMASeparatedTrainer(object):
             if prompt_pair is None:
                 continue
             factual_chat, counterfactual_chat, worker_message = prompt_pair
-            turn_idx = int(data_batch.non_tensor_batch['num_turns'][sample_idx]) - 1
+            c3_action_turns = data_batch.non_tensor_batch.get('c3_action_turn')
+            if (
+                c3_action_turns is not None
+                and int(c3_action_turns[sample_idx]) >= 0
+                and data_batch.meta_info.get('c3_focal_role') == role
+            ):
+                turn_idx = int(c3_action_turns[sample_idx])
+            else:
+                turn_idx = (
+                    int(data_batch.non_tensor_batch['num_turns'][sample_idx])
+                    - 1
+                )
             if turn_idx < 0:
                 continue
             action_token_ids = self._cpcr_action_token_ids(
@@ -1844,6 +1898,29 @@ class RayReMASeparatedTrainer(object):
         batch_size = len(data_batch)
         outcome_scores = reward_tensor_map['acc'].float().cpu()
         action_present = self._c3_action_present_mask(data_batch, role)
+        action_turns = data_batch.non_tensor_batch.get('c3_action_turn')
+        if action_turns is None:
+            raise ValueError(
+                "Scoped C3 rollout did not return c3_action_turn metadata"
+            )
+        action_turns = torch.as_tensor(action_turns, dtype=torch.long)
+        configured_branch_turn = self.scoped_c3_grpo_config.get(
+            'branch_turn',
+            'latest',
+        )
+        expected_branch_turn = (
+            int(self.config.actor_rollout_ref.rollout.max_num_turns) - 1
+            if configured_branch_turn == 'latest'
+            else int(configured_branch_turn)
+        )
+        wrong_action_turn = action_present & (
+            action_turns != expected_branch_turn
+        )
+        if bool(wrong_action_turn.any().item()):
+            raise ValueError(
+                "Scoped C3 selected an action from a different turn than "
+                f"branch_turn={expected_branch_turn}"
+            )
         exact_prefix = self._c3_exact_prefix_mask(
             data_batch,
             role,
@@ -1914,6 +1991,12 @@ class RayReMASeparatedTrainer(object):
         metrics[f'{prefix}/tss_required'] = float(tss_required)
         metrics[f'{prefix}/action_present_count'] = float(
             action_present.sum().item()
+        )
+        metrics[f'{prefix}/selected_action_turn'] = float(
+            expected_branch_turn + 1
+        )
+        metrics[f'{prefix}/selected_action_turn_mismatch_count'] = float(
+            wrong_action_turn.sum().item()
         )
         metrics[f'{prefix}/exact_prefix_sample_count'] = float(
             exact_prefix.sum().item()

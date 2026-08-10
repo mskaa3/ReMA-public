@@ -128,7 +128,7 @@ actor_rollout_ref:
     max_num_turns: 3
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     do_sample: True
-    n: 32
+    n: 16
     engine_kwargs:
       vllm:
         swap_space: null
@@ -267,13 +267,14 @@ algorithm:
     # Correct final answers that do not use worker LOCAL_RESULTs keep this
     # fraction of raw_score; using worker results restores the full raw_score.
     final_raw_score_usage_floor: 0.5
-    # Exact fixed-prefix credit. Rollouts for one UID share the hierarchy up to
-    # the currently trained role in the latest turn, branch at that role, and
-    # independently generate the remaining suffix. Non-final worker positives
-    # additionally pass the existing stitched local-vs-full-task TSS gate.
+    # Exact fixed-prefix credit. Rollouts for one UID branch at the currently
+    # trained role in the first turn and independently generate the complete
+    # remaining suffix. PPO updates that first-turn action from the final
+    # outcome; later rounds remain available for repair and backtracking.
+    # Non-final worker positives additionally pass the stitched TSS gate.
     scoped_c3_grpo:
       enable: True
-      branch_turn: latest
+      branch_turn: 0
       mixed_groups_only: True
       normalize_advantages: True
       scope_threshold: 0.0

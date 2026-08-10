@@ -183,11 +183,11 @@ def _encode_latest_conversation(
     max_prompt_length: int,
     max_total_length: int,
 ):
-    """Encode the exact latest hierarchical prompt/action pair.
+    """Encode one exact hierarchical prompt/action pair.
 
     Hierarchical stages are generated from independent role-specific prompts,
     so concatenating several rounds into one chat changes the conditioning
-    distribution. Keep the terminal round as one factual PPO action instead.
+    distribution. Keep the selected round as one factual PPO action instead.
     """
 
     ignore_index = -100
@@ -1175,6 +1175,7 @@ class MultiAgentRollout:
         }
         previous_feedback = [None for _ in range(batch_size)]
         latest_outputs = ["" for _ in range(batch_size)]
+        c3_action_records = [None for _ in range(batch_size)]
 
         def append_history(idx, role, content, num_gen_tokens, stop_reason, token_ids):
             history[idx].append({
@@ -1206,6 +1207,34 @@ class MultiAgentRollout:
         ):
             conversation_history[role][idx] = chat
             append_history(idx, role, output, num_gen_tokens, stop_reason, token_ids)
+
+        def record_c3_branch_action(
+            idx,
+            role,
+            chat,
+            output,
+            num_gen_tokens,
+            stop_reason,
+            token_ids,
+            *,
+            assigned_subtasks=None,
+        ):
+            if not (
+                c3_active
+                and i_turn == c3_branch_turn
+                and role == c3_focal_role
+            ):
+                return
+            c3_action_records[idx] = {
+                "role": role,
+                "turn_idx": i_turn,
+                "chat": [dict(message) for message in chat],
+                "output": output,
+                "num_gen_tokens": num_gen_tokens,
+                "stop_reason": stop_reason,
+                "token_ids": list(token_ids),
+                "assigned_subtasks": list(assigned_subtasks or []),
+            }
 
         for i_turn in range(max_num_turns):
             unfinished_indices = np.where(~finish_flags)[0]
@@ -1281,6 +1310,15 @@ class MultiAgentRollout:
                     stop_reason,
                     token_ids,
                 )
+                record_c3_branch_action(
+                    idx,
+                    decomposer_role,
+                    decomposer_chats_by_idx[idx],
+                    output,
+                    num_tokens,
+                    stop_reason,
+                    token_ids,
+                )
 
             # 2. Select workers for each subtask.
             selector_chats_by_idx = {}
@@ -1321,6 +1359,15 @@ class MultiAgentRollout:
                 output, num_tokens, stop_reason, token_ids = selector_records[idx]
                 selector_output_by_idx[idx] = output
                 record_prompt_and_output(
+                    idx,
+                    selector_role,
+                    selector_chats_by_idx[idx],
+                    output,
+                    num_tokens,
+                    stop_reason,
+                    token_ids,
+                )
+                record_c3_branch_action(
                     idx,
                     selector_role,
                     selector_chats_by_idx[idx],
@@ -1462,6 +1509,16 @@ class MultiAgentRollout:
                     mark_branch_open(stage_role, stage_indices)
                     for idx in stage_indices:
                         output, num_tokens, stop_reason, token_ids = stage_records[idx]
+                        record_c3_branch_action(
+                            idx,
+                            stage_role,
+                            worker_chats_by_idx[idx],
+                            output,
+                            num_tokens,
+                            stop_reason,
+                            token_ids,
+                            assigned_subtasks=stage_subtasks_by_idx[idx],
+                        )
                         worker_results[idx][stage_role] = output
                         worker_records[idx][stage_role] = (
                             worker_chats_by_idx[idx],
@@ -1525,7 +1582,7 @@ class MultiAgentRollout:
                     worker_reasoning_max_chars=feedback_worker_reasoning_max_chars,
                 )
 
-        return latest_outputs, conversation_history
+        return latest_outputs, conversation_history, c3_action_records
 
     def _mark_unfinished_as_max_turns(self, finish_flags: np.ndarray,
                                       finish_reason: List[Optional[str]]):
@@ -1544,6 +1601,8 @@ class MultiAgentRollout:
         max_num_turns: int,
         finish_reason: List[Optional[str]],
         latest_round_only: bool = False,
+        c3_focal_role: Optional[str] = None,
+        c3_action_records: Optional[List[Optional[Dict]]] = None,
     ):
         # add last round output to make full conversation
         for i_batch in range(len(last_round_responses)):
@@ -1575,12 +1634,30 @@ class MultiAgentRollout:
         for i_batch in range(len(last_round_responses)):
             for role in conversation_history.keys():
                 if latest_round_only:
-                    role_num_gen_tokens = num_gen_token_lst[role][i_batch]
-                    role_stop_reasons = stop_reason_lst[role][i_batch]
-                    latest_turn_idx = max(len(role_num_gen_tokens) - 1, 0)
-                    latest_stop_reason = (
-                        role_stop_reasons[-1] if role_stop_reasons else "stop"
-                    )
+                    selected_record = None
+                    if (
+                        role == c3_focal_role
+                        and c3_action_records is not None
+                    ):
+                        selected_record = c3_action_records[i_batch]
+                    if selected_record is not None:
+                        selected_turn_idx = int(selected_record["turn_idx"])
+                        selected_stop_reason = selected_record["stop_reason"]
+                        selected_conversation = [
+                            dict(message)
+                            for message in selected_record["chat"]
+                        ] + [{
+                            "role": "assistant",
+                            "content": selected_record["output"],
+                        }]
+                    else:
+                        role_num_gen_tokens = num_gen_token_lst[role][i_batch]
+                        role_stop_reasons = stop_reason_lst[role][i_batch]
+                        selected_turn_idx = max(len(role_num_gen_tokens) - 1, 0)
+                        selected_stop_reason = (
+                            role_stop_reasons[-1] if role_stop_reasons else "stop"
+                        )
+                        selected_conversation = conversation_history[role][i_batch]
                     (
                         input_ids,
                         labels,
@@ -1590,22 +1667,22 @@ class MultiAgentRollout:
                         prompt_was_truncated,
                         response_was_truncated,
                     ) = _encode_latest_conversation(
-                        conversation_history[role][i_batch],
+                        selected_conversation,
                         tokenizers[role],
-                        latest_stop_reason,
-                        latest_turn_idx,
+                        selected_stop_reason,
+                        selected_turn_idx,
                         self.config.prompt_length,
                         self.config.response_length + self.config.prompt_length,
                     )
-                    if latest_turn_idx >= max_num_turns:
+                    if selected_turn_idx >= max_num_turns:
                         raise ValueError(
-                            f"Latest turn index {latest_turn_idx} exceeds "
+                            f"Selected turn index {selected_turn_idx} exceeds "
                             f"configured max_num_turns={max_num_turns}"
                         )
                     sparse_num_gen_tokens = [0] * max_num_turns
                     sparse_stop_reasons = ["not_encoded"] * max_num_turns
-                    sparse_num_gen_tokens[latest_turn_idx] = encoded_num_gen_tokens
-                    sparse_stop_reasons[latest_turn_idx] = encoded_stop_reason
+                    sparse_num_gen_tokens[selected_turn_idx] = encoded_num_gen_tokens
+                    sparse_stop_reasons[selected_turn_idx] = encoded_stop_reason
                 else:
                     input_ids, labels, step_ids = _encode_conversation(
                         conversation_history[role][i_batch],
@@ -1745,6 +1822,8 @@ class MultiAgentRollout:
         agent_roles: List[str],
         prompts: DataProto,
         conversation_history: Dict[str, List[List[Dict[str, str]]]],
+        c3_focal_role: Optional[str] = None,
+        c3_action_records: Optional[List[Optional[Dict]]] = None,
     ):
         """Prepare final output"""
 
@@ -1772,18 +1851,45 @@ class MultiAgentRollout:
 
         for role in agent_roles:
             role_action_token_ids = np.empty(len(history), dtype=object)
-            role_action_token_ids[:] = [
-                next(
-                    (
-                        list(message.get("token_ids", []))
-                        for message in reversed(sample_history)
-                        if isinstance(message, dict) and message.get("role") == role
-                    ),
-                    [],
-                )
-                for sample_history in history
-            ]
+            selected_role_records = (
+                c3_action_records
+                if role == c3_focal_role and c3_action_records is not None
+                else None
+            )
+            if selected_role_records is not None:
+                role_action_token_ids[:] = [
+                    list(record.get("token_ids", [])) if record else []
+                    for record in selected_role_records
+                ]
+            else:
+                role_action_token_ids[:] = [
+                    next(
+                        (
+                            list(message.get("token_ids", []))
+                            for message in reversed(sample_history)
+                            if isinstance(message, dict) and message.get("role") == role
+                        ),
+                        [],
+                    )
+                    for sample_history in history
+                ]
             non_tensor_batch[f"{role}_action_token_ids"] = role_action_token_ids
+
+        if c3_focal_role and c3_action_records is not None:
+            non_tensor_batch["c3_action_turn"] = np.array([
+                int(record["turn_idx"]) if record else -1
+                for record in c3_action_records
+            ], dtype=np.int64)
+            c3_assigned_subtasks = np.empty(len(c3_action_records), dtype=object)
+            c3_assigned_subtasks[:] = [
+                list(record.get("assigned_subtasks", [])) if record else []
+                for record in c3_action_records
+            ]
+            non_tensor_batch["c3_action_assigned_subtasks"] = c3_assigned_subtasks
+            non_tensor_batch["c3_action_stop_reason"] = np.array([
+                record.get("stop_reason", "stop") if record else "stop"
+                for record in c3_action_records
+            ], dtype=object)
 
         # Keep raw sampled token ids out of the verbose public history. CPCR
         # receives them through the dedicated per-role arrays above.
@@ -1798,12 +1904,22 @@ class MultiAgentRollout:
         max_history_length = max(2 * self.config.max_num_turns,
                                  len(agent_roles) * self.config.max_num_turns)
         padded_history = _pad_history(clean_history, max_history_length)
-        padded_conversation_history = {
-            role:
-            _pad_history(conversation_history[role],
-                         max_history_length)
-            for role in agent_roles
-        }
+        padded_conversation_history = {}
+        for role in agent_roles:
+            role_conversations = conversation_history[role]
+            if (
+                role == c3_focal_role
+                and c3_action_records is not None
+            ):
+                role_conversations = [
+                    [dict(message) for message in record["chat"]]
+                    if record else conversation_history[role][sample_idx]
+                    for sample_idx, record in enumerate(c3_action_records)
+                ]
+            padded_conversation_history[role] = _pad_history(
+                role_conversations,
+                max_history_length,
+            )
 
         non_tensor_batch["history"] = padded_history
         for role in agent_roles:
@@ -1934,8 +2050,14 @@ class MultiAgentRollout:
         # Multi-turn dialogue generation
         # this will change the history, finish_flags, finish_reason
         hierarchy_config = prompts.meta_info.get("hierarchy", {})
+        c3_focal_role = None
+        c3_action_records = None
         if hierarchy_config.get("enable", False):
-            latest_outputs, conversation_history = self._run_hierarchical_conversation(
+            (
+                latest_outputs,
+                conversation_history,
+                c3_action_records,
+            ) = self._run_hierarchical_conversation(
                 prompts=prompts,
                 tokenizers=tokenizers,
                 max_num_turns=max_num_turns,
@@ -1948,6 +2070,7 @@ class MultiAgentRollout:
                 response_length=self.config.response_length,
                 finish_flag=finish_flag,
             )
+            c3_focal_role = prompts.meta_info.get("c3_focal_role")
         else:
             latest_outputs, conversation_history = self._run_multi_turn_conversation(
                 prompts=prompts,
@@ -1994,6 +2117,8 @@ class MultiAgentRollout:
             max_num_turns,
             finish_reason,
             latest_round_only=hierarchy_config.get("enable", False),
+            c3_focal_role=c3_focal_role,
+            c3_action_records=c3_action_records,
         )
 
         # Prepare return results
@@ -2005,6 +2130,8 @@ class MultiAgentRollout:
             agent_roles=agent_roles,
             prompts=prompts,
             conversation_history=conversation_history,
+            c3_focal_role=c3_focal_role,
+            c3_action_records=c3_action_records,
         )
         
         if self.config.add_checking and not hierarchy_config.get("enable", False):
