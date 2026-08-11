@@ -86,6 +86,12 @@ def compute_reward_diagnostic_metrics(batch: DataProto) -> Dict[str, Any]:
         'final_worker_usage_gate': 'reward/final/worker_usage_gate',
         'final_local_bonus_raw': 'reward/final/local_bonus_raw',
         'final_local_bonus': 'reward/final/local_bonus',
+        'accept_revise_enabled': 'rollout/accept_revise/enabled',
+        'accept_revise_accepted': 'rollout/accept_revise/accept_rate',
+        'accept_revise_decision_valid': 'rollout/accept_revise/decision_valid_rate',
+        'accept_revise_attempted_round_count': 'rollout/accept_revise/attempted_round_count',
+        'accept_revise_candidate_source_round': 'rollout/accept_revise/candidate_source_round',
+        'accept_revise_accepted_correct': 'rollout/accept_revise/accepted_correct_rate',
     }
     for source_key, target_key in scalar_aliases.items():
         _log_tensor_metric(metrics, batch, source_key, target_key)
@@ -245,6 +251,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             torch.mean((turn_finished == 2).float()).detach().item(),
         'num_turns/stop_when_truncated':
             torch.mean((turn_finished == 3).float()).detach().item(),
+        'num_turns/decomposer_accept':
+            torch.mean((turn_finished == 5).float()).detach().item(),
         'completion_tokens/mean':
             torch.mean(completion_tokens).detach().item(),
         'completion_tokens/max':

@@ -34,6 +34,19 @@ def _has_usable_final_boxed_answer(text: str) -> bool:
     return not any(marker in normalized for marker in missing_info_markers)
 
 
+def _parse_decomposer_decision(text: str, has_candidate: bool):
+    """Parse the small ACCEPT/REVISE protocol, defaulting safely to revision."""
+    match = re.search(
+        r"(?im)^\s*DECISION\s*:\s*(ACCEPT|REVISE)\b",
+        text if isinstance(text, str) else "",
+    )
+    requested = match.group(1).upper() if match else "REVISE"
+    format_valid = match is not None
+    forced_revise = requested == "ACCEPT" and not has_candidate
+    effective = "REVISE" if forced_revise else requested
+    return requested, effective, format_valid, forced_revise
+
+
 def _extract_local_result_values(text: str) -> List[str]:
     if not isinstance(text, str):
         return []
@@ -972,6 +985,36 @@ class MultiAgentRollout:
         return "WORKER RESULTS:\n" + "\n\n".join(sections)
 
     @staticmethod
+    def _format_final_question_block(question: str, final_context_mode: str) -> str:
+        modes_without_question = {
+            "notes_only",
+            "notes",
+            "no_question",
+            "worker_results_only",
+            "workers_only",
+            "local_results_only",
+            "plan_and_worker_results",
+            "parsed_plan_and_worker_results",
+        }
+        if str(final_context_mode).lower() in modes_without_question:
+            return ""
+        return f"Question:\n{question}\n\n"
+
+    def _format_plan_and_worker_results_for_final(
+        self,
+        subtasks: List[Tuple[str, str]],
+        completed_results: List[Tuple[str, str, str, str]],
+    ) -> str:
+        sections = []
+        parsed_plan = self._format_subtasks(subtasks)
+        if parsed_plan:
+            sections.append(f"PARSED PLAN:\n{parsed_plan}")
+        worker_results = self._format_worker_results_for_final(completed_results)
+        if worker_results:
+            sections.append(worker_results)
+        return "\n\n".join(sections)
+
+    @staticmethod
     def _format_final_notes(decomposer_output: str, worker_outputs: str) -> str:
         note_parts = [
             part.strip()
@@ -1036,6 +1079,7 @@ class MultiAgentRollout:
         last_worker_output: str,
         worker_roles: List[str],
         worker_reasoning_max_chars: int = 2200,
+        final_reasoning_max_chars: int = 1400,
     ) -> str:
         sections = []
         if plan and plan.strip():
@@ -1063,17 +1107,31 @@ class MultiAgentRollout:
             sections.append("PREVIOUS WORKER RESULTS:\n" + "\n\n".join(worker_sections))
 
         if last_worker_output and last_worker_output.strip():
-            compact_final = last_worker_output.strip()
+            final_output = last_worker_output.strip()
             boxed_matches = re.findall(
                 r"\\boxed\s*\{(?:[^{}]|\{[^{}]*\})*\}",
-                compact_final,
+                final_output,
                 re.DOTALL,
             )
             if boxed_matches:
-                compact_final = boxed_matches[-1]
+                final_answer = boxed_matches[-1]
+                answer_start = final_output.rfind(final_answer)
+                final_diagnosis = (
+                    final_output[:answer_start] + final_output[answer_start + len(final_answer):]
+                ).strip()
             else:
-                compact_final = compact_final[-600:]
-            sections.append(f"PREVIOUS FINAL ATTEMPT:\n{compact_final}")
+                final_answer = ""
+                final_diagnosis = final_output
+            final_diagnosis = self._compact_feedback_text(
+                final_diagnosis,
+                final_reasoning_max_chars,
+            )
+            if final_diagnosis:
+                sections.append(
+                    f"PREVIOUS FINAL DIAGNOSIS:\n{final_diagnosis}"
+                )
+            if final_answer:
+                sections.append(f"PREVIOUS FINAL ANSWER:\n{final_answer}")
 
         if not sections:
             return ""
@@ -1132,6 +1190,11 @@ class MultiAgentRollout:
         feedback_worker_reasoning_max_chars = int(
             hierarchy_config.get("feedback_worker_reasoning_max_chars", 2200)
         )
+        feedback_final_reasoning_max_chars = int(
+            hierarchy_config.get("feedback_final_reasoning_max_chars", 1400)
+        )
+        accept_revise_config = hierarchy_config.get("accept_revise", {})
+        accept_revise_enabled = bool(accept_revise_config.get("enable", False))
         scoped_c3_config = hierarchy_config.get("scoped_c3_grpo", {})
         c3_focal_role = prompts.meta_info.get("c3_focal_role")
         c3_group_ids = list(
@@ -1176,15 +1239,34 @@ class MultiAgentRollout:
         previous_feedback = [None for _ in range(batch_size)]
         latest_outputs = ["" for _ in range(batch_size)]
         c3_action_records = [None for _ in range(batch_size)]
+        candidate_outputs = ["" for _ in range(batch_size)]
+        candidate_source_turn = [-1 for _ in range(batch_size)]
+        accepted = [False for _ in range(batch_size)]
+        decision_valid = [True for _ in range(batch_size)]
+        round_attempted = [
+            [False for _ in range(max_num_turns)]
+            for _ in range(batch_size)
+        ]
 
-        def append_history(idx, role, content, num_gen_tokens, stop_reason, token_ids):
-            history[idx].append({
+        def append_history(
+            idx,
+            role,
+            content,
+            num_gen_tokens,
+            stop_reason,
+            token_ids,
+            **metadata,
+        ):
+            message = {
                 "role": role,
                 "content": content,
                 "num_gen_tokens": num_gen_tokens,
                 "stop_reason": stop_reason,
                 "token_ids": token_ids,
-            })
+                "executed": metadata.pop("executed", True),
+            }
+            message.update(metadata)
+            history[idx].append(message)
 
         def build_prompt(role, idx, content):
             return [
@@ -1204,9 +1286,18 @@ class MultiAgentRollout:
             num_gen_tokens,
             stop_reason,
             token_ids,
+            **metadata,
         ):
             conversation_history[role][idx] = chat
-            append_history(idx, role, output, num_gen_tokens, stop_reason, token_ids)
+            append_history(
+                idx,
+                role,
+                output,
+                num_gen_tokens,
+                stop_reason,
+                token_ids,
+                **metadata,
+            )
 
         def record_c3_branch_action(
             idx,
@@ -1277,6 +1368,18 @@ class MultiAgentRollout:
                 content = f"Question:\n{questions[idx]}"
                 if previous_feedback[idx]:
                     content += f"\n\n{previous_feedback[idx]}"
+                if accept_revise_enabled:
+                    if candidate_source_turn[idx] >= 0:
+                        content += (
+                            "\n\nReview the previous final answer. Begin with "
+                            "DECISION: ACCEPT to keep it, or DECISION: REVISE "
+                            "to run a repaired plan."
+                        )
+                    else:
+                        content += (
+                            "\n\nNo previous final answer exists. Begin with "
+                            "DECISION: REVISE."
+                        )
                 decomposer_chats_by_idx[idx] = build_prompt(
                     decomposer_role,
                     idx,
@@ -1320,10 +1423,69 @@ class MultiAgentRollout:
                     token_ids,
                 )
 
+            revise_indices = list(unfinished_indices)
+            if accept_revise_enabled:
+                revise_indices = []
+                for idx in unfinished_indices:
+                    _requested, effective, valid, forced = _parse_decomposer_decision(
+                        current_plan[idx],
+                        has_candidate=candidate_source_turn[idx] >= 0,
+                    )
+                    decision_valid[idx] = valid and not forced
+                    if effective == "REVISE":
+                        revise_indices.append(idx)
+                        continue
+
+                    accepted[idx] = True
+                    latest_outputs[idx] = candidate_outputs[idx]
+                    finish_flags[idx] = True
+                    finish_reason[idx] = "decomposer_accept"
+
+                    selector_chat = build_prompt(
+                        selector_role,
+                        idx,
+                        "The decomposer accepted the previous final answer.",
+                    )
+                    record_prompt_and_output(
+                        idx,
+                        selector_role,
+                        selector_chat,
+                        "",
+                        0,
+                        "stop",
+                        [],
+                        executed=False,
+                        skipped_due_to_accept=True,
+                    )
+                    for stage_role in stage_roles:
+                        is_final_role = stage_role == stage_roles[-1]
+                        carried_output = candidate_outputs[idx] if is_final_role else ""
+                        stage_chat = build_prompt(
+                            stage_role,
+                            idx,
+                            "The decomposer accepted the previous final answer.",
+                        )
+                        record_prompt_and_output(
+                            idx,
+                            stage_role,
+                            stage_chat,
+                            carried_output,
+                            0,
+                            "stop",
+                            [],
+                            executed=False,
+                            skipped_due_to_accept=True,
+                            carried_forward=is_final_role,
+                            candidate_source_turn=candidate_source_turn[idx],
+                        )
+
+                if not revise_indices:
+                    continue
+
             # 2. Select workers for each subtask.
             selector_chats_by_idx = {}
             parsed_subtasks = {}
-            for idx in unfinished_indices:
+            for idx in revise_indices:
                 subtasks = self._extract_subtasks(
                     current_plan[idx],
                     max_subtasks=max_planned_subtasks,
@@ -1340,7 +1502,7 @@ class MultiAgentRollout:
                 )
             selector_records = self._generate_from_hierarchical_chat_map(
                 selector_role,
-                unfinished_indices,
+                revise_indices,
                 selector_chats_by_idx,
                 tokenizers,
                 prompts.meta_info,
@@ -1349,13 +1511,13 @@ class MultiAgentRollout:
                 group_ids=c3_group_ids,
                 coupled_group_ids=coupled_groups_for(
                     selector_role,
-                    unfinished_indices,
+                    revise_indices,
                 ),
             )
-            mark_branch_open(selector_role, unfinished_indices)
+            mark_branch_open(selector_role, revise_indices)
             ordered_stages_by_idx = {}
             selector_output_by_idx = {}
-            for idx in unfinished_indices:
+            for idx in revise_indices:
                 output, num_tokens, stop_reason, token_ids = selector_records[idx]
                 selector_output_by_idx[idx] = output
                 record_prompt_and_output(
@@ -1387,23 +1549,23 @@ class MultiAgentRollout:
 
             # 3. Execute selected worker stages sequentially. Stage roles encode
             # the order; each later worker sees previous results.
-            worker_results = {idx: {role: "" for role in stage_roles} for idx in unfinished_indices}
+            worker_results = {idx: {role: "" for role in stage_roles} for idx in revise_indices}
             worker_records = {
                 idx: {
                     role: None
                     for role in stage_roles
                 }
-                for idx in unfinished_indices
+                for idx in revise_indices
             }
-            completed_results_by_idx = {idx: [] for idx in unfinished_indices}
+            completed_results_by_idx = {idx: [] for idx in revise_indices}
             max_stage_count = max(
-                [len(ordered_stages_by_idx[idx]) for idx in unfinished_indices],
+                [len(ordered_stages_by_idx[idx]) for idx in revise_indices],
                 default=0,
             )
             for stage_idx in range(max_stage_count):
                 for stage_role in stage_roles:
                     stage_indices = [
-                        idx for idx in unfinished_indices
+                        idx for idx in revise_indices
                         if (
                             stage_idx < len(ordered_stages_by_idx[idx])
                             and ordered_stages_by_idx[idx][stage_idx][0] == stage_role
@@ -1421,10 +1583,10 @@ class MultiAgentRollout:
                         worker_type_by_idx[idx] = worker_type
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
-                            if final_context_mode in {"notes_only", "notes", "no_question"}:
-                                question_block = ""
-                            else:
-                                question_block = f"Question:\n{questions[idx]}\n\n"
+                            question_block = self._format_final_question_block(
+                                questions[idx],
+                                final_context_mode,
+                            )
                         elif pass_question_to_workers:
                             question_block = (
                                 f"Reference problem:\n{questions[idx]}\n\n"
@@ -1439,6 +1601,14 @@ class MultiAgentRollout:
                             if final_context_mode in {"worker_results_only", "workers_only", "local_results_only"}:
                                 work_so_far = self._format_worker_results_for_final(
                                     completed_results_by_idx[idx]
+                                )
+                            elif final_context_mode in {
+                                "plan_and_worker_results",
+                                "parsed_plan_and_worker_results",
+                            }:
+                                work_so_far = self._format_plan_and_worker_results_for_final(
+                                    parsed_subtasks[idx],
+                                    completed_results_by_idx[idx],
                                 )
                             else:
                                 work_so_far = self._format_final_notes(
@@ -1535,10 +1705,15 @@ class MultiAgentRollout:
                         latest_outputs[idx] = output
                         is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
                         if is_final_stage:
+                            candidate_outputs[idx] = output
+                            candidate_source_turn[idx] = i_turn
+                            round_attempted[idx][i_turn] = True
                             if self.config.stop_when_truncated and stop_reason == "length":
                                 finish_flags[idx] = True
                                 finish_reason[idx] = "stop_when_truncated"
                             elif (
+                                not accept_revise_enabled
+                                and
                                 (not c3_active or i_turn >= c3_branch_turn)
                                 and
                                 _has_usable_final_boxed_answer(output)
@@ -1548,12 +1723,21 @@ class MultiAgentRollout:
                                 finish_reason[idx] = "final_boxed_answer"
 
             # Keep exactly one history slot per role per hierarchical turn.
-            for idx in unfinished_indices:
+            for idx in revise_indices:
                 for stage_role in stage_roles:
                     record = worker_records[idx].get(stage_role)
                     if record is None:
                         chat = build_prompt(stage_role, idx, "No subtasks were assigned to this worker stage.")
-                        record_prompt_and_output(idx, stage_role, chat, "", 0, "stop", [])
+                        record_prompt_and_output(
+                            idx,
+                            stage_role,
+                            chat,
+                            "",
+                            0,
+                            "stop",
+                            [],
+                            executed=False,
+                        )
                     else:
                         (
                             chat,
@@ -1575,14 +1759,22 @@ class MultiAgentRollout:
                         if history[idx] and history[idx][-1].get("role") == stage_role:
                             history[idx][-1]["assigned_subtasks"] = assigned_subtask_ids
 
-            for idx in unfinished_indices:
+            for idx in revise_indices:
                 previous_feedback[idx] = self._format_hierarchical_feedback(
                     current_plan[idx], selector_output_by_idx[idx], worker_results[idx],
                     latest_outputs[idx], stage_roles,
                     worker_reasoning_max_chars=feedback_worker_reasoning_max_chars,
+                    final_reasoning_max_chars=feedback_final_reasoning_max_chars,
                 )
 
-        return latest_outputs, conversation_history, c3_action_records
+        protocol_state = {
+            "enabled": accept_revise_enabled,
+            "accepted": accepted,
+            "candidate_source_turn": candidate_source_turn,
+            "decision_valid": decision_valid,
+            "round_attempted": round_attempted,
+        }
+        return latest_outputs, conversation_history, c3_action_records, protocol_state
 
     def _mark_unfinished_as_max_turns(self, finish_flags: np.ndarray,
                                       finish_reason: List[Optional[str]]):
@@ -1603,6 +1795,7 @@ class MultiAgentRollout:
         latest_round_only: bool = False,
         c3_focal_role: Optional[str] = None,
         c3_action_records: Optional[List[Optional[Dict]]] = None,
+        last_round_executed: Optional[List[Dict[str, bool]]] = None,
     ):
         # add last round output to make full conversation
         for i_batch in range(len(last_round_responses)):
@@ -1674,6 +1867,15 @@ class MultiAgentRollout:
                         self.config.prompt_length,
                         self.config.response_length + self.config.prompt_length,
                     )
+                    selected_was_executed = (
+                        selected_record is not None
+                        or last_round_executed is None
+                        or bool(last_round_executed[i_batch].get(role, True))
+                    )
+                    if not selected_was_executed:
+                        labels = [-100] * len(labels)
+                        step_ids = [-100] * len(step_ids)
+                        encoded_num_gen_tokens = 0
                     if selected_turn_idx >= max_num_turns:
                         raise ValueError(
                             f"Selected turn index {selected_turn_idx} exceeds "
@@ -1719,6 +1921,8 @@ class MultiAgentRollout:
                 finish_reason_array.append(3)
             elif fr == "final_boxed_answer":
                 finish_reason_array.append(4)
+            elif fr == "decomposer_accept":
+                finish_reason_array.append(5)
             elif fr is None:
                 finish_reason_array.append(0)
             else:
@@ -1824,6 +2028,7 @@ class MultiAgentRollout:
         conversation_history: Dict[str, List[List[Dict[str, str]]]],
         c3_focal_role: Optional[str] = None,
         c3_action_records: Optional[List[Optional[Dict]]] = None,
+        protocol_state: Optional[Dict] = None,
     ):
         """Prepare final output"""
 
@@ -1848,6 +2053,29 @@ class MultiAgentRollout:
             len(h) // len(agent_roles) for h in history
         ]
         non_tensor_batch["response"] = latest_outputs
+        if protocol_state is not None:
+            non_tensor_batch["accept_revise_enabled"] = np.array(
+                [bool(protocol_state.get("enabled", False))] * len(history),
+                dtype=bool,
+            )
+            non_tensor_batch["accepted"] = np.asarray(
+                protocol_state.get("accepted", [False] * len(history)),
+                dtype=bool,
+            )
+            non_tensor_batch["candidate_source_turn"] = np.asarray(
+                protocol_state.get("candidate_source_turn", [-1] * len(history)),
+                dtype=np.int64,
+            )
+            non_tensor_batch["accept_revise_decision_valid"] = np.asarray(
+                protocol_state.get("decision_valid", [True] * len(history)),
+                dtype=bool,
+            )
+            round_attempted = np.empty(len(history), dtype=object)
+            round_attempted[:] = [
+                list(values)
+                for values in protocol_state.get("round_attempted", [])
+            ]
+            non_tensor_batch["round_attempted"] = round_attempted
 
         for role in agent_roles:
             role_action_token_ids = np.empty(len(history), dtype=object)
@@ -2052,11 +2280,13 @@ class MultiAgentRollout:
         hierarchy_config = prompts.meta_info.get("hierarchy", {})
         c3_focal_role = None
         c3_action_records = None
+        protocol_state = None
         if hierarchy_config.get("enable", False):
             (
                 latest_outputs,
                 conversation_history,
                 c3_action_records,
+                protocol_state,
             ) = self._run_hierarchical_conversation(
                 prompts=prompts,
                 tokenizers=tokenizers,
@@ -2094,6 +2324,10 @@ class MultiAgentRollout:
             m["role"]: m["content"]
             for m in h[-len(agent_roles):]
         } for h in history]
+        last_round_executed = [{
+            m["role"]: bool(m.get("executed", True))
+            for m in h[-len(agent_roles):]
+        } for h in history]
 
         # extract information from history record
         num_gen_token_lst = {role: [] for role in agent_roles}
@@ -2119,6 +2353,7 @@ class MultiAgentRollout:
             latest_round_only=hierarchy_config.get("enable", False),
             c3_focal_role=c3_focal_role,
             c3_action_records=c3_action_records,
+            last_round_executed=last_round_executed,
         )
 
         # Prepare return results
@@ -2132,6 +2367,7 @@ class MultiAgentRollout:
             conversation_history=conversation_history,
             c3_focal_role=c3_focal_role,
             c3_action_records=c3_action_records,
+            protocol_state=protocol_state,
         )
         
         if self.config.add_checking and not hierarchy_config.get("enable", False):

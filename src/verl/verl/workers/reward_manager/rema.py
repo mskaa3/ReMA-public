@@ -676,6 +676,75 @@ class ReMARewardManager:
         data.batch['acc'] = torch.tensor(scores, dtype=torch.float32, device=prompt_ids.device)
         return scores
 
+    def score_responses(
+        self,
+        data_sources,
+        responses,
+        ground_truths,
+        extra_infos=None,
+        *,
+        show_progress=False,
+    ):
+        """Score arbitrary responses with the same verifier used by ``__call__``."""
+
+        if extra_infos is None:
+            extra_infos = [None] * len(responses)
+        lengths = {
+            len(data_sources),
+            len(responses),
+            len(ground_truths),
+            len(extra_infos),
+        }
+        if len(lengths) != 1:
+            raise ValueError(
+                "data_sources, responses, ground_truths, and extra_infos "
+                "must have equal lengths"
+            )
+
+        params = list(zip(data_sources, responses, ground_truths, extra_infos))
+        if not params:
+            return []
+
+        scores = []
+        with ProcessPool(max_workers=1) as pool:
+            future = pool.map(
+                partial(compute_score_fn, self.compute_score),
+                params,
+                timeout=10,
+            )
+            iterator = future.result()
+            progress = (
+                tqdm(total=len(params), desc="Computing scores")
+                if show_progress else None
+            )
+            try:
+                while True:
+                    try:
+                        scores.append(next(iterator))
+                    except TimeoutError:
+                        print('Time Out')
+                        scores.append(0.0)
+                    except TimeoutException:
+                        print('Math verify internal timeout')
+                        scores.append(0.0)
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        print(f"Error: {e}")
+                        raise
+                    finally:
+                        if progress is not None and len(scores) > progress.n:
+                            progress.update(len(scores) - progress.n)
+            finally:
+                if progress is not None:
+                    progress.close()
+
+        if len(scores) != len(params):
+            raise RuntimeError(
+                f"Verifier returned {len(scores)} scores for {len(params)} responses"
+            )
+        return scores
+
     def __call__(self, data: DataProto)-> Dict[str, torch.Tensor]:
         """We will expand this function gradually based on the available datasets"""
 
@@ -753,6 +822,12 @@ class ReMARewardManager:
         reward_tensor_map['worker_duplicate_result_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_ignores_worker_results_penalty_applied'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_ignores_worker_results_penalty_value'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['accept_revise_enabled'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['accept_revise_accepted'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['accept_revise_decision_valid'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['accept_revise_attempted_round_count'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['accept_revise_candidate_source_round'] = torch.zeros(batch_size, dtype=torch.float32)
+        reward_tensor_map['accept_revise_accepted_correct'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_unique_local_result_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_dependency_usage_rate'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['decomposer_repair_success'] = torch.zeros(batch_size, dtype=torch.float32)
@@ -800,38 +875,17 @@ class ReMARewardManager:
         
         already_print_data_sources = {}
 
-        params = [
-            (data[i].non_tensor_batch['data_source'],
-             data[i].non_tensor_batch['response'],
-             data[i].non_tensor_batch['reward_model']['ground_truth'],
-             data[i].non_tensor_batch.get('extra_info', None),
-             )
-            for i in range(len(data))
-        ]
+        scores = self.score_responses(
+            [data[i].non_tensor_batch['data_source'] for i in range(len(data))],
+            [data[i].non_tensor_batch['response'] for i in range(len(data))],
+            [
+                data[i].non_tensor_batch['reward_model']['ground_truth']
+                for i in range(len(data))
+            ],
+            [data[i].non_tensor_batch.get('extra_info', None) for i in range(len(data))],
+            show_progress=True,
+        )
 
-        scores = []
-        with ProcessPool(max_workers=1) as pool:
-            future = pool.map(partial(compute_score_fn, self.compute_score), params, timeout=10)
-            iterator = future.result()
-            with tqdm(total=len(data), desc="Computing scores") as pbar:
-                while True:
-                    try:
-                        result = next(iterator)
-                        scores.append(result)
-                    except TimeoutError:
-                        print('Time Out')
-                        scores.append(0.0)
-                    except TimeoutException:
-                        print('Math verify internal timeout')
-                        scores.append(0.0)
-                    except StopIteration:
-                        break
-                    except Exception as e:
-                        print(f"Error: {e}")
-                        raise e
-                    pbar.update(1)
-        
-        assert len(scores) == len(data)
         accuracy = torch.tensor(scores, dtype=torch.float32) # bsz
         reward_tensor_map['acc'] = accuracy
         for i_bsz in range(len(data)):
@@ -855,7 +909,38 @@ class ReMARewardManager:
                 valid_history[i_turn * len(agent_roles):(i_turn + 1) * len(agent_roles)]
                 for i_turn in range(num_turns)
             ]
-            current_turn_history = turn_histories[-1] if turn_histories else []
+            protocol_enabled = bool(
+                data_item.non_tensor_batch.get('accept_revise_enabled', False)
+            )
+            accepted = bool(data_item.non_tensor_batch.get('accepted', False))
+            decision_valid = bool(
+                data_item.non_tensor_batch.get('accept_revise_decision_valid', True)
+            )
+            candidate_source_turn = int(
+                data_item.non_tensor_batch.get('candidate_source_turn', -1)
+            )
+            round_attempted = data_item.non_tensor_batch.get('round_attempted', [])
+            attempted_round_count = sum(bool(value) for value in round_attempted)
+            reward_tensor_map['accept_revise_enabled'][i_bsz] = float(protocol_enabled)
+            reward_tensor_map['accept_revise_accepted'][i_bsz] = float(accepted)
+            reward_tensor_map['accept_revise_decision_valid'][i_bsz] = float(decision_valid)
+            reward_tensor_map['accept_revise_attempted_round_count'][i_bsz] = float(
+                attempted_round_count
+            )
+            reward_tensor_map['accept_revise_candidate_source_round'][i_bsz] = float(
+                candidate_source_turn + 1 if candidate_source_turn >= 0 else 0
+            )
+            reward_tensor_map['accept_revise_accepted_correct'][i_bsz] = float(
+                accepted and float(raw_score) > 0.0
+            )
+
+            assessment_turn_idx = len(turn_histories) - 1
+            if 0 <= candidate_source_turn < len(turn_histories):
+                assessment_turn_idx = candidate_source_turn
+            current_turn_history = (
+                turn_histories[assessment_turn_idx]
+                if turn_histories and assessment_turn_idx >= 0 else []
+            )
             meta_roles = {'meta_thinking', 'decomposer'}
             role_penalties = {role: 0.0 for role in agent_roles}
             role_bonuses = {role: 0.0 for role in agent_roles}
@@ -885,7 +970,7 @@ class ReMARewardManager:
             final_raw_score_usage_multiplier = 1.0
             if turn_histories:
                 current_turn_worker_metrics = _compute_turn_worker_metrics(
-                    turn_histories[-1],
+                    current_turn_history,
                     worker_roles,
                 )
                 distinct_worker_result_gate = current_turn_worker_metrics[
@@ -895,13 +980,13 @@ class ReMARewardManager:
                     distinct_worker_result_gate
                 )
                 hierarchy_bonus_gates = _compute_hierarchy_bonus_gates(
-                    turn_histories[-1], worker_roles, score_role
+                    current_turn_history, worker_roles, score_role
                 )
                 worker_bonus_stats = _compute_turn_worker_role_bonus_stats(
-                    turn_histories[-1], worker_roles, score_role
+                    current_turn_history, worker_roles, score_role
                 )
                 final_bonus_stats = _compute_final_stage_bonus_stats(
-                    turn_histories[-1], worker_roles, score_role
+                    current_turn_history, worker_roles, score_role
                 )
                 final_worker_usage_gate = (
                     positive_role_bonus_gate
@@ -932,8 +1017,10 @@ class ReMARewardManager:
             if 'decomposer' in agent_roles and turn_histories:
                 current_turn_metrics = current_turn_worker_metrics
                 previous_turn_metrics = (
-                    _compute_turn_worker_metrics(turn_histories[-2], worker_roles)
-                    if len(turn_histories) >= 2 else None
+                    _compute_turn_worker_metrics(
+                        turn_histories[assessment_turn_idx - 1], worker_roles
+                    )
+                    if assessment_turn_idx >= 1 else None
                 )
                 decomposer_unique_local_result_rate = current_turn_metrics['unique_local_result_rate']
                 decomposer_dependency_usage_rate = current_turn_metrics['dependency_usage_rate']
@@ -982,7 +1069,7 @@ class ReMARewardManager:
 
             if 'selector' in agent_roles and turn_histories:
                 selector_stats = _compute_selector_turn_bonus_stats(
-                    turn_histories[-1], worker_roles
+                    current_turn_history, worker_roles
                 )
                 selector_local_bonus_raw = (
                     SELECTOR_ASSIGNMENT_COMPLETENESS_BONUS * selector_stats['assignment_completeness']
@@ -1160,7 +1247,10 @@ class ReMARewardManager:
                     role_penalties[role] += WORKER_FINISH_PENALTY
 
             repeated_planner_roles = set()
-            previous_turn_history = turn_histories[-2] if len(turn_histories) >= 2 else []
+            previous_turn_history = (
+                turn_histories[assessment_turn_idx - 1]
+                if assessment_turn_idx >= 1 else []
+            )
             previous_planner_outputs = {
                 msg.get('role'): _normalize_role_output(msg.get('content', ''))
                 for msg in previous_turn_history
@@ -1495,6 +1585,16 @@ class ReMARewardManager:
                 if score_role is not None and score_role in role_shaped_scores:
                     print("[shaped_score]", role_shaped_scores[score_role])
                     print("[score_role]", score_role)
+                if protocol_enabled:
+                    print("[accept_revise]", {
+                        'accepted': accepted,
+                        'decision_valid': decision_valid,
+                        'attempted_round_count': attempted_round_count,
+                        'candidate_source_round': (
+                            candidate_source_turn + 1
+                            if candidate_source_turn >= 0 else 0
+                        ),
+                    })
                 if prd_composer is not None:
                     print("[prd_composer]", {
                         'enabled': float(reward_tensor_map['prd_composer_enabled'][i_bsz]),

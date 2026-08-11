@@ -33,6 +33,7 @@ from collections import defaultdict, deque
 
 import ray
 import numpy as np
+import torch
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
@@ -63,6 +64,141 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
 
 
 WorkerType = Type[Worker]
+
+
+def extract_round_score_role_outputs(
+    histories,
+    num_turns,
+    agent_roles,
+    score_role,
+    max_num_turns,
+):
+    """Extract the scoring-role candidate produced in every executed round."""
+
+    if score_role not in agent_roles:
+        raise ValueError(f"score_role={score_role!r} is not present in agent_roles")
+    if len(histories) != len(num_turns):
+        raise ValueError("histories and num_turns must have equal lengths")
+
+    batch_size = len(histories)
+    outputs = [["" for _ in range(batch_size)] for _ in range(max_num_turns)]
+    executed = torch.zeros((batch_size, max_num_turns), dtype=torch.bool)
+    roles_per_round = len(agent_roles)
+
+    for sample_idx, (sample_history, sample_num_turns) in enumerate(
+        zip(histories, num_turns)
+    ):
+        sample_num_turns = min(int(sample_num_turns), max_num_turns)
+        for turn_idx in range(sample_num_turns):
+            start = turn_idx * roles_per_round
+            turn_history = sample_history[start:start + roles_per_round]
+            final_message = next(
+                (
+                    message
+                    for message in turn_history
+                    if isinstance(message, dict)
+                    and message.get("role") == score_role
+                ),
+                None,
+            )
+            if final_message is None:
+                raise ValueError(
+                    f"Missing {score_role} history slot for sample={sample_idx}, "
+                    f"turn={turn_idx + 1}"
+                )
+            content = final_message.get("content", "")
+            outputs[turn_idx][sample_idx] = content if isinstance(content, str) else ""
+            executed[sample_idx, turn_idx] = bool(
+                final_message.get("executed", True)
+            )
+
+    return outputs, executed
+
+
+def carry_forward_round_scores(candidate_scores, executed):
+    """Build answer-state scores after each round, preserving stopped samples."""
+
+    if candidate_scores.shape != executed.shape:
+        raise ValueError("candidate_scores and executed must have equal shapes")
+    if candidate_scores.ndim != 2:
+        raise ValueError("candidate_scores must have shape [batch, turns]")
+
+    states = torch.zeros_like(candidate_scores)
+    current = torch.zeros(
+        candidate_scores.shape[0],
+        dtype=candidate_scores.dtype,
+        device=candidate_scores.device,
+    )
+    for turn_idx in range(candidate_scores.shape[1]):
+        current = torch.where(
+            executed[:, turn_idx].to(device=current.device),
+            candidate_scores[:, turn_idx],
+            current,
+        )
+        states[:, turn_idx] = current
+    return states
+
+
+def compute_round_transition_metrics(round_state_scores, round_executed):
+    """Measure answer repairs and regressions between actually executed rounds."""
+
+    if round_state_scores.shape != round_executed.shape:
+        raise ValueError("round_state_scores and round_executed must have equal shapes")
+    if round_state_scores.ndim != 2:
+        raise ValueError("round_state_scores must have shape [batch, turns]")
+
+    metrics = {}
+    total_correct_to_wrong = 0
+    total_wrong_to_correct = 0
+    total_previous_correct = 0
+    total_previous_wrong = 0
+
+    for turn_idx in range(1, round_state_scores.shape[1]):
+        transition_name = f"round_{turn_idx}_to_{turn_idx + 1}"
+        eligible = round_executed[:, turn_idx].bool()
+        previous_correct = round_state_scores[:, turn_idx - 1] > 0.0
+        current_correct = round_state_scores[:, turn_idx] > 0.0
+        correct_to_wrong_count = int(
+            (eligible & previous_correct & ~current_correct).sum().item()
+        )
+        wrong_to_correct_count = int(
+            (eligible & ~previous_correct & current_correct).sum().item()
+        )
+        previous_correct_count = int((eligible & previous_correct).sum().item())
+        previous_wrong_count = int((eligible & ~previous_correct).sum().item())
+        prefix = f"val/transitions/{transition_name}"
+        metrics[f"{prefix}/correct_to_wrong_count"] = float(correct_to_wrong_count)
+        metrics[f"{prefix}/wrong_to_correct_count"] = float(wrong_to_correct_count)
+        metrics[f"{prefix}/previous_correct_count"] = float(previous_correct_count)
+        metrics[f"{prefix}/previous_wrong_count"] = float(previous_wrong_count)
+        metrics[f"{prefix}/correct_to_wrong_rate"] = (
+            correct_to_wrong_count / previous_correct_count
+            if previous_correct_count else 0.0
+        )
+        metrics[f"{prefix}/wrong_to_correct_rate"] = (
+            wrong_to_correct_count / previous_wrong_count
+            if previous_wrong_count else 0.0
+        )
+
+        total_correct_to_wrong += correct_to_wrong_count
+        total_wrong_to_correct += wrong_to_correct_count
+        total_previous_correct += previous_correct_count
+        total_previous_wrong += previous_wrong_count
+
+    prefix = "val/transitions"
+    metrics[f"{prefix}/correct_to_wrong_count"] = float(total_correct_to_wrong)
+    metrics[f"{prefix}/wrong_to_correct_count"] = float(total_wrong_to_correct)
+    metrics[f"{prefix}/previous_correct_count"] = float(total_previous_correct)
+    metrics[f"{prefix}/previous_wrong_count"] = float(total_previous_wrong)
+    metrics[f"{prefix}/correct_to_wrong_rate"] = (
+        total_correct_to_wrong / total_previous_correct
+        if total_previous_correct else 0.0
+    )
+    metrics[f"{prefix}/wrong_to_correct_rate"] = (
+        total_wrong_to_correct / total_previous_wrong
+        if total_previous_wrong else 0.0
+    )
+    return metrics
 
 
 class Role(Enum):
@@ -183,7 +319,6 @@ class ResourcePoolManager:
             time.sleep(retry_interval)
 
 
-import torch
 from verl.utils.torch_functional import masked_mean
 from verl.workers.reward_manager.prd_composer import (
     PRD_REWARD_SOURCE_NAMES,
@@ -4461,11 +4596,17 @@ class RayReMASeparatedTrainer(object):
     def _validate(self):
         reward_tensor_lst = []
         acc_tensor_lst = []
+        round_state_score_lst = []
+        round_executed_lst = []
         data_source_lst = []
         num_turns_lst = []
         history_lst = []
         sample_groundtruths = []
         completion_tokens_lst = []
+        accepted_lst = []
+        decision_valid_lst = []
+        attempted_round_count_lst = []
+        candidate_source_round_lst = []
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -4539,6 +4680,34 @@ class RayReMASeparatedTrainer(object):
             # output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             output_texts = test_output_gen_batch.non_tensor_batch['response']
             sample_outputs.extend(output_texts)
+            accepted_lst.extend(
+                bool(value)
+                for value in test_output_gen_batch.non_tensor_batch.get(
+                    'accepted',
+                    np.zeros(len(test_output_gen_batch), dtype=bool),
+                )
+            )
+            decision_valid_lst.extend(
+                bool(value)
+                for value in test_output_gen_batch.non_tensor_batch.get(
+                    'accept_revise_decision_valid',
+                    np.ones(len(test_output_gen_batch), dtype=bool),
+                )
+            )
+            attempted_round_count_lst.extend(
+                sum(bool(item) for item in values)
+                for values in test_output_gen_batch.non_tensor_batch.get(
+                    'round_attempted',
+                    np.array([[] for _ in range(len(test_output_gen_batch))], dtype=object),
+                )
+            )
+            candidate_source_round_lst.extend(
+                int(value) + 1 if int(value) >= 0 else 0
+                for value in test_output_gen_batch.non_tensor_batch.get(
+                    'candidate_source_turn',
+                    np.full(len(test_output_gen_batch), -1, dtype=np.int64),
+                )
+            )
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info['mask_unfinished_reward'] = self.config.reward_model.mask_unfinished_reward
@@ -4548,6 +4717,77 @@ class RayReMASeparatedTrainer(object):
             score_reward_key = f'{score_role}_turn_level_reward'
             reward_tensor_lst.append(reward_tensor[score_reward_key])
             acc_tensor_lst.append(reward_tensor['acc'])
+
+            histories = test_output_gen_batch.non_tensor_batch['history'].tolist()
+            turn_counts = [
+                int(value)
+                for value in test_output_gen_batch.non_tensor_batch['num_turns'].tolist()
+            ]
+            round_outputs, round_executed = extract_round_score_role_outputs(
+                histories,
+                turn_counts,
+                rollout_meta_info['agent_roles'],
+                score_role,
+                max_num_turns,
+            )
+            candidate_scores = torch.zeros(
+                (len(test_batch), max_num_turns),
+                dtype=torch.float32,
+            )
+            final_scores = reward_tensor['acc'].detach().cpu().float()
+            candidate_source_turns = test_output_gen_batch.non_tensor_batch.get(
+                'candidate_source_turn',
+                np.array([count - 1 for count in turn_counts], dtype=np.int64),
+            )
+            for sample_idx, source_turn in enumerate(candidate_source_turns):
+                source_turn = int(source_turn)
+                if 0 <= source_turn < max_num_turns:
+                    candidate_scores[
+                        sample_idx,
+                        source_turn,
+                    ] = final_scores[sample_idx]
+
+            data_sources_for_scoring = test_batch.non_tensor_batch['data_source']
+            reward_models_for_scoring = test_batch.non_tensor_batch['reward_model']
+            extra_infos_for_scoring = test_batch.non_tensor_batch.get(
+                'extra_info',
+                np.array([None] * len(test_batch), dtype=object),
+            )
+            flat_data_sources = []
+            flat_responses = []
+            flat_ground_truths = []
+            flat_extra_infos = []
+            flat_locations = []
+            for turn_idx in range(max_num_turns):
+                for sample_idx in range(len(test_batch)):
+                    if not bool(round_executed[sample_idx, turn_idx].item()):
+                        continue
+                    if turn_idx == int(candidate_source_turns[sample_idx]):
+                        continue
+                    flat_data_sources.append(data_sources_for_scoring[sample_idx])
+                    flat_responses.append(round_outputs[turn_idx][sample_idx])
+                    flat_ground_truths.append(
+                        reward_models_for_scoring[sample_idx]['ground_truth']
+                    )
+                    flat_extra_infos.append(extra_infos_for_scoring[sample_idx])
+                    flat_locations.append((sample_idx, turn_idx))
+
+            flat_round_scores = self.val_reward_fn.score_responses(
+                flat_data_sources,
+                flat_responses,
+                flat_ground_truths,
+                flat_extra_infos,
+                show_progress=False,
+            )
+            for (sample_idx, turn_idx), score in zip(
+                flat_locations, flat_round_scores
+            ):
+                candidate_scores[sample_idx, turn_idx] = float(score)
+
+            round_state_score_lst.append(
+                carry_forward_round_scores(candidate_scores, round_executed)
+            )
+            round_executed_lst.append(round_executed)
 
             # Store scores
             scores = reward_tensor[score_reward_key].sum(-1).cpu().tolist()
@@ -4564,12 +4804,14 @@ class RayReMASeparatedTrainer(object):
             # not use `data_source`, use `subset` instead
             data_source_lst.append(test_batch.non_tensor_batch.get('subset', ['unknown'] * reward_tensor[score_reward_key].shape[0]))
             
-            history_lst.append(test_output_gen_batch.non_tensor_batch['history'].tolist())
+            history_lst.append(histories)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, groundtruths=sample_groundtruths, histories=history_lst)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         acc_tensor = torch.cat(acc_tensor_lst, dim=0).cpu() #(batch_size,)
+        round_state_scores = torch.cat(round_state_score_lst, dim=0).cpu()
+        round_executed = torch.cat(round_executed_lst, dim=0).cpu()
         data_sources = np.concatenate(data_source_lst, axis=0)
 
         # evaluate test_score based on data source
@@ -4590,6 +4832,44 @@ class RayReMASeparatedTrainer(object):
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
         for data_source, accs in data_source_acc.items():
             metric_dict[f'val/acc/{data_source}'] = np.mean(accs)
+
+        # ``round_N_acc`` is the correctness of the answer state after N
+        # rounds. Samples that stopped earlier retain their latest candidate.
+        for turn_idx in range(max_num_turns):
+            round_number = turn_idx + 1
+            metric_dict[f'val/round_{round_number}_acc'] = (
+                round_state_scores[:, turn_idx].float().mean().item()
+            )
+            metric_dict[f'val/round_{round_number}_executed_rate'] = (
+                round_executed[:, turn_idx].float().mean().item()
+            )
+            for data_source in data_source_acc:
+                source_mask = torch.from_numpy(data_sources == data_source)
+                metric_dict[f'val/round_{round_number}_acc/{data_source}'] = (
+                    round_state_scores[source_mask, turn_idx].float().mean().item()
+                )
+
+        metric_dict.update(
+            compute_round_transition_metrics(round_state_scores, round_executed)
+        )
+        if accepted_lst:
+            metric_dict['val/accept_revise/accept_rate'] = float(np.mean(accepted_lst))
+            metric_dict['val/accept_revise/decision_valid_rate'] = float(
+                np.mean(decision_valid_lst)
+            )
+            metric_dict['val/accept_revise/attempted_round_count'] = float(
+                np.mean(attempted_round_count_lst)
+            )
+            metric_dict['val/accept_revise/candidate_source_round'] = float(
+                np.mean(candidate_source_round_lst)
+            )
+            accepted_indices = [
+                idx for idx, value in enumerate(accepted_lst) if value
+            ]
+            if accepted_indices:
+                metric_dict['val/accept_revise/accepted_acc'] = float(
+                    acc_tensor[accepted_indices].float().mean().item()
+                )
         
         # Add num_turns and completion_tokens metrics
         if num_turns_lst:
