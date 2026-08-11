@@ -66,6 +66,28 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
 WorkerType = Type[Worker]
 
 
+def compute_usable_filtered_prompt_count(
+    available_prompt_count,
+    target_prompt_count,
+    prompt_minibatch_size,
+):
+    """Return a full target batch or the largest complete PPO minibatch."""
+    available_prompt_count = int(available_prompt_count)
+    target_prompt_count = int(target_prompt_count)
+    prompt_minibatch_size = int(prompt_minibatch_size)
+    if available_prompt_count < 0:
+        raise ValueError("available_prompt_count must be non-negative")
+    if target_prompt_count <= 0 or prompt_minibatch_size <= 0:
+        raise ValueError(
+            "target_prompt_count and prompt_minibatch_size must be positive"
+        )
+    if available_prompt_count >= target_prompt_count:
+        return target_prompt_count
+    return (
+        available_prompt_count // prompt_minibatch_size
+    ) * prompt_minibatch_size
+
+
 def extract_round_score_role_outputs(
     histories,
     num_turns,
@@ -5616,22 +5638,56 @@ class RayReMASeparatedTrainer(object):
                             batch = DataProto.concat([batch, new_batch])
                         
                         # check if we have enough data
-                        prompt_bsz = self.config.data.train_batch_size
+                        prompt_bsz = int(self.config.data.train_batch_size)
+                        selected_prompt_bsz = prompt_bsz
                         if num_prompt_in_batch < prompt_bsz:
                             # keep generating
                             print(f'{num_prompt_in_batch=} < {prompt_bsz=}')
-                            max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
+                            filter_config = self.config.algorithm.filter_groups
+                            max_num_gen_batches = filter_config.max_num_gen_batches
                             if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
                                 print(f'{num_gen_batches=}. Keep generating...')
                                 continue
-                            else:
-                                raise ValueError(
-                                    f'{num_gen_batches=} >= {max_num_gen_batches=}. Generated too many. Please check your data.'
+                            use_partial_batch = bool(
+                                filter_config.get(
+                                    'use_partial_batch_on_exhaustion',
+                                    False,
                                 )
-                        else:
-                            # Align the batch
-                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                            batch = batch[:traj_bsz]
+                            )
+                            prompt_minibatch_size = int(
+                                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                            )
+                            selected_prompt_bsz = compute_usable_filtered_prompt_count(
+                                num_prompt_in_batch,
+                                prompt_bsz,
+                                prompt_minibatch_size,
+                            )
+                            if not use_partial_batch or selected_prompt_bsz <= 0:
+                                raise ValueError(
+                                    f'{num_gen_batches=} >= {max_num_gen_batches=} '
+                                    f'with only {num_prompt_in_batch} trainable mixed '
+                                    f'prompts for role={self._current_train_agent!r}; '
+                                    f'need at least one complete prompt minibatch of '
+                                    f'{prompt_minibatch_size}.'
+                                )
+                            print(
+                                'Group-filter cap reached; using a partial '
+                                f'batch of {selected_prompt_bsz}/'
+                                f'{num_prompt_in_batch} mixed prompts.'
+                            )
+                            metrics['rollout/partial_filtered_batch_used'] = 1.0
+                            metrics['rollout/partial_filtered_prompt_count'] = float(
+                                selected_prompt_bsz
+                            )
+                            metrics['rollout/partial_filtered_available_count'] = float(
+                                num_prompt_in_batch
+                            )
+                        # Keep complete rollout groups and complete PPO minibatches.
+                        traj_bsz = (
+                            selected_prompt_bsz
+                            * self.config.actor_rollout_ref.rollout.n
+                        )
+                        batch = batch[:traj_bsz]
 
                     if self.config.actor_rollout_ref.rollout.n > 1:
                         metrics.update({

@@ -229,6 +229,9 @@ algorithm:
   filter_groups:
     enable: True
     max_num_gen_batches: 8
+    # If the cap is reached, train on the largest complete PPO minibatch of
+    # mixed groups instead of discarding useful rollouts or aborting the job.
+    use_partial_batch_on_exhaustion: True
   final_worker_curriculum:
     enable: False
     warmup_steps: 200
