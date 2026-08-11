@@ -70,8 +70,9 @@ def compute_usable_filtered_prompt_count(
     available_prompt_count,
     target_prompt_count,
     prompt_minibatch_size,
+    allow_sub_minibatch=False,
 ):
-    """Return a full target batch or the largest complete PPO minibatch."""
+    """Return a full target batch or the largest usable partial batch."""
     available_prompt_count = int(available_prompt_count)
     target_prompt_count = int(target_prompt_count)
     prompt_minibatch_size = int(prompt_minibatch_size)
@@ -83,9 +84,14 @@ def compute_usable_filtered_prompt_count(
         )
     if available_prompt_count >= target_prompt_count:
         return target_prompt_count
-    return (
+    complete_minibatch_count = (
         available_prompt_count // prompt_minibatch_size
     ) * prompt_minibatch_size
+    if complete_minibatch_count > 0:
+        return complete_minibatch_count
+    if allow_sub_minibatch:
+        return available_prompt_count
+    return 0
 
 
 def extract_round_score_role_outputs(
@@ -5657,10 +5663,23 @@ class RayReMASeparatedTrainer(object):
                             prompt_minibatch_size = int(
                                 self.config.actor_rollout_ref.actor.ppo_mini_batch_size
                             )
+                            allow_sub_minibatch = bool(
+                                filter_config.get(
+                                    'allow_sub_minibatch_on_exhaustion',
+                                    False,
+                                )
+                            )
+                            dynamic_batching_enabled = bool(
+                                self.config.actor_rollout_ref.actor.use_dynamic_bsz
+                            )
                             selected_prompt_bsz = compute_usable_filtered_prompt_count(
                                 num_prompt_in_batch,
                                 prompt_bsz,
                                 prompt_minibatch_size,
+                                allow_sub_minibatch=(
+                                    allow_sub_minibatch
+                                    and dynamic_batching_enabled
+                                ),
                             )
                             if not use_partial_batch or selected_prompt_bsz <= 0:
                                 raise ValueError(
@@ -5668,12 +5687,17 @@ class RayReMASeparatedTrainer(object):
                                     f'with only {num_prompt_in_batch} trainable mixed '
                                     f'prompts for role={self._current_train_agent!r}; '
                                     f'need at least one complete prompt minibatch of '
-                                    f'{prompt_minibatch_size}.'
+                                    f'{prompt_minibatch_size}, or enable dynamic '
+                                    f'sub-minibatch fallback.'
                                 )
+                            used_sub_minibatch = (
+                                selected_prompt_bsz < prompt_minibatch_size
+                            )
                             print(
                                 'Group-filter cap reached; using a partial '
                                 f'batch of {selected_prompt_bsz}/'
-                                f'{num_prompt_in_batch} mixed prompts.'
+                                f'{num_prompt_in_batch} mixed prompts'
+                                + (' (sub-minibatch).' if used_sub_minibatch else '.')
                             )
                             metrics['rollout/partial_filtered_batch_used'] = 1.0
                             metrics['rollout/partial_filtered_prompt_count'] = float(
@@ -5682,7 +5706,11 @@ class RayReMASeparatedTrainer(object):
                             metrics['rollout/partial_filtered_available_count'] = float(
                                 num_prompt_in_batch
                             )
-                        # Keep complete rollout groups and complete PPO minibatches.
+                            metrics[
+                                'rollout/partial_filtered_subminibatch_used'
+                            ] = float(used_sub_minibatch)
+                        # Keep complete rollout groups; dynamic batching can
+                        # consume a final sub-minibatch when the cap is sparse.
                         traj_bsz = (
                             selected_prompt_bsz
                             * self.config.actor_rollout_ref.rollout.n

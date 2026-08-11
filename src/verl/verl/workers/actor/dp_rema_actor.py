@@ -283,9 +283,23 @@ class DataParallelReMAPPOActor(BasePPOActor):
             non_tensor_select_keys = ['multi_modal_inputs']
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
-            dataloader = batch.split(self.config.ppo_mini_batch_size)
+            # Dynamic filtered rollouts can contain fewer samples per rank than
+            # the configured PPO minibatch. Treat that local shard as one
+            # complete minibatch instead of scaling its gradient as if samples
+            # were missing.
+            effective_ppo_mini_batch_size = min(
+                int(self.config.ppo_mini_batch_size),
+                int(batch.batch_size[0]),
+            )
+            if effective_ppo_mini_batch_size <= 0:
+                raise ValueError("Cannot update the actor with an empty batch")
+            dataloader = batch.split(effective_ppo_mini_batch_size)
 
-        metrics = {}
+        metrics = {
+            'actor/effective_ppo_mini_batch_size': [
+                float(effective_ppo_mini_batch_size)
+            ]
+        }
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -392,7 +406,9 @@ class DataParallelReMAPPOActor(BasePPOActor):
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        loss = policy_loss * (
+                            len(data) / effective_ppo_mini_batch_size
+                        )
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()

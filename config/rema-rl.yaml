@@ -232,6 +232,9 @@ algorithm:
     # If the cap is reached, train on the largest complete PPO minibatch of
     # mixed groups instead of discarding useful rollouts or aborting the job.
     use_partial_batch_on_exhaustion: True
+    # With dynamic batching, use a smaller minibatch when the cap yields fewer
+    # mixed groups than actor.ppo_mini_batch_size.
+    allow_sub_minibatch_on_exhaustion: True
   final_worker_curriculum:
     enable: False
     warmup_steps: 200
