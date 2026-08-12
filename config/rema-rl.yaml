@@ -295,7 +295,7 @@ algorithm:
       # 0 uses all alternative subtasks (at most max_planned_subtasks - 1).
       max_wrong_subtask_contrasts: 0
       normalization_epsilon: 1.0e-6
-      teacher_forcing_micro_batch_size_per_gpu: 2
+      teacher_forcing_micro_batch_size_per_gpu: 4
     # Legacy CPCR/TSS direct-credit ablation.
     direct_scoped_grpo:
       enable: False
