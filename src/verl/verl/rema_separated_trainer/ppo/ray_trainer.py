@@ -54,6 +54,7 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.rema_separated_trainer.ppo.cpcr import estimate_cpcr
 from verl.rema_separated_trainer.ppo.direct_scoped_grpo import (
     build_full_task_scope_counterfactual,
+    build_scope_assignment_counterfactual,
     estimate_direct_scoped_grpo,
 )
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
@@ -92,6 +93,66 @@ def compute_usable_filtered_prompt_count(
     if allow_sub_minibatch:
         return available_prompt_count
     return 0
+
+
+def build_trainable_rank_partitions(
+    sequence_lengths,
+    world_size,
+    trainable_mask,
+):
+    """Balance tokens while placing a trainable sample on every DP rank."""
+
+    sequence_lengths = [int(length) for length in sequence_lengths]
+    trainable_mask = [bool(value) for value in trainable_mask]
+    world_size = int(world_size)
+    sample_count = len(sequence_lengths)
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if len(trainable_mask) != sample_count:
+        raise ValueError("trainable_mask must match sequence_lengths")
+    if sample_count == 0 or sample_count % world_size != 0:
+        return None
+
+    rank_capacity = sample_count // world_size
+    trainable_indices = [
+        idx for idx, is_trainable in enumerate(trainable_mask)
+        if is_trainable
+    ]
+    if len(trainable_indices) < world_size:
+        return None
+
+    trainable_indices.sort(
+        key=lambda idx: (-sequence_lengths[idx], idx)
+    )
+    seed_indices = trainable_indices[:world_size]
+    seed_set = set(seed_indices)
+    partitions = [[idx] for idx in seed_indices]
+    partition_lengths = [sequence_lengths[idx] for idx in seed_indices]
+
+    remaining_indices = [
+        idx for idx in range(sample_count)
+        if idx not in seed_set
+    ]
+    remaining_indices.sort(
+        key=lambda idx: (-sequence_lengths[idx], idx)
+    )
+    for idx in remaining_indices:
+        available_ranks = [
+            rank_idx for rank_idx, partition in enumerate(partitions)
+            if len(partition) < rank_capacity
+        ]
+        rank_idx = min(
+            available_ranks,
+            key=lambda candidate: (
+                partition_lengths[candidate],
+                len(partitions[candidate]),
+                candidate,
+            ),
+        )
+        partitions[rank_idx].append(idx)
+        partition_lengths[rank_idx] += sequence_lengths[idx]
+
+    return partitions
 
 
 def extract_round_score_role_outputs(
@@ -1702,8 +1763,8 @@ class RayReMASeparatedTrainer(object):
         stage_roles = list(hierarchy.get('stage_roles', []))
         return role in stage_roles[:-1]
 
-    def _build_direct_scope_prompt_pair(self, data_batch, role, sample_idx):
-        """Return factual and full-task prompts for one non-final worker action."""
+    def _build_direct_scope_prompt_bundle(self, data_batch, role, sample_idx):
+        """Return factual, full-task, and wrong-subtask prompts for one action."""
 
         hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
         decomposer_role = hierarchy.get('decomposer_role', 'decomposer')
@@ -1738,6 +1799,28 @@ class RayReMASeparatedTrainer(object):
                     )
             if not assigned_subtasks:
                 return None
+            raw_plan_subtasks = data_batch.non_tensor_batch.get(
+                'c3_action_plan_subtasks'
+            )
+            if raw_plan_subtasks is None:
+                plan_subtasks = list(assigned_subtasks)
+            else:
+                raw_plan_subtasks = raw_plan_subtasks[sample_idx]
+                if isinstance(raw_plan_subtasks, np.ndarray):
+                    raw_plan_subtasks = raw_plan_subtasks.tolist()
+                plan_subtasks = []
+                for item in raw_plan_subtasks:
+                    if isinstance(item, np.ndarray):
+                        item = item.tolist()
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        return None
+                    subtask_id, description = item
+                    if str(subtask_id).strip() and str(description).strip():
+                        plan_subtasks.append(
+                            (str(subtask_id).upper(), str(description))
+                        )
+                if not plan_subtasks:
+                    plan_subtasks = list(assigned_subtasks)
             worker_message = {
                 'assigned_subtasks': [
                     subtask_id for subtask_id, _ in assigned_subtasks
@@ -1776,6 +1859,7 @@ class RayReMASeparatedTrainer(object):
                 plan_message['content'],
                 max_subtasks=max_planned_subtasks,
             )
+            plan_subtasks = list(parsed_subtasks)
             subtask_map = {
                 str(subtask_id).upper(): description
                 for subtask_id, description in parsed_subtasks
@@ -1805,7 +1889,32 @@ class RayReMASeparatedTrainer(object):
         )
         if counterfactual_chat is None:
             return None
-        return factual_chat, counterfactual_chat, worker_message
+        assigned_ids = {
+            str(subtask_id).upper()
+            for subtask_id, _ in assigned_subtasks
+        }
+        wrong_subtask_chats = []
+        for subtask_id, description in plan_subtasks:
+            subtask_id = str(subtask_id).upper()
+            if subtask_id in assigned_ids:
+                continue
+            replacement_text = MultiAgentRollout._format_subtasks([
+                (subtask_id, description)
+            ])
+            wrong_chat = build_scope_assignment_counterfactual(
+                factual_chat,
+                assigned_subtasks_text,
+                replacement_text,
+            )
+            if wrong_chat is None:
+                return None
+            wrong_subtask_chats.append((subtask_id, wrong_chat))
+        return {
+            'factual': factual_chat,
+            'full_task': counterfactual_chat,
+            'wrong_subtasks': wrong_subtask_chats,
+            'worker_message': worker_message,
+        }
 
     def _score_direct_scope_tss(
         self,
@@ -1817,13 +1926,14 @@ class RayReMASeparatedTrainer(object):
         metric_namespace='direct_scoped_grpo',
         scope_threshold=None,
     ):
-        """Score local-vs-full-task prompt preference for existing actions."""
+        """Score whether an action identifies its assigned subtask."""
 
         batch_size = len(data_batch)
         margins = torch.zeros(batch_size, dtype=torch.float32)
         valid_mask = torch.zeros(batch_size, dtype=torch.bool)
         factual_scores = torch.zeros(batch_size, dtype=torch.float32)
         full_task_scores = torch.zeros(batch_size, dtype=torch.float32)
+        wrong_subtask_scores = defaultdict(list)
         if not bool(candidate_mask.any().item()):
             return margins, valid_mask, factual_scores, full_task_scores
 
@@ -1832,15 +1942,35 @@ class RayReMASeparatedTrainer(object):
             self.config.actor_rollout_ref.rollout.response_length
         )
         encoded_items = []
+        expected_prompt_kinds = {}
+        scoring_config = (
+            self.scoped_c3_grpo_config
+            if self.scoped_c3_grpo_enabled
+            else self.direct_scoped_grpo_config
+        )
+        contrast_plan_subtasks = bool(
+            scoring_config.get('contrast_plan_subtasks', True)
+        )
+        max_wrong_contrasts = int(
+            scoring_config.get('max_wrong_subtask_contrasts', 0)
+        )
         for sample_idx in torch.nonzero(candidate_mask, as_tuple=False).flatten().tolist():
-            prompt_pair = self._build_direct_scope_prompt_pair(
+            prompt_bundle = self._build_direct_scope_prompt_bundle(
                 data_batch,
                 role,
                 sample_idx,
             )
-            if prompt_pair is None:
+            if prompt_bundle is None:
                 continue
-            factual_chat, counterfactual_chat, worker_message = prompt_pair
+            factual_chat = prompt_bundle['factual']
+            counterfactual_chat = prompt_bundle['full_task']
+            worker_message = prompt_bundle['worker_message']
+            wrong_chats = (
+                list(prompt_bundle['wrong_subtasks'])
+                if contrast_plan_subtasks else []
+            )
+            if max_wrong_contrasts > 0:
+                wrong_chats = wrong_chats[:max_wrong_contrasts]
             c3_action_turns = data_batch.non_tensor_batch.get('c3_action_turn')
             if (
                 c3_action_turns is not None
@@ -1878,8 +2008,33 @@ class RayReMASeparatedTrainer(object):
             )
             if factual_encoded is None or counterfactual_encoded is None:
                 continue
-            encoded_items.append((sample_idx, 'factual', factual_encoded))
-            encoded_items.append((sample_idx, 'full_task', counterfactual_encoded))
+            sample_items = [
+                (sample_idx, 'factual', None, factual_encoded),
+                (sample_idx, 'full_task', None, counterfactual_encoded),
+            ]
+            wrong_encoding_failed = False
+            for subtask_id, wrong_chat in wrong_chats:
+                wrong_encoded = self._cpcr_encode_prompt_action(
+                    wrong_chat,
+                    action_token_ids,
+                    prompt_length,
+                    max_length,
+                )
+                if wrong_encoded is None:
+                    wrong_encoding_failed = True
+                    break
+                sample_items.append((
+                    sample_idx,
+                    'wrong_subtask',
+                    subtask_id,
+                    wrong_encoded,
+                ))
+            if wrong_encoding_failed:
+                continue
+            encoded_items.extend(sample_items)
+            expected_prompt_kinds[sample_idx] = {
+                'wrong_count': len(wrong_chats),
+            }
 
         if not encoded_items:
             return margins, valid_mask, factual_scores, full_task_scores
@@ -1892,23 +2047,52 @@ class RayReMASeparatedTrainer(object):
             teacher_forcing_calls,
         ) = self._score_teacher_forced_actions(
             role,
-            [encoded for _, _, encoded in encoded_items],
+            [encoded for _, _, _, encoded in encoded_items],
         )
 
         seen_kinds = defaultdict(set)
-        for item_idx, (sample_idx, prompt_kind, _) in enumerate(encoded_items):
+        for item_idx, (
+            sample_idx,
+            prompt_kind,
+            _contrast_id,
+            _,
+        ) in enumerate(encoded_items):
             score = mean_log_probs[item_idx]
             if prompt_kind == 'factual':
                 factual_scores[sample_idx] = score
-            else:
+            elif prompt_kind == 'full_task':
                 full_task_scores[sample_idx] = score
+            else:
+                wrong_subtask_scores[sample_idx].append(score)
             seen_kinds[sample_idx].add(prompt_kind)
-        for sample_idx, prompt_kinds in seen_kinds.items():
-            if prompt_kinds == {'factual', 'full_task'}:
-                margins[sample_idx] = (
-                    factual_scores[sample_idx] - full_task_scores[sample_idx]
-                )
-                valid_mask[sample_idx] = True
+        local_vs_full_margins = []
+        local_vs_wrong_margins = []
+        samples_with_wrong = 0
+        wrong_contrast_count = 0
+        scope_classification_wins = 0
+        for sample_idx, expected in expected_prompt_kinds.items():
+            prompt_kinds = seen_kinds[sample_idx]
+            if not {'factual', 'full_task'}.issubset(prompt_kinds):
+                continue
+            expected_wrong_count = int(expected['wrong_count'])
+            sample_wrong_scores = wrong_subtask_scores[sample_idx]
+            if len(sample_wrong_scores) != expected_wrong_count:
+                continue
+            local_vs_full = (
+                factual_scores[sample_idx] - full_task_scores[sample_idx]
+            )
+            margin = local_vs_full
+            local_vs_full_margins.append(local_vs_full)
+            if sample_wrong_scores:
+                strongest_wrong = torch.stack(sample_wrong_scores).max()
+                local_vs_wrong = factual_scores[sample_idx] - strongest_wrong
+                margin = torch.minimum(margin, local_vs_wrong)
+                local_vs_wrong_margins.append(local_vs_wrong)
+                samples_with_wrong += 1
+                wrong_contrast_count += len(sample_wrong_scores)
+                scope_classification_wins += int(local_vs_wrong.item() > 0.0)
+            margins[sample_idx] = margin
+            valid_mask[sample_idx] = True
 
         valid_margins = margins[valid_mask]
         prefix = f'reward/{metric_namespace}/tss/roles/{role}'
@@ -1916,6 +2100,12 @@ class RayReMASeparatedTrainer(object):
         metrics[f'{prefix}/valid_count'] = float(valid_mask.sum().item())
         metrics[f'{prefix}/teacher_forcing_call_count'] = float(
             teacher_forcing_calls
+        )
+        metrics[f'{prefix}/wrong_subtask_contrast_count'] = float(
+            wrong_contrast_count
+        )
+        metrics[f'{prefix}/samples_with_wrong_subtask_count'] = float(
+            samples_with_wrong
         )
         metrics[f'{prefix}/coverage'] = (
             float(valid_mask.sum().item()) / float(candidate_mask.sum().item())
@@ -1940,12 +2130,30 @@ class RayReMASeparatedTrainer(object):
             metrics[f'{prefix}/gate_open_rate'] = float(
                 (valid_margins > threshold).float().mean().item()
             )
+            metrics[f'{prefix}/positive_wins_all_rate'] = float(
+                (valid_margins > threshold).float().mean().item()
+            )
             metrics[f'{prefix}/factual_log_prob_per_token_mean'] = float(
                 factual_scores[valid_mask].mean().item()
             )
             metrics[f'{prefix}/full_task_log_prob_per_token_mean'] = float(
                 full_task_scores[valid_mask].mean().item()
             )
+            metrics[f'{prefix}/local_vs_full_margin_mean'] = float(
+                torch.stack(local_vs_full_margins).mean().item()
+            )
+            if local_vs_wrong_margins:
+                metrics[f'{prefix}/local_vs_wrong_subtask_margin_mean'] = float(
+                    torch.stack(local_vs_wrong_margins).mean().item()
+                )
+                metrics[f'{prefix}/scope_classification_accuracy'] = (
+                    float(scope_classification_wins)
+                    / float(samples_with_wrong)
+                )
+                metrics[f'{prefix}/wrong_subtasks_per_sample'] = (
+                    float(wrong_contrast_count)
+                    / float(samples_with_wrong)
+                )
         return margins, valid_mask, factual_scores, full_task_scores
 
     def _c3_action_present_mask(self, data_batch, role):
@@ -5195,7 +5403,7 @@ class RayReMASeparatedTrainer(object):
             print(f"Warning: No online PRD composer state found at {prd_local_path}, using initialized PRD state")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        """Balance tokens and keep scoped updates collective-safe across ranks."""
         attention_mask = batch.batch['attention_mask']
         # meta_thinking_attention_mask = batch.batch['meta_thinking_attention_mask']
         # reasoning_attention_mask = batch.batch['reasoning_attention_mask']
@@ -5203,9 +5411,34 @@ class RayReMASeparatedTrainer(object):
         # global_seqlen_lst = (meta_thinking_attention_mask.view(batch_size, -1).sum(-1) + reasoning_attention_mask.view(batch_size, -1).sum(-1)).tolist()  # (train_batch_size,)
         global_seqlen_lst = attention_mask.view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg[self._current_train_agent].world_size
-        global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
-                                                              k_partitions=world_size,
-                                                              equal_size=True)
+        trainable_mask = (
+            batch.batch['labels'].ne(-100).any(dim=-1).tolist()
+        )
+        trainable_count = sum(bool(value) for value in trainable_mask)
+        metrics[f'{logging_prefix}/trainable_sample_count'] = float(
+            trainable_count
+        )
+        global_partition_lst = None
+        if self.scoped_c3_grpo_enabled or self.direct_scoped_grpo_enabled:
+            global_partition_lst = build_trainable_rank_partitions(
+                global_seqlen_lst,
+                world_size,
+                trainable_mask,
+            )
+            if global_partition_lst is None:
+                metrics[f'{logging_prefix}/collective_safe'] = 0.0
+                metrics[f'{logging_prefix}/trainable_rank_coverage'] = (
+                    float(trainable_count) / float(world_size)
+                )
+                return False
+            metrics[f'{logging_prefix}/collective_safe'] = 1.0
+            metrics[f'{logging_prefix}/trainable_rank_coverage'] = 1.0
+        else:
+            global_partition_lst = get_seqlen_balanced_partitions(
+                global_seqlen_lst,
+                k_partitions=world_size,
+                equal_size=True,
+            )
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
@@ -5213,6 +5446,7 @@ class RayReMASeparatedTrainer(object):
                                                     partitions=global_partition_lst,
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
+        return True
         
     
     def multi_turn_generate_sequences(self, gen_batch: DataProto):
@@ -5812,16 +6046,38 @@ class RayReMASeparatedTrainer(object):
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
+                    collective_safe_update = True
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        collective_safe_update = self._balance_batch(
+                            batch,
+                            metrics=metrics,
+                        )
+                    elif (
+                        self.scoped_c3_grpo_enabled
+                        or self.direct_scoped_grpo_enabled
+                    ):
+                        trainable_count = int(
+                            batch.batch['labels'].ne(-100).any(dim=-1).sum().item()
+                        )
+                        world_size = self.actor_rollout_wg[
+                            self._current_train_agent
+                        ].world_size
+                        collective_safe_update = trainable_count >= world_size
+
+                    metrics['rollout/skipped_sparse_actor_update'] = float(
+                        not collective_safe_update
+                    )
 
                     
                     # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg[self._current_train_agent].compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                    if collective_safe_update:
+                        with _timer('old_log_prob', timing_raw):
+                            old_log_prob = self.actor_rollout_wg[
+                                self._current_train_agent
+                            ].compute_log_prob(batch)
+                            batch = batch.union(old_log_prob)
 
-                    if self.use_reference_policy:
+                    if self.use_reference_policy and collective_safe_update:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
                             ref_log_prob = self.ref_policy_wg[self._current_train_agent].compute_ref_log_prob(batch)
@@ -5829,14 +6085,17 @@ class RayReMASeparatedTrainer(object):
 
 
                     # update critic
-                    if self.use_critic:
+                    if self.use_critic and collective_safe_update:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg[self._current_train_agent].update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if (
+                        collective_safe_update
+                        and self.config.trainer.critic_warmup <= self.global_steps
+                    ):
                         # update actor
                         with _timer('update_actor', timing_raw):
                             actor_output = self.actor_rollout_wg[self._current_train_agent].update_actor(batch)

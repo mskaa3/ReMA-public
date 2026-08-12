@@ -331,11 +331,7 @@ class DataParallelReMAPPOActor(BasePPOActor):
                     # response_mask = attention_mask[:, -response_length:]
                     labels = data['labels']
                     label_mask = labels != -100
-                    # Some trajectories (e.g. truncated before reasoning emits tokens) can
-                    # produce micro-batches with no valid label tokens at all.
-                    # Skip such micro-batches to avoid invalid turn-level mask construction.
-                    if not label_mask.any():
-                        continue
+                    has_train_tokens = bool(label_mask.any().item())
                     agent_role_ids = data['agent_role_ids'] if 'agent_role_ids' in data else None
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
@@ -351,6 +347,23 @@ class DataParallelReMAPPOActor(BasePPOActor):
 
                     # all return: (bsz, sequence_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+
+                    if not has_train_tokens:
+                        # Every FSDP rank must execute the same forward/backward
+                        # count. Sparse scoped batches can leave one dynamic
+                        # microbatch without role tokens on only some ranks.
+                        zero_loss = entropy.sum() * 0.0
+                        zero_loss.backward()
+                        append_to_dict(metrics, {
+                            'actor/empty_train_microbatch': 1.0,
+                            'actor/entropy_loss': 0.0,
+                            'actor/pg_loss': 0.0,
+                            'actor/pg_clipfrac': 0.0,
+                            'actor/pg_clipfrac_lower': 0.0,
+                            'actor/log_ratio_clipfrac': 0.0,
+                            'actor/ppo_kl': 0.0,
+                        })
+                        continue
 
                     # Compute PPO policy loss and related statistics
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, log_ratio_clipfrac = core_algos.compute_policy_loss(

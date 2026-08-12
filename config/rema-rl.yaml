@@ -233,7 +233,9 @@ algorithm:
     # mixed groups instead of discarding useful rollouts or aborting the job.
     use_partial_batch_on_exhaustion: True
     # With dynamic batching, use a smaller minibatch when the cap yields fewer
-    # mixed groups than actor.ppo_mini_batch_size.
+    # mixed groups than actor.ppo_mini_batch_size. The trainer redistributes
+    # trainable rows across DP ranks and uses synchronized zero-loss forwards
+    # for any empty role microbatches.
     allow_sub_minibatch_on_exhaustion: True
   final_worker_curriculum:
     enable: False
@@ -296,6 +298,11 @@ algorithm:
       mixed_groups_only: True
       normalize_advantages: True
       scope_threshold: 0.0
+      # Keep the full question fixed and compare the sampled worker action with
+      # both a full-task instruction and every other subtask in the same plan.
+      contrast_plan_subtasks: True
+      # 0 uses all alternative subtasks (at most max_planned_subtasks - 1).
+      max_wrong_subtask_contrasts: 0
       normalization_epsilon: 1.0e-6
       teacher_forcing_micro_batch_size_per_gpu: 2
     # Legacy CPCR/TSS direct-credit ablation.

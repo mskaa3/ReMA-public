@@ -1309,6 +1309,7 @@ class MultiAgentRollout:
             token_ids,
             *,
             assigned_subtasks=None,
+            plan_subtasks=None,
         ):
             if not (
                 c3_active
@@ -1325,6 +1326,7 @@ class MultiAgentRollout:
                 "stop_reason": stop_reason,
                 "token_ids": list(token_ids),
                 "assigned_subtasks": list(assigned_subtasks or []),
+                "plan_subtasks": list(plan_subtasks or []),
             }
 
         for i_turn in range(max_num_turns):
@@ -1688,6 +1690,7 @@ class MultiAgentRollout:
                             stop_reason,
                             token_ids,
                             assigned_subtasks=stage_subtasks_by_idx[idx],
+                            plan_subtasks=parsed_subtasks[idx],
                         )
                         worker_results[idx][stage_role] = output
                         worker_records[idx][stage_role] = (
@@ -2114,6 +2117,12 @@ class MultiAgentRollout:
                 for record in c3_action_records
             ]
             non_tensor_batch["c3_action_assigned_subtasks"] = c3_assigned_subtasks
+            c3_plan_subtasks = np.empty(len(c3_action_records), dtype=object)
+            c3_plan_subtasks[:] = [
+                list(record.get("plan_subtasks", [])) if record else []
+                for record in c3_action_records
+            ]
+            non_tensor_batch["c3_action_plan_subtasks"] = c3_plan_subtasks
             non_tensor_batch["c3_action_stop_reason"] = np.array([
                 record.get("stop_reason", "stop") if record else "stop"
                 for record in c3_action_records

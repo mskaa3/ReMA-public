@@ -34,9 +34,24 @@ def build_full_task_scope_counterfactual(
 ) -> list[dict] | None:
     """Replace the latest local assignment with a full-task assignment."""
 
+    return build_scope_assignment_counterfactual(
+        chat,
+        assigned_subtasks_text,
+        FULL_TASK_SCOPE_INSTRUCTION,
+    )
+
+
+def build_scope_assignment_counterfactual(
+    chat: Sequence[dict],
+    assigned_subtasks_text: str,
+    replacement_assignment_text: str,
+) -> list[dict] | None:
+    """Replace only the latest assignment while preserving all other context."""
+
     if (
         not chat
         or not assigned_subtasks_text
+        or not replacement_assignment_text
         or chat[-1].get("role") != "user"
     ):
         return None
@@ -50,7 +65,7 @@ def build_full_task_scope_counterfactual(
 
     counterfactual_content = (
         user_content[:assignment_start]
-        + FULL_TASK_SCOPE_INSTRUCTION
+        + replacement_assignment_text
         + user_content[assignment_start + len(assigned_subtasks_text):]
     )
     return [
