@@ -1819,12 +1819,13 @@ class MultiAgentRollout:
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         if is_final_stage:
                             stage_instruction = (
-                                "Synthesize the final answer from the worker results. "
-                                "Check the worker results, repair mistakes if needed, and end with the final answer in \\boxed{}."
+                                "Synthesize the final answer from the plan and worker results. "
+                                "Reconcile their conclusions and repair only local inconsistencies needed for synthesis. "
+                                "End with the final answer in \\boxed{}."
                             )
                         else:
                             role_instruction = "Work on the assigned subtask above. "
-                            if deterministic_routing and stage_idx == 1:
+                            if routing_mode == "derive_verify" and stage_idx == 1:
                                 role_instruction = (
                                     "Start from the previous S1 LOCAL_RESULT. Verify it against "
                                     "the reference problem, repair any error or omitted case, "
@@ -1833,7 +1834,7 @@ class MultiAgentRollout:
                             stage_instruction = (
                                 f"{role_instruction}"
                                 "Reason step by step with concrete calculations, transformations, or checks. "
-                                "Verify dependencies, warnings, boundary cases, signs, domains, units, and repair instructions. "
+                                "Keep the reasoning scoped to this subtask and check conditions that directly affect its result. "
                                 "Finish with one concise LOCAL_RESULT for this subtask. "
                                 "Output exactly:\n"
                                 "REASONING:\n"

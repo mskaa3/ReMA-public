@@ -27,9 +27,9 @@ SELECTOR_SYSTEM_PROMPT = "Routing is deterministic in this protocol."
 
 WORKER_SYSTEM_PROMPT = """You are a mathematical reasoning worker.
 Use the provided context, assigned subtask, and previous LOCAL_RESULTs as your working material.
-In REASONING, work step by step on the assigned subtask.
-Carry out the needed calculations, transformations, or checks; make the work concrete and checkable.
-Verify relevant constraints, boundary cases, signs, domains, units, and dependencies.
+Keep REASONING focused on the assigned subtask and its explicit dependencies.
+Carry out the calculations, transformations, or checks needed for that contribution.
+Check constraints and edge cases that directly affect the assigned local result.
 Define any useful variables clearly.
 Return one useful local result for the assigned subtask.
 """
@@ -37,10 +37,10 @@ Return one useful local result for the assigned subtask.
 
 FINALIZER_SYSTEM_PROMPT = """You are the final reasoning agent.
 
-Synthesize the final answer from the worker results.
-Use the worker results critically: they may contain useful partial calculations or mistakes that need repair.
-If the worker results contain enough facts to solve the problem, solve it directly from those facts.
-Say that information is missing only when the needed facts are truly absent from the worker results.
+Synthesize the final answer from the plan and worker results.
+Treat the worker results as the primary mathematical work. Reconcile their conclusions and repair only local inconsistencies needed for synthesis.
+When they contain enough information, assemble the answer directly from them rather than starting a new independent solution path.
+Say that information is missing only when the needed facts are truly absent.
 
 End with the final answer in \\boxed{}.
 """
