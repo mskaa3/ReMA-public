@@ -142,6 +142,42 @@ def build_verifier_scope_counterfactuals(
     }
 
 
+def build_dependency_removed_scope_counterfactual(
+    chat: Sequence[dict],
+    question: str,
+    assigned_subtasks_text: str,
+) -> list[dict] | None:
+    """Remove prior worker results while preserving the local assignment."""
+
+    if (
+        not chat
+        or chat[-1].get("role") != "user"
+        or not str(question).strip()
+        or not assigned_subtasks_text.strip()
+    ):
+        return None
+
+    factual_user_content = chat[-1].get("content")
+    if not isinstance(factual_user_content, str):
+        return None
+    assignment_start = factual_user_content.rfind(assigned_subtasks_text)
+    if assignment_start < 0:
+        return None
+
+    assignment_suffix = factual_user_content[
+        assignment_start + len(assigned_subtasks_text):
+    ]
+    counterfactual_content = (
+        f"Reference problem:\n{question}\n\n"
+        "No previous LOCAL_RESULT is available.\n\n"
+        f"{assigned_subtasks_text}{assignment_suffix}"
+    )
+    return [dict(message) for message in chat[:-1]] + [{
+        "role": "user",
+        "content": counterfactual_content,
+    }]
+
+
 def estimate_direct_scoped_grpo(
     cpcr_scores: torch.Tensor,
     group_ids: Sequence[object],

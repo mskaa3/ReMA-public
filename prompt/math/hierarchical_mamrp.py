@@ -30,19 +30,47 @@ PLAN:
 
 
 DERIVE_VERIFY_DECOMPOSER_SYSTEM_PROMPT = """You are the strategic planner for a mathematical problem.
-Analyze the problem before it is solved. Identify the most promising approach and the specific mistakes, constraints, or edge cases that should be checked afterwards.
-You may name useful equations, variables, or intermediate targets, but do not finish the calculation, give the final answer, or use \\boxed{}.
+Choose a solution path without carrying it out. Keep the reasoning one level above the calculation: explain why an approach applies and what could go wrong.
+
+Write STRATEGY as future instructions for deriving a candidate. You may restate given facts, define variables, and name an equation, transformation, or unevaluated intermediate target. Stop before evaluating the expression or solving the equation that determines the requested answer.
+Write CHECKS as future instructions for testing the candidate and repairing a specific kind of mistake.
+
+Never state a candidate or final answer, an equivalent evaluated result, a completed derivation, or \\boxed{}. Do not perform the answer-determining step even when it is trivial or the problem has only one step.
 
 Output exactly:
 
 REASONING:
-<concise meta-reasoning about why this approach fits the problem>
+<concise meta-reasoning about why the proposed approach fits the problem>
 
 STRATEGY:
-<concrete guidance for deriving a candidate solution>
+<future instructions that stop before the answer-determining calculation>
 
 CHECKS:
-<concrete guidance for checking and repairing that candidate>
+<future instructions for checking and repairing the candidate>
+"""
+
+
+SEQUENTIAL_DECOMPOSER_SYSTEM_PROMPT = """You are the strategic planner for a mathematical problem.
+Reason about the structure of the solution, then divide the work into exactly four ordered subtasks. Do not carry out the calculations that determine the requested final answer.
+
+The subtasks must form one coherent solution path rather than four independent attempts:
+- S1 establishes the first useful intermediate result.
+- S2 starts from the S1 result and advances the solution.
+- S3 starts from earlier results and completes the main derivation.
+- S4 checks the derived candidate against the problem, repairs any error or omitted case, and states the corrected result for final synthesis.
+
+Make every dependency explicit by naming the earlier subtask whose LOCAL_RESULT is needed. Keep each subtask focused on one distinct contribution. You may restate given facts, define variables, and specify equations or transformations, but do not state the final answer or use \\boxed{}.
+
+Output exactly:
+
+REASONING:
+<concise meta-reasoning about the solution path and its possible failure points>
+
+PLAN:
+- S1: <first subtask>
+- S2: <second subtask, explicitly using S1>
+- S3: <third subtask, explicitly using relevant earlier results>
+- S4: <verification and repair subtask, explicitly using the derived candidate>
 """
 
 
@@ -64,27 +92,7 @@ ASSIGNMENTS:
 """
 
 
-ALGEBRA_WORKER_SYSTEM_PROMPT = """You are algebra_worker.
-Use the provided context, assigned subtask, and previous LOCAL_RESULTs as your working material.
-In REASONING, work step by step on the assigned subtask.
-Carry out the needed calculations, transformations, or checks; make the work concrete and checkable.
-Verify relevant constraints, boundary cases, signs, domains, units, and dependencies.
-Define any useful variables clearly.
-Return one useful local result for the assigned subtask.
-"""
-
-
-FUNCTIONAL_ANALYSIS_WORKER_SYSTEM_PROMPT = """You are functional_analysis_worker.
-Use the provided context, assigned subtask, and previous LOCAL_RESULTs as your working material.
-In REASONING, work step by step on the assigned subtask.
-Carry out the needed calculations, transformations, or checks; make the work concrete and checkable.
-Verify relevant constraints, boundary cases, signs, domains, units, and dependencies.
-Define any useful variables clearly.
-Return one useful local result for the assigned subtask.
-"""
-
-
-GENERAL_MATH_WORKER_SYSTEM_PROMPT = """You are general_math_worker.
+WORKER_SYSTEM_PROMPT = """You are a mathematical reasoning worker.
 Use the provided context, assigned subtask, and previous LOCAL_RESULTs as your working material.
 In REASONING, work step by step on the assigned subtask.
 Carry out the needed calculations, transformations, or checks; make the work concrete and checkable.
@@ -113,9 +121,9 @@ ORCHESTRATION_SYSTEM_PROMPTS = {
 
 
 WORKER_TYPE_SYSTEM_PROMPTS = {
-    "algebra_worker": ALGEBRA_WORKER_SYSTEM_PROMPT,
-    "functional_analysis_worker": FUNCTIONAL_ANALYSIS_WORKER_SYSTEM_PROMPT,
-    "general_math_worker": GENERAL_MATH_WORKER_SYSTEM_PROMPT,
+    "algebra_worker": WORKER_SYSTEM_PROMPT,
+    "functional_analysis_worker": WORKER_SYSTEM_PROMPT,
+    "general_math_worker": WORKER_SYSTEM_PROMPT,
 }
 
 
@@ -142,9 +150,9 @@ def build_hierarchical_system_prompts(stage_roles=None, routing_mode=None):
     }
     if routing_mode == "derive_verify":
         prompts["decomposer"] = DERIVE_VERIFY_DECOMPOSER_SYSTEM_PROMPT
+    elif routing_mode == "sequential_plan":
+        prompts["decomposer"] = SEQUENTIAL_DECOMPOSER_SYSTEM_PROMPT
+        prompts["selector"] = "Routing is deterministic in this protocol."
     for stage_role in stage_roles or DEFAULT_STAGE_ROLES:
-        prompts[stage_role] = GENERAL_MATH_WORKER_SYSTEM_PROMPT
+        prompts[stage_role] = WORKER_SYSTEM_PROMPT
     return prompts
-
-
-HIERARCHICAL_SYSTEM_PROMPTS = build_hierarchical_system_prompts()

@@ -53,6 +53,7 @@ from verl.utils import torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 from verl.rema_separated_trainer.ppo.cpcr import estimate_cpcr
 from verl.rema_separated_trainer.ppo.direct_scoped_grpo import (
+    build_dependency_removed_scope_counterfactual,
     build_full_task_scope_counterfactual,
     build_scope_assignment_counterfactual,
     build_verifier_scope_counterfactuals,
@@ -1777,8 +1778,13 @@ class RayReMASeparatedTrainer(object):
     def _direct_scoped_role_requires_tss(self, data_batch, role):
         hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
         stage_roles = list(hierarchy.get('stage_roles', []))
-        if str(hierarchy.get('routing_mode', 'selector')).lower() == 'derive_verify':
+        routing_mode = str(
+            hierarchy.get('routing_mode', 'selector')
+        ).lower()
+        if routing_mode == 'derive_verify':
             return len(stage_roles) >= 2 and role == stage_roles[1]
+        if routing_mode == 'sequential_plan':
+            return role in stage_roles[:-1]
         return role in stage_roles[:-1]
 
     def _build_direct_scope_prompt_bundle(self, data_batch, role, sample_idx):
@@ -1901,7 +1907,10 @@ class RayReMASeparatedTrainer(object):
         factual_chat = self._cpcr_unpad_messages(
             data_batch.non_tensor_batch[chat_key][sample_idx]
         )
-        if str(hierarchy.get('routing_mode', 'selector')).lower() == 'derive_verify':
+        routing_mode = str(
+            hierarchy.get('routing_mode', 'selector')
+        ).lower()
+        if routing_mode == 'derive_verify':
             question = str(data_batch.non_tensor_batch['question'][sample_idx])
             verifier_counterfactuals = build_verifier_scope_counterfactuals(
                 factual_chat,
@@ -1943,6 +1952,37 @@ class RayReMASeparatedTrainer(object):
             if wrong_chat is None:
                 return None
             wrong_subtask_chats.append((subtask_id, wrong_chat))
+        if routing_mode == 'sequential_plan':
+            contrasts = [('full_task', counterfactual_chat)]
+            contrasts.extend([
+                (f'wrong_subtask_{subtask_id}', wrong_chat)
+                for subtask_id, wrong_chat in wrong_subtask_chats
+            ])
+            stage_roles = list(hierarchy.get('stage_roles', []))
+            role_stage_idx = (
+                stage_roles.index(role)
+                if role in stage_roles else -1
+            )
+            if role_stage_idx > 0:
+                question = str(
+                    data_batch.non_tensor_batch['question'][sample_idx]
+                )
+                no_dependency_chat = (
+                    build_dependency_removed_scope_counterfactual(
+                        factual_chat,
+                        question,
+                        assigned_subtasks_text,
+                    )
+                )
+                if no_dependency_chat is None:
+                    return None
+                contrasts.append(('dependency_removed', no_dependency_chat))
+            return {
+                'factual': factual_chat,
+                'contrasts': contrasts,
+                'tss_mode': 'sequential_scope_dependency',
+                'worker_message': worker_message,
+            }
         return {
             'factual': factual_chat,
             'full_task': counterfactual_chat,
@@ -1995,6 +2035,15 @@ class RayReMASeparatedTrainer(object):
         verifier_dependency_contrast = bool(
             scoring_config.get('verifier_dependency_contrast', True)
         )
+        sequential_full_task_contrast = bool(
+            scoring_config.get('sequential_full_task_contrast', True)
+        )
+        sequential_identity_contrast = bool(
+            scoring_config.get('sequential_identity_contrast', True)
+        )
+        sequential_dependency_contrast = bool(
+            scoring_config.get('sequential_dependency_contrast', True)
+        )
         for sample_idx in torch.nonzero(candidate_mask, as_tuple=False).flatten().tolist():
             prompt_bundle = self._build_direct_scope_prompt_bundle(
                 data_batch,
@@ -2014,6 +2063,32 @@ class RayReMASeparatedTrainer(object):
                     if contrast_name == 'dependency_removed' and not verifier_dependency_contrast:
                         continue
                     contrasts.append((contrast_name, contrast_chat))
+            elif tss_mode == 'sequential_scope_dependency':
+                contrasts = []
+                named_contrasts = list(prompt_bundle['contrasts'])
+                wrong_contrasts = [
+                    item for item in named_contrasts
+                    if item[0].startswith('wrong_subtask_')
+                ]
+                if wrong_contrasts:
+                    rotation = sample_idx % len(wrong_contrasts)
+                    wrong_contrasts = (
+                        wrong_contrasts[rotation:]
+                        + wrong_contrasts[:rotation]
+                    )
+                    if max_wrong_contrasts > 0:
+                        wrong_contrasts = wrong_contrasts[
+                            :max_wrong_contrasts
+                        ]
+                for contrast_name, contrast_chat in named_contrasts:
+                    if contrast_name == 'full_task':
+                        if sequential_full_task_contrast:
+                            contrasts.append((contrast_name, contrast_chat))
+                    elif contrast_name == 'dependency_removed':
+                        if sequential_dependency_contrast:
+                            contrasts.append((contrast_name, contrast_chat))
+                if sequential_identity_contrast and contrast_plan_subtasks:
+                    contrasts.extend(wrong_contrasts)
             else:
                 contrasts = [('full_task', prompt_bundle['full_task'])]
                 wrong_chats = (
@@ -2161,6 +2236,10 @@ class RayReMASeparatedTrainer(object):
             str(hierarchy.get('routing_mode', 'selector')).lower()
             == 'derive_verify'
         )
+        sequential_tss_mode = (
+            str(hierarchy.get('routing_mode', 'selector')).lower()
+            == 'sequential_plan'
+        )
         metrics[f'{prefix}/verifier_role_dependency_mode'] = float(
             verifier_tss_mode
         )
@@ -2168,7 +2247,19 @@ class RayReMASeparatedTrainer(object):
             verifier_tss_mode and verifier_role_contrast
         )
         metrics[f'{prefix}/dependency_contrast_enabled'] = float(
-            verifier_tss_mode and verifier_dependency_contrast
+            (verifier_tss_mode and verifier_dependency_contrast)
+            or (sequential_tss_mode and sequential_dependency_contrast)
+        )
+        metrics[f'{prefix}/sequential_scope_dependency_mode'] = float(
+            sequential_tss_mode
+        )
+        metrics[f'{prefix}/full_task_contrast_enabled'] = float(
+            sequential_tss_mode and sequential_full_task_contrast
+        )
+        metrics[f'{prefix}/identity_contrast_enabled'] = float(
+            sequential_tss_mode
+            and sequential_identity_contrast
+            and contrast_plan_subtasks
         )
         metrics[f'{prefix}/candidate_count'] = float(candidate_mask.sum().item())
         metrics[f'{prefix}/valid_count'] = float(valid_mask.sum().item())
@@ -4768,6 +4859,64 @@ class RayReMASeparatedTrainer(object):
                     raise ValueError(
                         "derive_verify TSS requires verifier_role_contrast or "
                         "verifier_dependency_contrast to be enabled"
+                    )
+            elif routing_mode == 'sequential_plan':
+                stage_roles = list(hierarchy_config.get('stage_roles', []))
+                worker_stage_count = len(stage_roles) - 1
+                if worker_stage_count < 1:
+                    raise ValueError(
+                        "hierarchy.routing_mode=sequential_plan requires at "
+                        "least one non-final worker and one final stage"
+                    )
+                max_planned_subtasks = int(
+                    hierarchy_config.get('max_planned_subtasks', 0)
+                )
+                if max_planned_subtasks != worker_stage_count:
+                    raise ValueError(
+                        "hierarchy.max_planned_subtasks must equal the number "
+                        "of non-final stages in sequential_plan mode"
+                    )
+                if int(config.actor_rollout_ref.rollout.max_num_turns) != 1:
+                    raise ValueError(
+                        "hierarchy.routing_mode=sequential_plan currently "
+                        "requires actor_rollout_ref.rollout.max_num_turns=1"
+                    )
+                if bool(
+                    hierarchy_config.get('accept_revise', {}).get(
+                        'enable', False
+                    )
+                ):
+                    raise ValueError(
+                        "hierarchy.accept_revise.enable must be False in the "
+                        "single-round sequential_plan protocol"
+                    )
+                selector_role = hierarchy_config.get(
+                    'selector_role', 'selector'
+                )
+                if selector_role in hierarchy_config.get(
+                    'train_agent_roles', []
+                ):
+                    raise ValueError(
+                        "The selector is deterministic in sequential_plan mode "
+                        "and must not appear in hierarchy.train_agent_roles"
+                    )
+                tss_config = hierarchy_config.get('scoped_c3_grpo', {})
+                worker_scope_contrast = bool(tss_config.get(
+                    'sequential_full_task_contrast', True
+                )) or (
+                    bool(tss_config.get(
+                        'sequential_identity_contrast', True
+                    ))
+                    and bool(tss_config.get('contrast_plan_subtasks', True))
+                )
+                if (
+                    bool(tss_config.get('enable', False))
+                    and not worker_scope_contrast
+                ):
+                    raise ValueError(
+                        "sequential_plan TSS requires a full-task contrast or "
+                        "an enabled planned-subtask identity contrast so W1 "
+                        "has at least one counterfactual"
                     )
 
         # 1. Check total batch size for data correctness

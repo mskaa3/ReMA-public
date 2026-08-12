@@ -53,6 +53,8 @@ actor_rollout_ref:
       worker_stage_1: 0.002
       worker_stage_2: 0.002
       worker_stage_3: 0.002
+      worker_stage_4: 0.002
+      worker_stage_5: 0.002
       finalizer: 0.002
     use_kl_loss: False # True for GRPO, False for DrGRPO
     kl_loss_coef: 0.001 # for grpo
@@ -249,12 +251,12 @@ algorithm:
     decomposer_role: decomposer
     selector_role: selector
     worker_roles: [general_math_worker]
-    # One derivation worker, one verification/repair worker, and one final stage.
-    num_worker_stages: 3
-    max_planned_subtasks: 2
-    # Skip selector generation: S1 -> stage 1, S2 -> stage 2, final -> stage 3.
-    # The selector remains only as a masked compatibility slot in the rollout.
-    routing_mode: derive_verify
+    # Four sequential subtask workers followed by one final synthesis stage.
+    num_worker_stages: 5
+    max_planned_subtasks: 4
+    # Skip selector generation: S1..S4 map positionally to stages 1..4 and the
+    # final answer maps to stage 5. The selector is a masked compatibility slot.
+    routing_mode: sequential_plan
     start_agent: decomposer
     default_worker: general_math_worker
     # Non-final workers see the original problem as reference context, but the
@@ -263,8 +265,8 @@ algorithm:
     worker_context_mode: full_question
     final_context_mode: plan_and_worker_results
     pass_question_to_workers: True
-    # The planner writes natural STRATEGY/CHECKS guidance. Routing normalizes
-    # those sections internally into S1 for the solver and S2 for the verifier.
+    # The planner produces exactly four dependent subtasks. Routing normalizes
+    # malformed or incomplete plans so every configured stage still executes.
     decomposer_max_new_tokens: 512
     # Local stages produce checkable work; the final stage has room to synthesize it.
     worker_max_new_tokens: 512
@@ -285,15 +287,14 @@ algorithm:
       mixed_groups_only: True
       normalize_advantages: True
       scope_threshold: 0.0
-      # In derive_verify mode, only W2 uses TSS. The role contrast preserves the
-      # W1 candidate but asks W2 to solve independently; the dependency contrast
-      # preserves the verifier role but removes W1's result.
-      verifier_role_contrast: True
-      verifier_dependency_contrast: True
-      # Legacy controls used only by the variable-subtask routing mode.
-      contrast_plan_subtasks: False
-      # 0 uses all alternative subtasks (at most max_planned_subtasks - 1).
-      max_wrong_subtask_contrasts: 0
+      # Every non-final worker is compared against solving the complete task,
+      # doing another planned subtask, and (from W2 onward) losing prior results.
+      sequential_full_task_contrast: True
+      sequential_identity_contrast: True
+      sequential_dependency_contrast: True
+      contrast_plan_subtasks: True
+      # Rotate one alternative subtask per rollout to control teacher-forcing cost.
+      max_wrong_subtask_contrasts: 1
       normalization_epsilon: 1.0e-6
       teacher_forcing_micro_batch_size_per_gpu: 4
     # Legacy CPCR/TSS direct-credit ablation.
@@ -421,7 +422,7 @@ algorithm:
         graph_prior_reverse_distance_penalty: 3.0
     worker_specs:
       general_math_worker: fallback mathematical reasoning and synthesis support
-    train_agent_roles: [decomposer, worker_stage_1, worker_stage_2, worker_stage_3]
+    train_agent_roles: [decomposer, worker_stage_1, worker_stage_2, worker_stage_3, worker_stage_4, worker_stage_5]
 
 trainer:
   debug_mode: False

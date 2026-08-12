@@ -1022,13 +1022,79 @@ class MultiAgentRollout:
         return normalized_subtasks, ordered_stages
 
     @staticmethod
-    def _format_deterministic_assignments(default_worker: str) -> str:
-        return (
-            "ASSIGNMENTS:\n"
-            f"- S1 -> {default_worker}\n"
-            f"- S2 -> {default_worker}\n"
-            f"- FINAL -> {default_worker}"
-        )
+    def _build_sequential_plan_stages(
+        subtasks: List[Tuple[str, str]],
+        stage_roles: List[str],
+        default_worker: str,
+    ) -> Tuple[
+        List[Tuple[str, str]],
+        List[Tuple[str, str, List[Tuple[str, str]]]],
+    ]:
+        """Normalize a plan into one dependent subtask per non-final stage."""
+        if len(stage_roles) < 2:
+            raise ValueError(
+                "routing_mode=sequential_plan requires at least one worker "
+                "stage followed by one final stage"
+            )
+
+        worker_stage_count = len(stage_roles) - 1
+        descriptions = [
+            description.strip()
+            for _, description in subtasks[:worker_stage_count]
+            if description.strip()
+        ]
+        fallback_descriptions = []
+        for subtask_idx in range(worker_stage_count):
+            subtask_number = subtask_idx + 1
+            if subtask_idx == 0:
+                description = (
+                    "Establish the first useful intermediate result for the "
+                    "reference problem and preserve the facts needed by later steps."
+                )
+            elif subtask_idx == worker_stage_count - 1:
+                description = (
+                    f"Use the S{subtask_number - 1} LOCAL_RESULT and any other "
+                    "relevant earlier results to verify the derived candidate, "
+                    "repair errors or omitted cases, and state the corrected result."
+                )
+            else:
+                description = (
+                    f"Use the S{subtask_number - 1} LOCAL_RESULT and relevant "
+                    "earlier results to advance the derivation with one distinct "
+                    "intermediate contribution."
+                )
+            fallback_descriptions.append(description)
+
+        normalized_subtasks = [
+            (
+                f"S{subtask_idx + 1}",
+                descriptions[subtask_idx]
+                if subtask_idx < len(descriptions)
+                else fallback_descriptions[subtask_idx],
+            )
+            for subtask_idx in range(worker_stage_count)
+        ]
+        ordered_stages = [
+            (stage_roles[subtask_idx], default_worker, [subtask])
+            for subtask_idx, subtask in enumerate(normalized_subtasks)
+        ]
+        ordered_stages.append((stage_roles[-1], default_worker, []))
+        return normalized_subtasks, ordered_stages
+
+    @staticmethod
+    def _format_deterministic_assignments(
+        default_worker: str,
+        subtasks: Optional[List[Tuple[str, str]]] = None,
+    ) -> str:
+        assignment_lines = [
+            f"- {subtask_id} -> {default_worker}"
+            for subtask_id, _ in (subtasks or [("S1", ""), ("S2", "")])
+        ]
+        return "\n".join([
+            "ASSIGNMENTS:",
+            *assignment_lines,
+            f"- FINAL -> {default_worker}",
+        ])
 
     @staticmethod
     def _format_worker_specs(worker_specs: Dict[str, str], worker_roles: List[str]) -> str:
@@ -1266,7 +1332,10 @@ class MultiAgentRollout:
         )
         final_context_mode = hierarchy_config.get("final_context_mode", "full_question")
         routing_mode = str(hierarchy_config.get("routing_mode", "selector")).lower()
-        deterministic_routing = routing_mode == "derive_verify"
+        deterministic_routing = routing_mode in {
+            "derive_verify",
+            "sequential_plan",
+        }
         decomposer_max_new_tokens = hierarchy_config.get("decomposer_max_new_tokens")
         selector_max_new_tokens = hierarchy_config.get("selector_max_new_tokens")
         worker_max_new_tokens = hierarchy_config.get("worker_max_new_tokens")
@@ -1582,11 +1651,18 @@ class MultiAgentRollout:
                     max_subtasks=max_planned_subtasks,
                 )
                 if deterministic_routing:
-                    subtasks, ordered_stages = self._build_derive_verify_stages(
-                        subtasks,
-                        stage_roles,
-                        default_worker,
-                    )
+                    if routing_mode == "derive_verify":
+                        subtasks, ordered_stages = self._build_derive_verify_stages(
+                            subtasks,
+                            stage_roles,
+                            default_worker,
+                        )
+                    else:
+                        subtasks, ordered_stages = self._build_sequential_plan_stages(
+                            subtasks,
+                            stage_roles,
+                            default_worker,
+                        )
                     ordered_stages_by_idx[idx] = ordered_stages
                 parsed_subtasks[idx] = subtasks
                 selector_chats_by_idx[idx] = build_prompt(
@@ -1599,10 +1675,11 @@ class MultiAgentRollout:
                     ),
                 )
             if deterministic_routing:
-                deterministic_assignments = self._format_deterministic_assignments(
-                    default_worker
-                )
                 for idx in revise_indices:
+                    deterministic_assignments = self._format_deterministic_assignments(
+                        default_worker,
+                        parsed_subtasks[idx],
+                    )
                     selector_output_by_idx[idx] = deterministic_assignments
                     record_prompt_and_output(
                         idx,
