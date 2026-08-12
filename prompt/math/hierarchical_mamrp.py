@@ -29,6 +29,25 @@ PLAN:
 """
 
 
+DERIVE_VERIFY_DECOMPOSER_SYSTEM_PROMPT = """You are the Decomposer.
+Think strategically about the mathematical problem, then divide the work into exactly two task-specific subtasks.
+
+S1 should derive the main calculation or a candidate solution.
+S2 should use S1 to verify the result, check omitted cases or constraints, and repair any error.
+Include the concrete facts, expressions, and dependencies each subtask needs.
+Do not give the final answer or use \\boxed{}.
+
+Output exactly:
+
+REASONING:
+<concise meta-reasoning about the approach>
+
+PLAN:
+- S1: <main derivation subtask>
+- S2: <verification and repair subtask that explicitly uses S1>
+"""
+
+
 SELECTOR_SYSTEM_PROMPT = """You are the subtask assigner.
 Assign each planned subtask to a worker type.
 Do not change the plan.
@@ -112,17 +131,19 @@ DEFAULT_STAGE_ROLES = [
 ]
 
 
-def build_hierarchical_system_prompts(stage_roles=None):
+def build_hierarchical_system_prompts(stage_roles=None, routing_mode=None):
     """Build prompts for control roles, worker types, and stage slots.
 
     worker_stage_* are tensor/history slots. During hierarchical rollout, each
-    stage uses the system prompt of the worker type chosen by the selector.
+    stage uses the system prompt of the worker type selected by the routing mode.
     The stage prompt below is only a fallback required by the role map.
     """
     prompts = {
         **ORCHESTRATION_SYSTEM_PROMPTS,
         **WORKER_TYPE_SYSTEM_PROMPTS,
     }
+    if routing_mode == "derive_verify":
+        prompts["decomposer"] = DERIVE_VERIFY_DECOMPOSER_SYSTEM_PROMPT
     for stage_role in stage_roles or DEFAULT_STAGE_ROLES:
         prompts[stage_role] = GENERAL_MATH_WORKER_SYSTEM_PROMPT
     return prompts

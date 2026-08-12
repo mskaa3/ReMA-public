@@ -1094,6 +1094,13 @@ class RayReMASeparatedTrainer(object):
                 plan_text,
                 max_subtasks=max_planned_subtasks,
             )
+            if str(hierarchy.get('routing_mode', 'selector')).lower() == 'derive_verify':
+                _, parsed_stages = MultiAgentRollout._build_derive_verify_stages(
+                    parsed_subtasks,
+                    stage_roles,
+                    default_worker,
+                )
+                return parsed_stages
             parsed_stages = MultiAgentRollout._parse_ordered_worker_stages(
                 selector_text,
                 parsed_subtasks,
@@ -1119,10 +1126,18 @@ class RayReMASeparatedTrainer(object):
         )
         candidate_stages = parse_execution_stages(candidate_plan, candidate_assignments)
 
-        execution_roles = [decomposer_role, selector_role] + [
+        deterministic_routing = (
+            str(hierarchy.get('routing_mode', 'selector')).lower() == 'derive_verify'
+        )
+        control_roles = (
+            [decomposer_role]
+            if deterministic_routing
+            else [decomposer_role, selector_role]
+        )
+        execution_roles = control_roles + [
             stage_role for stage_role, _, _ in ordered_stages
         ]
-        candidate_execution_roles = [decomposer_role, selector_role] + [
+        candidate_execution_roles = control_roles + [
             stage_role for stage_role, _, _ in candidate_stages
         ]
         if start_role not in execution_roles or start_role not in candidate_execution_roles:
@@ -4584,7 +4599,9 @@ class RayReMASeparatedTrainer(object):
                 'agent_roles': hierarchy_config['agent_roles'],
                 'finish_flag': FINISH_FLAG,
                 'system_prompts': build_hierarchical_system_prompts(
-                    hierarchy_config.get('stage_roles')),
+                    hierarchy_config.get('stage_roles'),
+                    hierarchy_config.get('routing_mode'),
+                ),
                 'max_num_turns': max_num_turns,
                 'hierarchy': hierarchy_config,
             }
@@ -4617,6 +4634,37 @@ class RayReMASeparatedTrainer(object):
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+
+        if self._hierarchy_enabled():
+            hierarchy_config = self._get_hierarchy_config()
+            routing_mode = str(
+                hierarchy_config.get('routing_mode', 'selector')
+            ).lower()
+            if routing_mode == 'derive_verify':
+                stage_roles = list(hierarchy_config.get('stage_roles', []))
+                if len(stage_roles) != 3:
+                    raise ValueError(
+                        "hierarchy.routing_mode=derive_verify requires exactly "
+                        "three stages: derive, verify/repair, and final"
+                    )
+                if int(config.actor_rollout_ref.rollout.max_num_turns) != 1:
+                    raise ValueError(
+                        "hierarchy.routing_mode=derive_verify currently requires "
+                        "actor_rollout_ref.rollout.max_num_turns=1"
+                    )
+                if bool(
+                    hierarchy_config.get('accept_revise', {}).get('enable', False)
+                ):
+                    raise ValueError(
+                        "hierarchy.accept_revise.enable must be False in the "
+                        "single-round derive_verify protocol"
+                    )
+                selector_role = hierarchy_config.get('selector_role', 'selector')
+                if selector_role in hierarchy_config.get('train_agent_roles', []):
+                    raise ValueError(
+                        "The selector is deterministic in derive_verify mode and "
+                        "must not appear in hierarchy.train_agent_roles"
+                    )
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n

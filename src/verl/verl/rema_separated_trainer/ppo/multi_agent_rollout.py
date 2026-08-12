@@ -946,6 +946,63 @@ class MultiAgentRollout:
         ]
 
     @staticmethod
+    def _build_derive_verify_stages(
+        subtasks: List[Tuple[str, str]],
+        stage_roles: List[str],
+        default_worker: str,
+    ) -> Tuple[
+        List[Tuple[str, str]],
+        List[Tuple[str, str, List[Tuple[str, str]]]],
+    ]:
+        """Normalize a plan into fixed derive, verify, and final stages."""
+        if len(stage_roles) != 3:
+            raise ValueError(
+                "routing_mode=derive_verify requires exactly three worker stages "
+                "(derive, verify/repair, final)"
+            )
+
+        descriptions = [
+            description.strip()
+            for _, description in subtasks[:2]
+            if description.strip()
+        ]
+        derive_description = (
+            descriptions[0]
+            if descriptions
+            else (
+                "Derive the main calculation or a candidate solution from the "
+                "reference problem, preserving the intermediate facts needed for verification."
+            )
+        )
+        verify_description = (
+            descriptions[1]
+            if len(descriptions) > 1
+            else (
+                "Use the S1 result to verify the candidate against every stated "
+                "constraint, repair any error or omitted case, and state the corrected result."
+            )
+        )
+        normalized_subtasks = [
+            ("S1", derive_description),
+            ("S2", verify_description),
+        ]
+        ordered_stages = [
+            (stage_roles[0], default_worker, [normalized_subtasks[0]]),
+            (stage_roles[1], default_worker, [normalized_subtasks[1]]),
+            (stage_roles[2], default_worker, []),
+        ]
+        return normalized_subtasks, ordered_stages
+
+    @staticmethod
+    def _format_deterministic_assignments(default_worker: str) -> str:
+        return (
+            "ASSIGNMENTS:\n"
+            f"- S1 -> {default_worker}\n"
+            f"- S2 -> {default_worker}\n"
+            f"- FINAL -> {default_worker}"
+        )
+
+    @staticmethod
     def _format_worker_specs(worker_specs: Dict[str, str], worker_roles: List[str]) -> str:
         return "\n".join([
             f"- {role}: {worker_specs.get(role, '')}"
@@ -1180,6 +1237,8 @@ class MultiAgentRollout:
             "full_question" if pass_question_to_workers else "subtask_context",
         )
         final_context_mode = hierarchy_config.get("final_context_mode", "full_question")
+        routing_mode = str(hierarchy_config.get("routing_mode", "selector")).lower()
+        deterministic_routing = routing_mode == "derive_verify"
         decomposer_max_new_tokens = hierarchy_config.get("decomposer_max_new_tokens")
         selector_max_new_tokens = hierarchy_config.get("selector_max_new_tokens")
         worker_max_new_tokens = hierarchy_config.get("worker_max_new_tokens")
@@ -1484,14 +1543,23 @@ class MultiAgentRollout:
                 if not revise_indices:
                     continue
 
-            # 2. Select workers for each subtask.
+            # 2. Parse the plan and either route it deterministically or ask the selector.
             selector_chats_by_idx = {}
             parsed_subtasks = {}
+            ordered_stages_by_idx = {}
+            selector_output_by_idx = {}
             for idx in revise_indices:
                 subtasks = self._extract_subtasks(
                     current_plan[idx],
                     max_subtasks=max_planned_subtasks,
                 )
+                if deterministic_routing:
+                    subtasks, ordered_stages = self._build_derive_verify_stages(
+                        subtasks,
+                        stage_roles,
+                        default_worker,
+                    )
+                    ordered_stages_by_idx[idx] = ordered_stages
                 parsed_subtasks[idx] = subtasks
                 selector_chats_by_idx[idx] = build_prompt(
                     selector_role,
@@ -1502,52 +1570,76 @@ class MultiAgentRollout:
                         f"Available workers:\n{worker_spec_text}"
                     ),
                 )
-            selector_records = self._generate_from_hierarchical_chat_map(
-                selector_role,
-                revise_indices,
-                selector_chats_by_idx,
-                tokenizers,
-                prompts.meta_info,
-                response_length,
-                max_new_tokens=selector_max_new_tokens,
-                group_ids=c3_group_ids,
-                coupled_group_ids=coupled_groups_for(
+            if deterministic_routing:
+                deterministic_assignments = self._format_deterministic_assignments(
+                    default_worker
+                )
+                for idx in revise_indices:
+                    selector_output_by_idx[idx] = deterministic_assignments
+                    record_prompt_and_output(
+                        idx,
+                        selector_role,
+                        selector_chats_by_idx[idx],
+                        deterministic_assignments,
+                        0,
+                        "stop",
+                        [],
+                        executed=False,
+                        deterministic_routing=True,
+                    )
+            else:
+                selector_records = self._generate_from_hierarchical_chat_map(
                     selector_role,
                     revise_indices,
-                ),
-            )
-            mark_branch_open(selector_role, revise_indices)
-            ordered_stages_by_idx = {}
-            selector_output_by_idx = {}
-            for idx in revise_indices:
-                output, num_tokens, stop_reason, token_ids = selector_records[idx]
-                selector_output_by_idx[idx] = output
-                record_prompt_and_output(
-                    idx,
-                    selector_role,
-                    selector_chats_by_idx[idx],
-                    output,
-                    num_tokens,
-                    stop_reason,
-                    token_ids,
+                    selector_chats_by_idx,
+                    tokenizers,
+                    prompts.meta_info,
+                    response_length,
+                    max_new_tokens=selector_max_new_tokens,
+                    group_ids=c3_group_ids,
+                    coupled_group_ids=coupled_groups_for(
+                        selector_role,
+                        revise_indices,
+                    ),
                 )
-                record_c3_branch_action(
-                    idx,
-                    selector_role,
-                    selector_chats_by_idx[idx],
-                    output,
-                    num_tokens,
-                    stop_reason,
-                    token_ids,
-                )
-                ordered_stages_by_idx[idx] = self._parse_ordered_worker_stages(
-                    output, parsed_subtasks[idx], stage_roles, worker_types, default_worker)
-                if stage_roles:
-                    final_stage_role = stage_roles[-1]
-                    if all(stage_role != final_stage_role
-                           for stage_role, _, _ in ordered_stages_by_idx[idx]):
-                        ordered_stages_by_idx[idx].append(
-                            (final_stage_role, default_worker, []))
+                mark_branch_open(selector_role, revise_indices)
+                for idx in revise_indices:
+                    output, num_tokens, stop_reason, token_ids = selector_records[idx]
+                    selector_output_by_idx[idx] = output
+                    record_prompt_and_output(
+                        idx,
+                        selector_role,
+                        selector_chats_by_idx[idx],
+                        output,
+                        num_tokens,
+                        stop_reason,
+                        token_ids,
+                    )
+                    record_c3_branch_action(
+                        idx,
+                        selector_role,
+                        selector_chats_by_idx[idx],
+                        output,
+                        num_tokens,
+                        stop_reason,
+                        token_ids,
+                    )
+                    ordered_stages_by_idx[idx] = self._parse_ordered_worker_stages(
+                        output,
+                        parsed_subtasks[idx],
+                        stage_roles,
+                        worker_types,
+                        default_worker,
+                    )
+                    if stage_roles:
+                        final_stage_role = stage_roles[-1]
+                        if all(
+                            stage_role != final_stage_role
+                            for stage_role, _, _ in ordered_stages_by_idx[idx]
+                        ):
+                            ordered_stages_by_idx[idx].append(
+                                (final_stage_role, default_worker, [])
+                            )
 
             # 3. Execute selected worker stages sequentially. Stage roles encode
             # the order; each later worker sees previous results.
@@ -1620,19 +1712,29 @@ class MultiAgentRollout:
                         else:
                             work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
-                        stage_instruction = (
-                            "Synthesize the final answer from the worker results. "
-                            "Check the worker results, repair mistakes if needed, and end with the final answer in \\boxed{}."
-                            if is_final_stage else
-                            "Work on the assigned subtask above. "
-                            "Reason step by step with concrete calculations, transformations, or checks. "
-                            "Verify dependencies, warnings, boundary cases, signs, domains, units, and repair instructions. "
-                            "Finish with one concise LOCAL_RESULT for this subtask. "
-                            "Output exactly:\n"
-                            "REASONING:\n"
-                            "<step-by-step reasoning for this subtask>\n\n"
-                            "LOCAL_RESULT: \\boxed{<useful result of this subtask>}"
-                        )
+                        if is_final_stage:
+                            stage_instruction = (
+                                "Synthesize the final answer from the worker results. "
+                                "Check the worker results, repair mistakes if needed, and end with the final answer in \\boxed{}."
+                            )
+                        else:
+                            role_instruction = "Work on the assigned subtask above. "
+                            if deterministic_routing and stage_idx == 1:
+                                role_instruction = (
+                                    "Start from the previous S1 LOCAL_RESULT. Verify it against "
+                                    "the reference problem, repair any error or omitted case, "
+                                    "and state the corrected result. "
+                                )
+                            stage_instruction = (
+                                f"{role_instruction}"
+                                "Reason step by step with concrete calculations, transformations, or checks. "
+                                "Verify dependencies, warnings, boundary cases, signs, domains, units, and repair instructions. "
+                                "Finish with one concise LOCAL_RESULT for this subtask. "
+                                "Output exactly:\n"
+                                "REASONING:\n"
+                                "<step-by-step reasoning for this subtask>\n\n"
+                                "LOCAL_RESULT: \\boxed{<useful result of this subtask>}"
+                            )
                         if is_final_stage and not assigned_subtasks_text:
                             assigned_subtasks_text = (
                                 "- Use the work above to synthesize the final answer."
@@ -1762,13 +1864,14 @@ class MultiAgentRollout:
                         if history[idx] and history[idx][-1].get("role") == stage_role:
                             history[idx][-1]["assigned_subtasks"] = assigned_subtask_ids
 
-            for idx in revise_indices:
-                previous_feedback[idx] = self._format_hierarchical_feedback(
-                    current_plan[idx], selector_output_by_idx[idx], worker_results[idx],
-                    latest_outputs[idx], stage_roles,
-                    worker_reasoning_max_chars=feedback_worker_reasoning_max_chars,
-                    final_reasoning_max_chars=feedback_final_reasoning_max_chars,
-                )
+            if i_turn + 1 < max_num_turns:
+                for idx in revise_indices:
+                    previous_feedback[idx] = self._format_hierarchical_feedback(
+                        current_plan[idx], selector_output_by_idx[idx], worker_results[idx],
+                        latest_outputs[idx], stage_roles,
+                        worker_reasoning_max_chars=feedback_worker_reasoning_max_chars,
+                        final_reasoning_max_chars=feedback_final_reasoning_max_chars,
+                    )
 
         protocol_state = {
             "enabled": accept_revise_enabled,
