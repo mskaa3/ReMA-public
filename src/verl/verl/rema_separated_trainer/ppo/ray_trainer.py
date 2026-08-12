@@ -4786,7 +4786,6 @@ class RayReMASeparatedTrainer(object):
                 'finish_flag': FINISH_FLAG,
                 'system_prompts': build_hierarchical_system_prompts(
                     hierarchy_config.get('stage_roles'),
-                    hierarchy_config.get('routing_mode'),
                 ),
                 'max_num_turns': max_num_turns,
                 'hierarchy': hierarchy_config,
