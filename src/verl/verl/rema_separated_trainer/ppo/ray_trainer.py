@@ -55,6 +55,7 @@ from verl.rema_separated_trainer.ppo.cpcr import estimate_cpcr
 from verl.rema_separated_trainer.ppo.direct_scoped_grpo import (
     build_full_task_scope_counterfactual,
     build_scope_assignment_counterfactual,
+    build_verifier_scope_counterfactuals,
     estimate_direct_scoped_grpo,
 )
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
@@ -1776,10 +1777,12 @@ class RayReMASeparatedTrainer(object):
     def _direct_scoped_role_requires_tss(self, data_batch, role):
         hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
         stage_roles = list(hierarchy.get('stage_roles', []))
+        if str(hierarchy.get('routing_mode', 'selector')).lower() == 'derive_verify':
+            return len(stage_roles) >= 2 and role == stage_roles[1]
         return role in stage_roles[:-1]
 
     def _build_direct_scope_prompt_bundle(self, data_batch, role, sample_idx):
-        """Return factual, full-task, and wrong-subtask prompts for one action."""
+        """Return the factual prompt and role-appropriate TSS contrasts."""
 
         hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
         decomposer_role = hierarchy.get('decomposer_role', 'decomposer')
@@ -1898,6 +1901,22 @@ class RayReMASeparatedTrainer(object):
         factual_chat = self._cpcr_unpad_messages(
             data_batch.non_tensor_batch[chat_key][sample_idx]
         )
+        if str(hierarchy.get('routing_mode', 'selector')).lower() == 'derive_verify':
+            question = str(data_batch.non_tensor_batch['question'][sample_idx])
+            verifier_counterfactuals = build_verifier_scope_counterfactuals(
+                factual_chat,
+                question,
+                assigned_subtasks_text,
+            )
+            if verifier_counterfactuals is None:
+                return None
+            return {
+                'factual': factual_chat,
+                'contrasts': list(verifier_counterfactuals.items()),
+                'tss_mode': 'verifier_role_dependency',
+                'worker_message': worker_message,
+            }
+
         counterfactual_chat = build_full_task_scope_counterfactual(
             factual_chat,
             assigned_subtasks_text,
@@ -1928,6 +1947,7 @@ class RayReMASeparatedTrainer(object):
             'factual': factual_chat,
             'full_task': counterfactual_chat,
             'wrong_subtasks': wrong_subtask_chats,
+            'tss_mode': 'subtask_scope',
             'worker_message': worker_message,
         }
 
@@ -1941,16 +1961,16 @@ class RayReMASeparatedTrainer(object):
         metric_namespace='direct_scoped_grpo',
         scope_threshold=None,
     ):
-        """Score whether an action identifies its assigned subtask."""
+        """Score an action against role-appropriate teacher-forced contrasts."""
 
         batch_size = len(data_batch)
         margins = torch.zeros(batch_size, dtype=torch.float32)
         valid_mask = torch.zeros(batch_size, dtype=torch.bool)
         factual_scores = torch.zeros(batch_size, dtype=torch.float32)
-        full_task_scores = torch.zeros(batch_size, dtype=torch.float32)
-        wrong_subtask_scores = defaultdict(list)
+        primary_contrast_scores = torch.zeros(batch_size, dtype=torch.float32)
+        contrast_scores = defaultdict(dict)
         if not bool(candidate_mask.any().item()):
-            return margins, valid_mask, factual_scores, full_task_scores
+            return margins, valid_mask, factual_scores, primary_contrast_scores
 
         prompt_length = int(self.config.actor_rollout_ref.rollout.prompt_length)
         max_length = prompt_length + int(
@@ -1969,6 +1989,12 @@ class RayReMASeparatedTrainer(object):
         max_wrong_contrasts = int(
             scoring_config.get('max_wrong_subtask_contrasts', 0)
         )
+        verifier_role_contrast = bool(
+            scoring_config.get('verifier_role_contrast', True)
+        )
+        verifier_dependency_contrast = bool(
+            scoring_config.get('verifier_dependency_contrast', True)
+        )
         for sample_idx in torch.nonzero(candidate_mask, as_tuple=False).flatten().tolist():
             prompt_bundle = self._build_direct_scope_prompt_bundle(
                 data_batch,
@@ -1978,14 +2004,30 @@ class RayReMASeparatedTrainer(object):
             if prompt_bundle is None:
                 continue
             factual_chat = prompt_bundle['factual']
-            counterfactual_chat = prompt_bundle['full_task']
             worker_message = prompt_bundle['worker_message']
-            wrong_chats = (
-                list(prompt_bundle['wrong_subtasks'])
-                if contrast_plan_subtasks else []
-            )
-            if max_wrong_contrasts > 0:
-                wrong_chats = wrong_chats[:max_wrong_contrasts]
+            tss_mode = prompt_bundle.get('tss_mode', 'subtask_scope')
+            if tss_mode == 'verifier_role_dependency':
+                contrasts = []
+                for contrast_name, contrast_chat in prompt_bundle['contrasts']:
+                    if contrast_name == 'solve_from_scratch' and not verifier_role_contrast:
+                        continue
+                    if contrast_name == 'dependency_removed' and not verifier_dependency_contrast:
+                        continue
+                    contrasts.append((contrast_name, contrast_chat))
+            else:
+                contrasts = [('full_task', prompt_bundle['full_task'])]
+                wrong_chats = (
+                    list(prompt_bundle['wrong_subtasks'])
+                    if contrast_plan_subtasks else []
+                )
+                if max_wrong_contrasts > 0:
+                    wrong_chats = wrong_chats[:max_wrong_contrasts]
+                contrasts.extend([
+                    (f'wrong_subtask_{subtask_id}', wrong_chat)
+                    for subtask_id, wrong_chat in wrong_chats
+                ])
+            if not contrasts:
+                continue
             c3_action_turns = data_batch.non_tensor_batch.get('c3_action_turn')
             if (
                 c3_action_turns is not None
@@ -2015,44 +2057,37 @@ class RayReMASeparatedTrainer(object):
                 prompt_length,
                 max_length,
             )
-            counterfactual_encoded = self._cpcr_encode_prompt_action(
-                counterfactual_chat,
-                action_token_ids,
-                prompt_length,
-                max_length,
-            )
-            if factual_encoded is None or counterfactual_encoded is None:
+            if factual_encoded is None:
                 continue
             sample_items = [
                 (sample_idx, 'factual', None, factual_encoded),
-                (sample_idx, 'full_task', None, counterfactual_encoded),
             ]
-            wrong_encoding_failed = False
-            for subtask_id, wrong_chat in wrong_chats:
-                wrong_encoded = self._cpcr_encode_prompt_action(
-                    wrong_chat,
+            contrast_encoding_failed = False
+            for contrast_name, contrast_chat in contrasts:
+                contrast_encoded = self._cpcr_encode_prompt_action(
+                    contrast_chat,
                     action_token_ids,
                     prompt_length,
                     max_length,
                 )
-                if wrong_encoded is None:
-                    wrong_encoding_failed = True
+                if contrast_encoded is None:
+                    contrast_encoding_failed = True
                     break
                 sample_items.append((
                     sample_idx,
-                    'wrong_subtask',
-                    subtask_id,
-                    wrong_encoded,
+                    'contrast',
+                    contrast_name,
+                    contrast_encoded,
                 ))
-            if wrong_encoding_failed:
+            if contrast_encoding_failed:
                 continue
             encoded_items.extend(sample_items)
             expected_prompt_kinds[sample_idx] = {
-                'wrong_count': len(wrong_chats),
+                'contrast_names': [name for name, _ in contrasts],
             }
 
         if not encoded_items:
-            return margins, valid_mask, factual_scores, full_task_scores
+            return margins, valid_mask, factual_scores, primary_contrast_scores
 
         (
             _,
@@ -2065,62 +2100,84 @@ class RayReMASeparatedTrainer(object):
             [encoded for _, _, _, encoded in encoded_items],
         )
 
-        seen_kinds = defaultdict(set)
+        factual_seen = set()
         for item_idx, (
             sample_idx,
             prompt_kind,
-            _contrast_id,
+            contrast_name,
             _,
         ) in enumerate(encoded_items):
             score = mean_log_probs[item_idx]
             if prompt_kind == 'factual':
                 factual_scores[sample_idx] = score
-            elif prompt_kind == 'full_task':
-                full_task_scores[sample_idx] = score
+                factual_seen.add(sample_idx)
             else:
-                wrong_subtask_scores[sample_idx].append(score)
-            seen_kinds[sample_idx].add(prompt_kind)
-        local_vs_full_margins = []
-        local_vs_wrong_margins = []
-        samples_with_wrong = 0
-        wrong_contrast_count = 0
-        scope_classification_wins = 0
+                contrast_scores[sample_idx][contrast_name] = score
+
+        contrast_margins = defaultdict(list)
+        contrast_log_probs = defaultdict(list)
+        contrast_wins = defaultdict(int)
+        contrast_counts = defaultdict(int)
+        total_contrast_count = 0
+        samples_with_all_contrasts = 0
         for sample_idx, expected in expected_prompt_kinds.items():
-            prompt_kinds = seen_kinds[sample_idx]
-            if not {'factual', 'full_task'}.issubset(prompt_kinds):
+            if sample_idx not in factual_seen:
                 continue
-            expected_wrong_count = int(expected['wrong_count'])
-            sample_wrong_scores = wrong_subtask_scores[sample_idx]
-            if len(sample_wrong_scores) != expected_wrong_count:
+            expected_names = list(expected['contrast_names'])
+            sample_scores = contrast_scores[sample_idx]
+            if any(name not in sample_scores for name in expected_names):
                 continue
-            local_vs_full = (
-                factual_scores[sample_idx] - full_task_scores[sample_idx]
+            sample_margins = []
+            for contrast_name in expected_names:
+                contrast_margin = (
+                    factual_scores[sample_idx] - sample_scores[contrast_name]
+                )
+                sample_margins.append(contrast_margin)
+                contrast_margins[contrast_name].append(contrast_margin)
+                contrast_log_probs[contrast_name].append(
+                    sample_scores[contrast_name]
+                )
+                contrast_wins[contrast_name] += int(
+                    contrast_margin.item() > 0.0
+                )
+                contrast_counts[contrast_name] += 1
+                total_contrast_count += 1
+            margins[sample_idx] = torch.stack(sample_margins).min()
+            primary_name = (
+                'solve_from_scratch'
+                if 'solve_from_scratch' in sample_scores
+                else 'full_task'
+                if 'full_task' in sample_scores
+                else expected_names[0]
             )
-            margin = local_vs_full
-            local_vs_full_margins.append(local_vs_full)
-            if sample_wrong_scores:
-                strongest_wrong = torch.stack(sample_wrong_scores).max()
-                local_vs_wrong = factual_scores[sample_idx] - strongest_wrong
-                margin = torch.minimum(margin, local_vs_wrong)
-                local_vs_wrong_margins.append(local_vs_wrong)
-                samples_with_wrong += 1
-                wrong_contrast_count += len(sample_wrong_scores)
-                scope_classification_wins += int(local_vs_wrong.item() > 0.0)
-            margins[sample_idx] = margin
+            primary_contrast_scores[sample_idx] = sample_scores[primary_name]
             valid_mask[sample_idx] = True
+            samples_with_all_contrasts += 1
 
         valid_margins = margins[valid_mask]
         prefix = f'reward/{metric_namespace}/tss/roles/{role}'
+        hierarchy = dict(data_batch.meta_info.get('hierarchy', {}))
+        verifier_tss_mode = (
+            str(hierarchy.get('routing_mode', 'selector')).lower()
+            == 'derive_verify'
+        )
+        metrics[f'{prefix}/verifier_role_dependency_mode'] = float(
+            verifier_tss_mode
+        )
+        metrics[f'{prefix}/role_contrast_enabled'] = float(
+            verifier_tss_mode and verifier_role_contrast
+        )
+        metrics[f'{prefix}/dependency_contrast_enabled'] = float(
+            verifier_tss_mode and verifier_dependency_contrast
+        )
         metrics[f'{prefix}/candidate_count'] = float(candidate_mask.sum().item())
         metrics[f'{prefix}/valid_count'] = float(valid_mask.sum().item())
         metrics[f'{prefix}/teacher_forcing_call_count'] = float(
             teacher_forcing_calls
         )
-        metrics[f'{prefix}/wrong_subtask_contrast_count'] = float(
-            wrong_contrast_count
-        )
-        metrics[f'{prefix}/samples_with_wrong_subtask_count'] = float(
-            samples_with_wrong
+        metrics[f'{prefix}/contrast_count'] = float(total_contrast_count)
+        metrics[f'{prefix}/samples_with_all_contrasts_count'] = float(
+            samples_with_all_contrasts
         )
         metrics[f'{prefix}/coverage'] = (
             float(valid_mask.sum().item()) / float(candidate_mask.sum().item())
@@ -2131,7 +2188,7 @@ class RayReMASeparatedTrainer(object):
                 float(scope_threshold)
                 if scope_threshold is not None
                 else float(
-                    self.direct_scoped_grpo_config.get(
+                    scoring_config.get(
                         'scope_threshold',
                         0.0,
                     )
@@ -2151,25 +2208,63 @@ class RayReMASeparatedTrainer(object):
             metrics[f'{prefix}/factual_log_prob_per_token_mean'] = float(
                 factual_scores[valid_mask].mean().item()
             )
-            metrics[f'{prefix}/full_task_log_prob_per_token_mean'] = float(
-                full_task_scores[valid_mask].mean().item()
+            metrics[f'{prefix}/all_contrast_win_rate'] = float(
+                (valid_margins > 0.0).float().mean().item()
             )
-            metrics[f'{prefix}/local_vs_full_margin_mean'] = float(
-                torch.stack(local_vs_full_margins).mean().item()
-            )
-            if local_vs_wrong_margins:
+            for contrast_name, margin_values in contrast_margins.items():
+                if not margin_values:
+                    continue
+                metric_name = contrast_name.lower()
+                metrics[f'{prefix}/{metric_name}_margin_mean'] = float(
+                    torch.stack(margin_values).mean().item()
+                )
+                metrics[f'{prefix}/{metric_name}_log_prob_per_token_mean'] = float(
+                    torch.stack(contrast_log_probs[contrast_name]).mean().item()
+                )
+                metrics[f'{prefix}/{metric_name}_win_rate'] = (
+                    float(contrast_wins[contrast_name])
+                    / float(contrast_counts[contrast_name])
+                )
+            if contrast_margins.get('solve_from_scratch'):
+                metrics[f'{prefix}/role_margin_mean'] = metrics[
+                    f'{prefix}/solve_from_scratch_margin_mean'
+                ]
+                metrics[f'{prefix}/role_win_rate'] = metrics[
+                    f'{prefix}/solve_from_scratch_win_rate'
+                ]
+            if contrast_margins.get('dependency_removed'):
+                metrics[f'{prefix}/dependency_margin_mean'] = metrics[
+                    f'{prefix}/dependency_removed_margin_mean'
+                ]
+                metrics[f'{prefix}/dependency_win_rate'] = metrics[
+                    f'{prefix}/dependency_removed_win_rate'
+                ]
+
+            # Preserve legacy metric names for the general subtask protocol.
+            if contrast_margins.get('full_task'):
+                metrics[f'{prefix}/full_task_log_prob_per_token_mean'] = float(
+                    primary_contrast_scores[valid_mask].mean().item()
+                )
+                metrics[f'{prefix}/local_vs_full_margin_mean'] = metrics[
+                    f'{prefix}/full_task_margin_mean'
+                ]
+            wrong_names = [
+                name for name in contrast_margins
+                if name.startswith('wrong_subtask_')
+            ]
+            if wrong_names:
+                wrong_values = [
+                    value
+                    for name in wrong_names
+                    for value in contrast_margins[name]
+                ]
+                metrics[f'{prefix}/wrong_subtask_contrast_count'] = float(
+                    len(wrong_values)
+                )
                 metrics[f'{prefix}/local_vs_wrong_subtask_margin_mean'] = float(
-                    torch.stack(local_vs_wrong_margins).mean().item()
+                    torch.stack(wrong_values).mean().item()
                 )
-                metrics[f'{prefix}/scope_classification_accuracy'] = (
-                    float(scope_classification_wins)
-                    / float(samples_with_wrong)
-                )
-                metrics[f'{prefix}/wrong_subtasks_per_sample'] = (
-                    float(wrong_contrast_count)
-                    / float(samples_with_wrong)
-                )
-        return margins, valid_mask, factual_scores, full_task_scores
+        return margins, valid_mask, factual_scores, primary_contrast_scores
 
     def _c3_action_present_mask(self, data_batch, role):
         token_key = f'{role}_action_token_ids'
@@ -4664,6 +4759,15 @@ class RayReMASeparatedTrainer(object):
                     raise ValueError(
                         "The selector is deterministic in derive_verify mode and "
                         "must not appear in hierarchy.train_agent_roles"
+                    )
+                tss_config = hierarchy_config.get('scoped_c3_grpo', {})
+                if bool(tss_config.get('enable', False)) and not (
+                    bool(tss_config.get('verifier_role_contrast', True))
+                    or bool(tss_config.get('verifier_dependency_contrast', True))
+                ):
+                    raise ValueError(
+                        "derive_verify TSS requires verifier_role_contrast or "
+                        "verifier_dependency_contrast to be enabled"
                     )
 
         # 1. Check total batch size for data correctness

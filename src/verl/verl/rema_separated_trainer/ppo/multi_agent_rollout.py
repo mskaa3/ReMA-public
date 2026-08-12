@@ -825,6 +825,34 @@ class MultiAgentRollout:
                 seen_subtasks.add(subtask_id)
                 if max_subtasks is not None and len(subtasks) >= max_subtasks:
                     break
+        if subtasks:
+            return subtasks
+
+        # The fixed derive/verify protocol asks the planner for natural
+        # strategy and checking guidance. Normalize those sections into the
+        # same internal S1/S2 representation used by routing and replay.
+        section_matches = list(re.finditer(
+            r"(?im)^\s*(STRATEGY|CHECKS)\s*:\s*",
+            plan_text,
+        ))
+        section_to_subtask = {
+            "STRATEGY": "S1",
+            "CHECKS": "S2",
+        }
+        for section_idx, match in enumerate(section_matches):
+            section_name = match.group(1).upper()
+            content_start = match.end()
+            content_end = (
+                section_matches[section_idx + 1].start()
+                if section_idx + 1 < len(section_matches)
+                else len(plan_text)
+            )
+            description = plan_text[content_start:content_end].strip()
+            if not description:
+                continue
+            subtasks.append((section_to_subtask[section_name], description))
+            if max_subtasks is not None and len(subtasks) >= max_subtasks:
+                break
         return subtasks
 
     @staticmethod

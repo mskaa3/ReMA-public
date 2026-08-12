@@ -18,6 +18,13 @@ FULL_TASK_SCOPE_INSTRUCTION = (
     "- Solve the complete original problem and derive the final answer."
 )
 
+WORKER_OUTPUT_FORMAT = (
+    "Output exactly:\n"
+    "REASONING:\n"
+    "<step-by-step reasoning>\n\n"
+    "LOCAL_RESULT: \\boxed{<result>}"
+)
+
 
 @dataclass(frozen=True)
 class DirectScopedGRPOEstimate:
@@ -75,6 +82,64 @@ def build_scope_assignment_counterfactual(
         "role": "user",
         "content": counterfactual_content,
     }]
+
+
+def build_verifier_scope_counterfactuals(
+    chat: Sequence[dict],
+    question: str,
+    assigned_subtasks_text: str,
+) -> dict[str, list[dict]] | None:
+    """Build clean role and dependency counterfactuals for a verifier action."""
+
+    if (
+        not chat
+        or chat[-1].get("role") != "user"
+        or not str(question).strip()
+        or not assigned_subtasks_text.strip()
+    ):
+        return None
+
+    factual_user_content = chat[-1].get("content")
+    if not isinstance(factual_user_content, str):
+        return None
+    assignment_start = factual_user_content.rfind(assigned_subtasks_text)
+    if assignment_start < 0:
+        return None
+
+    shared_prefix = [dict(message) for message in chat[:-1]]
+    context_with_candidate = factual_user_content[:assignment_start].rstrip()
+    dependency_hint = (
+        "Use previous LOCAL_RESULTs from the work above when they are relevant. "
+        "Check earlier subtasks when an inconsistency matters."
+    )
+    context_with_candidate = context_with_candidate.replace(
+        dependency_hint,
+        "",
+    ).rstrip()
+    solve_from_scratch = (
+        f"{context_with_candidate}\n\n"
+        "Solve the complete problem independently from scratch. Do not verify, "
+        "reuse, or discuss the previous candidate shown above. Derive the answer yourself.\n\n"
+        f"{WORKER_OUTPUT_FORMAT}"
+    )
+    dependency_removed = (
+        f"Reference problem:\n{question}\n\n"
+        "The previous S1 LOCAL_RESULT is unavailable.\n\n"
+        f"{assigned_subtasks_text}\n\n"
+        "Act as the verifier for the assigned subtask. Check the candidate against "
+        "the reference problem, repair errors or omitted cases, and state the corrected result.\n\n"
+        f"{WORKER_OUTPUT_FORMAT}"
+    )
+    return {
+        "solve_from_scratch": shared_prefix + [{
+            "role": "user",
+            "content": solve_from_scratch,
+        }],
+        "dependency_removed": shared_prefix + [{
+            "role": "user",
+            "content": dependency_removed,
+        }],
+    }
 
 
 def estimate_direct_scoped_grpo(

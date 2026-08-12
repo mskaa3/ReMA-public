@@ -453,11 +453,20 @@ def _compute_hierarchy_bonus_gates(turn_history, worker_roles, score_role):
         })
 
     normalized_decomposer = _normalize_role_output(decomposer_output)
-    has_plan_header = 'plan:' in normalized_decomposer
+    has_strategy_protocol = (
+        'strategy:' in normalized_decomposer
+        and 'checks:' in normalized_decomposer
+    )
+    has_plan_header = (
+        'plan:' in normalized_decomposer
+        or has_strategy_protocol
+    )
     planned_subtasks = {
         subtask.upper()
         for subtask in re.findall(r"\bS\d+\b", decomposer_output, re.IGNORECASE)
     }
+    if has_strategy_protocol and not planned_subtasks:
+        planned_subtasks = {'S1', 'S2'}
     contains_forbidden_solution_markers = (
         'boxed' in normalized_decomposer
         or '[finish]' in normalized_decomposer

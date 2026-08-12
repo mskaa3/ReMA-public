@@ -263,7 +263,8 @@ algorithm:
     worker_context_mode: full_question
     final_context_mode: plan_and_worker_results
     pass_question_to_workers: True
-    # The decomposer has room for meta-reasoning plus the two-item plan.
+    # The planner writes natural STRATEGY/CHECKS guidance. Routing normalizes
+    # those sections internally into S1 for the solver and S2 for the verifier.
     decomposer_max_new_tokens: 512
     # Local stages produce checkable work; the final stage has room to synthesize it.
     worker_max_new_tokens: 512
@@ -284,9 +285,13 @@ algorithm:
       mixed_groups_only: True
       normalize_advantages: True
       scope_threshold: 0.0
-      # Keep the full question fixed and compare the sampled worker action with
-      # both a full-task instruction and every other subtask in the same plan.
-      contrast_plan_subtasks: True
+      # In derive_verify mode, only W2 uses TSS. The role contrast preserves the
+      # W1 candidate but asks W2 to solve independently; the dependency contrast
+      # preserves the verifier role but removes W1's result.
+      verifier_role_contrast: True
+      verifier_dependency_contrast: True
+      # Legacy controls used only by the variable-subtask routing mode.
+      contrast_plan_subtasks: False
       # 0 uses all alternative subtasks (at most max_planned_subtasks - 1).
       max_wrong_subtask_contrasts: 0
       normalization_epsilon: 1.0e-6
