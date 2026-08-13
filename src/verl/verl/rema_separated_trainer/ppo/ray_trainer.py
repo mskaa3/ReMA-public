@@ -5889,6 +5889,7 @@ class RayReMASeparatedTrainer(object):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                skip_filtered_actor_update = False
 
                 # create a dummy tensor for the construction function
                 dummy_tensor = torch.arange(0, len(batch_dict['question']))
@@ -6165,6 +6166,9 @@ class RayReMASeparatedTrainer(object):
                     else:
                         # filter data based on group filter statistics
                         num_prompt_in_batch += len(kept_prompt_uids)
+                        # Keep one complete rollout batch for diagnostics when
+                        # the capped search finds no trainable GRPO group.
+                        unfiltered_new_batch = new_batch
                         # get kept data batch
                         kept_traj_idxs = []
                         for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch['uid']):
@@ -6215,7 +6219,29 @@ class RayReMASeparatedTrainer(object):
                                     and dynamic_batching_enabled
                                 ),
                             )
-                            if not use_partial_batch or selected_prompt_bsz <= 0:
+                            skip_zero_trainable = bool(
+                                filter_config.get(
+                                    'skip_update_on_zero_trainable',
+                                    False,
+                                )
+                                and num_prompt_in_batch == 0
+                            )
+                            if skip_zero_trainable:
+                                skip_filtered_actor_update = True
+                                batch = unfiltered_new_batch
+                                print(
+                                    'Group-filter cap reached with no trainable '
+                                    f'mixed prompts for role='
+                                    f'{self._current_train_agent!r}; skipping '
+                                    'this actor update.'
+                                )
+                                metrics[
+                                    'rollout/zero_trainable_filtered_update'
+                                ] = 1.0
+                                metrics[
+                                    'rollout/skipped_zero_trainable_update'
+                                ] = 1.0
+                            elif not use_partial_batch or selected_prompt_bsz <= 0:
                                 raise ValueError(
                                     f'{num_gen_batches=} >= {max_num_gen_batches=} '
                                     f'with only {num_prompt_in_batch} trainable mixed '
@@ -6224,32 +6250,34 @@ class RayReMASeparatedTrainer(object):
                                     f'{prompt_minibatch_size}, or enable dynamic '
                                     f'sub-minibatch fallback.'
                                 )
-                            used_sub_minibatch = (
-                                selected_prompt_bsz < prompt_minibatch_size
-                            )
-                            print(
-                                'Group-filter cap reached; using a partial '
-                                f'batch of {selected_prompt_bsz}/'
-                                f'{num_prompt_in_batch} mixed prompts'
-                                + (' (sub-minibatch).' if used_sub_minibatch else '.')
-                            )
-                            metrics['rollout/partial_filtered_batch_used'] = 1.0
-                            metrics['rollout/partial_filtered_prompt_count'] = float(
-                                selected_prompt_bsz
-                            )
-                            metrics['rollout/partial_filtered_available_count'] = float(
-                                num_prompt_in_batch
-                            )
-                            metrics[
-                                'rollout/partial_filtered_subminibatch_used'
-                            ] = float(used_sub_minibatch)
+                            if not skip_filtered_actor_update:
+                                used_sub_minibatch = (
+                                    selected_prompt_bsz < prompt_minibatch_size
+                                )
+                                print(
+                                    'Group-filter cap reached; using a partial '
+                                    f'batch of {selected_prompt_bsz}/'
+                                    f'{num_prompt_in_batch} mixed prompts'
+                                    + (' (sub-minibatch).' if used_sub_minibatch else '.')
+                                )
+                                metrics['rollout/partial_filtered_batch_used'] = 1.0
+                                metrics['rollout/partial_filtered_prompt_count'] = float(
+                                    selected_prompt_bsz
+                                )
+                                metrics['rollout/partial_filtered_available_count'] = float(
+                                    num_prompt_in_batch
+                                )
+                                metrics[
+                                    'rollout/partial_filtered_subminibatch_used'
+                                ] = float(used_sub_minibatch)
                         # Keep complete rollout groups; dynamic batching can
                         # consume a final sub-minibatch when the cap is sparse.
-                        traj_bsz = (
-                            selected_prompt_bsz
-                            * self.config.actor_rollout_ref.rollout.n
-                        )
-                        batch = batch[:traj_bsz]
+                        if not skip_filtered_actor_update:
+                            traj_bsz = (
+                                selected_prompt_bsz
+                                * self.config.actor_rollout_ref.rollout.n
+                            )
+                            batch = batch[:traj_bsz]
 
                     if self.config.actor_rollout_ref.rollout.n > 1:
                         metrics.update({
@@ -6346,13 +6374,13 @@ class RayReMASeparatedTrainer(object):
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
-                    collective_safe_update = True
-                    if self.config.trainer.balance_batch:
+                    collective_safe_update = not skip_filtered_actor_update
+                    if collective_safe_update and self.config.trainer.balance_batch:
                         collective_safe_update = self._balance_batch(
                             batch,
                             metrics=metrics,
                         )
-                    elif (
+                    elif collective_safe_update and (
                         self.scoped_c3_grpo_enabled
                         or self.direct_scoped_grpo_enabled
                     ):
@@ -6366,6 +6394,10 @@ class RayReMASeparatedTrainer(object):
 
                     metrics['rollout/skipped_sparse_actor_update'] = float(
                         not collective_safe_update
+                    )
+                    metrics.setdefault(
+                        'rollout/skipped_zero_trainable_update',
+                        0.0,
                     )
 
                     

@@ -236,6 +236,10 @@ algorithm:
     # trainable rows across DP ranks and uses synchronized zero-loss forwards
     # for any empty role microbatches.
     allow_sub_minibatch_on_exhaustion: True
+    # A binary GRPO group with no outcome variation has no ranking signal. At
+    # the generation cap, log such a step and skip its actor update rather than
+    # aborting the complete multi-role run.
+    skip_update_on_zero_trainable: True
   final_worker_curriculum:
     enable: False
     warmup_steps: 200
