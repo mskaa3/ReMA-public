@@ -63,7 +63,7 @@ export PRD_GRAPH_PRIOR_REVERSE_DISTANCE_PENALTY=${PRD_GRAPH_PRIOR_REVERSE_DISTAN
 export ROLLOUT_N=${ROLLOUT_N:-16}
 export TEST_FREQ=${TEST_FREQ:-10}
 
-# This launcher is specific to the sequential four-subtask protocol. Refuse to
+# This launcher is specific to the adaptive sequential protocol. Refuse to
 # combine it with an older checkout before staging files or starting Ray.
 if ! grep -Eq '^[[:space:]]+routing_mode:[[:space:]]+sequential_plan[[:space:]]*$' \
     "$SLURM_SUBMIT_DIR/config/rema-rl.yaml"; then
@@ -75,7 +75,7 @@ if ! grep -Eq '^[[:space:]]+num_worker_stages:[[:space:]]+5[[:space:]]*$' \
     echo "ERROR: expected num_worker_stages=5 in the submitted config" >&2
     exit 1
 fi
-if ! grep -Fq 'divide the work into exactly four ordered subtasks' \
+if ! grep -Fq 'smallest useful number of ordered subtasks, from one to four' \
     "$SLURM_SUBMIT_DIR/prompt/math/hierarchical_mamrp.py"; then
     echo "ERROR: sequential decomposer prompt is missing from the submitted checkout" >&2
     exit 1

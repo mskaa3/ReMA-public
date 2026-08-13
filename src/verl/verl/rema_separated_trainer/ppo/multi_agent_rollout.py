@@ -1030,49 +1030,28 @@ class MultiAgentRollout:
         List[Tuple[str, str]],
         List[Tuple[str, str, List[Tuple[str, str]]]],
     ]:
-        """Normalize a plan into one dependent subtask per non-final stage."""
+        """Map each planned subtask to one worker and keep the final stage fixed."""
         if len(stage_roles) < 2:
             raise ValueError(
                 "routing_mode=sequential_plan requires at least one worker "
                 "stage followed by one final stage"
             )
 
-        worker_stage_count = len(stage_roles) - 1
+        worker_stage_capacity = len(stage_roles) - 1
         descriptions = [
             description.strip()
-            for _, description in subtasks[:worker_stage_count]
+            for _, description in subtasks[:worker_stage_capacity]
             if description.strip()
         ]
-        fallback_descriptions = []
-        for subtask_idx in range(worker_stage_count):
-            subtask_number = subtask_idx + 1
-            if subtask_idx == 0:
-                description = (
-                    "Establish the first useful intermediate result for the "
-                    "reference problem and preserve the facts needed by later steps."
-                )
-            elif subtask_idx == worker_stage_count - 1:
-                description = (
-                    f"Use the S{subtask_number - 1} LOCAL_RESULT and any other "
-                    "relevant earlier results to verify the derived candidate, "
-                    "repair errors or omitted cases, and state the corrected result."
-                )
-            else:
-                description = (
-                    f"Use the S{subtask_number - 1} LOCAL_RESULT and relevant "
-                    "earlier results to advance the derivation with one distinct "
-                    "intermediate contribution."
-                )
-            fallback_descriptions.append(description)
+        if not descriptions:
+            descriptions = [
+                "Solve the reference problem and return the self-contained result "
+                "needed to synthesize the final answer."
+            ]
 
         normalized_subtasks = [
-            (
-                f"S{subtask_idx + 1}",
-                descriptions[subtask_idx]
-                if subtask_idx < len(descriptions)
-                else fallback_descriptions[subtask_idx],
-            )
-            for subtask_idx in range(worker_stage_count)
+            (f"S{subtask_idx + 1}", description)
+            for subtask_idx, description in enumerate(descriptions)
         ]
         ordered_stages = [
             (stage_roles[subtask_idx], default_worker, [subtask])
@@ -1123,6 +1102,22 @@ class MultiAgentRollout:
             for _, _, _, output in completed_results
             if output and output.strip()
         ])
+
+    @classmethod
+    def _format_previous_local_results(
+        cls,
+        completed_results: List[Tuple[str, str, str, str]],
+    ) -> str:
+        sections = []
+        for _, _, subtask_ids, output in completed_results:
+            local_result = cls._extract_local_result(output)
+            if not local_result:
+                continue
+            label = subtask_ids or "previous subtask"
+            sections.append(f"{label} LOCAL_RESULT: {local_result}")
+        if not sections:
+            return ""
+        return "PREVIOUS LOCAL RESULTS:\n" + "\n".join(sections)
 
     @staticmethod
     def _format_worker_results_for_final(completed_results: List[Tuple[str, str, str, str]]) -> str:
@@ -1190,9 +1185,28 @@ class MultiAgentRollout:
             re.IGNORECASE | re.DOTALL,
         )
         if match:
-            return match.group(1).strip()
-        first_line = output.strip().splitlines()[0] if output.strip() else ""
-        return first_line[:240]
+            result = match.group(1).strip()
+        else:
+            result = ""
+            boxed_starts = list(re.finditer(r"\\boxed\s*\{", output))
+            for boxed_start in reversed(boxed_starts):
+                brace_start = output.find("{", boxed_start.start())
+                depth = 0
+                for char_idx in range(brace_start, len(output)):
+                    if output[char_idx] == "{":
+                        depth += 1
+                    elif output[char_idx] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            result = output[boxed_start.start():char_idx + 1]
+                            break
+                if result:
+                    break
+            if not result:
+                lines = [line.strip() for line in output.splitlines() if line.strip()]
+                result = lines[-1] if lines else ""
+        result = " ".join(result.split())
+        return result[:600]
 
     @staticmethod
     def _extract_reasoning(output: str) -> str:
@@ -1815,7 +1829,9 @@ class MultiAgentRollout:
                                     self._format_work_so_far(completed_results_by_idx[idx]),
                                 )
                         else:
-                            work_so_far = self._format_work_so_far(completed_results_by_idx[idx])
+                            work_so_far = self._format_previous_local_results(
+                                completed_results_by_idx[idx]
+                            )
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         if is_final_stage:
                             stage_instruction = (
@@ -1847,8 +1863,7 @@ class MultiAgentRollout:
                             )
                         work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ""
                         dependency_instruction = (
-                            "Use previous LOCAL_RESULTs from the work above when they are relevant. "
-                            "Check earlier subtasks when an inconsistency matters.\n\n"
+                            "Use the PREVIOUS LOCAL RESULTS when the current task depends on them.\n\n"
                             if work_so_far and not is_final_stage else ""
                         )
                         chat = build_selected_worker_prompt(
@@ -1859,7 +1874,7 @@ class MultiAgentRollout:
                                 f"{question_block}"
                                 f"{work_so_far_block}"
                                 f"{dependency_instruction}"
-                                f"{assigned_subtasks_text}\n\n"
+                                f"CURRENT TASK:\n{assigned_subtasks_text}\n\n"
                                 f"{stage_instruction}\n\n"
                             ),
                             system_prompts.get("finalizer") if is_final_stage else None,

@@ -1,11 +1,7 @@
 DECOMPOSER_SYSTEM_PROMPT = """You are the strategic planner for a mathematical problem.
-Reason about the structure of the solution, then divide the work into exactly four ordered subtasks. Do not carry out the calculations that determine the requested final answer.
+Reason about the structure of the solution, then divide the work into the smallest useful number of ordered subtasks, from one to four. Do not carry out the calculations that determine the requested final answer.
 
-The subtasks must form one coherent solution path rather than four independent attempts:
-- S1 establishes the first useful intermediate result.
-- S2 starts from the S1 result and advances the solution.
-- S3 starts from earlier results and completes the main derivation.
-- S4 checks the derived candidate against the problem, repairs any error or omitted case, and states the corrected result for final synthesis.
+The subtasks must form one coherent solution path rather than independent attempts. Use one subtask when one coherent calculation is enough. Add another subtask only when it makes a distinct contribution that will be used later, such as a new intermediate result, a dependent calculation, or a necessary verification and repair.
 
 Make every dependency explicit by naming the earlier subtask whose LOCAL_RESULT is needed. Keep each subtask focused on one distinct contribution. You may restate given facts, define variables, and specify equations or transformations, but do not state the final answer or use \\boxed{}.
 
@@ -15,10 +11,9 @@ REASONING:
 <concise meta-reasoning about the solution path and its possible failure points>
 
 PLAN:
-- S1: <first subtask>
-- S2: <second subtask, explicitly using S1>
-- S3: <third subtask, explicitly using relevant earlier results>
-- S4: <verification and repair subtask, explicitly using the derived candidate>
+<write consecutive lines in the form "- S1: ...", "- S2: ...", and so on>
+
+Stop the PLAN after the last needed subtask. A one-subtask plan contains only S1.
 """
 
 

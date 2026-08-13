@@ -1227,7 +1227,9 @@ class RayReMASeparatedTrainer(object):
                             MultiAgentRollout._format_work_so_far(completed_results),
                         )
                 else:
-                    work_so_far = MultiAgentRollout._format_work_so_far(completed_results)
+                    work_so_far = MultiAgentRollout._format_previous_local_results(
+                        completed_results
+                    )
 
                 assigned_subtasks_text = MultiAgentRollout._format_subtasks(assigned_subtasks)
                 if is_final_stage:
@@ -1250,15 +1252,14 @@ class RayReMASeparatedTrainer(object):
                     )
                 work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ''
                 dependency_instruction = (
-                    "Use previous LOCAL_RESULTs from the work above when they are relevant. "
-                    "Check earlier subtasks when an inconsistency matters.\n\n"
+                    "Use the PREVIOUS LOCAL RESULTS when the current task depends on them.\n\n"
                     if work_so_far and not is_final_stage else ''
                 )
                 user_content = (
                     f"{question_block}"
                     f"{work_so_far_block}"
                     f"{dependency_instruction}"
-                    f"{assigned_subtasks_text}\n\n"
+                    f"CURRENT TASK:\n{assigned_subtasks_text}\n\n"
                     f"{stage_instruction}\n\n"
                 )
                 system_prompt = (
@@ -4872,8 +4873,8 @@ class RayReMASeparatedTrainer(object):
                 )
                 if max_planned_subtasks != worker_stage_count:
                     raise ValueError(
-                        "hierarchy.max_planned_subtasks must equal the number "
-                        "of non-final stages in sequential_plan mode"
+                        "hierarchy.max_planned_subtasks must equal the available "
+                        "non-final stage capacity in sequential_plan mode"
                     )
                 if int(config.actor_rollout_ref.rollout.max_num_turns) != 1:
                     raise ValueError(
