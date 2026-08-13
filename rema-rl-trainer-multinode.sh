@@ -103,13 +103,22 @@ srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
     echo "[$(hostname)] prepare: mkdir ${JOB_TMP}"
     mkdir -p "$JOB_TMP"
     echo "[$(hostname)] prepare: cleanup old staged data"
-    rm -rf "$JOB_TMP/overall_math" "$JOB_TMP/MATH" "$JOB_TMP/verl"
+    rm -rf "$JOB_TMP/overall_math" "$JOB_TMP/MATH" "$JOB_TMP/verl" \
+        "$JOB_TMP/prompt" "$JOB_TMP/config"
     echo "[$(hostname)] prepare: copy data/overall_math"
     cp -r "$SLURM_SUBMIT_DIR/data/overall_math" "$JOB_TMP/overall_math"
     echo "[$(hostname)] prepare: copy data/MATH"
     cp -r "$SLURM_SUBMIT_DIR/data/MATH" "$JOB_TMP/MATH"
     echo "[$(hostname)] prepare: copy src/verl"
     cp -r "$SLURM_SUBMIT_DIR/src/verl" "$JOB_TMP/verl"
+    echo "[$(hostname)] prepare: copy prompt and config"
+    cp -r "$SLURM_SUBMIT_DIR/prompt" "$JOB_TMP/prompt"
+    cp -r "$SLURM_SUBMIT_DIR/config" "$JOB_TMP/config"
+    echo "[$(hostname)] staged protocol fingerprint:"
+    sha256sum "$JOB_TMP/prompt/math/hierarchical_mamrp.py" \
+        "$JOB_TMP/config/rema-rl.yaml"
+    grep -E "^[[:space:]]+(num_worker_stages|max_planned_subtasks|routing_mode):" \
+        "$JOB_TMP/config/rema-rl.yaml"
     echo "[$(hostname)] prepare: copy sif ${SIF_REMOTE}"
     rclone copy "$SIF_REMOTE" "$JOB_TMP/" --stats=30s --stats-one-line
     echo "[$(hostname)] prepare: done"
@@ -128,6 +137,8 @@ COMMON_MOUNTS=(
     --mount "type=bind,src=${JOB_TMP},dst=/root/tmpdir"
     --mount "type=bind,src=${JOB_TMP}/verl,dst=/verl"
     --mount "type=bind,src=${JOB_TMP}/verl,dst=/root/ReMA-public/src/verl"
+    --mount "type=bind,src=${JOB_TMP}/prompt,dst=/root/ReMA-public/prompt"
+    --mount "type=bind,src=${JOB_TMP}/config,dst=/root/ReMA-public/config"
     --mount "type=bind,src=${RAY_NODE_TMP},dst=${RAY_NODE_TMP}"
 )
 
@@ -185,10 +196,10 @@ done
 COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export TMPDIR=${RAY_NODE_TMP}; \
 export HF_HOME=/root/tmpdir/hf_home; \
-export PYTHONPATH=/root/ReMA-public/src:/verl:\$PYTHONPATH; \
+export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src:/verl:\$PYTHONPATH; \
 export RAY_ADDRESS=${IP_HEAD}; \
 python3 -m verl.rema_separated_trainer.main_ppo \
-  --config-path=/home/ajanz/projects/ReMA-public/config \
+  --config-path=/root/ReMA-public/config \
   --config-name=rema-rl.yaml \
 	  actor_rollout_ref.model.path=${MODEL_PATH} \
 	  trainer.nnodes=${SLURM_NNODES} \
