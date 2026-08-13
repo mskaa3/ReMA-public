@@ -63,6 +63,24 @@ export PRD_GRAPH_PRIOR_REVERSE_DISTANCE_PENALTY=${PRD_GRAPH_PRIOR_REVERSE_DISTAN
 export ROLLOUT_N=${ROLLOUT_N:-16}
 export TEST_FREQ=${TEST_FREQ:-10}
 
+# This launcher is specific to the sequential four-subtask protocol. Refuse to
+# combine it with an older checkout before staging files or starting Ray.
+if ! grep -Eq '^[[:space:]]+routing_mode:[[:space:]]+sequential_plan[[:space:]]*$' \
+    "$SLURM_SUBMIT_DIR/config/rema-rl.yaml"; then
+    echo "ERROR: expected routing_mode=sequential_plan in the submitted config" >&2
+    exit 1
+fi
+if ! grep -Eq '^[[:space:]]+num_worker_stages:[[:space:]]+5[[:space:]]*$' \
+    "$SLURM_SUBMIT_DIR/config/rema-rl.yaml"; then
+    echo "ERROR: expected num_worker_stages=5 in the submitted config" >&2
+    exit 1
+fi
+if ! grep -Fq 'divide the work into exactly four ordered subtasks' \
+    "$SLURM_SUBMIT_DIR/prompt/math/hierarchical_mamrp.py"; then
+    echo "ERROR: sequential decomposer prompt is missing from the submitted checkout" >&2
+    exit 1
+fi
+
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}
 HEAD_NODE_IP=$(srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" hostname --ip-address)
