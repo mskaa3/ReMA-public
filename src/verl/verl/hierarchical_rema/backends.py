@@ -1018,7 +1018,10 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
 
         if getattr(self.config, "controller_constrained_decoding", False):
             if role == "decomposer":
-                regex = r"(?s)<decomposition_plan>.*?</decomposition_plan>"
+                regex = (
+                    r"(?s)\s*(?:<decomposer_scratchpad>.*?</decomposer_scratchpad>\s*)?"
+                    r"<decomposition_plan>.*?</decomposition_plan>\s*"
+                )
             elif role == "selector_decision":
                 worker_id_pattern = "|".join(
                     re.escape(str(worker_id))
@@ -1562,11 +1565,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 errors.append(str(exc))
                 repair_prompt = (
                     f"{prompt_text}\n\nYour previous answer did not match the required decomposition format. "
-                    f"Error: {exc}\nReturn ONLY the corrected <decomposition_plan> block. "
+                    f"Error: {exc}\nReturn ONLY the optional <decomposer_scratchpad> block followed by the corrected <decomposition_plan> block. "
                     "Do not add commentary, bullets, or repeated task text. "
                     "Every node must include NODE_ID and INSTRUCTION, and should include DEPENDENCIES. "
                     "Use allowed numeric node IDs and keep the dependency structure as a valid DAG. "
-                    "Use coarse REQUIRED_SKILLS families, with `none` only on pure routing or final-answer wrapper nodes. "
+                    "Use coarse REQUIRED_SKILLS families, with `none` only on pure routing nodes when unavoidable. "
                     "REQUIRED_SKILLS_NOTE is optional and should stay short when present. "
                     "Make FINAL_NODE_ID point to the terminal final-answer node."
                 )

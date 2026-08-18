@@ -9,6 +9,7 @@ try:
         ControllerTrainingSample,
         DecompositionCandidate,
         DecompositionRollout,
+        HFBackendConfig,
         HierarchicalTrainingBatch,
         HierarchicalGRPOTrainer,
         RewardWeights,
@@ -22,6 +23,7 @@ try:
         TaskRollout,
         TrainingMode,
         TrainingScheduleConfig,
+        TransformersHierarchicalBackend,
         REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
         WorkerExecution,
         WorkerRewardMode,
@@ -43,6 +45,7 @@ try:
         extract_decomposition_payload,
         extract_json_dict,
         extract_worker_result_text,
+        format_decomposition_plan,
         extract_selection_payload,
         validate_decomposition_payload,
     )
@@ -54,6 +57,7 @@ except ModuleNotFoundError:
         ControllerTrainingSample,
         DecompositionCandidate,
         DecompositionRollout,
+        HFBackendConfig,
         HierarchicalTrainingBatch,
         HierarchicalGRPOTrainer,
         RewardWeights,
@@ -67,6 +71,7 @@ except ModuleNotFoundError:
         TaskRollout,
         TrainingMode,
         TrainingScheduleConfig,
+        TransformersHierarchicalBackend,
         REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
         WorkerExecution,
         WorkerRewardMode,
@@ -88,6 +93,7 @@ except ModuleNotFoundError:
         extract_decomposition_payload,
         extract_json_dict,
         extract_worker_result_text,
+        format_decomposition_plan,
         extract_selection_payload,
         validate_decomposition_payload,
     )
@@ -276,6 +282,51 @@ def test_worker_training_skips_samples_from_fallback_decompositions() -> None:
     assert training_batch.worker_samples == []
     assert training_batch.worker_grpo_stats["num_decompositions_skipped_fallback"] == 1
     assert training_batch.worker_grpo_stats["num_worker_samples_skipped_fallback"] == 1
+
+
+def test_transformers_decomposer_uses_fallback_after_repeated_format_failures(monkeypatch) -> None:
+    backend = TransformersHierarchicalBackend(
+        HFBackendConfig(
+            max_format_retries=1,
+            controller_constrained_decoding=True,
+        )
+    )
+    task = make_task("algebra", "Solve for x: 2x + 3 = 11.", "4", "5")
+    rollout_config = RolloutConfig()
+    prompt_text = render_decomposer_prompt(
+        task=task,
+        max_nodes_hint=rollout_config.max_nodes_per_decomposition,
+        soft_max_hops_hint=rollout_config.soft_max_hops,
+        hard_max_hops_hint=rollout_config.hard_max_hops,
+    )
+    bad_outputs = iter(
+        [
+            "plain invalid text with no decomposition tags",
+            "<decomposer_scratchpad>thinking only</decomposer_scratchpad>",
+        ]
+    )
+
+    def fake_generate_text(**_kwargs):
+        return next(bad_outputs), 0.0
+
+    monkeypatch.setattr(backend, "_generate_text", fake_generate_text)
+
+    candidate = backend._generate_validated_decomposition(
+        prompt_text=prompt_text,
+        task=task,
+        policy_config=ControllerPolicyConfig(decomposer_model_path="mock-model"),
+        rollout_config=rollout_config,
+        fallback_id="forced-fallback-test",
+    )
+
+    assert candidate.decomposition_id == f"{task.task_id}-fallback-decomposition"
+    assert candidate.final_node_id == "1"
+    assert len(candidate.nodes) == 1
+    assert candidate.nodes[0].instruction == task.prompt
+    assert candidate.raw_payload["validation"]["fallback_used"] is True
+    assert candidate.raw_payload["validation"]["error"]
+    assert candidate.raw_payload["validation"]["raw_text"]
+    assert candidate.summary == ""
 
 
 def test_worker_training_skips_non_final_leaked_samples_only() -> None:
@@ -1052,10 +1103,12 @@ def test_decomposer_prompt_declares_strict_output_contract() -> None:
         max_nodes_hint=4,
     )
 
-    assert "- Return exactly one <decomposition_plan> block and nothing else." in prompt
-    assert "Use only these keys: SUMMARY, TARGET_QUANTITY, FINAL_ANSWER_FORMAT_HINT, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE." in prompt
+    assert "- You may optionally think inside <decomposer_scratchpad>...</decomposer_scratchpad>." in prompt
+    assert "- You must return exactly one <decomposition_plan> block." in prompt
+    assert "Use only these keys inside <decomposition_plan>: TARGET_QUANTITY, FINAL_ANSWER_FORMAT_HINT, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE." in prompt
     assert "Allowed node IDs: 1, 2, 3, 4." in prompt
     assert "OUTPUT_KEY" not in prompt
+    assert "SUMMARY:" not in prompt
 
 
 def test_non_final_worker_output_does_not_blank_signed_values() -> None:
@@ -1758,9 +1811,11 @@ def test_required_skills_normalize_new_role_like_labels() -> None:
 
 def test_line_based_controller_plans_are_parseable() -> None:
     decomposition_payload = extract_decomposition_payload(
+        "<decomposer_scratchpad>\n"
+        "Node 1 should set up the structure and node 2 should finish it.\n"
+        "</decomposer_scratchpad>\n"
         "<decomposition_plan>\n"
         "DECOMPOSITION_ID: decomp-1\n"
-        "SUMMARY: short plan\n"
         "FINAL_NODE_ID: 2\n"
         "NODE_ID: 1\n"
         "INSTRUCTION: analyze the structure\n"
@@ -1783,9 +1838,41 @@ def test_line_based_controller_plans_are_parseable() -> None:
     )
 
     assert decomposition_payload["final_node_id"] == "2"
+    assert decomposition_payload["summary"] == ""
     assert len(decomposition_payload["nodes"]) == 2
     assert selection_payload["selection_id"] == "sel-1"
     assert len(selection_payload["assignments"]) == 2
+
+
+def test_format_decomposition_plan_omits_empty_summary() -> None:
+    candidate = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="",
+        target_quantity="value of x",
+        final_answer_format_hint="integer",
+        final_node_id="2",
+        nodes=[
+            SubtaskNode(
+                node_id="1",
+                instruction="Rewrite the equation into standard form.",
+                dependencies=[],
+                required_skills=["algebra"],
+                output_key="1_output",
+            ),
+            SubtaskNode(
+                node_id="2",
+                instruction="Solve for x.",
+                dependencies=["1"],
+                required_skills=["algebra"],
+                output_key="final_answer",
+            ),
+        ],
+    )
+
+    rendered = format_decomposition_plan(candidate)
+
+    assert rendered.startswith("<decomposition_plan>")
+    assert "SUMMARY:" not in rendered
 
 
 def test_selector_plan_accepts_minimal_assignment_lines() -> None:

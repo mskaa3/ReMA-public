@@ -99,6 +99,14 @@ NODE_TYPE_TO_ID = {name: idx for idx, name in enumerate(NODE_TYPES)}
 ROLE_TYPE_TO_ID = {name: idx for idx, name in enumerate(ROLE_TYPES)}
 EDGE_TYPE_TO_ID = {name: idx for idx, name in enumerate(EDGE_TYPES)}
 DEFAULT_HASH_DIM = 384
+_SCRATCHPAD_BLOCK_PATTERN = re.compile(
+    r"<(?:worker|selector|decomposer)_scratchpad>\s*.*?\s*</(?:worker|selector|decomposer)_scratchpad>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_SCRATCHPAD_TAG_PATTERN = re.compile(
+    r"</?(?:worker|selector|decomposer)_scratchpad>",
+    flags=re.IGNORECASE,
+)
 
 
 def stable_hash(text: str) -> int:
@@ -116,6 +124,19 @@ def normalize_text(value: Any) -> str:
     text = text.replace("\r\n", "\n")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def strip_scratchpad_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = _SCRATCHPAD_BLOCK_PATTERN.sub(" ", text)
+    text = _SCRATCHPAD_TAG_PATTERN.sub(" ", text)
+    return text.strip()
+
+
+def normalize_reward_model_text(value: Any) -> str:
+    return normalize_text(strip_scratchpad_text(value))
 
 
 def clamp01(value: float) -> float:
@@ -347,11 +368,13 @@ def selector_assignment_node_ids(record: dict[str, Any]) -> list[str]:
 
 
 def _build_role_texts(record: dict[str, Any]) -> dict[str, str]:
-    question_text = normalize_text(record["task"]["prompt"])
-    decomposition_text = normalize_text(
+    question_text = normalize_reward_model_text(record["task"]["prompt"])
+    decomposition_text = normalize_reward_model_text(
         record["decomposition"].get("raw_text") or record["decomposition"].get("summary")
     )
-    final_text = normalize_text(f"final_answer={record['trajectory'].get('final_answer')}")
+    final_text = normalize_reward_model_text(
+        f"final_answer={record['trajectory'].get('final_answer')}"
+    )
     return {
         "question": question_text,
         "decomposer": decomposition_text,
@@ -496,10 +519,10 @@ def build_graph_example_for_inference(
         idx = len(node_texts)
         worker_indices_by_node_id[worker["node_id"]] = idx
         upstream_summary = "; ".join(
-            f"{item.get('node_id')}={normalize_text(item.get('used_value'))}"
+            f"{item.get('node_id')}={normalize_reward_model_text(item.get('used_value'))}"
             for item in worker.get("upstream_context", [])
         )
-        worker_text = normalize_text(
+        worker_text = normalize_reward_model_text(
             " ".join(
                 [
                     f"subtask={worker['subtask'].get('instruction')}",
@@ -1583,10 +1606,10 @@ def score_rollout_records(
 def _dependency_was_used(execution: WorkerExecution, dependency_output: str) -> bool:
     if execution.dependency_used:
         return True
-    normalized_dependency = normalize_text(dependency_output)
+    normalized_dependency = normalize_reward_model_text(dependency_output)
     if not normalized_dependency:
         return False
-    haystack = normalize_text(execution.raw_output_text or execution.output_text)
+    haystack = normalize_reward_model_text(execution.raw_output_text or execution.output_text)
     return bool(haystack and normalized_dependency in haystack)
 
 
@@ -1598,6 +1621,7 @@ def _build_inference_record(
     final_answer: str,
 ) -> dict[str, Any]:
     node_map = decomposition.nodes_by_id()
+    clean_final_answer = strip_scratchpad_text(final_answer)
     assignments = [
         {
             "node_id": assignment.node_id,
@@ -1629,8 +1653,8 @@ def _build_inference_record(
                             ),
                             "",
                         ),
-                        "output_text": dependency_output,
-                        "used_value": dependency_output,
+                        "output_text": strip_scratchpad_text(dependency_output),
+                        "used_value": strip_scratchpad_text(dependency_output),
                     }
                 )
         upstream_context_by_node[execution.node_id] = contexts
@@ -1643,6 +1667,10 @@ def _build_inference_record(
     for execution in executions:
         node = node_map[execution.node_id]
         assignment = selection.assignment_for(execution.node_id)
+        clean_output_text = strip_scratchpad_text(execution.output_text)
+        clean_raw_output_text = strip_scratchpad_text(
+            execution.raw_output_text or execution.output_text
+        )
         workers_payload.append(
             {
                 "node_id": execution.node_id,
@@ -1661,14 +1689,17 @@ def _build_inference_record(
                     "output_key": node.output_key,
                 },
                 "declared_dependencies": list(node.dependencies),
-                "dependency_outputs": dict(execution.dependency_outputs),
+                "dependency_outputs": {
+                    dependency_id: strip_scratchpad_text(dependency_output)
+                    for dependency_id, dependency_output in execution.dependency_outputs.items()
+                },
                 "upstream_context": upstream_context_by_node.get(execution.node_id, []),
                 "downstream_used_by": downstream_used_by.get(execution.node_id, []),
                 "compatibility": execution.compatibility,
                 "confidence_reward": execution.confidence_reward,
                 "entropy": execution.entropy,
-                "output_text": execution.output_text,
-                "raw_output_text": execution.raw_output_text,
+                "output_text": clean_output_text,
+                "raw_output_text": clean_raw_output_text,
                 "is_final_node": execution.node_id == decomposition.final_node_id,
             }
         )
@@ -1693,13 +1724,13 @@ def _build_inference_record(
         "trajectory": {
             "decomposition_id": decomposition.decomposition_id,
             "selection_id": selection.selection_id,
-            "final_answer": final_answer,
+            "final_answer": clean_final_answer,
             "final_node_id": decomposition.final_node_id,
             "legacy_final_correct": 0.0,
             "score": 0.0,
         },
         "decomposition": {
-            "raw_text": decomposition.raw_text,
+            "raw_text": strip_scratchpad_text(decomposition.raw_text),
             "summary": decomposition.summary,
             "final_node_id": decomposition.final_node_id,
             "subtasks": [
@@ -1715,7 +1746,7 @@ def _build_inference_record(
             ],
         },
         "selection": {
-            "raw_text": selection.raw_text,
+            "raw_text": strip_scratchpad_text(selection.raw_text),
             "assignments": assignments,
         },
         "graph": {

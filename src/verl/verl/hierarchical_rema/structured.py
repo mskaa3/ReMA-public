@@ -527,11 +527,12 @@ def _next_numeric_node_id(nodes: Sequence[SubtaskNode]) -> str:
 def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
     lines = [
         "<decomposition_plan>",
-        f"SUMMARY: {candidate.summary}",
         f"TARGET_QUANTITY: {candidate.target_quantity}",
         f"FINAL_ANSWER_FORMAT_HINT: {candidate.final_answer_format_hint}",
         f"FINAL_NODE_ID: {candidate.final_node_id}",
     ]
+    if candidate.summary.strip():
+        lines.insert(1, f"SUMMARY: {candidate.summary}")
     for node in candidate.nodes:
         lines.extend(
             [
@@ -624,7 +625,7 @@ def _parse_decomposition_plan(text: str) -> Dict[str, Any]:
     normalized = _normalize_structured_text(text, tags=KNOWN_DECOMPOSITION_TAGS)
     payload = _extract_key_value_payload(normalized)
     if payload.get("nodes"):
-        payload.setdefault("summary", "Compact decomposition.")
+        payload.setdefault("summary", "")
         payload.setdefault("target_quantity", "best final answer requested by TASK")
         payload.setdefault("final_answer_format_hint", "match the answer format requested by TASK")
         if not payload.get("final_node_id"):
@@ -723,7 +724,7 @@ def salvage_decomposition_payload(
         merged_payload["nodes"] = line_payload["nodes"]
 
     if merged_payload.get("nodes"):
-        merged_payload.setdefault("summary", "Compact decomposition.")
+        merged_payload.setdefault("summary", "")
         merged_payload.setdefault("target_quantity", "best final answer requested by TASK")
         merged_payload.setdefault("final_answer_format_hint", "match the answer format requested by TASK")
         if not merged_payload.get("final_node_id"):
@@ -828,6 +829,8 @@ def extract_json_dict(text: str) -> Dict[str, Any]:
 
 
 def extract_decomposition_payload(text: str) -> Dict[str, Any]:
+    if re.search(r"<decomposition_plan>\b", text, flags=re.IGNORECASE):
+        return _parse_decomposition_plan(text)
     try:
         return extract_json_dict(text)
     except StructuredOutputError:
@@ -966,7 +969,7 @@ def _truncate_to_node_budget(
     new_nodes = kept_nodes + [synthetic_final]
     return DecompositionCandidate(
         decomposition_id=candidate.decomposition_id,
-        summary=f"{candidate.summary} [TRUNCATED]",
+        summary=(f"{candidate.summary} [TRUNCATED]" if candidate.summary.strip() else ""),
         target_quantity=candidate.target_quantity,
         final_answer_format_hint=candidate.final_answer_format_hint,
         nodes=new_nodes,
@@ -1040,7 +1043,7 @@ def validate_decomposition_payload(
     fallback_id: str,
 ) -> DecompositionCandidate:
     decomposition_id = str(payload.get("decomposition_id") or fallback_id)
-    summary = str(payload.get("summary") or "No summary provided.")
+    summary = str(payload.get("summary") or "").strip()
     target_quantity = _normalize_target_quantity(payload.get("target_quantity"))
     final_answer_format_hint = _normalize_final_answer_format_hint(
         payload.get("final_answer_format_hint") or payload.get("final_answer_style")
@@ -1292,7 +1295,7 @@ def build_fallback_decomposition(
     resolved_instruction = str(task_prompt or "").strip() or "Solve the full original task directly and return the final answer."
     payload = {
         "decomposition_id": f"{task_id}-fallback-decomposition",
-        "summary": "Fallback decomposition: solve the full task directly.",
+        "summary": "",
         "target_quantity": "best final answer requested by TASK",
         "final_answer_format_hint": "match the answer format requested by TASK",
         "final_node_id": "1",

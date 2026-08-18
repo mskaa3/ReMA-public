@@ -1,23 +1,34 @@
 import math
+import pytest
 
 try:
     from verl.hierarchical_rema import (
         ControllerPolicyConfig,
+        DecompositionCandidate,
         HierarchicalGRPOTrainer,
         RolloutConfig,
+        SelectionCandidate,
+        SubtaskNode,
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        WorkerAssignment,
+        WorkerExecution,
     )
     from verl.hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
 except ModuleNotFoundError:
     from hierarchical_rema import (
         ControllerPolicyConfig,
+        DecompositionCandidate,
         HierarchicalGRPOTrainer,
         RolloutConfig,
+        SelectionCandidate,
+        SubtaskNode,
         TaskExample,
         TrainingMode,
         TrainingScheduleConfig,
+        WorkerAssignment,
+        WorkerExecution,
     )
     from hierarchical_rema.demo import make_worker_pool as make_default_worker_pool
 
@@ -142,3 +153,117 @@ def test_gfam_worker_history_uses_reward_model_rewards() -> None:
             assert item["reward_source"] == "gfam_v1"
             assert "observed_reward" in item
             assert "confidence_reward" not in item
+
+
+def test_gfam_inference_record_excludes_scratchpad_from_comparisons() -> None:
+    pytest.importorskip("torch")
+    try:
+        from verl.hierarchical_rema.gfam_reward import _build_inference_record
+    except ModuleNotFoundError:
+        from hierarchical_rema.gfam_reward import _build_inference_record
+
+    task = _make_task()
+    decomposition = DecompositionCandidate(
+        decomposition_id="decomp-1",
+        summary="",
+        target_quantity="value of x",
+        final_answer_format_hint="integer",
+        nodes=[
+            SubtaskNode(
+                node_id="1",
+                instruction="Rewrite the equation into the form 2x = 8.",
+                dependencies=[],
+                required_skills=["algebra"],
+                output_key="1_output",
+            ),
+            SubtaskNode(
+                node_id="2",
+                instruction="Use the equation from node 1 to isolate x and return the integer value of x.",
+                dependencies=["1"],
+                required_skills=["algebra"],
+                output_key="final_answer",
+            ),
+        ],
+        final_node_id="2",
+        raw_text=(
+            "<decomposer_scratchpad>\n"
+            "Private note that should not reach GFAM.\n"
+            "</decomposer_scratchpad>\n"
+            "<decomposition_plan>\nTARGET_QUANTITY: value of x\nFINAL_ANSWER_FORMAT_HINT: integer\nFINAL_NODE_ID: 2\n"
+            "NODE_ID: 1\nINSTRUCTION: Rewrite the equation into the form 2x = 8.\nDEPENDENCIES: none\nREQUIRED_SKILLS: algebra\n"
+            "NODE_ID: 2\nINSTRUCTION: Use the equation from node 1 to isolate x and return the integer value of x.\nDEPENDENCIES: 1\nREQUIRED_SKILLS: algebra\n"
+            "</decomposition_plan>"
+        ),
+    )
+    selection = SelectionCandidate(
+        selection_id="sel-1",
+        assignments=[
+            WorkerAssignment(
+                node_id="1",
+                worker_id="symbolic_manipulation_worker",
+                rationale="Best fit.",
+                compatibility=1.0,
+            ),
+            WorkerAssignment(
+                node_id="2",
+                worker_id="calculation_worker",
+                rationale="Best fit.",
+                compatibility=1.0,
+            ),
+        ],
+        raw_text=(
+            "<selector_scratchpad>\n"
+            "Private routing note.\n"
+            "</selector_scratchpad>\n"
+            "<selection_plan>\n1: symbolic_manipulation_worker\n2: calculation_worker\n</selection_plan>"
+        ),
+    )
+    executions = [
+        WorkerExecution(
+            node_id="1",
+            worker_id="symbolic_manipulation_worker",
+            output_text="2x = 8",
+            raw_output_text=(
+                "<worker_scratchpad>\n"
+                "From the original equation, subtract 3.\n"
+                "</worker_scratchpad>\n"
+                "<worker_result>\n2x = 8\n</worker_result>"
+            ),
+            worker_prompt="prompt-1",
+            dependency_outputs={},
+            entropy=0.0,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+        WorkerExecution(
+            node_id="2",
+            worker_id="calculation_worker",
+            output_text="4",
+            raw_output_text=(
+                "<worker_scratchpad>\n"
+                "Use 2x = 8 from node 1.\n"
+                "</worker_scratchpad>\n"
+                "<worker_result>\n4\n</worker_result>"
+            ),
+            worker_prompt="prompt-2",
+            dependency_outputs={"1": "2x = 8"},
+            entropy=0.0,
+            confidence_reward=0.0,
+            compatibility=1.0,
+        ),
+    ]
+
+    record = _build_inference_record(
+        task=task,
+        decomposition=decomposition,
+        selection=selection,
+        executions=executions,
+        final_answer="<worker_scratchpad>hidden</worker_scratchpad><worker_result>4</worker_result>",
+    )
+
+    assert "scratchpad" not in record["decomposition"]["raw_text"].lower()
+    assert "scratchpad" not in record["selection"]["raw_text"].lower()
+    assert "scratchpad" not in record["workers"][0]["raw_output_text"].lower()
+    assert "scratchpad" not in record["workers"][1]["raw_output_text"].lower()
+    assert "scratchpad" not in record["trajectory"]["final_answer"].lower()
+    assert record["graph"]["used_dependency_edges"] == []
