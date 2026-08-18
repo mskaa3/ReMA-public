@@ -28,11 +28,16 @@ class _FakeGFAMRewardScorer:
             execution.node_id: {"reward": 0.11 if execution.node_id == "1" else 0.22}
             for execution in executions
         }
+        selector_decision_rewards = {
+            execution.node_id: {"reward": 0.61 if execution.node_id == "1" else 0.49}
+            for execution in executions
+        }
         return {
             "source": "gfam_v1",
             "compiled_rewards": {
                 "decomposer": {"reward": 0.77},
                 "selector": {"reward": 0.55},
+                "selector_decisions": selector_decision_rewards,
                 "workers": worker_rewards,
                 "final": {"reward": 0.33},
             },
@@ -71,12 +76,20 @@ def test_gfam_reward_overrides_handcrafted_selection_and_decomposer_rewards() ->
     decomposition = rollout.decompositions[0]
 
     assert selection.reward.reward_model_source == "gfam_v1"
-    assert math.isclose(selection.reward.total_reward, 0.55)
+    assert math.isclose(selection.reward.total_reward, 0.33)
     assert selection.reward.to_dict() == {
-        "total_reward": 0.55,
+        "total_reward": 0.33,
         "reward_model_source": "gfam_v1",
     }
     assert selection.reward_model_outputs["source"] == "gfam_v1"
+    assert math.isclose(selection.reward_model_outputs["selection_reward"], 0.33)
+    assert math.isclose(selection.reward_model_outputs["selector_reward_mean"], 0.55)
+    assignment_rewards = {
+        assignment.node_id: assignment.reward_model_reward
+        for assignment in selection.selection.assignments
+    }
+    assert math.isclose(assignment_rewards["1"], 0.61)
+    assert math.isclose(assignment_rewards["2"], 0.49)
     assert math.isclose(decomposition.base_decomposition_reward, 0.77)
     assert math.isclose(decomposition.decomposition_reward, 0.77)
 

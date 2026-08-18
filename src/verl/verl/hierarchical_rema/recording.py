@@ -139,16 +139,22 @@ class RolloutRecorder:
         compiled_rewards = selection_rollout.reward_model_outputs.get("compiled_rewards", {})
         selector_decisions_payload = compiled_rewards.get("selector_decisions", {})
         workers_payload = compiled_rewards.get("workers", {})
+        selector_reward = compiled_rewards.get("selector", {}).get("reward")
+        final_reward = compiled_rewards.get("final", {}).get("reward")
         return {
             "source": selection_rollout.reward.reward_model_source,
             "decomposer_reward": decomposition_rollout.decomposition_reward,
-            "selector_reward": selection_rollout.reward.total_reward,
-            "selector_reward_mean": selection_rollout.reward.total_reward,
+            "selection_reward": selection_rollout.reward.total_reward,
+            "selector_reward": selector_reward,
+            "selector_reward_mean": selection_rollout.reward_model_outputs.get(
+                "selector_reward_mean",
+                selector_reward,
+            ),
             "selector_decision_rewards": {
                 node_id: payload.get("reward")
                 for node_id, payload in selector_decisions_payload.items()
             },
-            "final_reward": compiled_rewards.get("final", {}).get("reward"),
+            "final_reward": final_reward,
             "worker_rewards": {
                 node_id: payload.get("reward")
                 for node_id, payload in workers_payload.items()

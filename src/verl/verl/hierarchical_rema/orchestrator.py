@@ -348,6 +348,7 @@ class HierarchicalReMAOrchestrator:
         )
         compiled_rewards = scored.get("compiled_rewards", {})
         selector_payload = compiled_rewards.get("selector", {})
+        final_payload = compiled_rewards.get("final", {})
         selector_decision_payloads = compiled_rewards.get("selector_decisions", {})
         worker_payloads = compiled_rewards.get("workers", {})
         selector_decision_rewards: List[float] = []
@@ -357,8 +358,11 @@ class HierarchicalReMAOrchestrator:
                 continue
             assignment.reward_model_reward = float(assignment_payload["reward"])
             selector_decision_rewards.append(assignment.reward_model_reward)
-        if selector_decision_rewards:
-            reward.total_reward = sum(selector_decision_rewards) / len(selector_decision_rewards)
+        # Under GFAM, keep the selection-level reward aligned with whole-rollout
+        # quality, not the mean selector-action reward. Per-assignment selector
+        # rewards already flow through assignment.reward_model_reward.
+        if "reward" in final_payload:
+            reward.total_reward = float(final_payload["reward"])
         else:
             reward.total_reward = float(selector_payload.get("reward", reward.total_reward))
         reward.reward_model_source = "gfam_v1"
@@ -368,6 +372,12 @@ class HierarchicalReMAOrchestrator:
                 execution.reward_model_reward = float(worker_payload["reward"])
         return reward, {
             "source": "gfam_v1",
+            "selection_reward": reward.total_reward,
+            "selector_reward_mean": (
+                sum(selector_decision_rewards) / len(selector_decision_rewards)
+                if selector_decision_rewards
+                else float(selector_payload.get("reward", 0.0))
+            ),
             "compiled_rewards": compiled_rewards,
             "graph_summary": scored.get("graph_summary", {}),
         }
