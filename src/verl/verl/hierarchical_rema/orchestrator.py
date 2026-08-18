@@ -658,6 +658,14 @@ class HierarchicalReMAOrchestrator:
                     num_selections,
                     max(int(rollout_config.alternating_decomposer_num_selections), 1),
                 )
+                if (
+                    self.gfam_reward_scorer is not None
+                    and int(rollout_config.gfam_decomposer_max_selections) > 0
+                ):
+                    num_selections = min(
+                        num_selections,
+                        max(int(rollout_config.gfam_decomposer_max_selections), 1),
+                    )
         return num_decompositions, num_selections
 
     def _finalize_task_rollout(

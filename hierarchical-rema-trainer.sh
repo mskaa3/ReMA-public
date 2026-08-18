@@ -187,6 +187,7 @@ UPDATE_EVERY_N_ROLLOUT_BATCHES=${UPDATE_EVERY_N_ROLLOUT_BATCHES:-4}
 ROLLOUT_PROGRESS_EVERY=${ROLLOUT_PROGRESS_EVERY:-10}
 ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-best}
 ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-compact}
+GFAM_DECOMPOSER_MAX_SELECTIONS=${GFAM_DECOMPOSER_MAX_SELECTIONS:-2}
 
 TASK_SOURCE=${TASK_SOURCE:-$TASK_SOURCE_ARG}
 if [[ "$RUN_KIND" == "train" ]]; then
@@ -1388,6 +1389,7 @@ python3 -m hierarchical_rema.train \
   --alternating-selector-num-selections ${ALTERNATING_SELECTOR_NUM_SELECTIONS} \
   --alternating-decomposer-num-decompositions ${ALTERNATING_DECOMPOSER_NUM_DECOMPOSITIONS} \
   --alternating-decomposer-num-selections ${ALTERNATING_DECOMPOSER_NUM_SELECTIONS} \
+  --gfam-decomposer-max-selections ${GFAM_DECOMPOSER_MAX_SELECTIONS} \
   --max-nodes-per-decomposition ${MAX_NODES_PER_DECOMPOSITION} \
   --soft-max-hops ${SOFT_MAX_HOPS} \
   --hard-max-hops ${HARD_MAX_HOPS} \

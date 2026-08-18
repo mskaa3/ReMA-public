@@ -290,6 +290,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alternating-selector-num-selections", type=int, default=4)
     parser.add_argument("--alternating-decomposer-num-decompositions", type=int, default=8)
     parser.add_argument("--alternating-decomposer-num-selections", type=int, default=2)
+    parser.add_argument(
+        "--gfam-decomposer-max-selections",
+        type=int,
+        default=2,
+        help=(
+            "When GFAM reward scoring is enabled, cap decomposer-phase selector rollouts "
+            "per decomposition to this many downstream samples. Set to 0 to disable."
+        ),
+    )
     parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
@@ -1084,6 +1093,7 @@ def _finish_tracking(tracking) -> None:
 def _rollout_config_for_schedule(
     base_rollout_config: RolloutConfig,
     schedule: TrainingScheduleConfig,
+    use_gfam_reward_model: bool = False,
 ) -> RolloutConfig:
     num_decompositions = base_rollout_config.num_decompositions
     num_selections = base_rollout_config.num_selections_per_decomposition
@@ -1106,6 +1116,11 @@ def _rollout_config_for_schedule(
                 num_selections,
                 max(int(base_rollout_config.alternating_decomposer_num_selections), 1),
             )
+            if use_gfam_reward_model and int(base_rollout_config.gfam_decomposer_max_selections) > 0:
+                num_selections = min(
+                    num_selections,
+                    max(int(base_rollout_config.gfam_decomposer_max_selections), 1),
+                )
     return RolloutConfig(
         num_decompositions=num_decompositions,
         num_selections_per_decomposition=num_selections,
@@ -1113,6 +1128,7 @@ def _rollout_config_for_schedule(
         alternating_selector_num_selections=base_rollout_config.alternating_selector_num_selections,
         alternating_decomposer_num_decompositions=base_rollout_config.alternating_decomposer_num_decompositions,
         alternating_decomposer_num_selections=base_rollout_config.alternating_decomposer_num_selections,
+        gfam_decomposer_max_selections=base_rollout_config.gfam_decomposer_max_selections,
         max_nodes_per_decomposition=base_rollout_config.max_nodes_per_decomposition,
         soft_max_hops=base_rollout_config.soft_max_hops,
         hard_max_hops=base_rollout_config.hard_max_hops,
@@ -2203,6 +2219,7 @@ def main() -> None:
         alternating_selector_num_selections=args.alternating_selector_num_selections,
         alternating_decomposer_num_decompositions=args.alternating_decomposer_num_decompositions,
         alternating_decomposer_num_selections=args.alternating_decomposer_num_selections,
+        gfam_decomposer_max_selections=args.gfam_decomposer_max_selections,
         max_nodes_per_decomposition=max_nodes_per_decomposition,
         soft_max_hops=args.soft_max_hops,
         hard_max_hops=args.hard_max_hops,
@@ -2264,7 +2281,11 @@ def main() -> None:
             f"[hierarchical-rema][integrated] epoch={epoch_number}/{args.num_epochs} "
             f"phase={schedule.alternating_phase.value} tasks={len(epoch_tasks)}"
         )
-        rollout_config = _rollout_config_for_schedule(base_rollout_config, schedule)
+        rollout_config = _rollout_config_for_schedule(
+            base_rollout_config,
+            schedule,
+            use_gfam_reward_model=gfam_reward_scorer is not None,
+        )
         if (
             rollout_config.num_decompositions != base_rollout_config.num_decompositions
             or rollout_config.num_selections_per_decomposition
