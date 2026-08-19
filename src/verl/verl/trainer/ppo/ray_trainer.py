@@ -477,7 +477,7 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, groundtruths=None, histories=None):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.val_generations_to_log_to_wandb
@@ -487,8 +487,14 @@ class RayPPOTrainer(object):
 
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores))
+        if groundtruths is None:
+            groundtruths = [""] * len(inputs)
+        if histories is None:
+            histories = [""] * len(inputs)
+
+        # The shared W&B table schema also serves the multi-agent trainers and
+        # therefore expects ground truth and history for every sample.
+        samples = list(zip(inputs, outputs, scores, groundtruths, histories))
         samples.sort(key=lambda x: x[0])  # Sort by input text
 
         # Use fixed random seed for deterministic shuffling
@@ -577,7 +583,12 @@ class RayPPOTrainer(object):
             reward_tensor_lst.append(reward_tensor)
             data_source_lst.append(test_batch.non_tensor_batch.get('subset', ['unknown'] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            scores=sample_scores,
+            groundtruths=sample_groundtruths,
+        )
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
@@ -998,4 +1009,4 @@ class RayPPOTrainer(object):
             result['avg_score'] = sum(result['score']) / len(result['score'])
             results_to_save.append(result)
         with jsonlines.open(output_file, 'w') as writer:
-            writer.write_all(results_to_save)    
+            writer.write_all(results_to_save)
