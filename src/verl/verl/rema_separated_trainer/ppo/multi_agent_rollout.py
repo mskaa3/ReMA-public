@@ -9,6 +9,25 @@ from verl.protocol import collate_fn as data_proto_collate_fn, pad_dataproto_to_
 import torch
 import unicodedata
 import re
+import hashlib
+
+
+def curriculum_context_is_visible(
+    uid: object,
+    step: int,
+    probability: float,
+    *,
+    salt: str,
+) -> bool:
+    """Sample context dropout deterministically for an entire GRPO group."""
+    probability = min(max(float(probability), 0.0), 1.0)
+    if probability <= 0.0:
+        return False
+    if probability >= 1.0:
+        return True
+    payload = f"{salt}:{step}:{uid}".encode("utf-8")
+    sample = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") / 2**64
+    return sample < probability
 
 def normalize_text(text):
     return unicodedata.normalize('NFKC', text)
@@ -1344,6 +1363,11 @@ class MultiAgentRollout:
             "worker_context_mode",
             "full_question" if pass_question_to_workers else "subtask_context",
         )
+        pass_question_to_workers = worker_context_mode in {
+            "full_question",
+            "question",
+            "full",
+        }
         final_context_mode = hierarchy_config.get("final_context_mode", "full_question")
         routing_mode = str(hierarchy_config.get("routing_mode", "selector")).lower()
         deterministic_routing = routing_mode in {
@@ -1373,6 +1397,71 @@ class MultiAgentRollout:
                 np.arange(batch_size, dtype=object),
             )
         )
+        curriculum_step = int(prompts.meta_info.get("curriculum_step", 0))
+        is_validation = bool(prompts.meta_info.get("validate", False))
+        agent12_curriculum = hierarchy_config.get("agent12_curriculum", {}) or {}
+        teacher_solution_key = str(
+            prompts.meta_info.get("teacher_solution_key", "teacher_solution")
+        )
+        teacher_solution_probability = (
+            0.0
+            if is_validation
+            else float(
+                prompts.meta_info.get("teacher_solution_probability", 0.0)
+            )
+        )
+        teacher_solutions = prompts.non_tensor_batch.get(
+            teacher_solution_key,
+            np.asarray([""] * batch_size, dtype=object),
+        )
+        teacher_solution_max_chars = max(
+            int(agent12_curriculum.get("teacher_solution_max_chars", 8000)),
+            1,
+        )
+        teacher_solution_visible = np.asarray(
+            [
+                bool(str(teacher_solutions[idx]).strip())
+                and curriculum_context_is_visible(
+                    c3_group_ids[idx],
+                    curriculum_step,
+                    teacher_solution_probability,
+                    salt="teacher_solution",
+                )
+                for idx in range(batch_size)
+            ],
+            dtype=bool,
+        )
+        worker_question_probability = (
+            float(
+                agent12_curriculum.get(
+                    "worker_question_eval_probability",
+                    1.0,
+                )
+            )
+            if is_validation and agent12_curriculum.get("enable", False)
+            else float(
+                prompts.meta_info.get("worker_question_probability", 1.0)
+            )
+        )
+        worker_question_visible = np.asarray(
+            [
+                pass_question_to_workers
+                and curriculum_context_is_visible(
+                    c3_group_ids[idx],
+                    curriculum_step,
+                    worker_question_probability,
+                    salt="worker_question",
+                )
+                for idx in range(batch_size)
+            ],
+            dtype=bool,
+        )
+        prompts.non_tensor_batch["teacher_solution_visible"] = (
+            teacher_solution_visible
+        )
+        prompts.non_tensor_batch["worker_question_visible"] = (
+            worker_question_visible
+        )
         c3_active = bool(
             scoped_c3_config.get("enable", False)
             and not prompts.meta_info.get("validate", False)
@@ -1395,11 +1484,6 @@ class MultiAgentRollout:
                 f"focal_role={c3_focal_role}, "
                 f"branch_turn={c3_branch_turn + 1}/{max_num_turns}"
             )
-        pass_question_to_workers = worker_context_mode in {
-            "full_question",
-            "question",
-            "full",
-        }
         worker_spec_text = self._format_worker_specs(worker_specs, worker_types)
 
         conversation_history = {
@@ -1538,6 +1622,18 @@ class MultiAgentRollout:
             decomposer_chats_by_idx = {}
             for idx in unfinished_indices:
                 content = f"Question:\n{questions[idx]}"
+                if teacher_solution_visible[idx]:
+                    teacher_scaffold = str(teacher_solutions[idx])[
+                        :teacher_solution_max_chars
+                    ]
+                    content += (
+                        "\n\nCorrect teacher solution (planning scaffold):\n"
+                        f"{teacher_scaffold}\n\n"
+                        "Use this solution to identify a useful sequence of "
+                        "dependent subtasks. Produce a plan that remains usable "
+                        "when the solution is absent; do not copy its final answer "
+                        "into the plan."
+                    )
                 if previous_feedback[idx]:
                     content += f"\n\n{previous_feedback[idx]}"
                 if accept_revise_enabled:
@@ -1800,7 +1896,7 @@ class MultiAgentRollout:
                                 questions[idx],
                                 final_context_mode,
                             )
-                        elif pass_question_to_workers:
+                        elif worker_question_visible[idx]:
                             question_block = (
                                 f"Reference problem:\n{questions[idx]}\n\n"
                                 "Use the reference problem only to recover facts needed for the assigned subtask.\n\n"

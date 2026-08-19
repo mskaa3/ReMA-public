@@ -69,6 +69,72 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
 WorkerType = Type[Worker]
 
 
+@dataclass(frozen=True)
+class Agent12CurriculumState:
+    phase: str
+    phase_id: int
+    phase_step: int
+    teacher_solution_probability: float
+    worker_question_probability: float
+
+
+def compute_agent12_curriculum_state(
+    global_step: int,
+    *,
+    worker_bootstrap_steps: int,
+    decomposer_transfer_steps: int,
+    worker_question_fade_steps: int,
+    worker_question_final_probability: float,
+) -> Agent12CurriculumState:
+    """Return curriculum phase and context probabilities for one PPO step."""
+    completed_steps = max(int(global_step) - 1, 0)
+    worker_bootstrap_steps = max(int(worker_bootstrap_steps), 0)
+    decomposer_transfer_steps = max(int(decomposer_transfer_steps), 0)
+    worker_question_fade_steps = max(int(worker_question_fade_steps), 0)
+    final_probability = min(
+        max(float(worker_question_final_probability), 0.0),
+        1.0,
+    )
+
+    if completed_steps < worker_bootstrap_steps:
+        return Agent12CurriculumState(
+            phase="worker_bootstrap",
+            phase_id=0,
+            phase_step=completed_steps,
+            teacher_solution_probability=1.0,
+            worker_question_probability=1.0,
+        )
+
+    transfer_step = completed_steps - worker_bootstrap_steps
+    if transfer_step < decomposer_transfer_steps:
+        teacher_probability = 1.0 - (
+            transfer_step / max(decomposer_transfer_steps, 1)
+        )
+        return Agent12CurriculumState(
+            phase="decomposer_transfer",
+            phase_id=1,
+            phase_step=transfer_step,
+            teacher_solution_probability=teacher_probability,
+            worker_question_probability=1.0,
+        )
+
+    joint_step = transfer_step - decomposer_transfer_steps
+    if worker_question_fade_steps <= 0:
+        worker_question_probability = final_probability
+    else:
+        fade_fraction = min(joint_step / worker_question_fade_steps, 1.0)
+        worker_question_probability = 1.0 - (
+            (1.0 - final_probability) * fade_fraction
+        )
+    return Agent12CurriculumState(
+        phase="joint",
+        phase_id=2,
+        phase_step=joint_step,
+        teacher_solution_probability=0.0,
+        worker_question_probability=worker_question_probability,
+    )
+
+
 def compute_usable_filtered_prompt_count(
     available_prompt_count,
     target_prompt_count,
@@ -4777,6 +4843,30 @@ class RayReMASeparatedTrainer(object):
             return hierarchy_config.get('score_role', hierarchy_config['agent_roles'][-1])
         return 'reasoning'
 
+    def _get_agent12_curriculum_config(self) -> Dict:
+        if not self._hierarchy_enabled():
+            return {}
+        hierarchy_config = self._get_hierarchy_config()
+        return hierarchy_config.get('agent12_curriculum', {}) or {}
+
+    def _get_agent12_curriculum_state(self) -> Agent12CurriculumState:
+        curriculum = self._get_agent12_curriculum_config()
+        return compute_agent12_curriculum_state(
+            self.global_steps,
+            worker_bootstrap_steps=curriculum.get(
+                'worker_bootstrap_steps', 0
+            ),
+            decomposer_transfer_steps=curriculum.get(
+                'decomposer_transfer_steps', 0
+            ),
+            worker_question_fade_steps=curriculum.get(
+                'worker_question_fade_steps', 0
+            ),
+            worker_question_final_probability=curriculum.get(
+                'worker_question_final_probability', 1.0
+            ),
+        )
+
     def _build_rollout_meta_info(self, max_num_turns: int) -> Dict:
         if self._hierarchy_enabled():
             from prompt.math.hierarchical_mamrp import build_hierarchical_system_prompts
@@ -4917,6 +5007,68 @@ class RayReMASeparatedTrainer(object):
                         "sequential_plan TSS requires a full-task contrast or "
                         "an enabled planned-subtask identity contrast so W1 "
                         "has at least one counterfactual"
+                    )
+
+            curriculum = hierarchy_config.get('agent12_curriculum', {}) or {}
+            if bool(curriculum.get('enable', False)):
+                if bool(
+                    config.algorithm.get('final_worker_curriculum', {}).get(
+                        'enable', False
+                    )
+                ):
+                    raise ValueError(
+                        "agent12_curriculum and final_worker_curriculum cannot "
+                        "be enabled together"
+                    )
+                decomposer_role = hierarchy_config.get(
+                    'decomposer_role', 'decomposer'
+                )
+                train_roles = list(
+                    hierarchy_config.get('train_agent_roles', [])
+                )
+                if decomposer_role not in train_roles:
+                    raise ValueError(
+                        "agent12_curriculum requires the decomposer in "
+                        "hierarchy.train_agent_roles"
+                    )
+                worker_train_roles = [
+                    role for role in train_roles
+                    if role not in {
+                        decomposer_role,
+                        hierarchy_config.get('selector_role', 'selector'),
+                    }
+                ]
+                if not worker_train_roles:
+                    raise ValueError(
+                        "agent12_curriculum requires at least one trainable "
+                        "worker stage"
+                    )
+                for key in (
+                    'worker_bootstrap_steps',
+                    'decomposer_transfer_steps',
+                    'worker_question_fade_steps',
+                ):
+                    if int(curriculum.get(key, 0)) < 0:
+                        raise ValueError(f"agent12_curriculum.{key} must be non-negative")
+                for key in (
+                    'worker_question_final_probability',
+                    'worker_question_eval_probability',
+                ):
+                    probability = float(curriculum.get(key, 1.0))
+                    if not 0.0 <= probability <= 1.0:
+                        raise ValueError(
+                            f"agent12_curriculum.{key} must be in [0, 1]"
+                        )
+                if not str(
+                    curriculum.get('teacher_solution_key', '')
+                ).strip():
+                    raise ValueError(
+                        "agent12_curriculum.teacher_solution_key cannot be empty"
+                    )
+                if int(curriculum.get('teacher_solution_max_chars', 0)) <= 0:
+                    raise ValueError(
+                        "agent12_curriculum.teacher_solution_max_chars must be "
+                        "positive"
                     )
 
         # 1. Check total batch size for data correctness
@@ -5780,6 +5932,45 @@ class RayReMASeparatedTrainer(object):
         switch_config = self.config.algorithm.get('switch_agent', {})
         agent_roles = self._get_train_agent_roles()
         start_agent = self._get_start_agent()
+        agent12_curriculum = self._get_agent12_curriculum_config()
+        if agent12_curriculum.get('enable', False):
+            hierarchy_config = self._get_hierarchy_config()
+            decomposer_role = hierarchy_config.get(
+                'decomposer_role', 'decomposer'
+            )
+            selector_role = hierarchy_config.get('selector_role', 'selector')
+            worker_roles = [
+                role for role in agent_roles
+                if role not in {decomposer_role, selector_role}
+            ]
+            curriculum_state = self._get_agent12_curriculum_state()
+            switch_freq = max(int(switch_config.get('freq', 1)), 1)
+
+            if curriculum_state.phase == 'worker_bootstrap':
+                role_index = curriculum_state.phase_step // switch_freq
+                new_agent = worker_roles[role_index % len(worker_roles)]
+            elif curriculum_state.phase == 'decomposer_transfer':
+                new_agent = decomposer_role
+            else:
+                # Alternate model pools 1:1. Worker stage prompts still rotate
+                # within the shared Agent 2 model on its update blocks.
+                block_index = curriculum_state.phase_step // switch_freq
+                if block_index % 2 == 0:
+                    new_agent = decomposer_role
+                else:
+                    worker_index = (block_index // 2) % len(worker_roles)
+                    new_agent = worker_roles[worker_index]
+
+            self._current_train_agent_idx = agent_roles.index(new_agent)
+            if self._current_train_agent != new_agent:
+                print(
+                    "Agent 1/2 curriculum: "
+                    f"phase={curriculum_state.phase}, "
+                    f"training_role={new_agent}"
+                )
+                self._current_train_agent = new_agent
+            return
+
         final_worker_curriculum = self.config.algorithm.get('final_worker_curriculum', {})
         final_worker_warmup_steps = int(final_worker_curriculum.get('warmup_steps', 0))
         if (
@@ -5873,6 +6064,10 @@ class RayReMASeparatedTrainer(object):
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
         rollout_meta_info = self._build_rollout_meta_info(max_num_turns)
+        agent12_curriculum = self._get_agent12_curriculum_config()
+        agent12_curriculum_enabled = bool(
+            agent12_curriculum.get('enable', False)
+        )
         
         batch = None
         num_prompt_in_batch = 0
@@ -5907,6 +6102,22 @@ class RayReMASeparatedTrainer(object):
                 new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                 num_gen_batches += 1
 
+                curriculum_state = self._get_agent12_curriculum_state()
+                teacher_solution_key = str(
+                    agent12_curriculum.get(
+                        'teacher_solution_key', 'teacher_solution'
+                    )
+                )
+                if (
+                    agent12_curriculum_enabled
+                    and curriculum_state.teacher_solution_probability > 0.0
+                    and teacher_solution_key not in new_batch.non_tensor_batch
+                ):
+                    raise ValueError(
+                        f"Agent 1/2 curriculum phase={curriculum_state.phase!r} "
+                        f"requires dataset column {teacher_solution_key!r}"
+                    )
+
                 # pop those keys for generation
                 if 'multi_modal_inputs' in new_batch.non_tensor_batch.keys():
                     raise NotImplementedError('multi_modal_inputs is not implemented yet')
@@ -5916,14 +6127,27 @@ class RayReMASeparatedTrainer(object):
                     )
                 else:
                     # because verl originally calls this 'chat'
+                    generation_non_tensor_keys = ['question', 'uid']
+                    if teacher_solution_key in new_batch.non_tensor_batch:
+                        generation_non_tensor_keys.append(teacher_solution_key)
                     gen_batch = new_batch.select(
                         batch_keys=['batch_idx'],
-                        non_tensor_batch_keys=['question', 'uid'],
+                        non_tensor_batch_keys=generation_non_tensor_keys,
                         meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'hierarchy'],
                         deepcopy=True
                     )
                 gen_batch.meta_info['c3_focal_role'] = self._current_train_agent
                 gen_batch.meta_info['validate'] = False
+                if agent12_curriculum_enabled:
+                    gen_batch.meta_info['curriculum_step'] = self.global_steps
+                    gen_batch.meta_info['curriculum_phase'] = curriculum_state.phase
+                    gen_batch.meta_info['teacher_solution_key'] = teacher_solution_key
+                    gen_batch.meta_info['teacher_solution_probability'] = (
+                        curriculum_state.teacher_solution_probability
+                    )
+                    gen_batch.meta_info['worker_question_probability'] = (
+                        curriculum_state.worker_question_probability
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -5952,6 +6176,39 @@ class RayReMASeparatedTrainer(object):
                     # # repeat to align with repeated responses in rollout
                     # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     new_batch = new_batch.union(gen_batch_output)
+
+                    if agent12_curriculum_enabled:
+                        teacher_visible = new_batch.non_tensor_batch.get(
+                            'teacher_solution_visible',
+                            np.zeros(len(new_batch), dtype=bool),
+                        )
+                        worker_question_visible = new_batch.non_tensor_batch.get(
+                            'worker_question_visible',
+                            np.zeros(len(new_batch), dtype=bool),
+                        )
+                        metrics.update({
+                            'curriculum/phase_id': float(
+                                curriculum_state.phase_id
+                            ),
+                            'curriculum/phase_step': float(
+                                curriculum_state.phase_step
+                            ),
+                            'curriculum/teacher_solution_probability': float(
+                                curriculum_state.teacher_solution_probability
+                            ),
+                            'curriculum/teacher_solution_visible_rate': float(
+                                np.asarray(teacher_visible, dtype=float).mean()
+                            ),
+                            'curriculum/worker_question_probability': float(
+                                curriculum_state.worker_question_probability
+                            ),
+                            'curriculum/worker_question_visible_rate': float(
+                                np.asarray(
+                                    worker_question_visible,
+                                    dtype=float,
+                                ).mean()
+                            ),
+                        })
 
                     
                     # compute global_valid tokens
