@@ -185,7 +185,7 @@ python3 -m verl.trainer.main_generation \
         apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         bash -c "$TEACHER_COMMAND"
 
-    echo "Selecting correct teacher trajectories"
+    echo "Scoring teacher trajectories while retaining every task"
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
         apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         bash -lc 'export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src/verl:/verl:$PYTHONPATH; \
