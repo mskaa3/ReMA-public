@@ -282,6 +282,7 @@ class DataParallelPPOActor(BasePPOActor):
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_c = self.config.clip_ratio_c
                     entropy_coeff = self.config.entropy_coeff
+                    loss_agg_mode = self.config.get('loss_agg_mode', 'token')
 
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
@@ -291,7 +292,8 @@ class DataParallelPPOActor(BasePPOActor):
                                                                                   advantages=advantages,
                                                                                   eos_mask=response_mask,
                                                                                   cliprange=clip_ratio,
-                                                                                  clip_ratio_c=clip_ratio_c)
+                                                                                  clip_ratio_c=clip_ratio_c,
+                                                                                  loss_agg_mode=loss_agg_mode)
                     # compute entropy loss from entropy
                     entropy_loss = verl_F.masked_mean(entropy, response_mask)
 
