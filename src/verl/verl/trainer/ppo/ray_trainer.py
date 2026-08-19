@@ -603,7 +603,10 @@ class RayPPOTrainer(object):
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            mean_score = np.mean(rewards)
+            metric_dict[f'val/test_score/{data_source}'] = mean_score
+            if self.config.trainer.get('log_val_score_as_acc', False):
+                metric_dict[f'val/acc/{data_source}'] = mean_score
         
         
         # Save generation results to a JSON file

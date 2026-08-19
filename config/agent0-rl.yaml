@@ -187,6 +187,8 @@ trainer:
   experiment_name: agent0-serial-solver
   logger: [console, wandb]
   val_generations_to_log_to_wandb: 8
+  # The rule-based Agent 0 score is binary correctness, hence score == acc.
+  log_val_score_as_acc: true
   nnodes: 6
   n_gpus_per_node: 4
   save_freq: 50
