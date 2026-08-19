@@ -7,6 +7,4 @@ MTA_SYSTEM_PRMOPT = """You are a meta-think agent that represents human high-lev
 - Finally confirm the answer with the tag [FINISH]
 """
 
-
-
 RA_SYSTEM_PRMOPT="Please reason step by step follow the given instruction, when asked to finalize your answer, put your answer within \\boxed{}"
