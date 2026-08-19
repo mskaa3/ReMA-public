@@ -83,6 +83,7 @@ class NaiveRewardManager:
         already_print_data_sources = {}
 
         response_str_lst = []
+        valid_response_length_lst = []
         for i in range(len(data)):
             # decode response str
             data_item = data[i]  # DataProtoItem
@@ -93,6 +94,7 @@ class NaiveRewardManager:
             response_ids = data_item.batch['responses']
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
+            valid_response_length_lst.append(int(valid_response_length.item()))
             
             # decode the response and store it in non_tensor_batch
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
@@ -160,7 +162,9 @@ class NaiveRewardManager:
             #     extra_info=extra_info,
             # )
             score = scores[i]
-            reward_tensor[i, valid_response_length - 1] = score
+            valid_response_length = valid_response_length_lst[i]
+            if valid_response_length > 0:
+                reward_tensor[i, valid_response_length - 1] = score
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0

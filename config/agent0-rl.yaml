@@ -1,0 +1,204 @@
+# Standalone Agent 0: one serial solver trained directly from mathematical
+# correctness. This config intentionally contains no hierarchy or role rewards.
+data:
+  tokenizer: null
+  train_files: /root/tmpdir/agent0_data/train.parquet
+  val_files: /root/tmpdir/agent0_data/val.parquet
+  prompt_key: prompt
+  max_prompt_length: 2048
+  max_response_length: 4096
+  train_batch_size: 48
+  val_batch_size: null
+  return_raw_input_ids: false
+  return_raw_chat: false
+  shuffle: true
+  seed: 1
+  filter_overlong_prompts: true
+  truncation: error
+  image_key: images
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: Qwen/Qwen2.5-1.5B-Instruct
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 48
+    ppo_micro_batch_size: null
+    ppo_micro_batch_size_per_gpu: 2
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 16384
+    grad_clip: 1.0
+    clip_ratio: 0.2
+    clip_ratio_c: 3.0
+    entropy_coeff: 0.002
+    use_kl_loss: false
+    use_torch_compile: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    ppo_epochs: 1
+    shuffle: false
+    ulysses_sequence_parallel_size: 1
+    checkpoint:
+      # hf_model stores config/tokenizer; model_merger.py adds merged weights.
+      contents: [model, hf_model, optimizer, extra]
+    optim:
+      lr: 5.0e-6
+      lr_warmup_steps: -1
+      lr_warmup_steps_ratio: 0.0
+      min_lr_ratio: null
+      warmup_style: constant
+      total_training_steps: -1
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: false
+      optimizer_offload: false
+      fsdp_size: -1
+  ref:
+    fsdp_config:
+      param_offload: false
+      wrap_policy:
+        min_num_params: 0
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 16384
+    ulysses_sequence_parallel_size: 1
+  rollout:
+    name: vllm
+    temperature: 1.0
+    top_k: -1
+    top_p: 1.0
+    use_fire_sampling: false
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    dtype: bfloat16
+    gpu_memory_utilization: 0.8
+    ignore_eos: false
+    enforce_eager: false
+    free_cache_engine: false
+    load_format: dummy_dtensor
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 16384
+    max_model_len: 8192
+    max_num_seqs: 512
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 16384
+    disable_log_stats: true
+    enable_chunked_prefill: true
+    enable_sleep_mode: true
+    stop_when_truncated: true
+    do_sample: true
+    n: 16
+    val_kwargs:
+      top_k: -1
+      top_p: 1.0
+      temperature: 0
+      n: 1
+      do_sample: false
+
+# Required by the generic trainer schema but unused with GRPO.
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1.0e-5
+    lr_warmup_steps_ratio: 0.0
+    min_lr_ratio: null
+    warmup_style: constant
+    total_training_steps: -1
+  model:
+    path: ${actor_rollout_ref.model.path}
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    override_config: {}
+    external_lib: null
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+  ppo_mini_batch_size: 48
+  ppo_micro_batch_size: null
+  ppo_micro_batch_size_per_gpu: 2
+  forward_micro_batch_size: null
+  forward_micro_batch_size_per_gpu: 2
+  use_dynamic_bsz: true
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: 32768
+  ulysses_sequence_parallel_size: 1
+  ppo_epochs: 1
+  shuffle: false
+  grad_clip: 1.0
+  cliprange_value: 0.5
+  checkpoint:
+    contents: [model, hf_model, optimizer, extra]
+
+reward_model:
+  enable: false
+  strategy: fsdp
+  model:
+    input_tokenizer: ${actor_rollout_ref.model.path}
+    path: ${actor_rollout_ref.model.path}
+    external_lib: null
+    use_remove_padding: true
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: false
+      fsdp_size: -1
+  micro_batch_size: null
+  micro_batch_size_per_gpu: 2
+  max_length: null
+  ulysses_sequence_parallel_size: 1
+  use_dynamic_bsz: true
+  forward_max_token_len_per_gpu: 32768
+  reward_manager: naive
+
+custom_reward_function:
+  path: null
+  name: compute_score
+
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+
+trainer:
+  balance_batch: true
+  # MATH 8k with batch size 48 has about 166 batches per epoch. Keep enough
+  # epochs for total_training_steps to be the actual stopping condition.
+  total_epochs: 30
+  total_training_steps: 4000
+  project_name: verl-emerg-reason
+  experiment_name: agent0-serial-solver
+  logger: [console, wandb]
+  val_generations_to_log_to_wandb: 8
+  nnodes: 6
+  n_gpus_per_node: 4
+  save_freq: 50
+  resume_mode: disable
+  resume_from_path: false
+  test_freq: 10
+  critic_warmup: 0
+  default_hdfs_dir: null
+  # Node-local scratch is limited; the final checkpoint is sufficient for S3 export.
+  remove_previous_ckpt_in_save: true
+  del_local_ckpt_after_load: false
+  default_local_dir: /root/tmpdir/checkpoints/agent0-serial
+  val_before_train: true
+  val_only: false
+  save_train_generations: false
