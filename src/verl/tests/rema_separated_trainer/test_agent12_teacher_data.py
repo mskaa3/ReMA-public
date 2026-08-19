@@ -15,6 +15,7 @@
 from scripts.prepare_agent12_teacher_data import (
     clean_teacher_response,
     select_first_correct_trace,
+    select_teacher_trace,
 )
 
 
@@ -47,6 +48,36 @@ def test_select_first_correct_trace_reports_failure():
     assert trace is None
     assert candidate_index is None
     assert score == 0.0
+
+
+def test_select_teacher_trace_keeps_failed_attempt():
+    trace, candidate_index, score, is_correct = select_teacher_trace(
+        ["", "usable but wrong", "another wrong attempt"],
+        data_source="ReMA-math",
+        ground_truth="1",
+        extra_info={},
+        score_fn=lambda *_args: 0.0,
+    )
+
+    assert trace == "usable but wrong"
+    assert candidate_index == 1
+    assert score == 0.0
+    assert not is_correct
+
+
+def test_select_teacher_trace_still_prefers_correct_attempt():
+    trace, candidate_index, score, is_correct = select_teacher_trace(
+        ["wrong", "correct"],
+        data_source="ReMA-math",
+        ground_truth="1",
+        extra_info={},
+        score_fn=lambda _source, response, *_args: float(response == "correct"),
+    )
+
+    assert trace == "correct"
+    assert candidate_index == 1
+    assert score == 1.0
+    assert is_correct
 
 
 def test_clean_teacher_response_removes_generation_tokens():

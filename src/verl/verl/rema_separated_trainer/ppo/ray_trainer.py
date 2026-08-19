@@ -6130,6 +6130,14 @@ class RayReMASeparatedTrainer(object):
                     generation_non_tensor_keys = ['question', 'uid']
                     if teacher_solution_key in new_batch.non_tensor_batch:
                         generation_non_tensor_keys.append(teacher_solution_key)
+                    for teacher_metadata_key in (
+                        'teacher_score',
+                        'teacher_solution_correct',
+                    ):
+                        if teacher_metadata_key in new_batch.non_tensor_batch:
+                            generation_non_tensor_keys.append(
+                                teacher_metadata_key
+                            )
                     gen_batch = new_batch.select(
                         batch_keys=['batch_idx'],
                         non_tensor_batch_keys=generation_non_tensor_keys,
@@ -6186,6 +6194,21 @@ class RayReMASeparatedTrainer(object):
                             'worker_question_visible',
                             np.zeros(len(new_batch), dtype=bool),
                         )
+                        teacher_correct = new_batch.non_tensor_batch.get(
+                            'teacher_solution_correct',
+                            np.ones(len(new_batch), dtype=bool),
+                        )
+                        teacher_visible_array = np.asarray(
+                            teacher_visible,
+                            dtype=bool,
+                        )
+                        teacher_correct_array = np.asarray(
+                            teacher_correct,
+                            dtype=bool,
+                        )
+                        visible_teacher_count = int(
+                            teacher_visible_array.sum()
+                        )
                         metrics.update({
                             'curriculum/phase_id': float(
                                 curriculum_state.phase_id
@@ -6197,7 +6220,17 @@ class RayReMASeparatedTrainer(object):
                                 curriculum_state.teacher_solution_probability
                             ),
                             'curriculum/teacher_solution_visible_rate': float(
-                                np.asarray(teacher_visible, dtype=float).mean()
+                                teacher_visible_array.mean()
+                            ),
+                            'curriculum/teacher_solution_correct_rate': float(
+                                teacher_correct_array.mean()
+                            ),
+                            'curriculum/visible_teacher_correct_rate': float(
+                                (
+                                    teacher_correct_array
+                                    & teacher_visible_array
+                                ).sum()
+                                / max(visible_teacher_count, 1)
                             ),
                             'curriculum/worker_question_probability': float(
                                 curriculum_state.worker_question_probability

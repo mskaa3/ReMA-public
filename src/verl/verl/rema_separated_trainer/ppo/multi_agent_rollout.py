@@ -1414,6 +1414,12 @@ class MultiAgentRollout:
             teacher_solution_key,
             np.asarray([""] * batch_size, dtype=object),
         )
+        teacher_solution_correct = prompts.non_tensor_batch.get(
+            "teacher_solution_correct",
+            # Backward compatibility: previous teacher files retained only
+            # positively scored solutions and did not contain this column.
+            np.ones(batch_size, dtype=bool),
+        )
         teacher_solution_max_chars = max(
             int(agent12_curriculum.get("teacher_solution_max_chars", 8000)),
             1,
@@ -1626,13 +1632,25 @@ class MultiAgentRollout:
                     teacher_scaffold = str(teacher_solutions[idx])[
                         :teacher_solution_max_chars
                     ]
+                    if bool(teacher_solution_correct[idx]):
+                        scaffold_label = "Verified correct serial attempt"
+                        scaffold_instruction = (
+                            "Extract its useful reasoning structure without "
+                            "copying the final answer into the plan."
+                        )
+                    else:
+                        scaffold_label = "Unsuccessful serial attempt"
+                        scaffold_instruction = (
+                            "Identify what remains useful, repair likely "
+                            "mistakes, and do not treat its final answer as "
+                            "correct."
+                        )
                     content += (
-                        "\n\nCorrect teacher solution (planning scaffold):\n"
+                        f"\n\n{scaffold_label} (planning scaffold):\n"
                         f"{teacher_scaffold}\n\n"
-                        "Use this solution to identify a useful sequence of "
-                        "dependent subtasks. Produce a plan that remains usable "
-                        "when the solution is absent; do not copy its final answer "
-                        "into the plan."
+                        f"{scaffold_instruction} Identify a useful sequence of "
+                        "dependent subtasks and produce a plan that remains "
+                        "usable when this scaffold is absent."
                     )
                 if previous_feedback[idx]:
                     content += f"\n\n{previous_feedback[idx]}"

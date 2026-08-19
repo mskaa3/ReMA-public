@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Select correct Agent 0 traces for the Agent 1/2 curriculum."""
+"""Attach scored Agent 0 traces to every Agent 1/2 training example."""
 
 from __future__ import annotations
 
@@ -68,6 +68,46 @@ def select_first_correct_trace(
     return None, None, best_score
 
 
+def select_teacher_trace(
+    responses: Iterable[object],
+    *,
+    data_source: str,
+    ground_truth: str,
+    extra_info: object,
+    score_fn: ScoreFn,
+) -> Tuple[Optional[str], Optional[int], float, bool]:
+    """Prefer a correct trace, otherwise retain the first usable attempt."""
+    fallback_trace = None
+    fallback_index = None
+    fallback_score = 0.0
+
+    if isinstance(responses, str):
+        responses = [responses]
+    for candidate_index, response in enumerate(responses):
+        cleaned = clean_teacher_response(response)
+        if not cleaned:
+            continue
+        try:
+            score = float(
+                score_fn(data_source, cleaned, ground_truth, extra_info)
+            )
+        except Exception as exc:
+            print(
+                f"Keeping ungradable teacher candidate {candidate_index} as "
+                f"an unsuccessful attempt: {type(exc).__name__}: {exc}"
+            )
+            score = 0.0
+
+        if fallback_trace is None:
+            fallback_trace = cleaned
+            fallback_index = candidate_index
+            fallback_score = score
+        if score > 0.0:
+            return cleaned, candidate_index, score, True
+
+    return fallback_trace, fallback_index, fallback_score, False
+
+
 def _ground_truth(row: pd.Series) -> str:
     reward_model = row.get("reward_model")
     if isinstance(reward_model, dict) and "ground_truth" in reward_model:
@@ -86,6 +126,7 @@ def build_teacher_dataset(
 ) -> None:
     frame = pd.read_parquet(input_path)
     selected_rows = []
+    correct_trace_count = 0
 
     for _, row in frame.iterrows():
         responses = row.get("responses")
@@ -93,32 +134,34 @@ def build_teacher_dataset(
             raise ValueError("Teacher candidate parquet has no responses column")
         data_source = str(row.get("data_source", "ReMA-math"))
         extra_info = row.get("extra_info", {})
-        trace, candidate_index, score = select_first_correct_trace(
+        trace, candidate_index, score, is_correct = select_teacher_trace(
             responses,
             data_source=data_source,
             ground_truth=_ground_truth(row),
             extra_info=extra_info,
             score_fn=score_fn,
         )
-        if trace is None:
-            continue
-
         selected = row.to_dict()
         selected.pop("responses", None)
-        selected["teacher_solution"] = trace
-        selected["teacher_candidate_index"] = int(candidate_index)
+        selected["teacher_solution"] = trace or ""
+        selected["teacher_candidate_index"] = (
+            int(candidate_index) if candidate_index is not None else -1
+        )
         selected["teacher_score"] = float(score)
+        selected["teacher_solution_correct"] = bool(is_correct)
         selected_rows.append(selected)
+        correct_trace_count += int(is_correct)
 
     if not selected_rows:
-        raise ValueError("Agent 0 produced no correct teacher trajectories")
+        raise ValueError("Teacher candidate parquet contains no training rows")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(selected_rows).to_parquet(output_path, index=False)
-    coverage = len(selected_rows) / max(len(frame), 1)
+    correct_coverage = correct_trace_count / max(len(frame), 1)
     print(
-        f"Selected {len(selected_rows)}/{len(frame)} correct teacher traces "
-        f"(coverage={coverage:.3f}) into {output_path}"
+        f"Retained all {len(selected_rows)} teacher examples; "
+        f"{correct_trace_count} have a correct Agent 0 trace "
+        f"(correct_coverage={correct_coverage:.3f}). Wrote {output_path}"
     )
 
 

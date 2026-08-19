@@ -284,7 +284,8 @@ algorithm:
       # produced a long serial trace.
       teacher_solution_max_chars: 8000
       # Phase 1: freeze the decomposer and teach the shared worker/final model
-      # to execute plans extracted from correct serial solutions.
+      # to execute plans extracted from scored serial attempts. Failed Agent 0
+      # attempts are retained so workers can learn to repair them.
       worker_bootstrap_steps: 200
       # Phase 2: freeze workers and linearly drop the teacher solution while
       # optimizing the decomposer through downstream correctness.
