@@ -70,6 +70,12 @@ COMMON_MOUNTS=(
     --mount "type=bind,src=${RAY_NODE_TMP},dst=${RAY_NODE_TMP}"
 )
 
+echo "Preparing Ray temporary directories"
+srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+    rm -rf "$RAY_NODE_TMP"
+    mkdir -p "$RAY_NODE_TMP"
+'
+
 echo "Building single-agent parquet files on all nodes"
 srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
     apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
@@ -78,12 +84,6 @@ srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
         --train-input /root/tmpdir/MATH/train_lv3to5_8k.parquet \
         --val-input /root/tmpdir/overall_math/test.parquet \
         --output-dir /root/tmpdir/agent0_data'
-
-echo "Preparing Ray temporary directories"
-srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
-    rm -rf "$RAY_NODE_TMP"
-    mkdir -p "$RAY_NODE_TMP"
-'
 
 echo "Starting Ray head on ${HEAD_NODE} (${IP_HEAD})"
 srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
