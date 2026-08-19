@@ -275,6 +275,27 @@ algorithm:
     # Local stages produce checkable work; the final stage has room to synthesize it.
     worker_max_new_tokens: 512
     final_max_new_tokens: 896
+    # Three-phase distillation from a frozen serial solver. Disabled for the
+    # original ReMA runs and enabled only by the Agent 1/2 curriculum launcher.
+    agent12_curriculum:
+      enable: False
+      teacher_solution_key: teacher_solution
+      # Keep the decomposer prompt below max_prompt_length even when Agent 0
+      # produced a long serial trace.
+      teacher_solution_max_chars: 8000
+      # Phase 1: freeze the decomposer and teach the shared worker/final model
+      # to execute plans extracted from correct serial solutions.
+      worker_bootstrap_steps: 200
+      # Phase 2: freeze workers and linearly drop the teacher solution while
+      # optimizing the decomposer through downstream correctness.
+      decomposer_transfer_steps: 200
+      # Phase 3: alternate all roles and then remove the full question from
+      # non-final workers. The final stage already receives routed notes only.
+      worker_question_fade_steps: 200
+      worker_question_final_probability: 0.0
+      # Validate the target protocol rather than the temporary full-question
+      # bootstrap context.
+      worker_question_eval_probability: 0.0
     # This experiment uses one complete trajectory rather than repair rounds.
     accept_revise:
       enable: False
