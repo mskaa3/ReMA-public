@@ -325,7 +325,8 @@ def compute_policy_loss(
     cliprange=None,
     cliprange_low=None,
     cliprange_high=None,
-    clip_ratio_c=3.0
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = 'token',
 ):
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
 
@@ -340,6 +341,9 @@ def compute_policy_loss(
             shape: (bs, response_length)
         cliprange: (float)
             The clip range used in PPO. See https://arxiv.org/abs/1707.06347
+        loss_agg_mode: (str)
+            ``token`` averages over all response tokens. ``trajectory`` first
+            averages each response, then gives every response equal weight.
 
     Returns:
         pg_loss: `a scalar torch.Tensor`
@@ -352,6 +356,10 @@ def compute_policy_loss(
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
         + f" but get the value: {clip_ratio_c}."
     )
+    if loss_agg_mode not in {'token', 'trajectory'}:
+        raise ValueError(
+            f"Unsupported loss_agg_mode={loss_agg_mode!r}; expected 'token' or 'trajectory'."
+        )
 
     negative_approx_kl = log_prob - old_log_prob
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-3.0, max=3.0)
@@ -383,7 +391,15 @@ def compute_policy_loss(
     )
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
+    if loss_agg_mode == 'trajectory':
+        response_token_counts = eos_mask.sum(dim=-1)
+        valid_responses = response_token_counts > 0
+        if not valid_responses.any():
+            raise ValueError('Cannot aggregate policy loss: every response mask is empty.')
+        response_losses = (pg_losses * eos_mask).sum(dim=-1) / response_token_counts.clamp_min(1)
+        pg_loss = response_losses[valid_responses].mean()
+    else:
+        pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 

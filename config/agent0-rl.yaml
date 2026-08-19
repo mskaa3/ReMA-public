@@ -27,13 +27,16 @@ actor_rollout_ref:
     use_remove_padding: true
   actor:
     strategy: fsdp
-    # Match the effective ReMA optimizer schedule: four prompt minibatches per
-    # full batch of 48 mixed groups.
-    ppo_mini_batch_size: 12
+    # Use one PPO update per full batch of 48 mixed prompt groups. Splitting
+    # this into smaller minibatches caused four policy updates per logged step.
+    ppo_mini_batch_size: 48
     ppo_micro_batch_size: null
     ppo_micro_batch_size_per_gpu: 16
     use_dynamic_bsz: true
     ppo_max_token_len_per_gpu: 16384
+    # Give each sampled solution equal policy-loss weight, regardless of its
+    # generated length. Other trainers retain the default token aggregation.
+    loss_agg_mode: trajectory
     grad_clip: 1.0
     clip_ratio: 0.2
     clip_ratio_c: 3.0
@@ -49,7 +52,7 @@ actor_rollout_ref:
       # hf_model stores config/tokenizer; model_merger.py adds merged weights.
       contents: [model, hf_model, optimizer, extra]
     optim:
-      lr: 5.0e-6
+      lr: 1.0e-6
       lr_warmup_steps: -1
       lr_warmup_steps_ratio: 0.0
       min_lr_ratio: null
@@ -179,12 +182,12 @@ algorithm:
     type: fixed
     kl_coef: 0.0
   # As in ReMA, homogeneous groups have zero GRPO advantage and are replaced
-  # by fresh rollouts. A partial batch is allowed only in complete PPO
-  # minibatches after the generation budget is exhausted.
+  # by fresh rollouts. Optimize only complete batches so every logged step has
+  # the same number of prompt groups and exactly one PPO update.
   filter_groups:
     enable: true
     max_num_gen_batches: 8
-    allow_partial_batch: true
+    allow_partial_batch: false
 
 trainer:
   balance_batch: true
