@@ -5,7 +5,7 @@ data:
   train_files: /root/tmpdir/agent0_data/train.parquet
   val_files: /root/tmpdir/agent0_data/val.parquet
   prompt_key: prompt
-  max_prompt_length: 2048
+  max_prompt_length: 4096
   max_response_length: 4096
   train_batch_size: 48
   val_batch_size: null
@@ -27,9 +27,11 @@ actor_rollout_ref:
     use_remove_padding: true
   actor:
     strategy: fsdp
-    ppo_mini_batch_size: 48
+    # Match the effective ReMA optimizer schedule: four prompt minibatches per
+    # full batch of 48 mixed groups.
+    ppo_mini_batch_size: 12
     ppo_micro_batch_size: null
-    ppo_micro_batch_size_per_gpu: 2
+    ppo_micro_batch_size_per_gpu: 16
     use_dynamic_bsz: true
     ppo_max_token_len_per_gpu: 16384
     grad_clip: 1.0
@@ -65,7 +67,7 @@ actor_rollout_ref:
       wrap_policy:
         min_num_params: 0
     log_prob_micro_batch_size: null
-    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_micro_batch_size_per_gpu: 4
     log_prob_use_dynamic_bsz: true
     log_prob_max_token_len_per_gpu: 16384
     ulysses_sequence_parallel_size: 1
@@ -88,7 +90,7 @@ actor_rollout_ref:
     max_model_len: 8192
     max_num_seqs: 512
     log_prob_micro_batch_size: null
-    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_micro_batch_size_per_gpu: 4
     log_prob_use_dynamic_bsz: true
     log_prob_max_token_len_per_gpu: 16384
     disable_log_stats: true
@@ -161,7 +163,7 @@ reward_model:
   ulysses_sequence_parallel_size: 1
   use_dynamic_bsz: true
   forward_max_token_len_per_gpu: 32768
-  reward_manager: naive
+  reward_manager: agent0
 
 custom_reward_function:
   path: null
@@ -176,12 +178,19 @@ algorithm:
   kl_ctrl:
     type: fixed
     kl_coef: 0.0
+  # As in ReMA, homogeneous groups have zero GRPO advantage and are replaced
+  # by fresh rollouts. A partial batch is allowed only in complete PPO
+  # minibatches after the generation budget is exhausted.
+  filter_groups:
+    enable: true
+    max_num_gen_batches: 8
+    allow_partial_batch: true
 
 trainer:
   balance_batch: true
-  # MATH 8k with batch size 48 has about 166 batches per epoch. Keep enough
-  # epochs for total_training_steps to be the actual stopping condition.
-  total_epochs: 30
+  # Group filtering may consume up to eight dataloader batches per optimizer
+  # step. This is only a high ceiling; total_training_steps remains the stop.
+  total_epochs: 250
   total_training_steps: 4000
   project_name: verl-emerg-reason
   experiment_name: agent0-serial-solver

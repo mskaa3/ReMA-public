@@ -1,4 +1,4 @@
-# Copyright 2024 PRIME team and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .naive import NaiveRewardManager
-from .agent0 import Agent0RewardManager
-from .prime import PrimeRewardManager
-from .rema import ReMARewardManager
+"""Single-agent ReMA-style training for the serial solver teacher."""
