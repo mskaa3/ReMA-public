@@ -1,4 +1,4 @@
-# Copyright 2024 PRIME team and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .naive import NaiveRewardManager
-from .agent0 import Agent0RewardManager
-from .prime import PrimeRewardManager
-from .rema import ReMARewardManager
+"""Correctness reward manager for the standalone serial solver."""
+
+import torch
+
+from verl import DataProto
+from verl.workers.reward_manager.naive import NaiveRewardManager
+
+
+class Agent0RewardManager(NaiveRewardManager):
+    """Expose raw sequence correctness as both token reward and ``acc``."""
+
+    def __call__(self, data: DataProto) -> torch.Tensor:
+        reward_tensor = super().__call__(data)
+        data.batch["acc"] = reward_tensor.sum(dim=-1)
+        return reward_tensor

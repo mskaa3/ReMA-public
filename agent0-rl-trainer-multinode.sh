@@ -131,7 +131,7 @@ export TMPDIR=${RAY_NODE_TMP}; \
 export HF_HOME=/root/tmpdir/hf_home; \
 export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src:/verl:\$PYTHONPATH; \
 export RAY_ADDRESS=${IP_HEAD}; \
-python3 -m verl.trainer.main_ppo \
+python3 -m verl.agent0_trainer.main_ppo \
   --config-path=/root/ReMA-public/config \
   --config-name=agent0-rl.yaml \
   actor_rollout_ref.model.path=${MODEL_PATH} \
