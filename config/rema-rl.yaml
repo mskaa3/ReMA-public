@@ -279,15 +279,15 @@ algorithm:
     # original ReMA runs and enabled only by the Agent 1/2 curriculum launcher.
     agent12_curriculum:
       enable: False
-      teacher_solution_key: teacher_solution
+      teacher_attempts_key: teacher_attempts
       # Keep the decomposer prompt below max_prompt_length even when Agent 0
       # produced a long serial trace.
-      teacher_solution_max_chars: 8000
+      teacher_attempt_max_chars: 8000
       # Phase 1: freeze the decomposer and teach the shared worker/final model
-      # to execute plans extracted from scored serial attempts. Failed Agent 0
-      # attempts are retained so workers can learn to repair them.
+      # to execute plans extracted from serial attempts. One attempt is sampled
+      # per prompt group; all successful and unsuccessful attempts are retained.
       worker_bootstrap_steps: 200
-      # Phase 2: freeze workers and linearly drop the teacher solution while
+      # Phase 2: freeze workers and linearly drop the sampled teacher attempt while
       # optimizing the decomposer through downstream correctness.
       decomposer_transfer_steps: 200
       # Phase 3: alternate all roles and then remove the full question from

@@ -14,6 +14,7 @@
 
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import (
     curriculum_context_is_visible,
+    select_curriculum_teacher_attempt,
 )
 from verl.rema_separated_trainer.ppo.ray_trainer import (
     compute_agent12_curriculum_state,
@@ -23,7 +24,7 @@ from verl.rema_separated_trainer.ppo.ray_trainer import (
 def test_curriculum_context_visibility_is_group_deterministic():
     values = {
         curriculum_context_is_visible(
-            "shared-uid", 17, 0.5, salt="teacher_solution"
+            "shared-uid", 17, 0.5, salt="teacher_attempt"
         )
         for _ in range(16)
     }
@@ -33,6 +34,23 @@ def test_curriculum_context_visibility_is_group_deterministic():
 def test_curriculum_context_visibility_respects_probability_bounds():
     assert not curriculum_context_is_visible("uid", 1, 0.0, salt="context")
     assert curriculum_context_is_visible("uid", 1, 1.0, salt="context")
+
+
+def test_teacher_attempt_sampling_is_shared_by_the_grpo_group():
+    attempts = ["first", "second", "third"]
+    selected = {
+        select_curriculum_teacher_attempt(attempts, "shared-uid", 17)
+        for _ in range(16)
+    }
+
+    assert len(selected) == 1
+    attempt, index, count = selected.pop()
+    assert attempt == attempts[index]
+    assert count == len(attempts)
+
+
+def test_teacher_attempt_sampling_handles_empty_attempts():
+    assert select_curriculum_teacher_attempt([], "uid", 1) == ("", -1, 0)
 
 
 def _state(step):
@@ -49,8 +67,8 @@ def test_agent12_curriculum_phase_boundaries():
     assert _state(1).phase == "worker_bootstrap"
     assert _state(2).phase == "worker_bootstrap"
     assert _state(3).phase == "decomposer_transfer"
-    assert _state(3).teacher_solution_probability == 1.0
-    assert _state(4).teacher_solution_probability == 0.5
+    assert _state(3).teacher_attempt_probability == 1.0
+    assert _state(4).teacher_attempt_probability == 0.5
     assert _state(5).phase == "joint"
     assert _state(5).worker_question_probability == 1.0
     assert _state(7).worker_question_probability == 0.0

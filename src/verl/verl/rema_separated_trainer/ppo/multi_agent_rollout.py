@@ -29,6 +29,38 @@ def curriculum_context_is_visible(
     sample = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") / 2**64
     return sample < probability
 
+
+def select_curriculum_teacher_attempt(
+    attempts: object,
+    uid: object,
+    step: int,
+) -> Tuple[str, int, int]:
+    """Select one attempt deterministically for an entire GRPO prompt group."""
+    if isinstance(attempts, str):
+        candidates = [attempts]
+    elif isinstance(attempts, np.ndarray):
+        candidates = attempts.tolist()
+    elif isinstance(attempts, (list, tuple)):
+        candidates = list(attempts)
+    else:
+        candidates = []
+
+    candidates = [
+        candidate.strip()
+        for candidate in candidates
+        if isinstance(candidate, str) and candidate.strip()
+    ]
+    if not candidates:
+        return "", -1, 0
+
+    payload = f"teacher_attempt:{step}:{uid}".encode("utf-8")
+    selected_index = (
+        int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+        % len(candidates)
+    )
+    return candidates[selected_index], selected_index, len(candidates)
+
+
 def normalize_text(text):
     return unicodedata.normalize('NFKC', text)
 
@@ -1400,38 +1432,50 @@ class MultiAgentRollout:
         curriculum_step = int(prompts.meta_info.get("curriculum_step", 0))
         is_validation = bool(prompts.meta_info.get("validate", False))
         agent12_curriculum = hierarchy_config.get("agent12_curriculum", {}) or {}
-        teacher_solution_key = str(
-            prompts.meta_info.get("teacher_solution_key", "teacher_solution")
+        teacher_attempts_key = str(
+            prompts.meta_info.get("teacher_attempts_key", "teacher_attempts")
         )
-        teacher_solution_probability = (
+        teacher_attempt_probability = (
             0.0
             if is_validation
             else float(
-                prompts.meta_info.get("teacher_solution_probability", 0.0)
+                prompts.meta_info.get("teacher_attempt_probability", 0.0)
             )
         )
-        teacher_solutions = prompts.non_tensor_batch.get(
-            teacher_solution_key,
-            np.asarray([""] * batch_size, dtype=object),
+        teacher_attempt_lists = prompts.non_tensor_batch.get(
+            teacher_attempts_key,
+            np.asarray([[] for _ in range(batch_size)], dtype=object),
         )
-        teacher_solution_correct = prompts.non_tensor_batch.get(
-            "teacher_solution_correct",
-            # Backward compatibility: previous teacher files retained only
-            # positively scored solutions and did not contain this column.
-            np.ones(batch_size, dtype=bool),
+        sampled_teacher_attempts = []
+        sampled_teacher_attempt_indices = []
+        teacher_attempt_counts = []
+        for idx in range(batch_size):
+            attempt, attempt_index, attempt_count = (
+                select_curriculum_teacher_attempt(
+                    teacher_attempt_lists[idx],
+                    c3_group_ids[idx],
+                    curriculum_step,
+                )
+            )
+            sampled_teacher_attempts.append(attempt)
+            sampled_teacher_attempt_indices.append(attempt_index)
+            teacher_attempt_counts.append(attempt_count)
+        sampled_teacher_attempts = np.asarray(
+            sampled_teacher_attempts,
+            dtype=object,
         )
-        teacher_solution_max_chars = max(
-            int(agent12_curriculum.get("teacher_solution_max_chars", 8000)),
+        teacher_attempt_max_chars = max(
+            int(agent12_curriculum.get("teacher_attempt_max_chars", 8000)),
             1,
         )
-        teacher_solution_visible = np.asarray(
+        teacher_attempt_visible = np.asarray(
             [
-                bool(str(teacher_solutions[idx]).strip())
+                bool(sampled_teacher_attempts[idx])
                 and curriculum_context_is_visible(
                     c3_group_ids[idx],
                     curriculum_step,
-                    teacher_solution_probability,
-                    salt="teacher_solution",
+                    teacher_attempt_probability,
+                    salt="teacher_attempt",
                 )
                 for idx in range(batch_size)
             ],
@@ -1462,8 +1506,16 @@ class MultiAgentRollout:
             ],
             dtype=bool,
         )
-        prompts.non_tensor_batch["teacher_solution_visible"] = (
-            teacher_solution_visible
+        prompts.non_tensor_batch["teacher_attempt_visible"] = (
+            teacher_attempt_visible
+        )
+        prompts.non_tensor_batch["teacher_attempt_index"] = np.asarray(
+            sampled_teacher_attempt_indices,
+            dtype=np.int64,
+        )
+        prompts.non_tensor_batch["teacher_attempt_count"] = np.asarray(
+            teacher_attempt_counts,
+            dtype=np.int64,
         )
         prompts.non_tensor_batch["worker_question_visible"] = (
             worker_question_visible
@@ -1628,29 +1680,19 @@ class MultiAgentRollout:
             decomposer_chats_by_idx = {}
             for idx in unfinished_indices:
                 content = f"Question:\n{questions[idx]}"
-                if teacher_solution_visible[idx]:
-                    teacher_scaffold = str(teacher_solutions[idx])[
-                        :teacher_solution_max_chars
+                if teacher_attempt_visible[idx]:
+                    teacher_scaffold = sampled_teacher_attempts[idx][
+                        :teacher_attempt_max_chars
                     ]
-                    if bool(teacher_solution_correct[idx]):
-                        scaffold_label = "Verified correct serial attempt"
-                        scaffold_instruction = (
-                            "Extract its useful reasoning structure without "
-                            "copying the final answer into the plan."
-                        )
-                    else:
-                        scaffold_label = "Unsuccessful serial attempt"
-                        scaffold_instruction = (
-                            "Identify what remains useful, repair likely "
-                            "mistakes, and do not treat its final answer as "
-                            "correct."
-                        )
                     content += (
-                        f"\n\n{scaffold_label} (planning scaffold):\n"
+                        "\n\nCandidate serial reasoning trace "
+                        "(planning scaffold):\n"
                         f"{teacher_scaffold}\n\n"
-                        f"{scaffold_instruction} Identify a useful sequence of "
-                        "dependent subtasks and produce a plan that remains "
-                        "usable when this scaffold is absent."
+                        "Analyze this attempt critically: preserve useful "
+                        "reasoning, repair possible mistakes, and do not assume "
+                        "its final answer is correct. Produce a useful sequence "
+                        "of dependent subtasks that remains executable when "
+                        "this scaffold is absent."
                     )
                 if previous_feedback[idx]:
                     content += f"\n\n{previous_feedback[idx]}"
