@@ -18,12 +18,12 @@ from scripts.prepare_agent12_teacher_data import (
 )
 
 
-def test_collect_teacher_attempts_keeps_correct_and_incorrect_outputs():
+def test_collect_teacher_attempts_keeps_every_generated_slot():
     attempts = collect_teacher_attempts(
         ["wrong", "correct<|im_end|>", "", None, "another wrong attempt"]
     )
 
-    assert attempts == ["wrong", "correct", "another wrong attempt"]
+    assert attempts == ["wrong", "correct", "", "", "another wrong attempt"]
 
 
 def test_collect_teacher_attempts_accepts_single_response():

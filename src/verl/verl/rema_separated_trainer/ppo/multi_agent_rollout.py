@@ -30,37 +30,6 @@ def curriculum_context_is_visible(
     return sample < probability
 
 
-def select_curriculum_teacher_attempt(
-    attempts: object,
-    uid: object,
-    step: int,
-) -> Tuple[str, int, int]:
-    """Select one attempt deterministically for an entire GRPO prompt group."""
-    if isinstance(attempts, str):
-        candidates = [attempts]
-    elif isinstance(attempts, np.ndarray):
-        candidates = attempts.tolist()
-    elif isinstance(attempts, (list, tuple)):
-        candidates = list(attempts)
-    else:
-        candidates = []
-
-    candidates = [
-        candidate.strip()
-        for candidate in candidates
-        if isinstance(candidate, str) and candidate.strip()
-    ]
-    if not candidates:
-        return "", -1, 0
-
-    payload = f"teacher_attempt:{step}:{uid}".encode("utf-8")
-    selected_index = (
-        int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
-        % len(candidates)
-    )
-    return candidates[selected_index], selected_index, len(candidates)
-
-
 def normalize_text(text):
     return unicodedata.normalize('NFKC', text)
 
@@ -1432,8 +1401,8 @@ class MultiAgentRollout:
         curriculum_step = int(prompts.meta_info.get("curriculum_step", 0))
         is_validation = bool(prompts.meta_info.get("validate", False))
         agent12_curriculum = hierarchy_config.get("agent12_curriculum", {}) or {}
-        teacher_attempts_key = str(
-            prompts.meta_info.get("teacher_attempts_key", "teacher_attempts")
+        teacher_attempt_key = str(
+            prompts.meta_info.get("teacher_attempt_key", "teacher_attempt")
         )
         teacher_attempt_probability = (
             0.0
@@ -1442,27 +1411,9 @@ class MultiAgentRollout:
                 prompts.meta_info.get("teacher_attempt_probability", 0.0)
             )
         )
-        teacher_attempt_lists = prompts.non_tensor_batch.get(
-            teacher_attempts_key,
-            np.asarray([[] for _ in range(batch_size)], dtype=object),
-        )
-        sampled_teacher_attempts = []
-        sampled_teacher_attempt_indices = []
-        teacher_attempt_counts = []
-        for idx in range(batch_size):
-            attempt, attempt_index, attempt_count = (
-                select_curriculum_teacher_attempt(
-                    teacher_attempt_lists[idx],
-                    c3_group_ids[idx],
-                    curriculum_step,
-                )
-            )
-            sampled_teacher_attempts.append(attempt)
-            sampled_teacher_attempt_indices.append(attempt_index)
-            teacher_attempt_counts.append(attempt_count)
-        sampled_teacher_attempts = np.asarray(
-            sampled_teacher_attempts,
-            dtype=object,
+        sampled_teacher_attempts = prompts.non_tensor_batch.get(
+            teacher_attempt_key,
+            np.asarray([""] * batch_size, dtype=object),
         )
         teacher_attempt_max_chars = max(
             int(agent12_curriculum.get("teacher_attempt_max_chars", 8000)),
@@ -1508,14 +1459,6 @@ class MultiAgentRollout:
         )
         prompts.non_tensor_batch["teacher_attempt_visible"] = (
             teacher_attempt_visible
-        )
-        prompts.non_tensor_batch["teacher_attempt_index"] = np.asarray(
-            sampled_teacher_attempt_indices,
-            dtype=np.int64,
-        )
-        prompts.non_tensor_batch["teacher_attempt_count"] = np.asarray(
-            teacher_attempt_counts,
-            dtype=np.int64,
         )
         prompts.non_tensor_batch["worker_question_visible"] = (
             worker_question_visible

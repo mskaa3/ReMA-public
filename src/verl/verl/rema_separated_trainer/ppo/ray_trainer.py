@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Optional, Type, Dict
+from typing import Optional, Type, Dict, Tuple
 from copy import deepcopy
 from collections import defaultdict, deque
 
@@ -76,6 +76,86 @@ class Agent12CurriculumState:
     phase_step: int
     teacher_attempt_probability: float
     worker_question_probability: float
+
+
+def expand_agent12_teacher_attempt_batch(
+    batch_dict: Dict,
+    *,
+    attempts_key: str,
+    attempt_key: str,
+    expected_attempts: int,
+) -> Tuple[Dict, int]:
+    """Expand each question into one prompt group per Agent 0 attempt."""
+    if attempts_key not in batch_dict:
+        raise ValueError(
+            f"Agent 1/2 curriculum requires dataset column {attempts_key!r}"
+        )
+    if expected_attempts <= 0:
+        raise ValueError("expected_attempts must be positive")
+
+    attempts_batch = batch_dict[attempts_key]
+    base_batch_size = len(batch_dict['question'])
+    source_indices = []
+    selected_attempts = []
+    selected_attempt_indices = []
+
+    for source_index in range(base_batch_size):
+        attempts = attempts_batch[source_index]
+        if isinstance(attempts, str):
+            attempts = [attempts]
+        elif isinstance(attempts, np.ndarray):
+            attempts = attempts.tolist()
+        elif isinstance(attempts, (list, tuple)):
+            attempts = list(attempts)
+        else:
+            attempts = []
+        if len(attempts) != expected_attempts:
+            raise ValueError(
+                f"Question at batch index {source_index} has {len(attempts)} "
+                f"teacher attempts; expected {expected_attempts}. Regenerate "
+                "the teacher parquet with matching TEACHER_ROLLOUT_N."
+            )
+        for attempt_index, attempt in enumerate(attempts):
+            source_indices.append(source_index)
+            selected_attempts.append(
+                attempt.strip() if isinstance(attempt, str) else ""
+            )
+            selected_attempt_indices.append(attempt_index)
+
+    source_indices_np = np.asarray(source_indices, dtype=np.int64)
+    expanded_batch = {}
+    for key, value in batch_dict.items():
+        if key == attempts_key:
+            continue
+        if isinstance(value, torch.Tensor):
+            index_tensor = torch.as_tensor(
+                source_indices_np,
+                dtype=torch.long,
+                device=value.device,
+            )
+            expanded_batch[key] = value.index_select(0, index_tensor)
+        elif isinstance(value, np.ndarray):
+            expanded_batch[key] = value[source_indices_np]
+        else:
+            raise TypeError(
+                f"Cannot expand batch field {key!r} of type "
+                f"{type(value).__name__}"
+            )
+
+    expanded_batch[attempt_key] = np.asarray(
+        selected_attempts,
+        dtype=object,
+    )
+    expanded_batch['teacher_attempt_index'] = np.asarray(
+        selected_attempt_indices,
+        dtype=np.int64,
+    )
+    expanded_batch['teacher_attempt_count'] = np.full(
+        len(selected_attempts),
+        expected_attempts,
+        dtype=np.int64,
+    )
+    return expanded_batch, base_batch_size
 
 
 def compute_agent12_curriculum_state(
@@ -4910,6 +4990,7 @@ class RayReMASeparatedTrainer(object):
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+        effective_train_prompt_batch_size = int(config.data.train_batch_size)
 
         if self._hierarchy_enabled():
             hierarchy_config = self._get_hierarchy_config()
@@ -5065,6 +5146,41 @@ class RayReMASeparatedTrainer(object):
                     raise ValueError(
                         "agent12_curriculum.teacher_attempts_key cannot be empty"
                     )
+                if not str(
+                    curriculum.get('teacher_attempt_key', '')
+                ).strip():
+                    raise ValueError(
+                        "agent12_curriculum.teacher_attempt_key cannot be empty"
+                    )
+                if not bool(
+                    curriculum.get('expand_all_teacher_attempts', False)
+                ):
+                    raise ValueError(
+                        "agent12_curriculum requires "
+                        "expand_all_teacher_attempts=True"
+                    )
+                for key in (
+                    'teacher_attempts_per_question',
+                    'optimizer_prompt_batch_size',
+                ):
+                    if int(curriculum.get(key, 0)) <= 0:
+                        raise ValueError(
+                            f"agent12_curriculum.{key} must be positive"
+                        )
+                expected_prompt_batch_size = (
+                    int(config.data.train_batch_size)
+                    * int(curriculum.get('teacher_attempts_per_question', 0))
+                )
+                if int(curriculum.get('optimizer_prompt_batch_size', 0)) != (
+                    expected_prompt_batch_size
+                ):
+                    raise ValueError(
+                        "agent12_curriculum.optimizer_prompt_batch_size must "
+                        "equal data.train_batch_size * "
+                        "teacher_attempts_per_question so no teacher attempt "
+                        "group is dropped"
+                    )
+                effective_train_prompt_batch_size = expected_prompt_batch_size
                 if int(curriculum.get('teacher_attempt_max_chars', 0)) <= 0:
                     raise ValueError(
                         "agent12_curriculum.teacher_attempt_max_chars must be "
@@ -5072,7 +5188,10 @@ class RayReMASeparatedTrainer(object):
                     )
 
         # 1. Check total batch size for data correctness
-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+        real_train_batch_size = (
+            effective_train_prompt_batch_size
+            * config.actor_rollout_ref.rollout.n
+        )
         assert real_train_batch_size % n_gpus == 0, \
             f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
 
@@ -5120,7 +5239,9 @@ class RayReMASeparatedTrainer(object):
         #    ppo_mini_batch_size is divisible by ppo_micro_batch_size
         #    ppo_micro_batch_size * sequence_parallel_size >= n_gpus
         if not config.actor_rollout_ref.actor.use_dynamic_bsz:
-            assert config.data.train_batch_size >= config.actor_rollout_ref.actor.ppo_mini_batch_size
+            assert effective_train_prompt_batch_size >= (
+                config.actor_rollout_ref.actor.ppo_mini_batch_size
+            )
             sp_size = config.actor_rollout_ref.actor.get('ulysses_sequence_parallel_size', 1)
             if config.actor_rollout_ref.actor.ppo_micro_batch_size is not None:
                 assert config.actor_rollout_ref.actor.ppo_mini_batch_size % config.actor_rollout_ref.actor.ppo_micro_batch_size == 0
@@ -5128,7 +5249,9 @@ class RayReMASeparatedTrainer(object):
 
         # critic
         if self.use_critic and not config.critic.use_dynamic_bsz:
-            assert config.data.train_batch_size >= config.critic.ppo_mini_batch_size
+            assert effective_train_prompt_batch_size >= (
+                config.critic.ppo_mini_batch_size
+            )
             sp_size = config.critic.get('ulysses_sequence_parallel_size', 1)
             if config.critic.ppo_micro_batch_size is not None:
                 assert config.critic.ppo_mini_batch_size % config.critic.ppo_micro_batch_size == 0
@@ -6087,6 +6210,33 @@ class RayReMASeparatedTrainer(object):
                 timing_raw = {}
                 skip_filtered_actor_update = False
 
+                curriculum_state = self._get_agent12_curriculum_state()
+                teacher_attempts_key = str(
+                    agent12_curriculum.get(
+                        'teacher_attempts_key', 'teacher_attempts'
+                    )
+                )
+                teacher_attempt_key = str(
+                    agent12_curriculum.get(
+                        'teacher_attempt_key', 'teacher_attempt'
+                    )
+                )
+                base_question_batch_size = len(batch_dict['question'])
+                if agent12_curriculum_enabled:
+                    batch_dict, base_question_batch_size = (
+                        expand_agent12_teacher_attempt_batch(
+                            batch_dict,
+                            attempts_key=teacher_attempts_key,
+                            attempt_key=teacher_attempt_key,
+                            expected_attempts=int(
+                                agent12_curriculum.get(
+                                    'teacher_attempts_per_question', 16
+                                )
+                            ),
+                        )
+                    )
+                expanded_prompt_group_count = len(batch_dict['question'])
+
                 # create a dummy tensor for the construction function
                 dummy_tensor = torch.arange(0, len(batch_dict['question']))
                 batch_dict['batch_idx'] = dummy_tensor
@@ -6097,26 +6247,12 @@ class RayReMASeparatedTrainer(object):
                     batch_dict,
                     meta_info=deepcopy(rollout_meta_info),
                 )
+                # Assign uid after attempt expansion: every (question, attempt)
+                # is an independent GRPO group, while its N rollouts share uid.
                 new_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(new_batch.batch))],
                                                              dtype=object)
                 new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                 num_gen_batches += 1
-
-                curriculum_state = self._get_agent12_curriculum_state()
-                teacher_attempts_key = str(
-                    agent12_curriculum.get(
-                        'teacher_attempts_key', 'teacher_attempts'
-                    )
-                )
-                if (
-                    agent12_curriculum_enabled
-                    and curriculum_state.teacher_attempt_probability > 0.0
-                    and teacher_attempts_key not in new_batch.non_tensor_batch
-                ):
-                    raise ValueError(
-                        f"Agent 1/2 curriculum phase={curriculum_state.phase!r} "
-                        f"requires dataset column {teacher_attempts_key!r}"
-                    )
 
                 # pop those keys for generation
                 if 'multi_modal_inputs' in new_batch.non_tensor_batch.keys():
@@ -6128,8 +6264,15 @@ class RayReMASeparatedTrainer(object):
                 else:
                     # because verl originally calls this 'chat'
                     generation_non_tensor_keys = ['question', 'uid']
-                    if teacher_attempts_key in new_batch.non_tensor_batch:
-                        generation_non_tensor_keys.append(teacher_attempts_key)
+                    for teacher_context_key in (
+                        teacher_attempt_key,
+                        'teacher_attempt_index',
+                        'teacher_attempt_count',
+                    ):
+                        if teacher_context_key in new_batch.non_tensor_batch:
+                            generation_non_tensor_keys.append(
+                                teacher_context_key
+                            )
                     gen_batch = new_batch.select(
                         batch_keys=['batch_idx'],
                         non_tensor_batch_keys=generation_non_tensor_keys,
@@ -6141,7 +6284,7 @@ class RayReMASeparatedTrainer(object):
                 if agent12_curriculum_enabled:
                     gen_batch.meta_info['curriculum_step'] = self.global_steps
                     gen_batch.meta_info['curriculum_phase'] = curriculum_state.phase
-                    gen_batch.meta_info['teacher_attempts_key'] = teacher_attempts_key
+                    gen_batch.meta_info['teacher_attempt_key'] = teacher_attempt_key
                     gen_batch.meta_info['teacher_attempt_probability'] = (
                         curriculum_state.teacher_attempt_probability
                     )
@@ -6199,6 +6342,12 @@ class RayReMASeparatedTrainer(object):
                             dtype=bool,
                         )
                         metrics.update({
+                            'curriculum/base_question_batch_size': float(
+                                base_question_batch_size
+                            ),
+                            'curriculum/expanded_prompt_group_count': float(
+                                expanded_prompt_group_count
+                            ),
                             'curriculum/phase_id': float(
                                 curriculum_state.phase_id
                             ),
@@ -6467,6 +6616,13 @@ class RayReMASeparatedTrainer(object):
                         
                         # check if we have enough data
                         prompt_bsz = int(self.config.data.train_batch_size)
+                        if agent12_curriculum_enabled:
+                            prompt_bsz = int(
+                                agent12_curriculum.get(
+                                    'optimizer_prompt_batch_size',
+                                    prompt_bsz,
+                                )
+                            )
                         selected_prompt_bsz = prompt_bsz
                         if num_prompt_in_batch < prompt_bsz:
                             # keep generating
