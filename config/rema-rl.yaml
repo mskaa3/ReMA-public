@@ -279,6 +279,9 @@ algorithm:
     # original ReMA runs and enabled only by the Agent 1/2 curriculum launcher.
     agent12_curriculum:
       enable: False
+      # When false, the decomposer still generates plans but never receives an
+      # optimizer step. This supports isolated Agent 2 training.
+      train_decomposer: True
       teacher_attempts_key: teacher_attempts
       teacher_attempt_key: teacher_attempt
       expand_all_teacher_attempts: True
@@ -289,11 +292,11 @@ algorithm:
       # produced a long serial trace.
       teacher_attempt_max_chars: 8000
       # Phase 1: freeze the decomposer and teach the shared worker/final model
-      # to execute plans extracted from serial attempts. One attempt is sampled
-      # per prompt group; all successful and unsuccessful attempts are retained.
+      # to execute plans extracted from serial attempts. Every retained attempt
+      # forms a separate prompt group.
       worker_bootstrap_steps: 200
-      # Phase 2: freeze workers and linearly drop the sampled teacher attempt while
-      # optimizing the decomposer through downstream correctness.
+      # Phase 2: freeze workers and linearly drop the teacher-attempt context
+      # while optimizing the decomposer through downstream correctness.
       decomposer_transfer_steps: 200
       # Phase 3: alternate all roles and then remove the full question from
       # non-final workers. The final stage already receives routed notes only.
