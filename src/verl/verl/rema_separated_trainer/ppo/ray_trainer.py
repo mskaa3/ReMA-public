@@ -74,7 +74,7 @@ class Agent12CurriculumState:
     phase: str
     phase_id: int
     phase_step: int
-    teacher_solution_probability: float
+    teacher_attempt_probability: float
     worker_question_probability: float
 
 
@@ -101,7 +101,7 @@ def compute_agent12_curriculum_state(
             phase="worker_bootstrap",
             phase_id=0,
             phase_step=completed_steps,
-            teacher_solution_probability=1.0,
+            teacher_attempt_probability=1.0,
             worker_question_probability=1.0,
         )
 
@@ -114,7 +114,7 @@ def compute_agent12_curriculum_state(
             phase="decomposer_transfer",
             phase_id=1,
             phase_step=transfer_step,
-            teacher_solution_probability=teacher_probability,
+            teacher_attempt_probability=teacher_probability,
             worker_question_probability=1.0,
         )
 
@@ -130,7 +130,7 @@ def compute_agent12_curriculum_state(
         phase="joint",
         phase_id=2,
         phase_step=joint_step,
-        teacher_solution_probability=0.0,
+        teacher_attempt_probability=0.0,
         worker_question_probability=worker_question_probability,
     )
 
@@ -5060,14 +5060,14 @@ class RayReMASeparatedTrainer(object):
                             f"agent12_curriculum.{key} must be in [0, 1]"
                         )
                 if not str(
-                    curriculum.get('teacher_solution_key', '')
+                    curriculum.get('teacher_attempts_key', '')
                 ).strip():
                     raise ValueError(
-                        "agent12_curriculum.teacher_solution_key cannot be empty"
+                        "agent12_curriculum.teacher_attempts_key cannot be empty"
                     )
-                if int(curriculum.get('teacher_solution_max_chars', 0)) <= 0:
+                if int(curriculum.get('teacher_attempt_max_chars', 0)) <= 0:
                     raise ValueError(
-                        "agent12_curriculum.teacher_solution_max_chars must be "
+                        "agent12_curriculum.teacher_attempt_max_chars must be "
                         "positive"
                     )
 
@@ -6103,19 +6103,19 @@ class RayReMASeparatedTrainer(object):
                 num_gen_batches += 1
 
                 curriculum_state = self._get_agent12_curriculum_state()
-                teacher_solution_key = str(
+                teacher_attempts_key = str(
                     agent12_curriculum.get(
-                        'teacher_solution_key', 'teacher_solution'
+                        'teacher_attempts_key', 'teacher_attempts'
                     )
                 )
                 if (
                     agent12_curriculum_enabled
-                    and curriculum_state.teacher_solution_probability > 0.0
-                    and teacher_solution_key not in new_batch.non_tensor_batch
+                    and curriculum_state.teacher_attempt_probability > 0.0
+                    and teacher_attempts_key not in new_batch.non_tensor_batch
                 ):
                     raise ValueError(
                         f"Agent 1/2 curriculum phase={curriculum_state.phase!r} "
-                        f"requires dataset column {teacher_solution_key!r}"
+                        f"requires dataset column {teacher_attempts_key!r}"
                     )
 
                 # pop those keys for generation
@@ -6128,16 +6128,8 @@ class RayReMASeparatedTrainer(object):
                 else:
                     # because verl originally calls this 'chat'
                     generation_non_tensor_keys = ['question', 'uid']
-                    if teacher_solution_key in new_batch.non_tensor_batch:
-                        generation_non_tensor_keys.append(teacher_solution_key)
-                    for teacher_metadata_key in (
-                        'teacher_score',
-                        'teacher_solution_correct',
-                    ):
-                        if teacher_metadata_key in new_batch.non_tensor_batch:
-                            generation_non_tensor_keys.append(
-                                teacher_metadata_key
-                            )
+                    if teacher_attempts_key in new_batch.non_tensor_batch:
+                        generation_non_tensor_keys.append(teacher_attempts_key)
                     gen_batch = new_batch.select(
                         batch_keys=['batch_idx'],
                         non_tensor_batch_keys=generation_non_tensor_keys,
@@ -6149,9 +6141,9 @@ class RayReMASeparatedTrainer(object):
                 if agent12_curriculum_enabled:
                     gen_batch.meta_info['curriculum_step'] = self.global_steps
                     gen_batch.meta_info['curriculum_phase'] = curriculum_state.phase
-                    gen_batch.meta_info['teacher_solution_key'] = teacher_solution_key
-                    gen_batch.meta_info['teacher_solution_probability'] = (
-                        curriculum_state.teacher_solution_probability
+                    gen_batch.meta_info['teacher_attempts_key'] = teacher_attempts_key
+                    gen_batch.meta_info['teacher_attempt_probability'] = (
+                        curriculum_state.teacher_attempt_probability
                     )
                     gen_batch.meta_info['worker_question_probability'] = (
                         curriculum_state.worker_question_probability
@@ -6187,27 +6179,24 @@ class RayReMASeparatedTrainer(object):
 
                     if agent12_curriculum_enabled:
                         teacher_visible = new_batch.non_tensor_batch.get(
-                            'teacher_solution_visible',
+                            'teacher_attempt_visible',
                             np.zeros(len(new_batch), dtype=bool),
                         )
                         worker_question_visible = new_batch.non_tensor_batch.get(
                             'worker_question_visible',
                             np.zeros(len(new_batch), dtype=bool),
                         )
-                        teacher_correct = new_batch.non_tensor_batch.get(
-                            'teacher_solution_correct',
-                            np.ones(len(new_batch), dtype=bool),
+                        teacher_attempt_indices = new_batch.non_tensor_batch.get(
+                            'teacher_attempt_index',
+                            np.full(len(new_batch), -1, dtype=np.int64),
+                        )
+                        teacher_attempt_counts = new_batch.non_tensor_batch.get(
+                            'teacher_attempt_count',
+                            np.zeros(len(new_batch), dtype=np.int64),
                         )
                         teacher_visible_array = np.asarray(
                             teacher_visible,
                             dtype=bool,
-                        )
-                        teacher_correct_array = np.asarray(
-                            teacher_correct,
-                            dtype=bool,
-                        )
-                        visible_teacher_count = int(
-                            teacher_visible_array.sum()
                         )
                         metrics.update({
                             'curriculum/phase_id': float(
@@ -6216,21 +6205,25 @@ class RayReMASeparatedTrainer(object):
                             'curriculum/phase_step': float(
                                 curriculum_state.phase_step
                             ),
-                            'curriculum/teacher_solution_probability': float(
-                                curriculum_state.teacher_solution_probability
+                            'curriculum/teacher_attempt_probability': float(
+                                curriculum_state.teacher_attempt_probability
                             ),
-                            'curriculum/teacher_solution_visible_rate': float(
+                            'curriculum/teacher_attempt_visible_rate': float(
                                 teacher_visible_array.mean()
                             ),
-                            'curriculum/teacher_solution_correct_rate': float(
-                                teacher_correct_array.mean()
+                            'curriculum/teacher_attempt_count_mean': float(
+                                np.asarray(
+                                    teacher_attempt_counts,
+                                    dtype=float,
+                                ).mean()
                             ),
-                            'curriculum/visible_teacher_correct_rate': float(
-                                (
-                                    teacher_correct_array
-                                    & teacher_visible_array
-                                ).sum()
-                                / max(visible_teacher_count, 1)
+                            'curriculum/teacher_attempt_index_mean': float(
+                                np.asarray(
+                                    teacher_attempt_indices,
+                                    dtype=float,
+                                )[teacher_visible_array].mean()
+                                if teacher_visible_array.any()
+                                else -1.0
                             ),
                             'curriculum/worker_question_probability': float(
                                 curriculum_state.worker_question_probability

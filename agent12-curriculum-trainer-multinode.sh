@@ -25,7 +25,7 @@ export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct
 export WORKER_MODEL_PATH=${WORKER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 export TEACHER_ROLLOUT_N=${TEACHER_ROLLOUT_N:-16}
 export ROLLOUT_N=${ROLLOUT_N:-16}
-export TEACHER_SOLUTION_MAX_CHARS=${TEACHER_SOLUTION_MAX_CHARS:-8000}
+export TEACHER_ATTEMPT_MAX_CHARS=${TEACHER_ATTEMPT_MAX_CHARS:-8000}
 
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-200}
 export DECOMPOSER_TRANSFER_STEPS=${DECOMPOSER_TRANSFER_STEPS:-200}
@@ -39,7 +39,7 @@ export AGENT12_S3_REMOTE=${AGENT12_S3_REMOTE:-s3v2:s3min-tomasznaskret-171206335
 export AGENT12_RUN_NAME=${AGENT12_RUN_NAME:-agent12-curriculum-${SLURM_JOB_ID}}
 export REMOTE_RUN=${AGENT12_S3_REMOTE%/}/${AGENT12_RUN_NAME}
 export GENERATE_TEACHER_DATA=${GENERATE_TEACHER_DATA:-1}
-export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-qwen25-1.5b-n${TEACHER_ROLLOUT_N}.parquet}
+export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-qwen25-1.5b-n${TEACHER_ROLLOUT_N}-all-attempts.parquet}
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/agent12}
 export RAY_NODE_TMP=${RAY_NODE_TMP:-${JOB_TMP}/ray}
@@ -185,7 +185,7 @@ python3 -m verl.trainer.main_generation \
         apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         bash -c "$TEACHER_COMMAND"
 
-    echo "Scoring teacher trajectories while retaining every task"
+    echo "Collecting all teacher attempts while retaining every task"
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
         apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         bash -lc 'export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src/verl:/verl:$PYTHONPATH; \
@@ -224,7 +224,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   actor_rollout_ref.model.path=${DECOMPOSER_MODEL_PATH} \
   algorithm.switch_agent.model_paths=[${DECOMPOSER_MODEL_PATH},${WORKER_MODEL_PATH}] \
   algorithm.hierarchy.agent12_curriculum.enable=True \
-  algorithm.hierarchy.agent12_curriculum.teacher_solution_max_chars=${TEACHER_SOLUTION_MAX_CHARS} \
+  algorithm.hierarchy.agent12_curriculum.teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS} \
   algorithm.hierarchy.agent12_curriculum.worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS} \
   algorithm.hierarchy.agent12_curriculum.decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS} \
   algorithm.hierarchy.agent12_curriculum.worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS} \
@@ -309,7 +309,7 @@ srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" bash -lc '
 job_id=${SLURM_JOB_ID}
 step=${LATEST_STEP}
 teacher_model=${TEACHER_MODEL_PATH}
-teacher_solution_max_chars=${TEACHER_SOLUTION_MAX_CHARS}
+teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
 worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS}
