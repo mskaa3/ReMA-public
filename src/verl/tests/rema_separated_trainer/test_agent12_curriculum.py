@@ -21,6 +21,7 @@ from verl.rema_separated_trainer.ppo.multi_agent_rollout import (
 from verl.rema_separated_trainer.ppo.ray_trainer import (
     compute_agent12_curriculum_state,
     expand_agent12_teacher_attempt_batch,
+    select_agent12_training_role,
 )
 
 
@@ -95,3 +96,29 @@ def test_agent12_curriculum_phase_boundaries():
     assert _state(5).phase == "joint"
     assert _state(5).worker_question_probability == 1.0
     assert _state(7).worker_question_probability == 0.0
+
+
+def test_frozen_decomposer_is_never_selected_for_training():
+    worker_roles = ["worker_stage_1", "worker_stage_2"]
+    selected_roles = {
+        select_agent12_training_role(
+            _state(step),
+            decomposer_role="decomposer",
+            worker_roles=worker_roles,
+            switch_freq=1,
+            train_decomposer=False,
+        )
+        for step in range(1, 9)
+    }
+
+    assert selected_roles == set(worker_roles)
+
+
+def test_trainable_decomposer_is_selected_during_transfer():
+    assert select_agent12_training_role(
+        _state(3),
+        decomposer_role="decomposer",
+        worker_roles=["worker_stage_1"],
+        switch_freq=1,
+        train_decomposer=True,
+    ) == "decomposer"

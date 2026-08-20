@@ -28,6 +28,8 @@ export ROLLOUT_N=${ROLLOUT_N:-16}
 export TEACHER_ATTEMPT_MAX_CHARS=${TEACHER_ATTEMPT_MAX_CHARS:-8000}
 export BASE_QUESTION_BATCH_SIZE=${BASE_QUESTION_BATCH_SIZE:-3}
 export OPTIMIZER_PROMPT_BATCH_SIZE=${OPTIMIZER_PROMPT_BATCH_SIZE:-$((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N))}
+export TRAIN_DECOMPOSER=${TRAIN_DECOMPOSER:-true}
+export TRAIN_AGENT_ROLES=${TRAIN_AGENT_ROLES:-'[decomposer,worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4,worker_stage_5]'}
 
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-200}
 export DECOMPOSER_TRANSFER_STEPS=${DECOMPOSER_TRANSFER_STEPS:-200}
@@ -61,6 +63,7 @@ if (( OPTIMIZER_PROMPT_BATCH_SIZE != BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_
     exit 1
 fi
 echo "Agent 1/2 batch: ${BASE_QUESTION_BATCH_SIZE} questions x ${TEACHER_ROLLOUT_N} attempts x ${ROLLOUT_N} rollouts = $((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N * ROLLOUT_N)) trajectories"
+echo "Train decomposer: ${TRAIN_DECOMPOSER}; train roles: ${TRAIN_AGENT_ROLES}"
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}
@@ -232,6 +235,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   actor_rollout_ref.model.path=${DECOMPOSER_MODEL_PATH} \
   algorithm.switch_agent.model_paths=[${DECOMPOSER_MODEL_PATH},${WORKER_MODEL_PATH}] \
   algorithm.hierarchy.agent12_curriculum.enable=True \
+  algorithm.hierarchy.agent12_curriculum.train_decomposer=${TRAIN_DECOMPOSER} \
   algorithm.hierarchy.agent12_curriculum.expand_all_teacher_attempts=True \
   algorithm.hierarchy.agent12_curriculum.teacher_attempts_per_question=${TEACHER_ROLLOUT_N} \
   algorithm.hierarchy.agent12_curriculum.optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE} \
@@ -241,7 +245,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.agent12_curriculum.worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS} \
   algorithm.hierarchy.agent12_curriculum.worker_question_final_probability=0.0 \
   algorithm.hierarchy.agent12_curriculum.worker_question_eval_probability=0.0 \
-  algorithm.hierarchy.train_agent_roles=[decomposer,worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4,worker_stage_5] \
+  algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
   algorithm.hierarchy.reward_composer.enable=False \
   algorithm.hierarchy.reward_composer.online.enable=False \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
@@ -325,6 +329,8 @@ base_question_batch_size=${BASE_QUESTION_BATCH_SIZE}
 teacher_attempts_per_question=${TEACHER_ROLLOUT_N}
 rollouts_per_attempt=${ROLLOUT_N}
 optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE}
+train_decomposer=${TRAIN_DECOMPOSER}
+train_agent_roles=${TRAIN_AGENT_ROLES}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
 worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS}

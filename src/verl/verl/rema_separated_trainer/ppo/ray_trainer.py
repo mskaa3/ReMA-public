@@ -215,6 +215,32 @@ def compute_agent12_curriculum_state(
     )
 
 
+def select_agent12_training_role(
+    curriculum_state: Agent12CurriculumState,
+    *,
+    decomposer_role: str,
+    worker_roles,
+    switch_freq: int,
+    train_decomposer: bool,
+) -> str:
+    """Choose the role updated by one Agent 1/2 curriculum step."""
+    if not worker_roles:
+        raise ValueError("Agent 1/2 curriculum requires worker roles")
+    switch_freq = max(int(switch_freq), 1)
+
+    if curriculum_state.phase == 'worker_bootstrap' or not train_decomposer:
+        role_index = curriculum_state.phase_step // switch_freq
+        return worker_roles[role_index % len(worker_roles)]
+    if curriculum_state.phase == 'decomposer_transfer':
+        return decomposer_role
+
+    block_index = curriculum_state.phase_step // switch_freq
+    if block_index % 2 == 0:
+        return decomposer_role
+    worker_index = (block_index // 2) % len(worker_roles)
+    return worker_roles[worker_index]
+
+
 def compute_usable_filtered_prompt_count(
     available_prompt_count,
     target_prompt_count,
@@ -5107,9 +5133,18 @@ class RayReMASeparatedTrainer(object):
                 train_roles = list(
                     hierarchy_config.get('train_agent_roles', [])
                 )
-                if decomposer_role not in train_roles:
+                train_decomposer = bool(
+                    curriculum.get('train_decomposer', True)
+                )
+                if train_decomposer and decomposer_role not in train_roles:
                     raise ValueError(
-                        "agent12_curriculum requires the decomposer in "
+                        "agent12_curriculum.train_decomposer=True requires "
+                        "the decomposer in hierarchy.train_agent_roles"
+                    )
+                if not train_decomposer and decomposer_role in train_roles:
+                    raise ValueError(
+                        "agent12_curriculum.train_decomposer=False requires "
+                        "the decomposer to be absent from "
                         "hierarchy.train_agent_roles"
                     )
                 worker_train_roles = [
@@ -6068,21 +6103,16 @@ class RayReMASeparatedTrainer(object):
             ]
             curriculum_state = self._get_agent12_curriculum_state()
             switch_freq = max(int(switch_config.get('freq', 1)), 1)
-
-            if curriculum_state.phase == 'worker_bootstrap':
-                role_index = curriculum_state.phase_step // switch_freq
-                new_agent = worker_roles[role_index % len(worker_roles)]
-            elif curriculum_state.phase == 'decomposer_transfer':
-                new_agent = decomposer_role
-            else:
-                # Alternate model pools 1:1. Worker stage prompts still rotate
-                # within the shared Agent 2 model on its update blocks.
-                block_index = curriculum_state.phase_step // switch_freq
-                if block_index % 2 == 0:
-                    new_agent = decomposer_role
-                else:
-                    worker_index = (block_index // 2) % len(worker_roles)
-                    new_agent = worker_roles[worker_index]
+            train_decomposer = bool(
+                agent12_curriculum.get('train_decomposer', True)
+            )
+            new_agent = select_agent12_training_role(
+                curriculum_state,
+                decomposer_role=decomposer_role,
+                worker_roles=worker_roles,
+                switch_freq=switch_freq,
+                train_decomposer=train_decomposer,
+            )
 
             self._current_train_agent_idx = agent_roles.index(new_agent)
             if self._current_train_agent != new_agent:
@@ -6347,6 +6377,11 @@ class RayReMASeparatedTrainer(object):
                             ),
                             'curriculum/expanded_prompt_group_count': float(
                                 expanded_prompt_group_count
+                            ),
+                            'curriculum/decomposer_trainable': float(
+                                agent12_curriculum.get(
+                                    'train_decomposer', True
+                                )
                             ),
                             'curriculum/phase_id': float(
                                 curriculum_state.phase_id
