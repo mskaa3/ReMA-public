@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Attach every non-empty Agent 0 attempt to Agent 1/2 examples."""
+"""Attach every Agent 0 generation slot to Agent 1/2 examples."""
 
 from __future__ import annotations
 
@@ -34,14 +34,10 @@ def clean_teacher_response(response: object) -> str:
 
 
 def collect_teacher_attempts(responses: Iterable[object]) -> List[str]:
-    """Return all non-empty generation attempts without correctness labels."""
+    """Return all generated attempts without correctness labels."""
     if isinstance(responses, str):
         responses = [responses]
-    return [
-        cleaned
-        for response in responses
-        if (cleaned := clean_teacher_response(response))
-    ]
+    return [clean_teacher_response(response) for response in responses]
 
 
 def build_teacher_dataset(
@@ -51,7 +47,8 @@ def build_teacher_dataset(
     frame = pd.read_parquet(input_path)
     selected_rows = []
     total_attempt_count = 0
-    rows_without_attempts = 0
+    usable_attempt_count = 0
+    rows_without_usable_attempts = 0
 
     for _, row in frame.iterrows():
         responses = row.get("responses")
@@ -63,7 +60,8 @@ def build_teacher_dataset(
         selected["teacher_attempts"] = attempts
         selected_rows.append(selected)
         total_attempt_count += len(attempts)
-        rows_without_attempts += int(not attempts)
+        usable_attempt_count += sum(bool(attempt) for attempt in attempts)
+        rows_without_usable_attempts += int(not any(attempts))
 
     if not selected_rows:
         raise ValueError("Teacher candidate parquet contains no training rows")
@@ -71,9 +69,10 @@ def build_teacher_dataset(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(selected_rows).to_parquet(output_path, index=False)
     print(
-        f"Retained all {len(selected_rows)} examples and "
-        f"{total_attempt_count} non-empty Agent 0 attempts; "
-        f"{rows_without_attempts} examples have no usable attempt. "
+        f"Retained all {len(selected_rows)} examples and all "
+        f"{total_attempt_count} Agent 0 attempts; {usable_attempt_count} are "
+        f"non-empty and {rows_without_usable_attempts} examples have no "
+        f"usable attempt. "
         f"Wrote {output_path}"
     )
 

@@ -26,6 +26,8 @@ export WORKER_MODEL_PATH=${WORKER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 export TEACHER_ROLLOUT_N=${TEACHER_ROLLOUT_N:-16}
 export ROLLOUT_N=${ROLLOUT_N:-16}
 export TEACHER_ATTEMPT_MAX_CHARS=${TEACHER_ATTEMPT_MAX_CHARS:-8000}
+export BASE_QUESTION_BATCH_SIZE=${BASE_QUESTION_BATCH_SIZE:-3}
+export OPTIMIZER_PROMPT_BATCH_SIZE=${OPTIMIZER_PROMPT_BATCH_SIZE:-$((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N))}
 
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-200}
 export DECOMPOSER_TRANSFER_STEPS=${DECOMPOSER_TRANSFER_STEPS:-200}
@@ -39,7 +41,7 @@ export AGENT12_S3_REMOTE=${AGENT12_S3_REMOTE:-s3v2:s3min-tomasznaskret-171206335
 export AGENT12_RUN_NAME=${AGENT12_RUN_NAME:-agent12-curriculum-${SLURM_JOB_ID}}
 export REMOTE_RUN=${AGENT12_S3_REMOTE%/}/${AGENT12_RUN_NAME}
 export GENERATE_TEACHER_DATA=${GENERATE_TEACHER_DATA:-1}
-export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-qwen25-1.5b-n${TEACHER_ROLLOUT_N}-all-attempts.parquet}
+export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-qwen25-1.5b-n${TEACHER_ROLLOUT_N}-all-attempt-groups.parquet}
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/agent12}
 export RAY_NODE_TMP=${RAY_NODE_TMP:-${JOB_TMP}/ray}
@@ -54,6 +56,11 @@ if (( POOL_GPUS_PER_NODE * 2 > GPUS_PER_NODE )); then
     echo "Two model pools request more GPUs than the SLURM allocation" >&2
     exit 1
 fi
+if (( OPTIMIZER_PROMPT_BATCH_SIZE != BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N )); then
+    echo "OPTIMIZER_PROMPT_BATCH_SIZE must equal BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N for full attempt expansion" >&2
+    exit 1
+fi
+echo "Agent 1/2 batch: ${BASE_QUESTION_BATCH_SIZE} questions x ${TEACHER_ROLLOUT_N} attempts x ${ROLLOUT_N} rollouts = $((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N * ROLLOUT_N)) trajectories"
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}
@@ -221,9 +228,13 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   --config-path=/root/ReMA-public/config \
   --config-name=rema-rl.yaml \
   data.train_files=${TEACHER_TRAIN_FILE} \
+  data.train_batch_size=${BASE_QUESTION_BATCH_SIZE} \
   actor_rollout_ref.model.path=${DECOMPOSER_MODEL_PATH} \
   algorithm.switch_agent.model_paths=[${DECOMPOSER_MODEL_PATH},${WORKER_MODEL_PATH}] \
   algorithm.hierarchy.agent12_curriculum.enable=True \
+  algorithm.hierarchy.agent12_curriculum.expand_all_teacher_attempts=True \
+  algorithm.hierarchy.agent12_curriculum.teacher_attempts_per_question=${TEACHER_ROLLOUT_N} \
+  algorithm.hierarchy.agent12_curriculum.optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE} \
   algorithm.hierarchy.agent12_curriculum.teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS} \
   algorithm.hierarchy.agent12_curriculum.worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS} \
   algorithm.hierarchy.agent12_curriculum.decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS} \
@@ -310,6 +321,10 @@ job_id=${SLURM_JOB_ID}
 step=${LATEST_STEP}
 teacher_model=${TEACHER_MODEL_PATH}
 teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS}
+base_question_batch_size=${BASE_QUESTION_BATCH_SIZE}
+teacher_attempts_per_question=${TEACHER_ROLLOUT_N}
+rollouts_per_attempt=${ROLLOUT_N}
+optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
 worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS}

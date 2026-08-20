@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
+import pytest
+
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import (
     curriculum_context_is_visible,
-    select_curriculum_teacher_attempt,
 )
 from verl.rema_separated_trainer.ppo.ray_trainer import (
     compute_agent12_curriculum_state,
+    expand_agent12_teacher_attempt_batch,
 )
 
 
@@ -36,21 +39,41 @@ def test_curriculum_context_visibility_respects_probability_bounds():
     assert curriculum_context_is_visible("uid", 1, 1.0, salt="context")
 
 
-def test_teacher_attempt_sampling_is_shared_by_the_grpo_group():
-    attempts = ["first", "second", "third"]
-    selected = {
-        select_curriculum_teacher_attempt(attempts, "shared-uid", 17)
-        for _ in range(16)
-    }
+def test_teacher_attempt_expansion_builds_one_group_per_attempt():
+    expanded, base_batch_size = expand_agent12_teacher_attempt_batch(
+        {
+            "question": np.asarray(["q1", "q2"], dtype=object),
+            "data_source": np.asarray(["d1", "d2"], dtype=object),
+            "teacher_attempts": np.asarray(
+                [["a1", "a2", "a3"], ["b1", "b2", "b3"]],
+                dtype=object,
+            ),
+        },
+        attempts_key="teacher_attempts",
+        attempt_key="teacher_attempt",
+        expected_attempts=3,
+    )
 
-    assert len(selected) == 1
-    attempt, index, count = selected.pop()
-    assert attempt == attempts[index]
-    assert count == len(attempts)
+    assert base_batch_size == 2
+    assert expanded["question"].tolist() == ["q1"] * 3 + ["q2"] * 3
+    assert expanded["teacher_attempt"].tolist() == [
+        "a1", "a2", "a3", "b1", "b2", "b3"
+    ]
+    assert expanded["teacher_attempt_index"].tolist() == [0, 1, 2, 0, 1, 2]
+    assert expanded["data_source"].tolist() == ["d1"] * 3 + ["d2"] * 3
 
 
-def test_teacher_attempt_sampling_handles_empty_attempts():
-    assert select_curriculum_teacher_attempt([], "uid", 1) == ("", -1, 0)
+def test_teacher_attempt_expansion_rejects_incomplete_attempt_sets():
+    with pytest.raises(ValueError, match="expected 3"):
+        expand_agent12_teacher_attempt_batch(
+            {
+                "question": np.asarray(["q1"], dtype=object),
+                "teacher_attempts": np.asarray([["a1", "a2"]], dtype=object),
+            },
+            attempts_key="teacher_attempts",
+            attempt_key="teacher_attempt",
+            expected_attempts=3,
+        )
 
 
 def _state(step):

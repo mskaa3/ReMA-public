@@ -280,6 +280,11 @@ algorithm:
     agent12_curriculum:
       enable: False
       teacher_attempts_key: teacher_attempts
+      teacher_attempt_key: teacher_attempt
+      expand_all_teacher_attempts: True
+      teacher_attempts_per_question: 16
+      # Number of (question, attempt) GRPO groups retained for one update.
+      optimizer_prompt_batch_size: 48
       # Keep the decomposer prompt below max_prompt_length even when Agent 0
       # produced a long serial trace.
       teacher_attempt_max_chars: 8000
