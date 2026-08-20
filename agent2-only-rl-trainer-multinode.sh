@@ -11,7 +11,16 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Slurm executes a private spool copy of the submitted script, so BASH_SOURCE
+# does not point at the repository once the job starts.
+SCRIPT_DIR=${SLURM_SUBMIT_DIR:-$(pwd)}
+CURRICULUM_SCRIPT=${SCRIPT_DIR}/agent12-curriculum-trainer-multinode.sh
+
+if [[ ! -f "${CURRICULUM_SCRIPT}" ]]; then
+    echo "ERROR: ${CURRICULUM_SCRIPT} was not found." >&2
+    echo "Submit this job from the ReMA repository root." >&2
+    exit 1
+fi
 
 # Keep the complete run in worker bootstrap. Agent 1 generates plans from the
 # Agent 0 attempts, while only the shared worker/final model is optimized.
@@ -24,4 +33,4 @@ export JOINT_STEPS=0
 export TOTAL_STEPS=${TOTAL_STEPS:-${WORKER_BOOTSTRAP_STEPS}}
 export AGENT12_RUN_NAME=${AGENT12_RUN_NAME:-agent2-only-${SLURM_JOB_ID}}
 
-exec bash "${SCRIPT_DIR}/agent12-curriculum-trainer-multinode.sh"
+exec bash "${CURRICULUM_SCRIPT}"
