@@ -36,6 +36,68 @@ from verl.utils.hdfs_io import makedirs
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 
 
+def _write_generation_checkpoint(dataset, output_lst, completed_count, output_path):
+    """Atomically persist the completed dataset prefix for safe resumption."""
+    completed_count = int(completed_count)
+    checkpoint = dataset.iloc[:completed_count].copy()
+    checkpoint['responses'] = [
+        [output_lst[sample_idx][row_idx] for sample_idx in range(len(output_lst))]
+        for row_idx in range(completed_count)
+    ]
+
+    output_dir = os.path.dirname(output_path)
+    makedirs(output_dir, exist_ok=True)
+    temporary_path = f'{output_path}.tmp.{os.getpid()}'
+    checkpoint.to_parquet(temporary_path, index=False)
+    os.replace(temporary_path, output_path)
+    print(
+        f'Generation checkpoint: {completed_count}/{len(dataset)} examples '
+        f'written to {output_path}'
+    )
+
+
+def _load_generation_checkpoint(dataset, output_path, n_samples, prompt_key):
+    """Restore completed responses from an earlier generation attempt."""
+    output_lst = [[] for _ in range(n_samples)]
+    if not os.path.isfile(output_path):
+        return output_lst, 0
+
+    checkpoint = pd.read_parquet(output_path)
+    if 'responses' not in checkpoint.columns:
+        raise ValueError(f'Generation checkpoint {output_path} has no responses column')
+    if len(checkpoint) > len(dataset):
+        raise ValueError(
+            f'Generation checkpoint has {len(checkpoint)} rows, but the input '
+            f'dataset has only {len(dataset)}'
+        )
+
+    # A resumed file may come from S3, so reject an accidentally reused dataset.
+    if len(checkpoint) and prompt_key in checkpoint.columns:
+        for row_idx in {0, len(checkpoint) - 1}:
+            if repr(checkpoint.iloc[row_idx][prompt_key]) != repr(dataset.iloc[row_idx][prompt_key]):
+                raise ValueError(
+                    f'Generation checkpoint prompt mismatch at row {row_idx}: '
+                    f'{output_path}'
+                )
+
+    for attempts in checkpoint['responses'].tolist():
+        if isinstance(attempts, np.ndarray):
+            attempts = attempts.tolist()
+        if not isinstance(attempts, (list, tuple)) or len(attempts) != n_samples:
+            raise ValueError(
+                f'Every generation checkpoint row must contain exactly '
+                f'{n_samples} responses'
+            )
+        for sample_idx, response in enumerate(attempts):
+            output_lst[sample_idx].append(response)
+
+    print(
+        f'Resuming generation from {output_path}: '
+        f'{len(checkpoint)}/{len(dataset)} examples already complete'
+    )
+    return output_lst, len(checkpoint)
+
+
 @hydra.main(config_path='config', config_name='generation', version_base=None)
 def main(config):
     run_generation(config)
@@ -73,6 +135,42 @@ def main_task(config):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    total_samples = len(dataset)
+    config_batch_size = config.data.batch_size
+    num_batch = -(-total_samples // config_batch_size)
+    n_samples = int(config.data.n_samples)
+    resume_from_output = bool(config.data.get('resume_from_output', False))
+    checkpoint_every_batches = max(
+        int(config.data.get('checkpoint_every_batches', 0)),
+        0,
+    )
+    samples_per_call = max(int(config.data.get('samples_per_call', 1)), 1)
+    if n_samples % samples_per_call != 0:
+        raise ValueError(
+            f'data.n_samples={n_samples} must be divisible by '
+            f'data.samples_per_call={samples_per_call}'
+        )
+    if int(config.rollout.n) != samples_per_call:
+        raise ValueError(
+            f'rollout.n={config.rollout.n} must equal '
+            f'data.samples_per_call={samples_per_call}'
+        )
+
+    if resume_from_output:
+        output_lst, completed_count = _load_generation_checkpoint(
+            dataset,
+            config.data.output_path,
+            n_samples,
+            config.data.prompt_key,
+        )
+    else:
+        output_lst = [[] for _ in range(n_samples)]
+        completed_count = 0
+
+    if completed_count == total_samples:
+        print(f'Generation already complete: {total_samples}/{total_samples} examples')
+        return []
+
     ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(ActorRolloutRefWorker), config=config, role='rollout')
     # Generation creates one rollout worker group, so reserving CPU capacity for
     # the default five colocated groups would make multi-GPU nodes unschedulable.
@@ -82,17 +180,13 @@ def main_task(config):
     )
     wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init)
     wg.init_model()
-
-    total_samples = len(dataset)
-    # real_batch_size = data.batch['input_ids'].shape[0]
-    config_batch_size = config.data.batch_size
     dispatch_dp_size = wg.world_size
-    num_batch = -(-total_samples // config_batch_size)
-    output_lst = [[] for _ in range(config.data.n_samples)]
 
-    for batch_idx in range(num_batch):
+    output_text_unpad = []
+    for batch_start in range(completed_count, total_samples, config_batch_size):
+        batch_idx = batch_start // config_batch_size
         print(f'[{batch_idx+1}/{num_batch}] Start to process.')
-        batch_chat_lst = chat_lst[batch_idx * config_batch_size:(batch_idx + 1) * config_batch_size]
+        batch_chat_lst = chat_lst[batch_start:batch_start + config_batch_size]
         inputs = tokenizer.apply_chat_template(batch_chat_lst,
                                                add_generation_prompt=True,
                                                padding=True,
@@ -124,11 +218,13 @@ def main_task(config):
         assert batch_size % dispatch_dp_size == 0, f'batch_size {batch_size} is not divisible by dispatch_dp_size {dispatch_dp_size}'
 
         print(f'[{batch_idx+1}/{num_batch}] Start to generate.')
-        # START TO GENERATE FOR n_samples TIMES
-        for i in range(config.data.n_samples):
+        # Generate multiple candidates in one vLLM call. Besides being faster,
+        # this avoids thousands of fragile CuMem sleep/wake transitions.
+        for sample_start in range(0, n_samples, samples_per_call):
             output = wg.generate_sequences(data)
-            # remove dummy data
-            output = output[:real_batch_size]
+            # Outputs are interleaved by prompt, then by sample. Dummy prompts
+            # were appended after real prompts, so their candidates are last.
+            output = output[:real_batch_size * samples_per_call]
             output_text = tokenizer.batch_decode(output.batch['input_ids'][:, -config.rollout.response_length:],
                                                  skip_special_tokens=False)
 
@@ -138,21 +234,45 @@ def main_task(config):
             for text in output_text:
                 output_text_unpad.append(text.replace(pad_token, ''))
 
-            output_lst[i].extend(output_text_unpad)
+            expected_count = real_batch_size * samples_per_call
+            if len(output_text_unpad) != expected_count:
+                raise RuntimeError(
+                    f'Expected {expected_count} generated responses, got '
+                    f'{len(output_text_unpad)}'
+                )
+            for row_idx in range(real_batch_size):
+                row_offset = row_idx * samples_per_call
+                for sample_offset in range(samples_per_call):
+                    output_lst[sample_start + sample_offset].append(
+                        output_text_unpad[row_offset + sample_offset]
+                    )
 
-    # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
-    output_lst = np.array(output_lst, dtype=object)
-    output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
+        completed_count = batch_start + real_batch_size
+        completed_batches = batch_idx + 1
+        if (
+            checkpoint_every_batches > 0
+            and (
+                completed_batches % checkpoint_every_batches == 0
+                or completed_count == total_samples
+            )
+        ):
+            _write_generation_checkpoint(
+                dataset,
+                output_lst,
+                completed_count,
+                config.data.output_path,
+            )
 
-    # add to the data frame
-    dataset[f'responses'] = output_lst
+    # Always materialize the complete file, including when periodic checkpoints
+    # are disabled.
+    _write_generation_checkpoint(
+        dataset,
+        output_lst,
+        completed_count,
+        config.data.output_path,
+    )
 
-    # write to a new parquet
-    output_dir = os.path.dirname(config.data.output_path)
-    makedirs(output_dir, exist_ok=True)
-    dataset.to_parquet(config.data.output_path)
-
-    return output_text
+    return output_text_unpad
 
 
 if __name__ == '__main__':

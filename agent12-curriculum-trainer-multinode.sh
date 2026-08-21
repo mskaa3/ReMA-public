@@ -24,6 +24,9 @@ export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 export WORKER_MODEL_PATH=${WORKER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 export TEACHER_ROLLOUT_N=${TEACHER_ROLLOUT_N:-16}
+export TEACHER_SAMPLES_PER_CALL=${TEACHER_SAMPLES_PER_CALL:-${TEACHER_ROLLOUT_N}}
+export TEACHER_CHECKPOINT_EVERY_BATCHES=${TEACHER_CHECKPOINT_EVERY_BATCHES:-5}
+export TEACHER_GENERATION_MAX_ATTEMPTS=${TEACHER_GENERATION_MAX_ATTEMPTS:-3}
 export ROLLOUT_N=${ROLLOUT_N:-16}
 export TEACHER_ATTEMPT_MAX_CHARS=${TEACHER_ATTEMPT_MAX_CHARS:-8000}
 export BASE_QUESTION_BATCH_SIZE=${BASE_QUESTION_BATCH_SIZE:-3}
@@ -44,11 +47,13 @@ export AGENT12_RUN_NAME=${AGENT12_RUN_NAME:-agent12-curriculum-${SLURM_JOB_ID}}
 export REMOTE_RUN=${AGENT12_S3_REMOTE%/}/${AGENT12_RUN_NAME}
 export GENERATE_TEACHER_DATA=${GENERATE_TEACHER_DATA:-1}
 export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-qwen25-1.5b-n${TEACHER_ROLLOUT_N}-all-attempt-groups.parquet}
+export TEACHER_CANDIDATES_REMOTE=${TEACHER_CANDIDATES_REMOTE:-${TEACHER_TRAIN_REMOTE%.parquet}.generation-progress.parquet}
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/agent12}
 export RAY_NODE_TMP=${RAY_NODE_TMP:-${JOB_TMP}/ray}
 export CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-${JOB_TMP}/checkpoints/agent12}
 export TEACHER_TRAIN_FILE=${TEACHER_TRAIN_FILE:-${JOB_TMP}/agent12_data/train.parquet}
+export TEACHER_CANDIDATES_FILE=${TEACHER_CANDIDATES_FILE:-${JOB_TMP}/agent12_data/teacher_candidates.parquet}
 
 if (( GPUS_PER_NODE % 2 != 0 )); then
     echo "GPUS_PER_NODE must be even because Agent 1 and Agent 2 use separate pools" >&2
@@ -60,6 +65,10 @@ if (( POOL_GPUS_PER_NODE * 2 > GPUS_PER_NODE )); then
 fi
 if (( OPTIMIZER_PROMPT_BATCH_SIZE != BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N )); then
     echo "OPTIMIZER_PROMPT_BATCH_SIZE must equal BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N for full attempt expansion" >&2
+    exit 1
+fi
+if (( TEACHER_ROLLOUT_N % TEACHER_SAMPLES_PER_CALL != 0 )); then
+    echo "TEACHER_ROLLOUT_N must be divisible by TEACHER_SAMPLES_PER_CALL" >&2
     exit 1
 fi
 echo "Agent 1/2 batch: ${BASE_QUESTION_BATCH_SIZE} questions x ${TEACHER_ROLLOUT_N} attempts x ${ROLLOUT_N} rollouts = $((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N * ROLLOUT_N)) trajectories"
@@ -179,6 +188,12 @@ if [[ "$GENERATE_TEACHER_DATA" == "1" || "$GENERATE_TEACHER_DATA" == "true" ]]; 
             --output-dir /root/tmpdir/agent0_data'
 
     echo "Generating ${TEACHER_ROLLOUT_N} frozen Agent 0 candidates per question"
+    if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        rclone copyto "$TEACHER_CANDIDATES_REMOTE" "$TEACHER_CANDIDATES_FILE"; then
+        echo "Downloaded resumable teacher progress from ${TEACHER_CANDIDATES_REMOTE}"
+    else
+        echo "No resumable teacher progress found; starting from the first example"
+    fi
     TEACHER_COMMAND="unset ROCR_VISIBLE_DEVICES; \
 export TMPDIR=${RAY_NODE_TMP}; \
 export HF_HOME=/root/tmpdir/hf_home; \
@@ -190,10 +205,44 @@ python3 -m verl.trainer.main_generation \
   trainer.nnodes=${SLURM_NNODES} \
   trainer.n_gpus_per_node=${GPUS_PER_NODE} \
   model.path=${TEACHER_MODEL_PATH} \
-  data.n_samples=${TEACHER_ROLLOUT_N}"
-    PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-        apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
-        bash -c "$TEACHER_COMMAND"
+  data.n_samples=${TEACHER_ROLLOUT_N} \
+  data.samples_per_call=${TEACHER_SAMPLES_PER_CALL} \
+  data.checkpoint_every_batches=${TEACHER_CHECKPOINT_EVERY_BATCHES} \
+  rollout.n=${TEACHER_SAMPLES_PER_CALL}"
+
+    generation_status=1
+    for ((generation_attempt = 1; generation_attempt <= TEACHER_GENERATION_MAX_ATTEMPTS; generation_attempt++)); do
+        echo "Teacher generation attempt ${generation_attempt}/${TEACHER_GENERATION_MAX_ATTEMPTS}"
+        if PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+            apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+            bash -c "$TEACHER_COMMAND"; then
+            generation_status=0
+        else
+            generation_status=$?
+        fi
+
+        if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+            bash -lc 'test -s "$TEACHER_CANDIDATES_FILE" && rclone copyto "$TEACHER_CANDIDATES_FILE" "$TEACHER_CANDIDATES_REMOTE"'; then
+            echo "Teacher generation progress uploaded to ${TEACHER_CANDIDATES_REMOTE}"
+        else
+            echo "No completed teacher batch is available for progress upload"
+        fi
+
+        if (( generation_status == 0 )); then
+            break
+        fi
+        if (( generation_attempt < TEACHER_GENERATION_MAX_ATTEMPTS )); then
+            echo "Teacher generation failed with status ${generation_status}; restarting Ray and resuming"
+            stop_ray
+            start_ray
+        fi
+    done
+    if (( generation_status != 0 )); then
+        stop_ray
+        echo "Teacher generation failed after ${TEACHER_GENERATION_MAX_ATTEMPTS} attempts." >&2
+        echo "Partial data, when available, is stored at ${TEACHER_CANDIDATES_REMOTE}" >&2
+        exit "$generation_status"
+    fi
 
     echo "Collecting all teacher attempts while retaining every task"
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \

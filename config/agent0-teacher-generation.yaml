@@ -8,6 +8,9 @@ data:
   n_samples: 16
   output_path: /root/tmpdir/agent12_data/teacher_candidates.parquet
   batch_size: 48
+  resume_from_output: true
+  checkpoint_every_batches: 5
+  samples_per_call: 16
 
 model:
   path: Qwen/Qwen2.5-1.5B-Instruct
@@ -24,7 +27,7 @@ rollout:
   gpu_memory_utilization: 0.8
   ignore_eos: False
   enforce_eager: True
-  free_cache_engine: True
+  free_cache_engine: False
   load_format: dummy_dtensor
   tensor_model_parallel_size: 1
   max_num_batched_tokens: 16384
@@ -36,7 +39,7 @@ rollout:
   do_sample: True
   disable_log_stats: True
   enable_chunked_prefill: True
-  n: 1
+  n: 16
 
 actor:
   strategy: fsdp
