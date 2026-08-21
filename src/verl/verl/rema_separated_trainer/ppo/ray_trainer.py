@@ -5962,14 +5962,19 @@ class RayReMASeparatedTrainer(object):
                 wg.load_checkpoint(critic_path,
                                     del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
+        # A chunked online run intentionally switches to a new immutable shard
+        # between sessions, while retaining model and optimizer state.
+        restore_dataloader = bool(
+            self.config.trainer.get('restore_dataloader_on_resume', True)
+        )
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        if os.path.exists(dataloader_local_path):
+        if restore_dataloader and os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
+        elif restore_dataloader:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        else:
+            print("Starting the current data shard from a fresh dataloader state")
 
         prd_local_path = os.path.join(global_step_folder, 'prd_composer.pt')
         if self.online_prd_enabled and os.path.exists(prd_local_path):
@@ -6182,6 +6187,28 @@ class RayReMASeparatedTrainer(object):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        session_stop_step = int(
+            self.config.trainer.get(
+                'session_stop_step',
+                self.total_training_steps,
+            )
+        )
+        if session_stop_step > self.total_training_steps:
+            raise ValueError(
+                f'trainer.session_stop_step={session_stop_step} exceeds '
+                f'total_training_steps={self.total_training_steps}'
+            )
+        if session_stop_step <= self.global_steps:
+            print(
+                f'Training session already complete at step {self.global_steps}; '
+                f'target was {session_stop_step}'
+            )
+            return
+        print(
+            f'Training session target: {session_stop_step}; '
+            f'global training target: {self.total_training_steps}'
+        )
+
         if self.config.trainer.get('fork_wandb_id', None) is not None:
             fork_wandb_id = self.config.trainer.fork_wandb_id
             # wandb_kwargs = {'resume': 'must', 'id': fork_wandb_id}
@@ -6322,7 +6349,8 @@ class RayReMASeparatedTrainer(object):
                         curriculum_state.worker_question_probability
                     )
 
-                is_last_step = self.global_steps >= self.total_training_steps
+                is_training_last_step = self.global_steps >= self.total_training_steps
+                is_session_last_step = self.global_steps >= session_stop_step
 
                 with _timer('step', timing_raw):
                     # generate a batch
@@ -6911,15 +6939,17 @@ class RayReMASeparatedTrainer(object):
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        (is_last_step or  self.global_steps % self.config.trainer.test_freq == 0):
+                        (is_training_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
-                            if is_last_step:
+                            if is_training_last_step:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and ( is_last_step or \
-                            self.global_steps % self.config.trainer.save_freq == 0):
+                    if is_session_last_step or (
+                        self.config.trainer.save_freq > 0
+                        and self.global_steps % self.config.trainer.save_freq == 0
+                    ):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
                 final_worker_curriculum = self.config.algorithm.get('final_worker_curriculum', {})
@@ -6952,8 +6982,14 @@ class RayReMASeparatedTrainer(object):
                 c3_ineligible_prompt_cnt = 0
                 total_prompt_cnt = 0
 
-                if is_last_step:
-                    pprint(f'Final validation metrics: {last_val_metrics}')
+                if is_session_last_step:
+                    if is_training_last_step:
+                        pprint(f'Final validation metrics: {last_val_metrics}')
+                    else:
+                        print(
+                            f'Chunked training session completed at step '
+                            f'{self.global_steps}'
+                        )
                     return
 
                 self.global_steps += 1

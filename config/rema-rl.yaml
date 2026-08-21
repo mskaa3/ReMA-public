@@ -463,6 +463,10 @@ trainer:
   balance_batch: True
   total_epochs: 5
   total_training_steps: 4000
+  # Optional cumulative stop for one chunked training process. Optimizer
+  # scheduling still uses total_training_steps.
+  session_stop_step: ${trainer.total_training_steps}
+  restore_dataloader_on_resume: True
   profile_steps: null
   project_name: verl-emerg-reason
   experiment_name: verl_trainer  #-${data.train_batch_size}_n-${actor_rollout_ref.rollout.n}

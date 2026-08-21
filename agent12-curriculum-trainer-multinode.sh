@@ -44,10 +44,14 @@ export SAVE_FREQ=${SAVE_FREQ:-50}
 
 export AGENT12_S3_REMOTE=${AGENT12_S3_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12}
 export AGENT12_RUN_NAME=${AGENT12_RUN_NAME:-agent12-curriculum-${SLURM_JOB_ID}}
+export AGENT12_WANDB_RUN_ID=${AGENT12_WANDB_RUN_ID:-${AGENT12_RUN_NAME}}
 export REMOTE_RUN=${AGENT12_S3_REMOTE%/}/${AGENT12_RUN_NAME}
 export GENERATE_TEACHER_DATA=${GENERATE_TEACHER_DATA:-1}
+export ONLINE_TEACHER_GENERATION=${ONLINE_TEACHER_GENERATION:-false}
+export TEACHER_SHARD_QUESTIONS=${TEACHER_SHARD_QUESTIONS:-512}
 export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-qwen25-1.5b-n${TEACHER_ROLLOUT_N}-all-attempt-groups.parquet}
 export TEACHER_CANDIDATES_REMOTE=${TEACHER_CANDIDATES_REMOTE:-${TEACHER_TRAIN_REMOTE%.parquet}.generation-progress.parquet}
+export TEACHER_SHARD_REMOTE_ROOT=${TEACHER_SHARD_REMOTE_ROOT:-${TEACHER_TRAIN_REMOTE%.parquet}.shards/q${TEACHER_SHARD_QUESTIONS}}
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/agent12}
 export RAY_NODE_TMP=${RAY_NODE_TMP:-${JOB_TMP}/ray}
@@ -69,6 +73,10 @@ if (( OPTIMIZER_PROMPT_BATCH_SIZE != BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_
 fi
 if (( TEACHER_ROLLOUT_N % TEACHER_SAMPLES_PER_CALL != 0 )); then
     echo "TEACHER_ROLLOUT_N must be divisible by TEACHER_SAMPLES_PER_CALL" >&2
+    exit 1
+fi
+if (( TEACHER_SHARD_QUESTIONS <= 0 )); then
+    echo "TEACHER_SHARD_QUESTIONS must be positive" >&2
     exit 1
 fi
 echo "Agent 1/2 batch: ${BASE_QUESTION_BATCH_SIZE} questions x ${TEACHER_ROLLOUT_N} attempts x ${ROLLOUT_N} rollouts = $((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N * ROLLOUT_N)) trajectories"
@@ -176,6 +184,217 @@ stop_ray() {
     RAY_JOB_PIDS=()
 }
 
+run_agent12_training() {
+    local train_file=$1
+    local session_stop_step=$2
+    local val_before_train=$3
+    local restore_dataloader=$4
+    local train_command
+
+    echo "Training Agent 1/2 on ${train_file} through step ${session_stop_step}"
+    train_command="unset ROCR_VISIBLE_DEVICES; \
+export TMPDIR=${RAY_NODE_TMP}; \
+export HF_HOME=/root/tmpdir/hf_home; \
+export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src/verl:/verl:\$PYTHONPATH; \
+export RAY_ADDRESS=${IP_HEAD}; \
+export WANDB_RUN_ID=${AGENT12_WANDB_RUN_ID}; \
+export WANDB_RESUME=allow; \
+python3 -m verl.rema_separated_trainer.main_ppo \
+  --config-path=/root/ReMA-public/config \
+  --config-name=rema-rl.yaml \
+  data.train_files=${train_file} \
+  data.train_batch_size=${BASE_QUESTION_BATCH_SIZE} \
+  actor_rollout_ref.model.path=${DECOMPOSER_MODEL_PATH} \
+  algorithm.switch_agent.model_paths=[${DECOMPOSER_MODEL_PATH},${WORKER_MODEL_PATH}] \
+  algorithm.hierarchy.agent12_curriculum.enable=True \
+  algorithm.hierarchy.agent12_curriculum.train_decomposer=${TRAIN_DECOMPOSER} \
+  algorithm.hierarchy.agent12_curriculum.expand_all_teacher_attempts=True \
+  algorithm.hierarchy.agent12_curriculum.teacher_attempts_per_question=${TEACHER_ROLLOUT_N} \
+  algorithm.hierarchy.agent12_curriculum.optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE} \
+  algorithm.hierarchy.agent12_curriculum.teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS} \
+  algorithm.hierarchy.agent12_curriculum.worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS} \
+  algorithm.hierarchy.agent12_curriculum.decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS} \
+  algorithm.hierarchy.agent12_curriculum.worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS} \
+  algorithm.hierarchy.agent12_curriculum.worker_question_final_probability=0.0 \
+  algorithm.hierarchy.agent12_curriculum.worker_question_eval_probability=0.0 \
+  algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
+  algorithm.hierarchy.reward_composer.enable=False \
+  algorithm.hierarchy.reward_composer.online.enable=False \
+  actor_rollout_ref.rollout.n=${ROLLOUT_N} \
+  trainer.nnodes=${SLURM_NNODES} \
+  trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
+  trainer.total_epochs=100 \
+  trainer.total_training_steps=${TOTAL_STEPS} \
+  trainer.session_stop_step=${session_stop_step} \
+  trainer.restore_dataloader_on_resume=${restore_dataloader} \
+  trainer.val_before_train=${val_before_train} \
+  trainer.test_freq=${TEST_FREQ} \
+  trainer.save_freq=${SAVE_FREQ} \
+  trainer.experiment_name=${AGENT12_RUN_NAME} \
+  trainer.default_local_dir=${CHECKPOINT_ROOT}"
+
+    PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        bash -c "$train_command"
+}
+
+if [[ "$ONLINE_TEACHER_GENERATION" == "1" || "$ONLINE_TEACHER_GENERATION" == "true" ]]; then
+    echo "Chunked online teacher generation enabled: ${TEACHER_SHARD_QUESTIONS} questions per shard"
+    echo "Preparing frozen Agent 0 prompts"
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        bash -lc 'export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src/verl:/verl:$PYTHONPATH; \
+            python3 /root/ReMA-public/scripts/prepare_agent0_data.py \
+            --train-input /root/tmpdir/MATH/train_lv3to5_8k.parquet \
+            --val-input /root/tmpdir/overall_math/test.parquet \
+            --output-dir /root/tmpdir/agent0_data'
+
+    TOTAL_TEACHER_QUESTIONS=$(srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 -c "import pandas as pd; print(len(pd.read_parquet('/root/tmpdir/agent0_data/train.parquet')))" \
+        | tail -n 1 | tr -d '[:space:]')
+    if [[ ! "$TOTAL_TEACHER_QUESTIONS" =~ ^[0-9]+$ ]] || (( TOTAL_TEACHER_QUESTIONS == 0 )); then
+        echo "Could not determine the number of Agent 0 training questions" >&2
+        exit 1
+    fi
+    export TOTAL_TEACHER_QUESTIONS
+    TEACHER_SHARD_COUNT=$(((TOTAL_TEACHER_QUESTIONS + TEACHER_SHARD_QUESTIONS - 1) / TEACHER_SHARD_QUESTIONS))
+    export TEACHER_SHARD_COUNT
+    echo "Online pipeline: ${TOTAL_TEACHER_QUESTIONS} questions in ${TEACHER_SHARD_COUNT} shards"
+
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        mkdir -p "$JOB_TMP/agent12_data/shards"
+
+    for ((shard_index = 0; shard_index < TEACHER_SHARD_COUNT; shard_index++)); do
+        shard_id=$(printf 'shard-%05d' "$shard_index")
+        shard_start=$((shard_index * TEACHER_SHARD_QUESTIONS))
+        shard_end=$((shard_start + TEACHER_SHARD_QUESTIONS))
+        if (( shard_end > TOTAL_TEACHER_QUESTIONS )); then
+            shard_end=$TOTAL_TEACHER_QUESTIONS
+        fi
+        shard_size=$((shard_end - shard_start))
+
+        shard_candidates_file=${JOB_TMP}/agent12_data/shards/${shard_id}.candidates.parquet
+        shard_train_file=${JOB_TMP}/agent12_data/shards/${shard_id}.train.parquet
+        shard_candidates_container=/root/tmpdir/agent12_data/shards/${shard_id}.candidates.parquet
+        shard_train_container=/root/tmpdir/agent12_data/shards/${shard_id}.train.parquet
+        shard_candidates_remote=${TEACHER_SHARD_REMOTE_ROOT}/candidates/${shard_id}.parquet
+        shard_train_remote=${TEACHER_SHARD_REMOTE_ROOT}/train/${shard_id}.parquet
+        export TEACHER_CANDIDATES_FILE=$shard_candidates_file
+        export TEACHER_CANDIDATES_REMOTE=$shard_candidates_remote
+
+        echo "Teacher shard $((shard_index + 1))/${TEACHER_SHARD_COUNT}: questions [${shard_start}, ${shard_end})"
+        if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+            rclone copyto "$shard_train_remote" "$shard_train_file"; then
+            echo "Reusing complete teacher shard ${shard_train_remote}"
+        else
+            if [[ "$GENERATE_TEACHER_DATA" != "1" && "$GENERATE_TEACHER_DATA" != "true" ]]; then
+                echo "Missing ${shard_train_remote} and teacher generation is disabled" >&2
+                exit 1
+            fi
+
+            if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+                rclone copyto "$shard_candidates_remote" "$shard_candidates_file"; then
+                echo "Resuming candidate shard from ${shard_candidates_remote}"
+            else
+                echo "No candidate progress for ${shard_id}; generating it from scratch"
+            fi
+
+            start_ray
+            teacher_command="unset ROCR_VISIBLE_DEVICES; \
+export TMPDIR=${RAY_NODE_TMP}; \
+export HF_HOME=/root/tmpdir/hf_home; \
+export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src/verl:/verl:\$PYTHONPATH; \
+export RAY_ADDRESS=${IP_HEAD}; \
+python3 -m verl.trainer.main_generation \
+  --config-path=/root/ReMA-public/config \
+  --config-name=agent0-teacher-generation.yaml \
+  trainer.nnodes=${SLURM_NNODES} \
+  trainer.n_gpus_per_node=${GPUS_PER_NODE} \
+  model.path=${TEACHER_MODEL_PATH} \
+  data.output_path=${shard_candidates_container} \
+  data.start_index=${shard_start} \
+  data.max_examples=${shard_size} \
+  data.n_samples=${TEACHER_ROLLOUT_N} \
+  data.samples_per_call=${TEACHER_SAMPLES_PER_CALL} \
+  data.checkpoint_every_batches=${TEACHER_CHECKPOINT_EVERY_BATCHES} \
+  rollout.n=${TEACHER_SAMPLES_PER_CALL}"
+
+            generation_status=1
+            for ((generation_attempt = 1; generation_attempt <= TEACHER_GENERATION_MAX_ATTEMPTS; generation_attempt++)); do
+                echo "${shard_id} generation attempt ${generation_attempt}/${TEACHER_GENERATION_MAX_ATTEMPTS}"
+                if PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+                    apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+                    bash -c "$teacher_command"; then
+                    generation_status=0
+                else
+                    generation_status=$?
+                fi
+
+                if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+                    bash -lc 'test -s "$TEACHER_CANDIDATES_FILE" && rclone copyto "$TEACHER_CANDIDATES_FILE" "$TEACHER_CANDIDATES_REMOTE"'; then
+                    echo "Candidate progress uploaded to ${shard_candidates_remote}"
+                else
+                    echo "No completed batch is available for ${shard_id} progress upload"
+                fi
+
+                if (( generation_status == 0 )); then
+                    break
+                fi
+                if (( generation_attempt < TEACHER_GENERATION_MAX_ATTEMPTS )); then
+                    echo "Restarting Ray before resuming ${shard_id}"
+                    stop_ray
+                    start_ray
+                fi
+            done
+            if (( generation_status != 0 )); then
+                stop_ray
+                echo "Teacher generation failed for ${shard_id}; partial data is at ${shard_candidates_remote}" >&2
+                exit "$generation_status"
+            fi
+
+            srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+                apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+                python3 /root/ReMA-public/scripts/prepare_agent12_teacher_data.py \
+                    --input "$shard_candidates_container" \
+                    --output "$shard_train_container"
+            srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+                rclone copyto "$shard_train_file" "$shard_train_remote"
+            echo "Complete teacher shard uploaded to ${shard_train_remote}"
+            stop_ray
+        fi
+
+        session_stop_step=$(((shard_end * TOTAL_STEPS + TOTAL_TEACHER_QUESTIONS - 1) / TOTAL_TEACHER_QUESTIONS))
+        if [[ -f "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt" ]]; then
+            completed_training_step=$(cat "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt")
+        else
+            completed_training_step=0
+        fi
+        if (( session_stop_step > completed_training_step )); then
+            if (( completed_training_step == 0 )); then
+                val_before_train=True
+            else
+                val_before_train=False
+            fi
+            start_ray
+            run_agent12_training "$shard_train_file" "$session_stop_step" "$val_before_train" False
+            stop_ray
+        else
+            echo "Training already reached step ${completed_training_step}; skipping shard target ${session_stop_step}"
+        fi
+    done
+
+    echo "Merging all online teacher shards"
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 /root/ReMA-public/scripts/merge_agent12_teacher_shards.py \
+            --input-dir /root/tmpdir/agent12_data/shards \
+            --output /root/tmpdir/agent12_data/train.parquet \
+            --expected-rows "$TOTAL_TEACHER_QUESTIONS"
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        rclone copyto "$TEACHER_TRAIN_FILE" "$TEACHER_TRAIN_REMOTE"
+    echo "Merged teacher data uploaded to ${TEACHER_TRAIN_REMOTE}"
+else
 if [[ "$GENERATE_TEACHER_DATA" == "1" || "$GENERATE_TEACHER_DATA" == "true" ]]; then
     start_ray
     echo "Preparing frozen Agent 0 prompts"
@@ -269,48 +488,9 @@ else
 fi
 
 start_ray
-
-echo "Training Agent 1 (decomposer) and Agent 2 (workers/final)"
-TRAIN_COMMAND="unset ROCR_VISIBLE_DEVICES; \
-export TMPDIR=${RAY_NODE_TMP}; \
-export HF_HOME=/root/tmpdir/hf_home; \
-export PYTHONPATH=/root/ReMA-public:/root/ReMA-public/src/verl:/verl:\$PYTHONPATH; \
-export RAY_ADDRESS=${IP_HEAD}; \
-python3 -m verl.rema_separated_trainer.main_ppo \
-  --config-path=/root/ReMA-public/config \
-  --config-name=rema-rl.yaml \
-  data.train_files=${TEACHER_TRAIN_FILE} \
-  data.train_batch_size=${BASE_QUESTION_BATCH_SIZE} \
-  actor_rollout_ref.model.path=${DECOMPOSER_MODEL_PATH} \
-  algorithm.switch_agent.model_paths=[${DECOMPOSER_MODEL_PATH},${WORKER_MODEL_PATH}] \
-  algorithm.hierarchy.agent12_curriculum.enable=True \
-  algorithm.hierarchy.agent12_curriculum.train_decomposer=${TRAIN_DECOMPOSER} \
-  algorithm.hierarchy.agent12_curriculum.expand_all_teacher_attempts=True \
-  algorithm.hierarchy.agent12_curriculum.teacher_attempts_per_question=${TEACHER_ROLLOUT_N} \
-  algorithm.hierarchy.agent12_curriculum.optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE} \
-  algorithm.hierarchy.agent12_curriculum.teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS} \
-  algorithm.hierarchy.agent12_curriculum.worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS} \
-  algorithm.hierarchy.agent12_curriculum.decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS} \
-  algorithm.hierarchy.agent12_curriculum.worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS} \
-  algorithm.hierarchy.agent12_curriculum.worker_question_final_probability=0.0 \
-  algorithm.hierarchy.agent12_curriculum.worker_question_eval_probability=0.0 \
-  algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
-  algorithm.hierarchy.reward_composer.enable=False \
-  algorithm.hierarchy.reward_composer.online.enable=False \
-  actor_rollout_ref.rollout.n=${ROLLOUT_N} \
-  trainer.nnodes=${SLURM_NNODES} \
-  trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
-  trainer.total_epochs=100 \
-  trainer.total_training_steps=${TOTAL_STEPS} \
-  trainer.val_before_train=True \
-  trainer.test_freq=${TEST_FREQ} \
-  trainer.save_freq=${SAVE_FREQ} \
-  trainer.experiment_name=${AGENT12_RUN_NAME} \
-  trainer.default_local_dir=${CHECKPOINT_ROOT}"
-
-PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-    apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
-    bash -c "$TRAIN_COMMAND"
+run_agent12_training "$TEACHER_TRAIN_FILE" "$TOTAL_STEPS" True True
+stop_ray
+fi
 
 LATEST_STEP=$(srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
     bash -lc 'if [[ -f "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt" ]]; then cat "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt"; fi' \
@@ -387,6 +567,9 @@ decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS}
 worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS}
 joint_steps=${JOINT_STEPS}
 teacher_data=${TEACHER_TRAIN_REMOTE}
+online_teacher_generation=${ONLINE_TEACHER_GENERATION}
+teacher_shard_questions=${TEACHER_SHARD_QUESTIONS}
+teacher_shard_remote_root=${TEACHER_SHARD_REMOTE_ROOT}
 EOF
     rclone copyto "$MERGE_ROOT/metadata.txt" "$REMOTE_RUN/metadata.txt"
 '

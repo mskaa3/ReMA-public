@@ -127,6 +127,21 @@ def main_task(config):
 
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
+    start_index = max(int(config.data.get('start_index', 0)), 0)
+    max_examples = config.data.get('max_examples', None)
+    end_index = len(dataset)
+    if max_examples is not None:
+        end_index = min(end_index, start_index + max(int(max_examples), 0))
+    if start_index >= len(dataset) or end_index <= start_index:
+        raise ValueError(
+            f'Empty generation slice: start_index={start_index}, '
+            f'max_examples={max_examples}, dataset_size={len(dataset)}'
+        )
+    dataset = dataset.iloc[start_index:end_index].reset_index(drop=True)
+    print(
+        f'Generation slice: [{start_index}, {end_index}) '
+        f'({len(dataset)} examples)'
+    )
     chat_lst = dataset[config.data.prompt_key].tolist()
 
     chat_lst = [chat.tolist() for chat in chat_lst]
