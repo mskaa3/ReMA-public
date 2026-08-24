@@ -202,17 +202,20 @@ stage_remote_file_on_all_nodes() {
             set -euo pipefail
             node_name=${SLURMD_NODENAME:-$(hostname)}
             mkdir -p "$(dirname "$STAGE_LOCAL_PATH")"
+            temporary_path="${STAGE_LOCAL_PATH}.partial.$$"
+            rm -f "$temporary_path"
             echo "$node_name: downloading $STAGE_DESCRIPTION from $STAGE_REMOTE_PATH"
-            if ! rclone copyto "$STAGE_REMOTE_PATH" "$STAGE_LOCAL_PATH" \
-                    --stats=30s --stats-one-line; then
+            if ! rclone cat "$STAGE_REMOTE_PATH" > "$temporary_path"; then
+                rm -f "$temporary_path"
                 echo "$node_name: rclone failed while staging $STAGE_DESCRIPTION" >&2
                 exit 1
             fi
-            if [[ ! -s "$STAGE_LOCAL_PATH" ]]; then
-                echo "$node_name: staged file is missing or empty: $STAGE_LOCAL_PATH" >&2
-                ls -la "$(dirname "$STAGE_LOCAL_PATH")" >&2 || true
+            if [[ ! -s "$temporary_path" ]]; then
+                rm -f "$temporary_path"
+                echo "$node_name: remote file is missing or empty: $STAGE_REMOTE_PATH" >&2
                 exit 1
             fi
+            mv -f "$temporary_path" "$STAGE_LOCAL_PATH"
             size_bytes=$(stat -c %s "$STAGE_LOCAL_PATH")
             echo "$node_name: staged $STAGE_DESCRIPTION ($size_bytes bytes)"
         '
@@ -318,10 +321,11 @@ if [[ "$ONLINE_TEACHER_GENERATION" == "1" || "$ONLINE_TEACHER_GENERATION" == "tr
         export TEACHER_CANDIDATES_REMOTE=$shard_candidates_remote
 
         echo "Teacher shard $((shard_index + 1))/${TEACHER_SHARD_COUNT}: questions [${shard_start}, ${shard_end})"
-        if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-            rclone copyto "$shard_train_remote" "$shard_train_file"; then
+        if stage_remote_file_on_all_nodes \
+                "$shard_train_remote" "$shard_train_file" "$shard_id"; then
             echo "Reusing complete teacher shard ${shard_train_remote}"
         else
+            echo "No complete teacher shard found at ${shard_train_remote}"
             if [[ "$GENERATE_TEACHER_DATA" != "1" && "$GENERATE_TEACHER_DATA" != "true" ]]; then
                 echo "Missing ${shard_train_remote} and teacher generation is disabled" >&2
                 exit 1
@@ -396,12 +400,9 @@ python3 -m verl.trainer.main_generation \
                 rclone copyto "$shard_train_file" "$shard_train_remote"
             echo "Complete teacher shard uploaded to ${shard_train_remote}"
             stop_ray
+            stage_remote_file_on_all_nodes \
+                "$shard_train_remote" "$shard_train_file" "$shard_id"
         fi
-
-        # TaskRunner may execute on any Ray node, while /mnt/lscratch is local.
-        # Materialize the immutable shard everywhere before starting training.
-        stage_remote_file_on_all_nodes \
-            "$shard_train_remote" "$shard_train_file" "$shard_id"
 
         session_stop_step=$(((shard_end * TOTAL_STEPS + TOTAL_TEACHER_QUESTIONS - 1) / TOTAL_TEACHER_QUESTIONS))
         if [[ -f "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt" ]]; then
