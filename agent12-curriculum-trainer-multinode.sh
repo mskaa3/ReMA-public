@@ -184,41 +184,44 @@ stop_ray() {
     RAY_JOB_PIDS=()
 }
 
-stage_remote_file_on_all_nodes() {
+download_remote_file_on_head() {
     local remote_path=$1
     local local_path=$2
     local description=$3
+    local result
 
     if [[ -z "$remote_path" ]]; then
-        echo "A remote path is required to stage ${description} on every node" >&2
-        exit 1
+        echo "A remote path is required to download ${description}" >&2
+        return 2
     fi
 
-    export STAGE_REMOTE_PATH="$remote_path"
-    export STAGE_LOCAL_PATH="$local_path"
-    export STAGE_DESCRIPTION="$description"
-    echo "Staging ${description} on all ${SLURM_NNODES} nodes"
-    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+    export DOWNLOAD_REMOTE_PATH="$remote_path"
+    export DOWNLOAD_LOCAL_PATH="$local_path"
+    if ! result=$(srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" bash -lc '
             set -euo pipefail
-            node_name=${SLURMD_NODENAME:-$(hostname)}
-            mkdir -p "$(dirname "$STAGE_LOCAL_PATH")"
-            temporary_path="${STAGE_LOCAL_PATH}.partial.$$"
+            mkdir -p "$(dirname "$DOWNLOAD_LOCAL_PATH")"
+            temporary_path="${DOWNLOAD_LOCAL_PATH}.partial.$$"
             rm -f "$temporary_path"
-            echo "$node_name: downloading $STAGE_DESCRIPTION from $STAGE_REMOTE_PATH"
-            if ! rclone cat "$STAGE_REMOTE_PATH" > "$temporary_path"; then
+            if rclone cat "$DOWNLOAD_REMOTE_PATH" > "$temporary_path" 2>/dev/null \
+                    && [[ -s "$temporary_path" ]]; then
+                mv -f "$temporary_path" "$DOWNLOAD_LOCAL_PATH"
+                size_bytes=$(stat -c %s "$DOWNLOAD_LOCAL_PATH")
+                echo "__REMOTE_FILE_PRESENT__:${size_bytes}"
+            else
                 rm -f "$temporary_path"
-                echo "$node_name: rclone failed while staging $STAGE_DESCRIPTION" >&2
-                exit 1
+                echo "__REMOTE_FILE_MISSING__"
             fi
-            if [[ ! -s "$temporary_path" ]]; then
-                rm -f "$temporary_path"
-                echo "$node_name: remote file is missing or empty: $STAGE_REMOTE_PATH" >&2
-                exit 1
-            fi
-            mv -f "$temporary_path" "$STAGE_LOCAL_PATH"
-            size_bytes=$(stat -c %s "$STAGE_LOCAL_PATH")
-            echo "$node_name: staged $STAGE_DESCRIPTION ($size_bytes bytes)"
-        '
+        '); then
+        echo "Failed to check ${description} on ${HEAD_NODE}" >&2
+        return 2
+    fi
+
+    if [[ "$result" == *"__REMOTE_FILE_PRESENT__:"* ]]; then
+        size_bytes=${result##*__REMOTE_FILE_PRESENT__:}
+        echo "Downloaded ${description} to ${HEAD_NODE} (${size_bytes} bytes)"
+        return 0
+    fi
+    return 1
 }
 
 run_agent12_training() {
@@ -321,20 +324,29 @@ if [[ "$ONLINE_TEACHER_GENERATION" == "1" || "$ONLINE_TEACHER_GENERATION" == "tr
         export TEACHER_CANDIDATES_REMOTE=$shard_candidates_remote
 
         echo "Teacher shard $((shard_index + 1))/${TEACHER_SHARD_COUNT}: questions [${shard_start}, ${shard_end})"
-        if stage_remote_file_on_all_nodes \
+        if download_remote_file_on_head \
                 "$shard_train_remote" "$shard_train_file" "$shard_id"; then
             echo "Reusing complete teacher shard ${shard_train_remote}"
         else
+            download_status=$?
+            if (( download_status == 2 )); then
+                exit 1
+            fi
             echo "No complete teacher shard found at ${shard_train_remote}"
             if [[ "$GENERATE_TEACHER_DATA" != "1" && "$GENERATE_TEACHER_DATA" != "true" ]]; then
                 echo "Missing ${shard_train_remote} and teacher generation is disabled" >&2
                 exit 1
             fi
 
-            if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-                rclone copyto "$shard_candidates_remote" "$shard_candidates_file"; then
+            if download_remote_file_on_head \
+                    "$shard_candidates_remote" "$shard_candidates_file" \
+                    "${shard_id} candidate progress"; then
                 echo "Resuming candidate shard from ${shard_candidates_remote}"
             else
+                download_status=$?
+                if (( download_status == 2 )); then
+                    exit 1
+                fi
                 echo "No candidate progress for ${shard_id}; generating it from scratch"
             fi
 
@@ -400,8 +412,6 @@ python3 -m verl.trainer.main_generation \
                 rclone copyto "$shard_train_file" "$shard_train_remote" --s3-no-check-bucket
             echo "Complete teacher shard uploaded to ${shard_train_remote}"
             stop_ray
-            stage_remote_file_on_all_nodes \
-                "$shard_train_remote" "$shard_train_file" "$shard_id"
         fi
 
         session_stop_step=$(((shard_end * TOTAL_STEPS + TOTAL_TEACHER_QUESTIONS - 1) / TOTAL_TEACHER_QUESTIONS))
@@ -447,10 +457,15 @@ if [[ "$GENERATE_TEACHER_DATA" == "1" || "$GENERATE_TEACHER_DATA" == "true" ]]; 
             --output-dir /root/tmpdir/agent0_data'
 
     echo "Generating ${TEACHER_ROLLOUT_N} frozen Agent 0 candidates per question"
-    if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-        rclone copyto "$TEACHER_CANDIDATES_REMOTE" "$TEACHER_CANDIDATES_FILE"; then
+    if download_remote_file_on_head \
+            "$TEACHER_CANDIDATES_REMOTE" "$TEACHER_CANDIDATES_FILE" \
+            "teacher generation progress"; then
         echo "Downloaded resumable teacher progress from ${TEACHER_CANDIDATES_REMOTE}"
     else
+        download_status=$?
+        if (( download_status == 2 )); then
+            exit 1
+        fi
         echo "No resumable teacher progress found; starting from the first example"
     fi
     TEACHER_COMMAND="unset ROCR_VISIBLE_DEVICES; \
@@ -523,12 +538,16 @@ else
         exit 1
     fi
     echo "Reusing teacher data from ${TEACHER_TRAIN_REMOTE}"
-    srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-        rclone copyto "$TEACHER_TRAIN_REMOTE" "$TEACHER_TRAIN_FILE"
+    if ! download_remote_file_on_head \
+            "$TEACHER_TRAIN_REMOTE" "$TEACHER_TRAIN_FILE" \
+            "the full teacher dataset"; then
+        echo "Teacher data is missing or empty at ${TEACHER_TRAIN_REMOTE}" >&2
+        exit 1
+    fi
 fi
 
-stage_remote_file_on_all_nodes \
-    "$TEACHER_TRAIN_REMOTE" "$TEACHER_TRAIN_FILE" "the full teacher dataset"
+srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+    test -s "$TEACHER_TRAIN_FILE"
 
 start_ray
 run_agent12_training "$TEACHER_TRAIN_FILE" "$TOTAL_STEPS" True True
