@@ -370,7 +370,7 @@ python3 -m verl.trainer.main_generation \
                 fi
 
                 if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-                    bash -lc 'test -s "$TEACHER_CANDIDATES_FILE" && rclone copyto "$TEACHER_CANDIDATES_FILE" "$TEACHER_CANDIDATES_REMOTE"'; then
+                    bash -lc 'test -s "$TEACHER_CANDIDATES_FILE" && rclone copyto "$TEACHER_CANDIDATES_FILE" "$TEACHER_CANDIDATES_REMOTE" --s3-no-check-bucket'; then
                     echo "Candidate progress uploaded to ${shard_candidates_remote}"
                 else
                     echo "No completed batch is available for ${shard_id} progress upload"
@@ -397,7 +397,7 @@ python3 -m verl.trainer.main_generation \
                     --input "$shard_candidates_container" \
                     --output "$shard_train_container"
             srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-                rclone copyto "$shard_train_file" "$shard_train_remote"
+                rclone copyto "$shard_train_file" "$shard_train_remote" --s3-no-check-bucket
             echo "Complete teacher shard uploaded to ${shard_train_remote}"
             stop_ray
             stage_remote_file_on_all_nodes \
@@ -432,7 +432,7 @@ python3 -m verl.trainer.main_generation \
             --output /root/tmpdir/agent12_data/train.parquet \
             --expected-rows "$TOTAL_TEACHER_QUESTIONS"
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-        rclone copyto "$TEACHER_TRAIN_FILE" "$TEACHER_TRAIN_REMOTE"
+        rclone copyto "$TEACHER_TRAIN_FILE" "$TEACHER_TRAIN_REMOTE" --s3-no-check-bucket
     echo "Merged teacher data uploaded to ${TEACHER_TRAIN_REMOTE}"
 else
 if [[ "$GENERATE_TEACHER_DATA" == "1" || "$GENERATE_TEACHER_DATA" == "true" ]]; then
@@ -481,7 +481,7 @@ python3 -m verl.trainer.main_generation \
         fi
 
         if srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-            bash -lc 'test -s "$TEACHER_CANDIDATES_FILE" && rclone copyto "$TEACHER_CANDIDATES_FILE" "$TEACHER_CANDIDATES_REMOTE"'; then
+            bash -lc 'test -s "$TEACHER_CANDIDATES_FILE" && rclone copyto "$TEACHER_CANDIDATES_FILE" "$TEACHER_CANDIDATES_REMOTE" --s3-no-check-bucket'; then
             echo "Teacher generation progress uploaded to ${TEACHER_CANDIDATES_REMOTE}"
         else
             echo "No completed teacher batch is available for progress upload"
@@ -513,7 +513,7 @@ python3 -m verl.trainer.main_generation \
 
     if [[ -n "$TEACHER_TRAIN_REMOTE" ]]; then
         srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-            rclone copyto "$TEACHER_TRAIN_FILE" "$TEACHER_TRAIN_REMOTE"
+            rclone copyto "$TEACHER_TRAIN_FILE" "$TEACHER_TRAIN_REMOTE" --s3-no-check-bucket
         echo "Teacher data uploaded to ${TEACHER_TRAIN_REMOTE}"
     fi
     stop_ray
@@ -554,6 +554,7 @@ srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
         actor_dir="$CHECKPOINT_ROOT/global_step_${LATEST_STEP}/${role}/actor"
         if [[ -d "$actor_dir" ]]; then
             rclone copy "$actor_dir" "$REMOTE_RUN/raw/${export_name}/${node_name}/actor" \
+                --s3-no-check-bucket \
                 --include "/model_world_size_*_rank_*.pt" \
                 --include "/huggingface/**" --exclude "*" \
                 --stats=30s --stats-one-line
@@ -588,7 +589,8 @@ for export_name in decomposer workers; do
         python3 /verl/scripts/model_merger.py --local_dir "$MERGE_ROOT/$export_name/actor"
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
         rclone copy "$MERGE_ROOT/$export_name/actor/huggingface" \
-        "$REMOTE_RUN/$export_name/huggingface" --stats=30s --stats-one-line
+        "$REMOTE_RUN/$export_name/huggingface" --s3-no-check-bucket \
+        --stats=30s --stats-one-line
 done
 
 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" bash -lc '
@@ -614,7 +616,7 @@ online_teacher_generation=${ONLINE_TEACHER_GENERATION}
 teacher_shard_questions=${TEACHER_SHARD_QUESTIONS}
 teacher_shard_remote_root=${TEACHER_SHARD_REMOTE_ROOT}
 EOF
-    rclone copyto "$MERGE_ROOT/metadata.txt" "$REMOTE_RUN/metadata.txt"
+    rclone copyto "$MERGE_ROOT/metadata.txt" "$REMOTE_RUN/metadata.txt" --s3-no-check-bucket
 '
 
 echo "Agent 1 model: ${REMOTE_RUN}/decomposer/huggingface"
