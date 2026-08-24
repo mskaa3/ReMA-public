@@ -79,11 +79,18 @@ def run_ppo(config) -> None:
             print("RAY_ADDRESS is not set; starting a local Ray runtime.")
         ray.init(**init_kwargs)
 
-    runner = TaskRunner.remote()
+    # The dataset and driver-side checkpoint metadata live on node-local
+    # scratch. Keep TaskRunner on the launch node across chunked sessions.
+    driver_node_ip = ray._private.services.get_node_ip_address()
+    driver_node_resource = f"node:{driver_node_ip}"
+    print(f"Pinning TaskRunner to {driver_node_resource}")
+    runner = TaskRunner.options(
+        resources={driver_node_resource: 0.001},
+    ).remote()
     ray.get(runner.run.remote(config))
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+@ray.remote(num_cpus=1)
 class TaskRunner:
 
     def run(self, config):

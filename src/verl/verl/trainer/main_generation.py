@@ -109,7 +109,16 @@ def run_generation(config) -> None:
         # this is for local ray cluster
         ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
 
-    ray.get(main_task.remote(config))
+    # Generation checkpoints live on node-local scratch. Keep the coordinator
+    # on the launch node so the shell process can persist and resume that file.
+    driver_node_ip = ray._private.services.get_node_ip_address()
+    driver_node_resource = f'node:{driver_node_ip}'
+    print(f'Pinning generation coordinator to {driver_node_resource}')
+    ray.get(
+        main_task.options(
+            resources={driver_node_resource: 0.001},
+        ).remote(config)
+    )
 
 
 @ray.remote(num_cpus=1)
