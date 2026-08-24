@@ -166,6 +166,7 @@ srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
     if [[ -d "$actor_dir" ]]; then
         node_name=${SLURMD_NODENAME:-$(hostname)}
         rclone copy "$actor_dir" "$REMOTE_RUN/raw/$node_name/actor" \
+            --s3-no-check-bucket \
             --include "/model_world_size_*_rank_*.pt" \
             --include "/huggingface/**" --exclude "*" \
             --stats=30s --stats-one-line
@@ -214,9 +215,10 @@ step=${LATEST_STEP}
 base_model=${MODEL_PATH}
 rollout_n=${ROLLOUT_N}
 EOF
-    rclone copy "$MERGE_ROOT/actor/huggingface" "$REMOTE_RUN/huggingface" --stats=30s --stats-one-line
-    rclone copyto "$MERGE_ROOT/metadata.txt" "$REMOTE_RUN/metadata.txt"
-    rclone copyto "$SLURM_SUBMIT_DIR/prompt/math/serial_solver.py" "$REMOTE_RUN/serial_solver.py"
+    rclone copy "$MERGE_ROOT/actor/huggingface" "$REMOTE_RUN/huggingface" \
+        --s3-no-check-bucket --stats=30s --stats-one-line
+    rclone copyto "$MERGE_ROOT/metadata.txt" "$REMOTE_RUN/metadata.txt" --s3-no-check-bucket
+    rclone copyto "$SLURM_SUBMIT_DIR/prompt/math/serial_solver.py" "$REMOTE_RUN/serial_solver.py" --s3-no-check-bucket
     echo "Agent 0 model: $REMOTE_RUN/huggingface"
 '
 
