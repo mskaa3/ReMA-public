@@ -184,6 +184,31 @@ stop_ray() {
     RAY_JOB_PIDS=()
 }
 
+stage_remote_file_on_all_nodes() {
+    local remote_path=$1
+    local local_path=$2
+    local description=$3
+
+    if [[ -z "$remote_path" ]]; then
+        echo "A remote path is required to stage ${description} on every node" >&2
+        exit 1
+    fi
+
+    echo "Staging ${description} on all ${SLURM_NNODES} nodes"
+    srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
+        env STAGE_REMOTE_PATH="$remote_path" \
+            STAGE_LOCAL_PATH="$local_path" \
+            STAGE_DESCRIPTION="$description" \
+        bash -lc '
+            set -euo pipefail
+            mkdir -p "$(dirname "$STAGE_LOCAL_PATH")"
+            rclone copyto "$STAGE_REMOTE_PATH" "$STAGE_LOCAL_PATH"
+            test -s "$STAGE_LOCAL_PATH"
+            size_bytes=$(stat -c %s "$STAGE_LOCAL_PATH")
+            echo "${SLURMD_NODENAME:-$(hostname)}: staged ${STAGE_DESCRIPTION} (${size_bytes} bytes)"
+        '
+}
+
 run_agent12_training() {
     local train_file=$1
     local session_stop_step=$2
@@ -364,6 +389,11 @@ python3 -m verl.trainer.main_generation \
             stop_ray
         fi
 
+        # TaskRunner may execute on any Ray node, while /mnt/lscratch is local.
+        # Materialize the immutable shard everywhere before starting training.
+        stage_remote_file_on_all_nodes \
+            "$shard_train_remote" "$shard_train_file" "$shard_id"
+
         session_stop_step=$(((shard_end * TOTAL_STEPS + TOTAL_TEACHER_QUESTIONS - 1) / TOTAL_TEACHER_QUESTIONS))
         if [[ -f "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt" ]]; then
             completed_training_step=$(cat "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt")
@@ -486,6 +516,9 @@ else
     srun --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
         rclone copyto "$TEACHER_TRAIN_REMOTE" "$TEACHER_TRAIN_FILE"
 fi
+
+stage_remote_file_on_all_nodes \
+    "$TEACHER_TRAIN_REMOTE" "$TEACHER_TRAIN_FILE" "the full teacher dataset"
 
 start_ray
 run_agent12_training "$TEACHER_TRAIN_FILE" "$TOTAL_STEPS" True True
