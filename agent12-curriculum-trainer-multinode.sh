@@ -194,18 +194,27 @@ stage_remote_file_on_all_nodes() {
         exit 1
     fi
 
+    export STAGE_REMOTE_PATH="$remote_path"
+    export STAGE_LOCAL_PATH="$local_path"
+    export STAGE_DESCRIPTION="$description"
     echo "Staging ${description} on all ${SLURM_NNODES} nodes"
-    srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
-        env STAGE_REMOTE_PATH="$remote_path" \
-            STAGE_LOCAL_PATH="$local_path" \
-            STAGE_DESCRIPTION="$description" \
-        bash -lc '
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
             set -euo pipefail
+            node_name=${SLURMD_NODENAME:-$(hostname)}
             mkdir -p "$(dirname "$STAGE_LOCAL_PATH")"
-            rclone copyto "$STAGE_REMOTE_PATH" "$STAGE_LOCAL_PATH"
-            test -s "$STAGE_LOCAL_PATH"
+            echo "$node_name: downloading $STAGE_DESCRIPTION from $STAGE_REMOTE_PATH"
+            if ! rclone copyto "$STAGE_REMOTE_PATH" "$STAGE_LOCAL_PATH" \
+                    --stats=30s --stats-one-line; then
+                echo "$node_name: rclone failed while staging $STAGE_DESCRIPTION" >&2
+                exit 1
+            fi
+            if [[ ! -s "$STAGE_LOCAL_PATH" ]]; then
+                echo "$node_name: staged file is missing or empty: $STAGE_LOCAL_PATH" >&2
+                ls -la "$(dirname "$STAGE_LOCAL_PATH")" >&2 || true
+                exit 1
+            fi
             size_bytes=$(stat -c %s "$STAGE_LOCAL_PATH")
-            echo "${SLURMD_NODENAME:-$(hostname)}: staged ${STAGE_DESCRIPTION} (${size_bytes} bytes)"
+            echo "$node_name: staged $STAGE_DESCRIPTION ($size_bytes bytes)"
         '
 }
 
