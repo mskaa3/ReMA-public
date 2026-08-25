@@ -6218,6 +6218,17 @@ class RayReMASeparatedTrainer(object):
             wandb_kwargs = {'fork_from': f"{fork_wandb_id}?_step={self.global_steps}"}
         else:
             wandb_kwargs = {}
+            wandb_run_id = self.config.trainer.get('wandb_run_id', None)
+            if wandb_run_id:
+                wandb_resume = self.config.trainer.get('wandb_resume', 'allow')
+                wandb_kwargs.update(
+                    id=str(wandb_run_id),
+                    resume=str(wandb_resume),
+                )
+                print(
+                    f'**[WANDB]: using run id `{wandb_run_id}` '
+                    f'with resume=`{wandb_resume}` **'
+                )
         
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
