@@ -855,6 +855,9 @@ class RayReMASeparatedTrainer(object):
         self._init_direct_scoped_grpo()
         self._init_cpcr()
 
+    def _tokenizer_for_role(self, role):
+        return getattr(self, 'role_tokenizers', {}).get(role, self.tokenizer)
+
     def _init_scoped_c3_grpo(self):
         hierarchy_config = self.config.algorithm.get('hierarchy', {})
         scoped_config = (
@@ -1113,6 +1116,7 @@ class RayReMASeparatedTrainer(object):
 
     def _cpcr_encode_prompt_action(
         self,
+        role,
         chat,
         action_ids,
         prompt_length,
@@ -1120,7 +1124,8 @@ class RayReMASeparatedTrainer(object):
     ):
         """Attach an already sampled token action to a stored role prompt."""
 
-        query_ids = self.tokenizer.apply_chat_template(
+        tokenizer = self._tokenizer_for_role(role)
+        query_ids = tokenizer.apply_chat_template(
             chat,
             add_generation_prompt=True,
             tokenize=True,
@@ -1165,11 +1170,12 @@ class RayReMASeparatedTrainer(object):
             data_batch.batch[step_ids_key][sample_idx] == turn_idx
         ]
         action_labels = action_labels[action_labels != -100]
+        tokenizer = self._tokenizer_for_role(role)
         if stop_reason == 'stop':
             if (
-                self.tokenizer.eos_token_id is None
+                tokenizer.eos_token_id is None
                 or action_labels.numel() == 0
-                or int(action_labels[-1].item()) != self.tokenizer.eos_token_id
+                or int(action_labels[-1].item()) != tokenizer.eos_token_id
             ):
                 return None
             action_labels = action_labels[:-1]
@@ -1468,6 +1474,7 @@ class RayReMASeparatedTrainer(object):
             return empty, empty, 0, 0, 0
 
         worker_group = self.actor_rollout_wg[role]
+        tokenizer = self._tokenizer_for_role(role)
         scoring_config = (
             self.scoped_c3_grpo_config
             if self.scoped_c3_grpo_enabled
@@ -1508,7 +1515,7 @@ class RayReMASeparatedTrainer(object):
             batch_size = len(action_chunk)
             input_ids = torch.full(
                 (batch_size, sequence_length),
-                self.tokenizer.pad_token_id,
+                tokenizer.pad_token_id,
                 dtype=torch.long,
             )
             labels = torch.full(
@@ -1676,6 +1683,7 @@ class RayReMASeparatedTrainer(object):
                             pair_encoded = []
                             break
                         encoded = self._cpcr_encode_prompt_action(
+                            suffix_role,
                             chat,
                             action_token_ids,
                             prompt_length,
@@ -2300,6 +2308,7 @@ class RayReMASeparatedTrainer(object):
             if action_token_ids is None:
                 continue
             factual_encoded = self._cpcr_encode_prompt_action(
+                role,
                 factual_chat,
                 action_token_ids,
                 prompt_length,
@@ -2313,6 +2322,7 @@ class RayReMASeparatedTrainer(object):
             contrast_encoding_failed = False
             for contrast_name, contrast_chat in contrasts:
                 contrast_encoded = self._cpcr_encode_prompt_action(
+                    role,
                     contrast_chat,
                     action_token_ids,
                     prompt_length,
@@ -5463,6 +5473,7 @@ class RayReMASeparatedTrainer(object):
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
         rollout_meta_info = self._build_rollout_meta_info(max_num_turns)
         score_role = self._get_score_role()
+        score_tokenizer = self._tokenizer_for_role(score_role)
 
         for test_data in self.val_dataloader:
             # test_batch = DataProto.from_single_dict(test_data)
@@ -5504,8 +5515,8 @@ class RayReMASeparatedTrainer(object):
                     )
             
             test_gen_batch.meta_info.update({
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
+                'eos_token_id': score_tokenizer.eos_token_id,
+                'pad_token_id': score_tokenizer.pad_token_id,
                 'recompute_log_prob': False,
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
@@ -5768,7 +5779,7 @@ class RayReMASeparatedTrainer(object):
         if self.hybrid_engine:
             switch_config = self.config.algorithm.get('switch_agent', {})
             default_model_path = self.config.actor_rollout_ref.model.path
-            model_paths = switch_config.get('model_paths', [default_model_path, default_model_path])
+            model_paths = list(switch_config.get('model_paths', [default_model_path, default_model_path]))
             default_remove_padding = self.config.actor_rollout_ref.model.get('use_remove_padding', False)
             model_remove_padding = switch_config.get('model_use_remove_padding', None)
             if model_remove_padding is not None and len(model_remove_padding) != len(model_paths):
@@ -5850,6 +5861,15 @@ class RayReMASeparatedTrainer(object):
         
         self.actor_rollout_wg1 = all_wg['agent1_actor_rollout']
         self.actor_rollout_wg1.init_model()
+
+        from verl.utils import hf_tokenizer
+        tokenizer_by_path = {str(default_model_path): self.tokenizer}
+        model_tokenizers = []
+        for model_path in model_paths:
+            model_path = str(model_path)
+            if model_path not in tokenizer_by_path:
+                tokenizer_by_path[model_path] = hf_tokenizer(model_path)
+            model_tokenizers.append(tokenizer_by_path[model_path])
         
         self.actor_rollout_wg = {
             'meta_thinking': self.actor_rollout_wg0,
@@ -5862,9 +5882,15 @@ class RayReMASeparatedTrainer(object):
             for role in hierarchy_config['agent_roles']:
                 self.actor_rollout_wg[role] = self.actor_rollout_wg0 if role == decomposer_role else self.actor_rollout_wg1
 
+        worker_tokenizer = model_tokenizers[1] if len(model_tokenizers) > 1 else model_tokenizers[0]
+        self.role_tokenizers = {
+            role: model_tokenizers[0] if worker_group is self.actor_rollout_wg0 else worker_tokenizer
+            for role, worker_group in self.actor_rollout_wg.items()
+        }
+
         self.multi_agent_rollout = MultiAgentRollout(
             self.config.actor_rollout_ref.rollout,
-            {role: self.tokenizer for role in self.actor_rollout_wg.keys()},
+            self.role_tokenizers,
             self.actor_rollout_wg,
         )
 
