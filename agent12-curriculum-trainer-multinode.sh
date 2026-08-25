@@ -271,6 +271,8 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   trainer.test_freq=${TEST_FREQ} \
   trainer.save_freq=${SAVE_FREQ} \
   trainer.experiment_name=${AGENT12_RUN_NAME} \
+  trainer.wandb_run_id=${AGENT12_WANDB_RUN_ID} \
+  trainer.wandb_resume=allow \
   trainer.default_local_dir=${CHECKPOINT_ROOT}"
 
     PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
