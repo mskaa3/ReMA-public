@@ -17,7 +17,7 @@ export AGENT0_S3_REMOTE=${AGENT0_S3_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/
 
 export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 export RAY_PORT=${RAY_PORT:-6379}
-export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+export MODEL_PATH=${MODEL_PATH:-microsoft/Phi-4-mini-reasoning}
 export ROLLOUT_N=${ROLLOUT_N:-16}
 export TEST_FREQ=${TEST_FREQ:-10}
 export SAVE_FREQ=${SAVE_FREQ:-50}

@@ -20,7 +20,7 @@ data:
 actor_rollout_ref:
   hybrid_engine: true
   model:
-    path: Qwen/Qwen2.5-1.5B-Instruct
+    path: microsoft/Phi-4-mini-reasoning
     external_lib: null
     override_config: {}
     enable_gradient_checkpointing: true
