@@ -21,7 +21,7 @@ export SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
 export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/${SIF_NAME}}
 
 export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-microsoft/Phi-4-mini-reasoning}
-export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-microsoft/Phi-4-mini-reasoning}
 export WORKER_MODEL_PATH=${WORKER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 export TEACHER_ROLLOUT_N=${TEACHER_ROLLOUT_N:-16}
 export TEACHER_SAMPLES_PER_CALL=${TEACHER_SAMPLES_PER_CALL:-${TEACHER_ROLLOUT_N}}
