@@ -250,6 +250,9 @@ algorithm:
     model_paths:
       - ${actor_rollout_ref.model.path}
       - ${actor_rollout_ref.model.path}
+    model_use_remove_padding:
+      - ${actor_rollout_ref.model.use_remove_padding}
+      - ${actor_rollout_ref.model.use_remove_padding}
   hierarchy:
     enable: True
     decomposer_role: decomposer

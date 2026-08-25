@@ -5769,9 +5769,23 @@ class RayReMASeparatedTrainer(object):
             switch_config = self.config.algorithm.get('switch_agent', {})
             default_model_path = self.config.actor_rollout_ref.model.path
             model_paths = switch_config.get('model_paths', [default_model_path, default_model_path])
+            default_remove_padding = self.config.actor_rollout_ref.model.get('use_remove_padding', False)
+            model_remove_padding = switch_config.get('model_use_remove_padding', None)
+            if model_remove_padding is not None and len(model_remove_padding) != len(model_paths):
+                raise ValueError(
+                    "algorithm.switch_agent.model_use_remove_padding must have "
+                    "the same length as algorithm.switch_agent.model_paths"
+                )
+
+            def use_remove_padding_for(model_idx):
+                if model_remove_padding is None:
+                    return default_remove_padding
+                return model_remove_padding[model_idx]
+
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Agent0_ActorRollout)
             agent0_config = copy.deepcopy(self.config.actor_rollout_ref)
             agent0_config.model.path = model_paths[0]
+            agent0_config.model.use_remove_padding = use_remove_padding_for(0)
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Agent0_ActorRollout],
                                                      config=agent0_config,
                                                      role='actor_rollout')
@@ -5780,6 +5794,7 @@ class RayReMASeparatedTrainer(object):
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Agent1_ActorRollout)
             agent1_config = copy.deepcopy(self.config.actor_rollout_ref)
             agent1_config.model.path = model_paths[1] if len(model_paths) > 1 else model_paths[0]
+            agent1_config.model.use_remove_padding = use_remove_padding_for(1 if len(model_paths) > 1 else 0)
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Agent1_ActorRollout],
                                                      config=agent1_config,
                                                      role='actor_rollout')
