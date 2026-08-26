@@ -165,6 +165,7 @@ def compute_agent12_curriculum_state(
     decomposer_transfer_steps: int,
     worker_question_fade_steps: int,
     worker_question_final_probability: float,
+    worker_question_bootstrap_probability: float = 1.0,
 ) -> Agent12CurriculumState:
     """Return curriculum phase and context probabilities for one PPO step."""
     completed_steps = max(int(global_step) - 1, 0)
@@ -175,6 +176,10 @@ def compute_agent12_curriculum_state(
         max(float(worker_question_final_probability), 0.0),
         1.0,
     )
+    bootstrap_probability = min(
+        max(float(worker_question_bootstrap_probability), 0.0),
+        1.0,
+    )
 
     if completed_steps < worker_bootstrap_steps:
         return Agent12CurriculumState(
@@ -182,7 +187,7 @@ def compute_agent12_curriculum_state(
             phase_id=0,
             phase_step=completed_steps,
             teacher_attempt_probability=1.0,
-            worker_question_probability=1.0,
+            worker_question_probability=bootstrap_probability,
         )
 
     transfer_step = completed_steps - worker_bootstrap_steps
@@ -4981,6 +4986,9 @@ class RayReMASeparatedTrainer(object):
             worker_question_final_probability=curriculum.get(
                 'worker_question_final_probability', 1.0
             ),
+            worker_question_bootstrap_probability=curriculum.get(
+                'worker_question_bootstrap_probability', 1.0
+            ),
         )
 
     def _build_rollout_meta_info(self, max_num_turns: int) -> Dict:
@@ -5177,6 +5185,7 @@ class RayReMASeparatedTrainer(object):
                     if int(curriculum.get(key, 0)) < 0:
                         raise ValueError(f"agent12_curriculum.{key} must be non-negative")
                 for key in (
+                    'worker_question_bootstrap_probability',
                     'worker_question_final_probability',
                     'worker_question_eval_probability',
                 ):

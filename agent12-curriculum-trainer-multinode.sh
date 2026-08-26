@@ -37,6 +37,7 @@ export TRAIN_DECOMPOSER=${TRAIN_DECOMPOSER:-true}
 export TRAIN_AGENT_ROLES=${TRAIN_AGENT_ROLES:-'[decomposer,worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4,worker_stage_5]'}
 
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-200}
+export WORKER_QUESTION_BOOTSTRAP_PROBABILITY=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY:-1.0}
 export DECOMPOSER_TRANSFER_STEPS=${DECOMPOSER_TRANSFER_STEPS:-200}
 export WORKER_QUESTION_FADE_STEPS=${WORKER_QUESTION_FADE_STEPS:-200}
 export JOINT_STEPS=${JOINT_STEPS:-400}
@@ -256,6 +257,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.agent12_curriculum.optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE} \
   algorithm.hierarchy.agent12_curriculum.teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS} \
   algorithm.hierarchy.agent12_curriculum.worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS} \
+  algorithm.hierarchy.agent12_curriculum.worker_question_bootstrap_probability=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY} \
   algorithm.hierarchy.agent12_curriculum.decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS} \
   algorithm.hierarchy.agent12_curriculum.worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS} \
   algorithm.hierarchy.agent12_curriculum.worker_question_final_probability=0.0 \
@@ -634,6 +636,7 @@ worker_base=${WORKER_MODEL_PATH}
 decomposer_use_remove_padding=${DECOMPOSER_USE_REMOVE_PADDING}
 worker_use_remove_padding=${WORKER_USE_REMOVE_PADDING}
 worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS}
+worker_question_bootstrap_probability=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY}
 decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS}
 worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS}
 joint_steps=${JOINT_STEPS}

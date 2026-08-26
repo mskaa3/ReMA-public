@@ -298,6 +298,7 @@ algorithm:
       # to execute plans extracted from serial attempts. Every retained attempt
       # forms a separate prompt group.
       worker_bootstrap_steps: 200
+      worker_question_bootstrap_probability: 1.0
       # Phase 2: freeze workers and linearly drop the teacher-attempt context
       # while optimizing the decomposer through downstream correctness.
       decomposer_transfer_steps: 200

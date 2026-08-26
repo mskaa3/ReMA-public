@@ -98,6 +98,21 @@ def test_agent12_curriculum_phase_boundaries():
     assert _state(7).worker_question_probability == 0.0
 
 
+def test_worker_bootstrap_can_hide_question_from_workers():
+    state = compute_agent12_curriculum_state(
+        1,
+        worker_bootstrap_steps=2,
+        decomposer_transfer_steps=2,
+        worker_question_fade_steps=2,
+        worker_question_final_probability=0.0,
+        worker_question_bootstrap_probability=0.0,
+    )
+
+    assert state.phase == "worker_bootstrap"
+    assert state.teacher_attempt_probability == 1.0
+    assert state.worker_question_probability == 0.0
+
+
 def test_frozen_decomposer_is_never_selected_for_training():
     worker_roles = ["worker_stage_1", "worker_stage_2"]
     selected_roles = {

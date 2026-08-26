@@ -27,6 +27,7 @@ fi
 export TRAIN_DECOMPOSER=false
 export TRAIN_AGENT_ROLES='[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4,worker_stage_5]'
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-800}
+export WORKER_QUESTION_BOOTSTRAP_PROBABILITY=0.0
 export DECOMPOSER_TRANSFER_STEPS=0
 export WORKER_QUESTION_FADE_STEPS=0
 export JOINT_STEPS=0
