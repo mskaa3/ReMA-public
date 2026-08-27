@@ -1174,10 +1174,15 @@ class MultiAgentRollout:
         sections = []
         parsed_plan = self._format_subtasks(subtasks)
         if parsed_plan:
-            sections.append(f"PARSED PLAN:\n{parsed_plan}")
-        worker_results = self._format_worker_results_for_final(completed_results)
-        if worker_results:
-            sections.append(worker_results)
+            sections.append(f"PLAN:\n{parsed_plan}")
+        worker_sections = []
+        for stage_role, _, subtask_ids, output in completed_results:
+            if not output or not output.strip():
+                continue
+            label = subtask_ids or stage_role
+            worker_sections.append(f"{label}:\n{output.strip()}")
+        if worker_sections:
+            sections.append("WORK SO FAR:\n" + "\n\n".join(worker_sections))
         return "\n\n".join(sections)
 
     @staticmethod
@@ -1934,7 +1939,7 @@ class MultiAgentRollout:
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         if is_final_stage:
                             stage_instruction = (
-                                "Synthesize the final answer from the plan and worker results. "
+                                "Continue from the plan and work so far, then synthesize the final answer. "
                                 "Reconcile their conclusions and repair only local inconsistencies needed for synthesis. "
                                 "End with the final answer in \\boxed{}."
                             )

@@ -1300,6 +1300,10 @@ class RayReMASeparatedTrainer(object):
         plan = stitched_outputs.get(decomposer_role, '')
         assignments = stitched_outputs.get(selector_role, '')
         ordered_stages = parse_execution_stages(plan, assignments)
+        parsed_plan_subtasks = MultiAgentRollout._extract_subtasks(
+            plan,
+            max_subtasks=max_planned_subtasks,
+        )
 
         candidate_plan = (
             candidate_messages.get(decomposer_role, {}).get('content', '')
@@ -1383,10 +1387,9 @@ class RayReMASeparatedTrainer(object):
                 stage_idx, worker_type, assigned_subtasks = stage_specs[role]
                 is_final_stage = stage_idx == len(ordered_stages) - 1
                 if is_final_stage:
-                    question_block = (
-                        ''
-                        if final_context_mode in {'notes_only', 'notes', 'no_question'}
-                        else f"Question:\n{question}\n\n"
+                    question_block = MultiAgentRollout._format_final_question_block(
+                        question,
+                        final_context_mode,
                     )
                 elif pass_question_to_workers:
                     question_block = (
@@ -1404,6 +1407,14 @@ class RayReMASeparatedTrainer(object):
                         work_so_far = MultiAgentRollout._format_worker_results_for_final(
                             completed_results
                         )
+                    elif final_context_mode in {
+                        'plan_and_worker_results',
+                        'parsed_plan_and_worker_results',
+                    }:
+                        work_so_far = MultiAgentRollout._format_plan_and_worker_results_for_final(
+                            parsed_plan_subtasks,
+                            completed_results,
+                        )
                     else:
                         work_so_far = MultiAgentRollout._format_final_notes(
                             plan,
@@ -1417,8 +1428,9 @@ class RayReMASeparatedTrainer(object):
                 assigned_subtasks_text = MultiAgentRollout._format_subtasks(assigned_subtasks)
                 if is_final_stage:
                     stage_instruction = (
-                        "Synthesize the final answer from the worker results. "
-                        "Check the worker results, repair mistakes if needed, and end with the final answer in \\boxed{}."
+                        "Continue from the plan and work so far, then synthesize the final answer. "
+                        "Reconcile their conclusions and repair only local inconsistencies needed for synthesis. "
+                        "End with the final answer in \\boxed{}."
                     )
                     if not assigned_subtasks_text:
                         assigned_subtasks_text = "- Use the work above to synthesize the final answer."

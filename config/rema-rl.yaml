@@ -5,7 +5,7 @@ data:
   val_files: /root/tmpdir/overall_math/test.parquet
   prompt_key: question
   reward_fn_key: data_source
-  max_prompt_length: 4096
+  max_prompt_length: 6144
   max_response_length: 1024
   train_batch_size: 48
   val_batch_size: 64
@@ -275,8 +275,9 @@ algorithm:
     # The planner chooses the smallest useful number of dependent subtasks from
     # one to four. A malformed empty plan falls back to one task.
     decomposer_max_new_tokens: 512
-    # Local stages produce checkable work; the final stage has room to synthesize it.
-    worker_max_new_tokens: 512
+    # Local stages have enough room to complete their reasoning and still emit
+    # the terminal LOCAL_RESULT required by downstream stages.
+    worker_max_new_tokens: 1024
     final_max_new_tokens: 896
     # Three-phase distillation from a frozen serial solver. Disabled for the
     # original ReMA runs and enabled only by the Agent 1/2 curriculum launcher.

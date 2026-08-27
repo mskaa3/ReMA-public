@@ -47,7 +47,7 @@ Return one useful local result for the assigned subtask.
 
 FINALIZER_SYSTEM_PROMPT = """You are the final reasoning agent.
 
-Synthesize the final answer from the plan and worker results.
+Continue from the reasoning in the plan and work so far, then synthesize the final answer.
 Treat the worker results as the primary mathematical work. Reconcile their conclusions and repair only local inconsistencies needed for synthesis.
 When they contain enough information, assemble the answer directly from them rather than starting a new independent solution path.
 Say that information is missing only when the needed facts are truly absent.
