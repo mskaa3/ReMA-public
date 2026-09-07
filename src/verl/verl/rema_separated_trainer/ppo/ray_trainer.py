@@ -385,6 +385,31 @@ def extract_round_score_role_outputs(
     return outputs, executed
 
 
+def select_score_role_rewards(
+    reward_tensor,
+    default_score_role,
+    agent_roles,
+    dynamic_score_roles=None,
+):
+    """Select each sample's terminal-role reward tensor."""
+
+    default_key = f'{default_score_role}_turn_level_reward'
+    if dynamic_score_roles is None:
+        return reward_tensor[default_key]
+    if len(dynamic_score_roles) != reward_tensor[default_key].shape[0]:
+        raise ValueError(
+            "dynamic_score_roles and reward batch must have equal lengths"
+        )
+    return torch.stack([
+        reward_tensor[
+            f'{dynamic_role}_turn_level_reward'
+            if dynamic_role in agent_roles
+            else default_key
+        ][sample_idx]
+        for sample_idx, dynamic_role in enumerate(dynamic_score_roles)
+    ])
+
+
 def carry_forward_round_scores(candidate_scores, executed):
     """Build answer-state scores after each round, preserving stopped samples."""
 
@@ -2286,20 +2311,13 @@ class RayReMASeparatedTrainer(object):
             dynamic_score_roles = test_output_gen_batch.non_tensor_batch.get(
                 'terminal_stage_role'
             )
-            if dynamic_score_roles is None:
-                score_reward_key = f'{score_role}_turn_level_reward'
-                reward_tensor_lst.append(reward_tensor[score_reward_key])
-            else:
-                reward_tensor_lst.append(torch.stack([
-                    reward_tensor[
-                        f'{dynamic_role}_turn_level_reward'
-                        if dynamic_role in rollout_meta_info['agent_roles']
-                        else f'{score_role}_turn_level_reward'
-                    ][sample_idx]
-                    for sample_idx, dynamic_role in enumerate(
-                        dynamic_score_roles
-                    )
-                ]))
+            score_reward_tensor = select_score_role_rewards(
+                reward_tensor,
+                score_role,
+                rollout_meta_info['agent_roles'],
+                dynamic_score_roles,
+            )
+            reward_tensor_lst.append(score_reward_tensor)
             acc_tensor_lst.append(reward_tensor['acc'])
 
             histories = test_output_gen_batch.non_tensor_batch['history'].tolist()
@@ -2375,7 +2393,7 @@ class RayReMASeparatedTrainer(object):
             round_executed_lst.append(round_executed)
 
             # Store scores
-            scores = reward_tensor[score_reward_key].sum(-1).cpu().tolist()
+            scores = score_reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
             num_turns = torch.tensor(test_output_gen_batch.non_tensor_batch['num_turns'].tolist(), dtype=torch.float32, device="cpu")
             num_turns_lst.append(num_turns)
@@ -2387,7 +2405,10 @@ class RayReMASeparatedTrainer(object):
             completion_tokens_lst.append(completion_tokens)
 
             # not use `data_source`, use `subset` instead
-            data_source_lst.append(test_batch.non_tensor_batch.get('subset', ['unknown'] * reward_tensor[score_reward_key].shape[0]))
+            data_source_lst.append(test_batch.non_tensor_batch.get(
+                'subset',
+                ['unknown'] * score_reward_tensor.shape[0],
+            ))
             
             history_lst.append(histories)
 

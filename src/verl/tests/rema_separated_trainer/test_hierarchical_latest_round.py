@@ -15,6 +15,7 @@ from verl.rema_separated_trainer.ppo.ray_trainer import (
     compute_round_transition_metrics,
     compute_token_level_scores,
     extract_round_score_role_outputs,
+    select_score_role_rewards,
 )
 from verl.workers.reward_manager.rema import _compute_turn_worker_metrics
 
@@ -38,6 +39,31 @@ class _CharacterTokenizer:
     def encode(text, add_special_tokens):
         assert add_special_tokens
         return [ord(character) for character in text]
+
+
+def test_validation_selects_each_dynamic_terminal_role_reward():
+    rewards = {
+        'worker_stage_1_turn_level_reward': torch.tensor([
+            [1.0, 2.0],
+            [3.0, 4.0],
+        ]),
+        'worker_stage_2_turn_level_reward': torch.tensor([
+            [5.0, 6.0],
+            [7.0, 8.0],
+        ]),
+    }
+
+    selected = select_score_role_rewards(
+        rewards,
+        'worker_stage_2',
+        ['worker_stage_1', 'worker_stage_2'],
+        ['worker_stage_1', 'worker_stage_2'],
+    )
+
+    torch.testing.assert_close(
+        selected,
+        torch.tensor([[1.0, 2.0], [7.0, 8.0]]),
+    )
 
 
 def test_filtered_prompt_fallback_keeps_complete_minibatches():
