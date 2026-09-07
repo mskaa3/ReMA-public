@@ -1961,12 +1961,10 @@ class MultiAgentRollout:
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
                         if is_finalizer_stage:
                             stage_instruction = (
-                                "Complete the assigned terminal subtask using the previous LOCAL_RESULTs. "
-                                "Reason through the calculation required by this subtask without reconstructing "
-                                "an unseen original problem. Return the requested terminal result in the exact form:\n"
-                                "REASONING:\n"
-                                "<step-by-step reasoning for the terminal subtask>\n\n"
-                                "LOCAL_RESULT: \\boxed{<answer to the terminal subtask>}"
+                                "Continue from the plan and work so far, complete the assigned terminal subtask, "
+                                "and synthesize the final answer. Reconcile the available conclusions and repair "
+                                "only local inconsistencies needed for synthesis. Reason naturally and end with "
+                                "the final answer in \\boxed{}."
                             )
                         else:
                             role_instruction = "Work on the assigned subtask above. "
