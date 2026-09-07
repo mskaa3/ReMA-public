@@ -20,9 +20,11 @@ export RAY_PORT=${RAY_PORT:-6379}
 export SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
 export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/${SIF_NAME}}
 
-export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
-export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-microsoft/Phi-4-mini-reasoning}
+export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
 export WORKER_MODEL_PATH=${WORKER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+export DECOMPOSER_USE_REMOVE_PADDING=${DECOMPOSER_USE_REMOVE_PADDING:-true}
+export WORKER_USE_REMOVE_PADDING=${WORKER_USE_REMOVE_PADDING:-true}
 export TEACHER_ROLLOUT_N=${TEACHER_ROLLOUT_N:-16}
 export TEACHER_SAMPLES_PER_CALL=${TEACHER_SAMPLES_PER_CALL:-${TEACHER_ROLLOUT_N}}
 export TEACHER_CHECKPOINT_EVERY_BATCHES=${TEACHER_CHECKPOINT_EVERY_BATCHES:-5}
@@ -33,8 +35,17 @@ export BASE_QUESTION_BATCH_SIZE=${BASE_QUESTION_BATCH_SIZE:-3}
 export OPTIMIZER_PROMPT_BATCH_SIZE=${OPTIMIZER_PROMPT_BATCH_SIZE:-$((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N))}
 export TRAIN_DECOMPOSER=${TRAIN_DECOMPOSER:-true}
 export TRAIN_AGENT_ROLES=${TRAIN_AGENT_ROLES:-'[decomposer,worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4,worker_stage_5]'}
+export TERMINAL_WORKER_AS_ANSWER=${TERMINAL_WORKER_AS_ANSWER:-false}
+export NUM_WORKER_STAGES=${NUM_WORKER_STAGES:-5}
+export MAX_PLANNED_SUBTASKS=${MAX_PLANNED_SUBTASKS:-4}
+export WORKER_CHECKPOINT_ROLE=${WORKER_CHECKPOINT_ROLE:-worker_stage_${NUM_WORKER_STAGES}}
+export PREFIX_PROBE_ENABLE=${PREFIX_PROBE_ENABLE:-false}
+export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}
 
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-200}
+export WORKER_QUESTION_BOOTSTRAP_PROBABILITY=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY:-1.0}
+export WORKER_QUESTION_FINAL_PROBABILITY=${WORKER_QUESTION_FINAL_PROBABILITY:-0.0}
+export WORKER_QUESTION_EVAL_PROBABILITY=${WORKER_QUESTION_EVAL_PROBABILITY:-0.0}
 export DECOMPOSER_TRANSFER_STEPS=${DECOMPOSER_TRANSFER_STEPS:-200}
 export WORKER_QUESTION_FADE_STEPS=${WORKER_QUESTION_FADE_STEPS:-200}
 export JOINT_STEPS=${JOINT_STEPS:-400}
@@ -49,7 +60,7 @@ export REMOTE_RUN=${AGENT12_S3_REMOTE%/}/${AGENT12_RUN_NAME}
 export GENERATE_TEACHER_DATA=${GENERATE_TEACHER_DATA:-1}
 export ONLINE_TEACHER_GENERATION=${ONLINE_TEACHER_GENERATION:-false}
 export TEACHER_SHARD_QUESTIONS=${TEACHER_SHARD_QUESTIONS:-512}
-export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-qwen25-1.5b-n${TEACHER_ROLLOUT_N}-all-attempt-groups.parquet}
+export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-phi4-mini-reasoning-n${TEACHER_ROLLOUT_N}-all-attempt-groups.parquet}
 export TEACHER_CANDIDATES_REMOTE=${TEACHER_CANDIDATES_REMOTE:-${TEACHER_TRAIN_REMOTE%.parquet}.generation-progress.parquet}
 export TEACHER_SHARD_REMOTE_ROOT=${TEACHER_SHARD_REMOTE_ROOT:-${TEACHER_TRAIN_REMOTE%.parquet}.shards/q${TEACHER_SHARD_QUESTIONS}}
 
@@ -246,6 +257,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   data.train_batch_size=${BASE_QUESTION_BATCH_SIZE} \
   actor_rollout_ref.model.path=${DECOMPOSER_MODEL_PATH} \
   algorithm.switch_agent.model_paths=[${DECOMPOSER_MODEL_PATH},${WORKER_MODEL_PATH}] \
+  algorithm.switch_agent.model_use_remove_padding=[${DECOMPOSER_USE_REMOVE_PADDING},${WORKER_USE_REMOVE_PADDING}] \
   algorithm.hierarchy.agent12_curriculum.enable=True \
   algorithm.hierarchy.agent12_curriculum.train_decomposer=${TRAIN_DECOMPOSER} \
   algorithm.hierarchy.agent12_curriculum.expand_all_teacher_attempts=True \
@@ -253,13 +265,17 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.agent12_curriculum.optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE} \
   algorithm.hierarchy.agent12_curriculum.teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS} \
   algorithm.hierarchy.agent12_curriculum.worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS} \
+  algorithm.hierarchy.agent12_curriculum.worker_question_bootstrap_probability=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY} \
   algorithm.hierarchy.agent12_curriculum.decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS} \
   algorithm.hierarchy.agent12_curriculum.worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS} \
-  algorithm.hierarchy.agent12_curriculum.worker_question_final_probability=0.0 \
-  algorithm.hierarchy.agent12_curriculum.worker_question_eval_probability=0.0 \
+  algorithm.hierarchy.agent12_curriculum.worker_question_final_probability=${WORKER_QUESTION_FINAL_PROBABILITY} \
+  algorithm.hierarchy.agent12_curriculum.worker_question_eval_probability=${WORKER_QUESTION_EVAL_PROBABILITY} \
+  algorithm.hierarchy.terminal_worker_as_answer=${TERMINAL_WORKER_AS_ANSWER} \
+  algorithm.hierarchy.num_worker_stages=${NUM_WORKER_STAGES} \
+  algorithm.hierarchy.max_planned_subtasks=${MAX_PLANNED_SUBTASKS} \
   algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
-  algorithm.hierarchy.reward_composer.enable=False \
-  algorithm.hierarchy.reward_composer.online.enable=False \
+  algorithm.hierarchy.scoped_c3_grpo.prefix_probe.enable=${PREFIX_PROBE_ENABLE} \
+  algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
   trainer.nnodes=${SLURM_NNODES} \
   trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
@@ -569,7 +585,7 @@ echo "Collecting distributed Agent 1/2 checkpoints at step ${LATEST_STEP}"
 srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
     set -euo pipefail
     node_name=${SLURMD_NODENAME:-$(hostname)}
-    for spec in "decomposer:decomposer" "workers:worker_stage_5"; do
+    for spec in "decomposer:decomposer" "workers:${WORKER_CHECKPOINT_ROLE}"; do
         export_name=${spec%%:*}
         role=${spec##*:}
         actor_dir="$CHECKPOINT_ROOT/global_step_${LATEST_STEP}/${role}/actor"
@@ -626,9 +642,20 @@ rollouts_per_attempt=${ROLLOUT_N}
 optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE}
 train_decomposer=${TRAIN_DECOMPOSER}
 train_agent_roles=${TRAIN_AGENT_ROLES}
+terminal_worker_as_answer=${TERMINAL_WORKER_AS_ANSWER}
+num_worker_stages=${NUM_WORKER_STAGES}
+max_planned_subtasks=${MAX_PLANNED_SUBTASKS}
+worker_checkpoint_role=${WORKER_CHECKPOINT_ROLE}
+prefix_probe_enable=${PREFIX_PROBE_ENABLE}
+prefix_probe_max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
+decomposer_use_remove_padding=${DECOMPOSER_USE_REMOVE_PADDING}
+worker_use_remove_padding=${WORKER_USE_REMOVE_PADDING}
 worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS}
+worker_question_bootstrap_probability=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY}
+worker_question_final_probability=${WORKER_QUESTION_FINAL_PROBABILITY}
+worker_question_eval_probability=${WORKER_QUESTION_EVAL_PROBABILITY}
 decomposer_transfer_steps=${DECOMPOSER_TRANSFER_STEPS}
 worker_question_fade_steps=${WORKER_QUESTION_FADE_STEPS}
 joint_steps=${JOINT_STEPS}

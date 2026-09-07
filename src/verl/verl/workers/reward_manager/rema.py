@@ -14,10 +14,7 @@
 
 from functools import partial
 from typing import Dict
-import hashlib
-import json
 import re
-from pathlib import Path
 
 from tqdm import tqdm
 from verl import DataProto
@@ -26,13 +23,6 @@ import torch
 from pebble import ProcessPool
 from concurrent.futures import TimeoutError
 from math_verify.errors import TimeoutException
-from verl.workers.reward_manager.prd_composer import (
-    PRD_REWARD_SOURCE_NAMES,
-    PRDRewardComposer,
-    build_prd_graph_prior_tensors,
-    build_prd_role_feature_tensor,
-    build_prd_source_tensor,
-)
 
 META_BOXED_PENALTY = 0.25
 WORKER_BOXED_PENALTY = 0.05
@@ -113,64 +103,8 @@ def compute_format_r(data_source, role, response_str):
         raise ValueError(f'Unknown {data_source=} for format reward.')
 
 
-def _tensor_scalar(reward_tensor_map, name, batch_idx, default=0.0):
-    tensor = reward_tensor_map.get(name)
-    if tensor is None:
-        return float(default)
-    return float(tensor[batch_idx].item())
 
 
-def _build_prd_reward_sources(reward_tensor_map, batch_idx, raw_score):
-    """Collect current reward metrics as PRD reward-source values.
-
-    Penalty sources are represented as negative values.  The composer therefore
-    only needs non-negative routing weights to preserve source signs.
-    """
-
-    return {
-        "raw_score": float(raw_score),
-        "final_effective_raw_score": _tensor_scalar(reward_tensor_map, "final_effective_raw_score", batch_idx),
-        "positive_role_bonus_gate": _tensor_scalar(reward_tensor_map, "positive_role_bonus_gate", batch_idx),
-        "final_worker_usage_gate": _tensor_scalar(reward_tensor_map, "final_worker_usage_gate", batch_idx),
-        "upstream_global_correctness_bonus": _tensor_scalar(reward_tensor_map, "upstream_global_correctness_bonus", batch_idx),
-        "upstream_hierarchical_correctness_bonus": _tensor_scalar(reward_tensor_map, "upstream_hierarchical_correctness_bonus", batch_idx),
-        "decomposer_global_correctness_bonus": _tensor_scalar(reward_tensor_map, "decomposer_global_correctness_bonus", batch_idx),
-        "decomposer_local_bonus": _tensor_scalar(reward_tensor_map, "decomposer_local_bonus", batch_idx),
-        "decomposer_plan_parseable_gate": _tensor_scalar(reward_tensor_map, "decomposer_plan_parseable_gate", batch_idx),
-        "hierarchy_utilization_gate": _tensor_scalar(reward_tensor_map, "hierarchy_utilization_gate", batch_idx),
-        "decomposer_unique_local_result_rate": _tensor_scalar(reward_tensor_map, "decomposer_unique_local_result_rate", batch_idx),
-        "decomposer_dependency_usage_rate": _tensor_scalar(reward_tensor_map, "decomposer_dependency_usage_rate", batch_idx),
-        "decomposer_repair_success": _tensor_scalar(reward_tensor_map, "decomposer_repair_success", batch_idx),
-        "selector_global_correctness_bonus": _tensor_scalar(reward_tensor_map, "selector_global_correctness_bonus", batch_idx),
-        "selector_local_bonus": _tensor_scalar(reward_tensor_map, "selector_local_bonus", batch_idx),
-        "selector_assignment_completeness": _tensor_scalar(reward_tensor_map, "selector_assignment_completeness", batch_idx),
-        "selector_assignment_precision": _tensor_scalar(reward_tensor_map, "selector_assignment_precision", batch_idx),
-        "selector_assignment_recall": _tensor_scalar(reward_tensor_map, "selector_assignment_recall", batch_idx),
-        "selector_assignment_final_present": _tensor_scalar(reward_tensor_map, "selector_assignment_final_present", batch_idx),
-        "selector_worker_valid_local_result_rate": _tensor_scalar(reward_tensor_map, "selector_worker_valid_local_result_rate", batch_idx),
-        "worker_global_correctness_bonus_mean": _tensor_scalar(reward_tensor_map, "worker_global_correctness_bonus_mean", batch_idx),
-        "worker_local_bonus_mean": _tensor_scalar(reward_tensor_map, "worker_local_bonus_mean", batch_idx),
-        "worker_unique_local_result_rate": _tensor_scalar(reward_tensor_map, "worker_unique_local_result_rate", batch_idx),
-        "worker_downstream_used_rate": _tensor_scalar(reward_tensor_map, "worker_downstream_used_rate", batch_idx),
-        "worker_later_worker_used_rate": _tensor_scalar(reward_tensor_map, "worker_later_worker_used_rate", batch_idx),
-        "final_local_bonus": _tensor_scalar(reward_tensor_map, "final_local_bonus", batch_idx),
-        "final_worker_result_usage_rate": _tensor_scalar(reward_tensor_map, "final_worker_result_usage_rate", batch_idx),
-        "final_consistency_with_worker_results": _tensor_scalar(reward_tensor_map, "final_consistency_with_worker_results", batch_idx),
-        "penalty_meta_boxed": -_tensor_scalar(reward_tensor_map, "meta_boxed_penalty_value", batch_idx),
-        "penalty_worker_finish": -_tensor_scalar(reward_tensor_map, "worker_finish_penalty_value", batch_idx),
-        "penalty_worker_empty_assigned": -_tensor_scalar(reward_tensor_map, "worker_empty_assigned_penalty_value", batch_idx),
-        "penalty_worker_missing_local_result": -_tensor_scalar(reward_tensor_map, "worker_missing_local_result_penalty_value", batch_idx),
-        "penalty_worker_subtask_overreach": -_tensor_scalar(reward_tensor_map, "worker_subtask_overreach_penalty_value", batch_idx),
-        "penalty_worker_duplicate_result": -_tensor_scalar(reward_tensor_map, "worker_duplicate_result_penalty_value", batch_idx),
-        "penalty_selector_extra_assignment": -_tensor_scalar(reward_tensor_map, "selector_extra_assignment_penalty_value", batch_idx),
-        "penalty_selector_missing_assignment": -_tensor_scalar(reward_tensor_map, "selector_missing_assignment_penalty_value", batch_idx),
-        "penalty_selector_duplicate_assignment": -_tensor_scalar(reward_tensor_map, "selector_duplicate_assignment_penalty_value", batch_idx),
-        "penalty_selector_missing_final": -_tensor_scalar(reward_tensor_map, "selector_missing_final_penalty_value", batch_idx),
-        "penalty_selector_empty_output": -_tensor_scalar(reward_tensor_map, "selector_empty_output_penalty_value", batch_idx),
-        "penalty_final_ignores_worker_results": -_tensor_scalar(reward_tensor_map, "final_ignores_worker_results_penalty_value", batch_idx),
-        "penalty_planner_repeat": -_tensor_scalar(reward_tensor_map, "planner_repeat_penalty_value", batch_idx),
-        "penalty_planner_excess_subtask": -_tensor_scalar(reward_tensor_map, "planner_excess_subtask_penalty_value", batch_idx),
-    }
 
 
 def _normalize_role_output(text):
@@ -611,43 +545,8 @@ class ReMARewardManager:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or _default_compute_score
-        self.prd_composer = None
-        self.prd_composer_checkpoint_path = None
-        self.prd_export_count = 0
 
-    def _get_prd_composer(self, reward_composer_config):
-        if not reward_composer_config or not reward_composer_config.get('enable', False):
-            return None
-        checkpoint_path = reward_composer_config.get('checkpoint_path')
-        if not checkpoint_path:
-            return None
-        if (
-            self.prd_composer is not None
-            and self.prd_composer_checkpoint_path == checkpoint_path
-        ):
-            return self.prd_composer
-        composer = PRDRewardComposer.from_checkpoint(checkpoint_path, map_location='cpu')
-        composer.eval()
-        self.prd_composer = composer
-        self.prd_composer_checkpoint_path = checkpoint_path
-        return self.prd_composer
 
-    def _maybe_export_prd_record(
-        self,
-        reward_composer_config,
-        record,
-    ):
-        export_path = reward_composer_config.get('export_jsonl_path') if reward_composer_config else None
-        if not export_path:
-            return
-        max_records = reward_composer_config.get('export_jsonl_max_records')
-        if max_records is not None and self.prd_export_count >= int(max_records):
-            return
-        path = Path(export_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open('a', encoding='utf-8') as f:
-            f.write(json.dumps(record, ensure_ascii=True) + '\n')
-        self.prd_export_count += 1
 
     def verify(self, data):
         scores = []
@@ -787,14 +686,13 @@ class ReMARewardManager:
         # Backward compatibility for older hierarchical configs where worker
         # types themselves were the rollout roles.
         worker_roles.update(worker_type_roles.intersection(agent_roles))
-        score_role = hierarchy_config.get(
+        configured_score_role = hierarchy_config.get(
             'score_role',
             agent_roles[-1] if agent_roles else None,
         )
-        reward_composer_config = hierarchy_config.get('reward_composer', {})
-        prd_composer = self._get_prd_composer(reward_composer_config)
-        prd_blend_alpha = float(reward_composer_config.get('blend_alpha', 0.0))
-        prd_blend_alpha = max(0.0, min(1.0, prd_blend_alpha))
+        terminal_worker_as_answer = bool(
+            hierarchy_config.get('terminal_worker_as_answer', False)
+        )
         planner_roles = {'decomposer', 'selector'}
         reward_tensor_map = {
             f'{role}_turn_level_reward': torch.zeros(batch_size, max_num_turns, dtype=torch.float32) for role in agent_roles
@@ -876,12 +774,7 @@ class ReMARewardManager:
         reward_tensor_map['final_effective_raw_score'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_local_bonus_raw'] = torch.zeros(batch_size, dtype=torch.float32)
         reward_tensor_map['final_local_bonus'] = torch.zeros(batch_size, dtype=torch.float32)
-        reward_tensor_map['prd_composer_enabled'] = torch.zeros(batch_size, dtype=torch.float32)
-        reward_tensor_map['prd_composer_blend_alpha'] = torch.full((batch_size,), prd_blend_alpha, dtype=torch.float32)
-        reward_tensor_map['prd_composer_routing_mean'] = torch.zeros(batch_size, dtype=torch.float32)
-        reward_tensor_map['prd_composer_role_score_mean'] = torch.zeros(batch_size, dtype=torch.float32)
-        reward_tensor_map['prd_composer_manual_score_mean'] = torch.zeros(batch_size, dtype=torch.float32)
-        
+
         already_print_data_sources = {}
 
         scores = self.score_responses(
@@ -899,6 +792,13 @@ class ReMARewardManager:
         reward_tensor_map['acc'] = accuracy
         for i_bsz in range(len(data)):
             data_item = data[i_bsz]  # DataProtoItem
+            score_role = configured_score_role
+            if terminal_worker_as_answer:
+                dynamic_score_role = data_item.non_tensor_batch.get(
+                    'terminal_stage_role', ''
+                )
+                if dynamic_score_role in agent_roles:
+                    score_role = dynamic_score_role
             response_str = data_item.non_tensor_batch['response']
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             data_source = data_item.non_tensor_batch['data_source']
@@ -1491,87 +1391,6 @@ class ReMARewardManager:
                 manual_role_scores[role] = float(role_score)
 
             role_shaped_scores.update(manual_role_scores)
-            prd_source_values = _build_prd_reward_sources(
-                reward_tensor_map,
-                i_bsz,
-                raw_score,
-            )
-            self._maybe_export_prd_record(
-                reward_composer_config,
-                {
-                    "reward_sources": prd_source_values,
-                    "agent_roles": list(agent_roles),
-                    "score_role": score_role,
-                    "worker_roles": sorted(worker_roles),
-                    "role_scores": manual_role_scores,
-                    "raw_score": float(raw_score),
-                    "num_turns": int(num_turns),
-                    "data_source": data_source,
-                    "prompt_key": hashlib.sha1(
-                        str(data_item.non_tensor_batch.get('question', '')).encode('utf-8')
-                    ).hexdigest(),
-                },
-            )
-
-            if prd_composer is not None and prd_blend_alpha > 0.0:
-                source_tensor = build_prd_source_tensor(
-                    prd_source_values,
-                    PRD_REWARD_SOURCE_NAMES,
-                ).unsqueeze(0)
-                role_feature_tensor = build_prd_role_feature_tensor(
-                    agent_roles,
-                    score_role,
-                    worker_roles,
-                    role_bonuses=role_bonuses,
-                    role_penalties=role_penalties,
-                    manual_role_scores=(
-                        manual_role_scores
-                        if reward_composer_config.get('use_manual_role_features', False)
-                        else None
-                    ),
-                ).unsqueeze(0)
-                routing_bias, routing_mask = build_prd_graph_prior_tensors(
-                    agent_roles,
-                    score_role,
-                    worker_roles,
-                    PRD_REWARD_SOURCE_NAMES,
-                    mode=str(reward_composer_config.get('graph_prior_mode', 'none')),
-                    soft_distance_penalty=float(
-                        reward_composer_config.get('graph_prior_soft_distance_penalty', 1.0)
-                    ),
-                    reverse_distance_penalty=float(
-                        reward_composer_config.get('graph_prior_reverse_distance_penalty', 3.0)
-                    ),
-                )
-                with torch.no_grad():
-                    prd_output = prd_composer(
-                        source_tensor,
-                        role_feature_tensor,
-                        routing_bias=routing_bias,
-                        routing_mask=routing_mask,
-                    )
-                prd_role_scores = prd_output['role_scores'].squeeze(0).tolist()
-                routing_mean = float(prd_output['routing'].mean().item())
-                manual_mean = (
-                    sum(manual_role_scores.values()) / len(manual_role_scores)
-                    if manual_role_scores else 0.0
-                )
-                prd_mean = (
-                    sum(float(score) for score in prd_role_scores) / len(prd_role_scores)
-                    if prd_role_scores else 0.0
-                )
-                reward_tensor_map['prd_composer_enabled'][i_bsz] = 1.0
-                reward_tensor_map['prd_composer_routing_mean'][i_bsz] = routing_mean
-                reward_tensor_map['prd_composer_role_score_mean'][i_bsz] = prd_mean
-                reward_tensor_map['prd_composer_manual_score_mean'][i_bsz] = manual_mean
-                role_shaped_scores = {}
-                for i_role, role in enumerate(agent_roles):
-                    prd_score = float(prd_role_scores[i_role])
-                    blended_score = (
-                        (1.0 - prd_blend_alpha) * manual_role_scores[role]
-                        + prd_blend_alpha * prd_score
-                    )
-                    role_shaped_scores[role] = float(blended_score)
 
             for role in agent_roles:
                 reward_tensor_map[f'{role}_turn_level_reward'][i_bsz, num_turns - 1] = (
@@ -1603,14 +1422,6 @@ class ReMARewardManager:
                             candidate_source_turn + 1
                             if candidate_source_turn >= 0 else 0
                         ),
-                    })
-                if prd_composer is not None:
-                    print("[prd_composer]", {
-                        'enabled': float(reward_tensor_map['prd_composer_enabled'][i_bsz]),
-                        'blend_alpha': float(reward_tensor_map['prd_composer_blend_alpha'][i_bsz]),
-                        'routing_mean': float(reward_tensor_map['prd_composer_routing_mean'][i_bsz]),
-                        'role_score_mean': float(reward_tensor_map['prd_composer_role_score_mean'][i_bsz]),
-                        'manual_score_mean': float(reward_tensor_map['prd_composer_manual_score_mean'][i_bsz]),
                     })
                 if 'decomposer' in agent_roles:
                     print("[decomposer_metrics]", {

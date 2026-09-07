@@ -35,7 +35,7 @@ def normalize_text(text):
 
 
 def _has_usable_final_boxed_answer(text: str) -> bool:
-    """Return True when the final stage produced a boxed answer, not a refusal."""
+    """Return True when the terminal stage produced a boxed answer, not a refusal."""
     if not isinstance(text, str) or "\\boxed" not in text:
         return False
 
@@ -66,29 +66,6 @@ def _parse_decomposer_decision(text: str, has_candidate: bool):
     effective = "REVISE" if forced_revise else requested
     return requested, effective, format_valid, forced_revise
 
-
-def _extract_local_result_values(text: str) -> List[str]:
-    if not isinstance(text, str):
-        return []
-
-    return [
-        match.strip()
-        for match in re.findall(r"(?im)^\s*LOCAL[_ ]RESULT\s*:\s*(.+?)\s*$", text)
-        if match.strip()
-    ]
-
-
-def _final_uses_worker_local_result(final_output: str, completed_results: List[Tuple[str, str, str, str]]) -> bool:
-    if not isinstance(final_output, str) or not final_output.strip():
-        return False
-
-    normalized_final = " ".join(final_output.lower().split())
-    for _, _, _, worker_output in completed_results:
-        for local_result in _extract_local_result_values(worker_output):
-            normalized_result = " ".join(local_result.lower().split())
-            if normalized_result and normalized_result in normalized_final:
-                return True
-    return False
 
 def _pad_history(input_historys: List[List[Dict[str, str]]],
                  max_length: int,
@@ -1046,18 +1023,28 @@ class MultiAgentRollout:
         subtasks: List[Tuple[str, str]],
         stage_roles: List[str],
         default_worker: str,
+        terminal_worker_as_answer: bool = False,
     ) -> Tuple[
         List[Tuple[str, str]],
         List[Tuple[str, str, List[Tuple[str, str]]]],
     ]:
-        """Map each planned subtask to one worker and keep the final stage fixed."""
-        if len(stage_roles) < 2:
+        """Map a variable-length sequential plan onto fixed tensor roles."""
+        minimum_stage_count = 1 if terminal_worker_as_answer else 2
+        if len(stage_roles) < minimum_stage_count:
             raise ValueError(
                 "routing_mode=sequential_plan requires at least one worker "
-                "stage followed by one final stage"
+                + (
+                    "stage"
+                    if terminal_worker_as_answer
+                    else "stage followed by one final stage"
+                )
             )
 
-        worker_stage_capacity = len(stage_roles) - 1
+        worker_stage_capacity = (
+            len(stage_roles)
+            if terminal_worker_as_answer
+            else len(stage_roles) - 1
+        )
         descriptions = [
             description.strip()
             for _, description in subtasks[:worker_stage_capacity]
@@ -1073,11 +1060,19 @@ class MultiAgentRollout:
             (f"S{subtask_idx + 1}", description)
             for subtask_idx, description in enumerate(descriptions)
         ]
-        ordered_stages = [
-            (stage_roles[subtask_idx], default_worker, [subtask])
-            for subtask_idx, subtask in enumerate(normalized_subtasks)
-        ]
-        ordered_stages.append((stage_roles[-1], default_worker, []))
+        if terminal_worker_as_answer:
+            ordered_stages = [
+                (stage_roles[subtask_idx], default_worker, [subtask])
+                for subtask_idx, subtask in enumerate(normalized_subtasks)
+            ]
+        else:
+            ordered_stages = [
+                (stage_roles[subtask_idx], default_worker, [subtask])
+                for subtask_idx, subtask in enumerate(normalized_subtasks[:-1])
+            ]
+            ordered_stages.append(
+                (stage_roles[-1], default_worker, [normalized_subtasks[-1]])
+            )
         return normalized_subtasks, ordered_stages
 
     @staticmethod
@@ -1089,11 +1084,7 @@ class MultiAgentRollout:
             f"- {subtask_id} -> {default_worker}"
             for subtask_id, _ in (subtasks or [("S1", ""), ("S2", "")])
         ]
-        return "\n".join([
-            "ASSIGNMENTS:",
-            *assignment_lines,
-            f"- FINAL -> {default_worker}",
-        ])
+        return "\n".join(["ASSIGNMENTS:", *assignment_lines])
 
     @staticmethod
     def _format_worker_specs(worker_specs: Dict[str, str], worker_roles: List[str]) -> str:
@@ -1139,13 +1130,18 @@ class MultiAgentRollout:
             return ""
         return "PREVIOUS LOCAL RESULTS:\n" + "\n".join(sections)
 
-    @staticmethod
-    def _format_worker_results_for_final(completed_results: List[Tuple[str, str, str, str]]) -> str:
-        sections = [
-            f"{stage_role} as {worker_type} ({subtask_ids}):\n{output.strip()}"
-            for stage_role, worker_type, subtask_ids, output in completed_results
-            if output and output.strip()
-        ]
+    @classmethod
+    def _format_worker_results_for_final(
+        cls,
+        completed_results: List[Tuple[str, str, str, str]],
+    ) -> str:
+        sections = []
+        for _, _, subtask_ids, output in completed_results:
+            local_result = cls._extract_local_result(output)
+            if not local_result:
+                continue
+            label = subtask_ids or "previous subtask"
+            sections.append(f"{label} LOCAL_RESULT: {local_result}")
         if not sections:
             return ""
         return "WORKER RESULTS:\n" + "\n\n".join(sections)
@@ -1174,10 +1170,15 @@ class MultiAgentRollout:
         sections = []
         parsed_plan = self._format_subtasks(subtasks)
         if parsed_plan:
-            sections.append(f"PARSED PLAN:\n{parsed_plan}")
-        worker_results = self._format_worker_results_for_final(completed_results)
-        if worker_results:
-            sections.append(worker_results)
+            sections.append(f"PLAN:\n{parsed_plan}")
+        worker_sections = []
+        for stage_role, _, subtask_ids, output in completed_results:
+            if not output or not output.strip():
+                continue
+            label = subtask_ids or stage_role
+            worker_sections.append(f"{label}:\n{output.strip()}")
+        if worker_sections:
+            sections.append("WORK SO FAR:\n" + "\n\n".join(worker_sections))
         return "\n\n".join(sections)
 
     @staticmethod
@@ -1351,10 +1352,18 @@ class MultiAgentRollout:
                 f"worker_stage_{idx}"
                 for idx in range(1, int(hierarchy_config.get("num_worker_stages", 0)) + 1)
             ] or worker_types
+        terminal_worker_as_answer = bool(
+            hierarchy_config.get("terminal_worker_as_answer", False)
+        )
         max_planned_subtasks = int(
             hierarchy_config.get(
                 "max_planned_subtasks",
-                max(len(stage_roles) - 1, 1),
+                max(
+                    len(stage_roles)
+                    if terminal_worker_as_answer
+                    else len(stage_roles) - 1,
+                    1,
+                ),
             )
         )
         default_worker = hierarchy_config.get("default_worker", worker_types[-1] if worker_types else selector_role)
@@ -1496,6 +1505,7 @@ class MultiAgentRollout:
         c3_action_records = [None for _ in range(batch_size)]
         candidate_outputs = ["" for _ in range(batch_size)]
         candidate_source_turn = [-1 for _ in range(batch_size)]
+        terminal_stage_roles = ["" for _ in range(batch_size)]
         accepted = [False for _ in range(batch_size)]
         decision_valid = [True for _ in range(batch_size)]
         round_attempted = [
@@ -1775,6 +1785,7 @@ class MultiAgentRollout:
                             subtasks,
                             stage_roles,
                             default_worker,
+                            terminal_worker_as_answer=terminal_worker_as_answer,
                         )
                     ordered_stages_by_idx[idx] = ordered_stages
                 parsed_subtasks[idx] = subtasks
@@ -1859,6 +1870,11 @@ class MultiAgentRollout:
                                 (final_stage_role, default_worker, [])
                             )
 
+            for idx in revise_indices:
+                ordered_stages = ordered_stages_by_idx.get(idx, [])
+                if ordered_stages:
+                    terminal_stage_roles[idx] = ordered_stages[-1][0]
+
             # 3. Execute selected worker stages sequentially. Stage roles encode
             # the order; each later worker sees previous results.
             worker_results = {idx: {role: "" for role in stage_roles} for idx in revise_indices}
@@ -1893,13 +1909,24 @@ class MultiAgentRollout:
                         _, worker_type, assigned_subtasks = ordered_stages_by_idx[idx][stage_idx]
                         stage_subtasks_by_idx[idx] = assigned_subtasks
                         worker_type_by_idx[idx] = worker_type
-                        is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
-                        if is_final_stage:
+                        is_terminal_stage = (
+                            stage_idx == len(ordered_stages_by_idx[idx]) - 1
+                        )
+                        is_finalizer_stage = (
+                            is_terminal_stage and not terminal_worker_as_answer
+                        )
+                        if is_finalizer_stage:
                             question_block = self._format_final_question_block(
                                 questions[idx],
                                 final_context_mode,
                             )
-                        elif worker_question_visible[idx]:
+                        elif (
+                            worker_question_visible[idx]
+                            and not (
+                                is_terminal_stage
+                                and terminal_worker_as_answer
+                            )
+                        ):
                             question_block = (
                                 f"Reference problem:\n{questions[idx]}\n\n"
                                 "Use the reference problem only to recover facts needed for the assigned subtask.\n\n"
@@ -1909,7 +1936,7 @@ class MultiAgentRollout:
                                 "The assigned subtask is your task context and should contain the needed facts. "
                                 "Use previous LOCAL_RESULTs when they help.\n\n"
                             )
-                        if is_final_stage:
+                        if is_finalizer_stage:
                             if final_context_mode in {"worker_results_only", "workers_only", "local_results_only"}:
                                 work_so_far = self._format_worker_results_for_final(
                                     completed_results_by_idx[idx]
@@ -1932,11 +1959,14 @@ class MultiAgentRollout:
                                 completed_results_by_idx[idx]
                             )
                         assigned_subtasks_text = self._format_subtasks(assigned_subtasks)
-                        if is_final_stage:
+                        if is_finalizer_stage:
                             stage_instruction = (
-                                "Synthesize the final answer from the plan and worker results. "
-                                "Reconcile their conclusions and repair only local inconsistencies needed for synthesis. "
-                                "End with the final answer in \\boxed{}."
+                                "Complete the assigned terminal subtask using the previous LOCAL_RESULTs. "
+                                "Reason through the calculation required by this subtask without reconstructing "
+                                "an unseen original problem. Return the requested terminal result in the exact form:\n"
+                                "REASONING:\n"
+                                "<step-by-step reasoning for the terminal subtask>\n\n"
+                                "LOCAL_RESULT: \\boxed{<answer to the terminal subtask>}"
                             )
                         else:
                             role_instruction = "Work on the assigned subtask above. "
@@ -1956,14 +1986,14 @@ class MultiAgentRollout:
                                 "<step-by-step reasoning for this subtask>\n\n"
                                 "LOCAL_RESULT: \\boxed{<useful result of this subtask>}"
                             )
-                        if is_final_stage and not assigned_subtasks_text:
-                            assigned_subtasks_text = (
-                                "- Use the work above to synthesize the final answer."
+                        if is_terminal_stage and not assigned_subtasks_text:
+                            raise ValueError(
+                                "The terminal worker must receive the last planned subtask"
                             )
                         work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ""
                         dependency_instruction = (
                             "Use the PREVIOUS LOCAL RESULTS when the current task depends on them.\n\n"
-                            if work_so_far and not is_final_stage else ""
+                            if work_so_far and not is_finalizer_stage else ""
                         )
                         chat = build_selected_worker_prompt(
                             stage_role,
@@ -1976,7 +2006,7 @@ class MultiAgentRollout:
                                 f"CURRENT TASK:\n{assigned_subtasks_text}\n\n"
                                 f"{stage_instruction}\n\n"
                             ),
-                            system_prompts.get("finalizer") if is_final_stage else None,
+                            system_prompts.get("finalizer") if is_finalizer_stage else None,
                         )
                         worker_chats_by_idx[idx] = chat
                     stage_records = self._generate_from_hierarchical_chat_map(
@@ -1988,7 +2018,7 @@ class MultiAgentRollout:
                         response_length,
                         max_new_tokens=(
                             final_max_new_tokens
-                            if all(
+                            if not terminal_worker_as_answer and all(
                                 stage_idx == len(ordered_stages_by_idx[idx]) - 1
                                 for idx in stage_indices
                             )
@@ -2024,12 +2054,13 @@ class MultiAgentRollout:
                             [subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]],
                         )
                         subtask_ids = ", ".join([subtask_id for subtask_id, _ in stage_subtasks_by_idx[idx]])
-                        previous_completed_results = list(completed_results_by_idx[idx])
                         completed_results_by_idx[idx].append((stage_role, worker_type_by_idx[idx], subtask_ids, output))
 
                         latest_outputs[idx] = output
-                        is_final_stage = stage_idx == len(ordered_stages_by_idx[idx]) - 1
-                        if is_final_stage:
+                        is_terminal_stage = (
+                            stage_idx == len(ordered_stages_by_idx[idx]) - 1
+                        )
+                        if is_terminal_stage:
                             candidate_outputs[idx] = output
                             candidate_source_turn[idx] = i_turn
                             round_attempted[idx][i_turn] = True
@@ -2042,7 +2073,6 @@ class MultiAgentRollout:
                                 (not c3_active or i_turn >= c3_branch_turn)
                                 and
                                 _has_usable_final_boxed_answer(output)
-                                and _final_uses_worker_local_result(output, previous_completed_results)
                             ):
                                 finish_flags[idx] = True
                                 finish_reason[idx] = "final_boxed_answer"
@@ -2099,6 +2129,7 @@ class MultiAgentRollout:
             "candidate_source_turn": candidate_source_turn,
             "decision_valid": decision_valid,
             "round_attempted": round_attempted,
+            "terminal_stage_roles": terminal_stage_roles,
         }
         return latest_outputs, conversation_history, c3_action_records, protocol_state
 
@@ -2343,6 +2374,30 @@ class MultiAgentRollout:
 
         return tensor_dict
 
+    @staticmethod
+    def _select_scoring_outputs(
+        latest_outputs: List[str],
+        history: List[List[Dict[str, str]]],
+        hierarchy_config: Dict,
+    ) -> List[str]:
+        if hierarchy_config.get("terminal_worker_as_answer", False):
+            return latest_outputs
+
+        score_role = hierarchy_config.get("score_role")
+        if not score_role:
+            return latest_outputs
+        return [
+            next(
+                (
+                    msg.get("content", "")
+                    for msg in reversed(sample_history)
+                    if isinstance(msg, dict) and msg.get("role") == score_role
+                ),
+                output,
+            )
+            for sample_history, output in zip(history, latest_outputs)
+        ]
+
     def _prepare_final_output(
         self,
         tensor_dict: Dict[str, Dict[str, torch.Tensor]],
@@ -2361,19 +2416,11 @@ class MultiAgentRollout:
         non_tensor_batch = prompts.non_tensor_batch
         hierarchy_config = prompts.meta_info.get("hierarchy", {})
         if hierarchy_config.get("enable", False):
-            score_role = hierarchy_config.get("score_role")
-            if score_role:
-                latest_outputs = [
-                    next(
-                        (
-                            msg.get("content", "")
-                            for msg in reversed(sample_history)
-                            if isinstance(msg, dict) and msg.get("role") == score_role
-                        ),
-                        output,
-                    )
-                    for sample_history, output in zip(history, latest_outputs)
-                ]
+            latest_outputs = self._select_scoring_outputs(
+                latest_outputs,
+                history,
+                hierarchy_config,
+            )
         non_tensor_batch["finish_reason"] = finish_reason
         non_tensor_batch["num_turns"] = [
             len(h) // len(agent_roles) for h in history
@@ -2402,6 +2449,13 @@ class MultiAgentRollout:
                 for values in protocol_state.get("round_attempted", [])
             ]
             non_tensor_batch["round_attempted"] = round_attempted
+            non_tensor_batch["terminal_stage_role"] = np.asarray(
+                protocol_state.get(
+                    "terminal_stage_roles",
+                    [""] * len(history),
+                ),
+                dtype=object,
+            )
 
         for role in agent_roles:
             role_action_token_ids = np.empty(len(history), dtype=object)
@@ -2451,8 +2505,8 @@ class MultiAgentRollout:
                 for record in c3_action_records
             ], dtype=object)
 
-        # Keep raw sampled token ids out of the verbose public history. CPCR
-        # receives them through the dedicated per-role arrays above.
+        # Keep raw sampled token ids out of the verbose public history. C3 uses
+        # the dedicated focal-action arrays above.
         clean_history = [
             [
                 {key: value for key, value in message.items() if key != "token_ids"}

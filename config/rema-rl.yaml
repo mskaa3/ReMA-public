@@ -5,7 +5,7 @@ data:
   val_files: /root/tmpdir/overall_math/test.parquet
   prompt_key: question
   reward_fn_key: data_source
-  max_prompt_length: 4096
+  max_prompt_length: 6144
   max_response_length: 1024
   train_batch_size: 48
   val_batch_size: 64
@@ -250,6 +250,9 @@ algorithm:
     model_paths:
       - ${actor_rollout_ref.model.path}
       - ${actor_rollout_ref.model.path}
+    model_use_remove_padding:
+      - ${actor_rollout_ref.model.use_remove_padding}
+      - ${actor_rollout_ref.model.use_remove_padding}
   hierarchy:
     enable: True
     decomposer_role: decomposer
@@ -258,6 +261,9 @@ algorithm:
     # Capacity for up to four subtask workers followed by one fixed final stage.
     num_worker_stages: 5
     max_planned_subtasks: 4
+    # When enabled, S1..SN map directly to worker stages 1..N and worker N's
+    # boxed LOCAL_RESULT is the system answer. No separate finalizer is run.
+    terminal_worker_as_answer: False
     # Skip selector generation: planned S1..SN map positionally to stages 1..N;
     # unused worker slots stay masked and the final answer always maps to stage 5.
     routing_mode: sequential_plan
@@ -272,8 +278,9 @@ algorithm:
     # The planner chooses the smallest useful number of dependent subtasks from
     # one to four. A malformed empty plan falls back to one task.
     decomposer_max_new_tokens: 512
-    # Local stages produce checkable work; the final stage has room to synthesize it.
-    worker_max_new_tokens: 512
+    # Local stages have enough room to complete their reasoning and still emit
+    # the terminal LOCAL_RESULT required by downstream stages.
+    worker_max_new_tokens: 1024
     final_max_new_tokens: 896
     # Three-phase distillation from a frozen serial solver. Disabled for the
     # original ReMA runs and enabled only by the Agent 1/2 curriculum launcher.
@@ -295,6 +302,7 @@ algorithm:
       # to execute plans extracted from serial attempts. Every retained attempt
       # forms a separate prompt group.
       worker_bootstrap_steps: 200
+      worker_question_bootstrap_probability: 1.0
       # Phase 2: freeze workers and linearly drop the teacher-attempt context
       # while optimizing the decomposer through downstream correctness.
       decomposer_transfer_steps: 200
@@ -308,152 +316,27 @@ algorithm:
     # This experiment uses one complete trajectory rather than repair rounds.
     accept_revise:
       enable: False
-    # Retained for manual diagnostic scores only. Scoped C3 optimizes raw acc
-    # directly and reports manual_role_rewards_used=0.
+    # Legacy manual-reward setting. Scoped C3 ignores the resulting role scores
+    # and consumes only terminal accuracy.
     final_raw_score_usage_floor: 0.5
     # Exact fixed-prefix credit. Rollouts for one UID branch at the currently
     # trained role and independently generate the complete remaining suffix.
-    # Non-final worker positives additionally pass the stitched TSS gate.
     scoped_c3_grpo:
       enable: True
       # The single round is indexed as turn 0.
       branch_turn: 0
       mixed_groups_only: True
       normalize_advantages: True
-      scope_threshold: 0.0
-      # Every non-final worker is compared against solving the complete task,
-      # doing another planned subtask, and (from W2 onward) losing prior results.
-      sequential_full_task_contrast: True
-      sequential_identity_contrast: True
-      sequential_dependency_contrast: True
-      contrast_plan_subtasks: True
-      # Rotate one alternative subtask per rollout to control teacher-forcing cost.
-      max_wrong_subtask_contrasts: 1
       normalization_epsilon: 1.0e-6
-      teacher_forcing_micro_batch_size_per_gpu: 4
-    # Legacy CPCR/TSS direct-credit ablation.
-    direct_scoped_grpo:
-      enable: False
-      scope_threshold: 0.0
-      normalization_epsilon: 1.0e-6
-    # Cross-prefix credit from existing rollout groups. The implementation
-    # transports the full suffix from the credited role through the final stage
-    # and scores every reused action with teacher forcing; it performs no decoding.
-    cpcr:
-      enable: False
-      # Direct mode supplies role-local scores to GRPO without a learned mixer.
-      mode: direct_scoped_grpo
-      estimator: full_suffix
-      outcome_mode: candidate_factual
-      roles: current
-      prd_loss_weight: 1.0
-      prd_huber_delta: 1.0
-      # The legacy feature-distance counterfactual loss is disabled when CPCR
-      # supervises PRD unless this ablation flag is enabled.
-      combine_with_implicit_cf: False
-      # Cost controls. Set a limit to 0 for all groups/candidates.
-      # Score every N visits of each trained role, not every N global steps;
-      # this avoids aliasing with round-robin role switching.
-      score_interval: 1
-      mixed_groups_only: True
-      max_groups_per_step: 2
-      max_candidates_per_group: 4
-      # CPCR/TSS sequences have highly variable lengths. Score one fixed
-      # microbatch per rank and RPC so every FSDP rank runs identical collectives.
-      teacher_forcing_micro_batch_size_per_gpu: 2
-      min_effective_sample_size: 2.0
-      # A low-ESS group falls back to uniform LOO over the available support
-      # for diagnostics, but that fallback is not a PRD target by default.
-      use_fallback_targets: False
-      log_weight_clip: 20.0
-      fallback: group_loo
-    reward_composer:
-      enable: False
-      checkpoint_path: null
-      # Blend learned PRD rewards with the current manual role rewards:
-      # role_reward = (1 - alpha) * manual_reward + alpha * prd_reward.
-      blend_alpha: 0.0
-      # Keep False for learned PRD experiments; True is only useful for
-      # debugging imitation because it exposes manual role rewards as inputs.
-      use_manual_role_features: False
-      # Optional offline-training export. When set, reward manager appends one
-      # JSONL record per scored sample with reward_sources and manual role_scores.
-      export_jsonl_path: null
-      export_jsonl_max_records: null
-      # Optional graph prior for learned PRD routing. "soft" biases credit to
-      # flow along decomposer -> selector -> workers -> final while still
-      # allowing non-obvious cross-role signals. "hard" masks reverse links.
-      graph_prior_mode: soft
-      graph_prior_soft_distance_penalty: 1.0
-      graph_prior_reverse_distance_penalty: 3.0
-      online:
+      # Isolated-message leakage gate. It uses the model assigned to the
+      # decomposer as a greedy solver and never sees the original question.
+      prefix_probe:
         enable: False
-        # "source" keeps the original source-to-role composer.
-        # "role" uses the experimental role-to-role credit router.
-        model_type: role
-        # CPCR is the sole teacher. Reliable labels are replayed to amortize
-        # expensive full-suffix scoring; global correctness ranking is diagnostic.
-        training_objective: cpcr_replay
-        init_checkpoint_path: null
-        lr: 3.0e-4
-        weight_decay: 0.0
-        hidden_dim: 128
-        source_embed_dim: 32
-        global_context_dim: null
-        # Null chooses a safe default: softmax for role router, sigmoid for source composer.
-        routing_activation: null
-        routing_floor: 0.05
-        # A binary global reward gives CPCR advantages in [-1, 1].
-        score_activation: tanh
-        # Legacy activity-only ranking. Keep disabled when matched implicit
-        # counterfactual supervision is active.
-        role_rank_loss_weight: 0.0
-        role_activity_margin: 0.05
-        role_rank_temperature: 1.0
-        # Legacy feature-distance counterfactual objective, retained only for
-        # ablations. The cpcr_replay objective does not execute this branch.
-        implicit_cf_loss_weight: 0.0
-        implicit_cf_role_distance_margin: 0.05
-        implicit_cf_huber_delta: 1.0
-        warmup_steps: 150
-        blend_alpha: 0.05
-        blend_alpha_max: 0.05
-        blend_ramp_steps: 200
-        min_group_size: 2
-        mixed_groups_only: True
-        # Update the lagged reward network after every PRD optimizer step.
-        sync_interval: 1
-        ema_beta: 0.9
-        cpcr_replay:
-          capacity: 8192
-          max_age_steps: 500
-          batch_size: 256
-          min_train_size: 64
-          min_size_for_blend: 64
-          # Replay rows from one probe are correlated. Train and blend only
-          # after enough independently selected problem-role probes exist.
-          min_unique_train_probe_groups_for_training: 20
-          min_unique_train_probe_groups_for_blend: 50
-          min_train_records_per_role_for_blend: 20
-          min_train_probe_groups_per_role_for_blend: 2
-          min_validation_records_per_role_for_blend: 8
-          min_validation_probe_groups_per_role_for_blend: 1
-          # Hold out complete role-probes periodically for every role. This
-          # prevents a random problem hash from starving selector/final credit
-          # validation while keeping correlated rollout rows in one split.
-          validation_split_mode: role_probe_stratified
-          validation_fraction: 0.2
-          validation_min_size: 32
-          validation_batch_size: 512
-          validation_quality_ema_beta: 0.9
-          min_validation_correlation_for_blend: 0.10
-          min_validation_sign_accuracy_for_blend: 0.55
-          balance_roles: True
-        grad_clip: 1.0
-        use_manual_role_features: False
-        graph_prior_mode: soft
-        graph_prior_soft_distance_penalty: 1.0
-        graph_prior_reverse_distance_penalty: 3.0
+        solver_role: decomposer
+        max_new_tokens: 256
+        system_prompt: >-
+          Determine the final mathematical answer from the provided
+          information. Show concise reasoning and end with \boxed{}.
     worker_specs:
       general_math_worker: fallback mathematical reasoning and synthesis support
     train_agent_roles: [decomposer, worker_stage_1, worker_stage_2, worker_stage_3, worker_stage_4, worker_stage_5]

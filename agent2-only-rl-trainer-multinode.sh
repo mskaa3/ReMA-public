@@ -23,10 +23,21 @@ if [[ ! -f "${CURRICULUM_SCRIPT}" ]]; then
 fi
 
 # Keep the complete run in worker bootstrap. Agent 1 generates plans from the
-# Agent 0 attempts, while only the shared worker/final model is optimized.
+# Agent 0 attempts, while only the shared worker model is optimized. The last
+# planned worker is terminal and its boxed LOCAL_RESULT is scored directly.
+# Non-terminal workers see the question; the terminal worker is hard-blocked
+# from it in the rollout builder and must use routed LOCAL_RESULTs.
 export TRAIN_DECOMPOSER=false
-export TRAIN_AGENT_ROLES='[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4,worker_stage_5]'
+export TRAIN_AGENT_ROLES='[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4]'
+export TERMINAL_WORKER_AS_ANSWER=true
+export NUM_WORKER_STAGES=4
+export MAX_PLANNED_SUBTASKS=4
+export PREFIX_PROBE_ENABLE=true
+export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-800}
+export WORKER_QUESTION_BOOTSTRAP_PROBABILITY=1.0
+export WORKER_QUESTION_FINAL_PROBABILITY=1.0
+export WORKER_QUESTION_EVAL_PROBABILITY=1.0
 export DECOMPOSER_TRANSFER_STEPS=0
 export WORKER_QUESTION_FADE_STEPS=0
 export JOINT_STEPS=0

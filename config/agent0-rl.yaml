@@ -20,11 +20,11 @@ data:
 actor_rollout_ref:
   hybrid_engine: true
   model:
-    path: Qwen/Qwen2.5-1.5B-Instruct
+    path: microsoft/Phi-4-mini-reasoning
     external_lib: null
     override_config: {}
     enable_gradient_checkpointing: true
-    use_remove_padding: true
+    use_remove_padding: false
   actor:
     strategy: fsdp
     # Use one PPO update per full batch of 48 mixed prompt groups. Splitting

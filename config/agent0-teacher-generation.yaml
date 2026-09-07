@@ -15,7 +15,7 @@ data:
   max_examples: null
 
 model:
-  path: Qwen/Qwen2.5-1.5B-Instruct
+  path: microsoft/Phi-4-mini-reasoning
   external_lib: null
 
 rollout:
