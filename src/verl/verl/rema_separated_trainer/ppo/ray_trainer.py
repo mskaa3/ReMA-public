@@ -1309,8 +1309,7 @@ class RayReMASeparatedTrainer(object):
             metrics,
         )
 
-    @staticmethod
-    def _update_prefix_probe_batch_metrics(data_batch, metrics):
+    def _update_prefix_probe_batch_metrics(self, data_batch, metrics):
         """Report leakage gates for the trajectories retained for training."""
 
         metric_prefix = 'reward/prefix_probe/retained'
@@ -1354,6 +1353,35 @@ class RayReMASeparatedTrainer(object):
                 metrics[f'{metric_prefix}/{source_kind}/leakage_rate'] = float(
                     (values[measured] > 0.0).mean()
                 )
+
+        def format_rate(name):
+            value = metrics.get(f'{metric_prefix}/{name}')
+            return 'n/a' if value is None else f'{float(value):.3f}'
+
+        def format_leakage(source_kind):
+            count = int(metrics.get(
+                f'{metric_prefix}/{source_kind}/measured_count',
+                0.0,
+            ))
+            leakage = format_rate(f'{source_kind}/leakage_rate')
+            return f'{source_kind}={leakage}(n={count})'
+
+        print(
+            ' '.join([
+                '[prefix-probe]',
+                f'step={self.global_steps}',
+                f'role={self._current_train_agent}',
+                f'raw={format_rate("raw_outcome_mean")}',
+                f'gated={format_rate("gated_outcome_mean")}',
+                f'removed_positive={format_rate("removed_positive_rate")}',
+                f'gate_valid={format_rate("gate_valid_rate")}',
+                f'upstream_clean={format_rate("upstream_clean_rate")}',
+                format_leakage('decomposer'),
+                format_leakage('nonterminal_worker'),
+                format_leakage('upstream_worker'),
+            ]),
+            flush=True,
+        )
 
     @staticmethod
     def _unpad_role_messages(messages):
