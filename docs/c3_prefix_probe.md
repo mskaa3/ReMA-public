@@ -20,8 +20,8 @@ The raw score remains a diagnostic measure of terminal correctness.
 For decomposer actions, give only the generated plan to an answer probe. For
 non-terminal worker actions, give only that worker's message. The probe sees no
 original question, prior messages, other worker results, or teacher solution.
-It must either return one boxed final answer or declare the information
-insufficient.
+It must return one boxed final answer, using `\\boxed{UNKNOWN}` when the
+information is insufficient.
 
 ```text
 probe_input[r,k] = focal_message[r,k]
@@ -56,6 +56,13 @@ L = clip((p_matched - p_shuffled) / (1 - p_shuffled + eps), 0, 1)
 
 Multiple short probe samples could provide a lower-variance estimate when
 compute permits, but the current probe deliberately uses one greedy answer.
+
+A probe measurement is valid only when the receiver emits a non-empty,
+balanced `\\boxed{...}` answer. Empty, truncated, and malformed
+responses are not interpreted as evidence of a clean message. They invalidate
+the affected C3 sample (fail closed). A missing upstream worker is tracked
+separately and remains a valid case. The default generation budget remains 256
+tokens; health metrics expose whether that budget causes truncation.
 
 ## Optimization objective
 
@@ -104,10 +111,11 @@ Leakage metrics use `reward/leakage/all` before group filtering and
 - `raw_accuracy`, `gated_accuracy`, and `removed_correct_rate`,
 - `trajectory_count`, used to aggregate multiple generated chunks correctly,
 - `gate_valid_rate` and `upstream_clean_rate`,
-- `decomposer/{count,rate}`,
-- `focal_worker/{count,rate}`,
-- `upstream_workers/{count,rate}`,
-- `roles/<role>/{count,rate}` for the unfiltered role-specific view.
+- `decomposer/{count,rate,valid_rate,nonempty_rate,length_stop_rate}`,
+- `focal_worker/{count,rate,valid_rate,nonempty_rate,length_stop_rate}`,
+- `upstream_workers/{count,rate,valid_rate,nonempty_rate,length_stop_rate}`,
+- `roles/<role>/{count,rate,valid_rate,nonempty_rate,length_stop_rate}` for
+  the unfiltered role-specific view.
 
 C3 metrics use `reward/c3/roles/<role>`:
 
@@ -122,7 +130,10 @@ Rollout filtering keeps only `rollout/c3/generation_batches`,
 
 The console emits one `[leakage/all]` line after probing, one
 `[leakage/train]` line after filtering, and one `[c3]` line after constructing
-the role-local advantages. Per-trajectory probe responses remain available in
+the role-local advantages. Leakage `rate` is conditional on valid probe
+answers, while `valid_rate` reports coverage. A bounded number of malformed
+responses is printed as `[prefix_probe/invalid]` diagnostics. Per-trajectory
+probe responses remain available in
 the replay JSONL when `trainer.save_train_generations=True`.
 Validation continues to report raw `val/acc/*`; online leakage probes are run
 only for training trajectories.

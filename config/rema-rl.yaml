@@ -331,9 +331,12 @@ algorithm:
         enable: False
         solver_role: decomposer
         max_new_tokens: 256
+        diagnostic_samples: 2
         system_prompt: >-
-          Determine the final mathematical answer from the provided
-          information. Show concise reasoning and end with \boxed{}.
+          Infer and solve the mathematical task recoverable from the provided
+          information. Do not ask for more context. Show concise reasoning and
+          always end with exactly one non-empty, complete \boxed{...}. If the
+          requested answer cannot be inferred, end with \boxed{UNKNOWN}.
     worker_specs:
       general_math_worker: fallback mathematical reasoning and synthesis support
     train_agent_roles: [decomposer, worker_stage_1, worker_stage_2, worker_stage_3, worker_stage_4, worker_stage_5]

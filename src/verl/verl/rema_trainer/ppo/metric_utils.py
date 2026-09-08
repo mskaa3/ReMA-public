@@ -135,12 +135,21 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     )
 
 
+def _compute_sequence_score_and_reward(batch: DataProto):
+    """Read legacy turn rewards or scoped token rewards for logging."""
+
+    if 'turn_level_reward' in batch.batch:
+        sequence_reward = batch.batch['turn_level_reward'].sum(-1)
+        return sequence_reward, sequence_reward
+    return (
+        batch.batch['token_level_scores'].sum(-1),
+        batch.batch['token_level_rewards'].sum(-1),
+    )
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
     # TODO: add response length
-    # sequence_score = batch.batch['token_level_scores'].sum(-1)
-    # sequence_reward = batch.batch['token_level_rewards'].sum(-1)
-    sequence_score = batch.batch['turn_level_reward'].sum(-1)
-    sequence_reward = batch.batch['turn_level_reward'].sum(-1)
+    sequence_score, sequence_reward = _compute_sequence_score_and_reward(batch)
     num_turns = batch.batch['num_turns'].to(torch.float32)
 
     advantages = batch.batch['advantages']

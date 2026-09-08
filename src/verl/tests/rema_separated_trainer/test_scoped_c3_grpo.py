@@ -12,6 +12,11 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
 from verl.rema_separated_trainer.ppo.prefix_probe import (
     apply_prefix_probe_gate,
     collect_prefix_probe_requests,
+    extract_complete_boxed_answer,
+    has_complete_boxed_answer,
+)
+from verl.rema_trainer.ppo.metric_utils import (
+    _compute_sequence_score_and_reward,
 )
 
 
@@ -113,6 +118,20 @@ def test_prefix_probe_collects_only_workers_upstream_of_terminal():
     ]
 
 
+def test_prefix_probe_requires_nonempty_complete_box():
+    assert has_complete_boxed_answer(r"Reasoning. \boxed{\frac{13}{8}}")
+    assert has_complete_boxed_answer(r"Result: \boxed{(3, \frac{\pi}{2})}")
+    assert extract_complete_boxed_answer(
+        r"Result: \boxed{\frac{13}{8}}"
+    ) == r"\frac{13}{8}"
+    assert not has_complete_boxed_answer("")
+    assert not has_complete_boxed_answer(r"Reasoning without a final answer")
+    assert not has_complete_boxed_answer(r"\boxed{}")
+    assert not has_complete_boxed_answer(r"\boxed{13")
+    assert not has_complete_boxed_answer(r"\boxed{13}\boxed{broken")
+    assert not has_complete_boxed_answer(r"\fbox{13}")
+
+
 def test_prefix_probe_gate_zeros_decomposer_leakage():
     gate = apply_prefix_probe_gate(
         [1.0, 1.0, 0.0],
@@ -130,6 +149,24 @@ def test_prefix_probe_gate_zeros_decomposer_leakage():
     assert gate.valid_mask == [True, True, True]
 
 
+def test_prefix_probe_gate_rejects_unparseable_plan():
+    gate = apply_prefix_probe_gate(
+        [1.0],
+        [float("nan")],
+        [0.0],
+        [float("nan")],
+        ["worker_stage_2"],
+        focal_role="worker_stage_1",
+        decomposer_role="decomposer",
+        selector_role="selector",
+        stage_roles=["worker_stage_1", "worker_stage_2"],
+    )
+
+    assert gate.outcome_scores == [0.0]
+    assert gate.valid_mask == [False]
+    assert gate.upstream_clean_mask == [False]
+
+
 def test_prefix_probe_gate_masks_leaky_upstream_for_worker():
     gate = apply_prefix_probe_gate(
         [1.0, 1.0, 1.0],
@@ -145,6 +182,71 @@ def test_prefix_probe_gate_masks_leaky_upstream_for_worker():
 
     assert gate.outcome_scores == [1.0, 0.0, 0.0]
     assert gate.valid_mask == [True, False, True]
+
+
+def test_prefix_probe_gate_rejects_invalid_requested_upstream_probe():
+    gate = apply_prefix_probe_gate(
+        [1.0],
+        [0.0],
+        [float("nan")],
+        [float("nan")],
+        ["worker_stage_2"],
+        focal_role="worker_stage_2",
+        decomposer_role="decomposer",
+        selector_role="selector",
+        stage_roles=["worker_stage_1", "worker_stage_2"],
+        upstream_worker_requested=[True],
+        upstream_worker_valid=[False],
+    )
+
+    assert gate.outcome_scores == [0.0]
+    assert gate.valid_mask == [False]
+    assert gate.upstream_clean_mask == [False]
+
+
+def test_prefix_probe_gate_allows_absent_upstream_probe():
+    gate = apply_prefix_probe_gate(
+        [1.0],
+        [0.0],
+        [float("nan")],
+        [float("nan")],
+        ["worker_stage_2"],
+        focal_role="worker_stage_2",
+        decomposer_role="decomposer",
+        selector_role="selector",
+        stage_roles=["worker_stage_1", "worker_stage_2"],
+        upstream_worker_requested=[False],
+        upstream_worker_valid=[False],
+    )
+
+    assert gate.outcome_scores == [1.0]
+    assert gate.valid_mask == [True]
+    assert gate.upstream_clean_mask == [True]
+
+
+def test_data_metrics_fall_back_to_scoped_token_rewards():
+    batch = SimpleNamespace(batch={
+        "token_level_scores": torch.tensor([[0.0, 1.0], [0.0, 0.0]]),
+        "token_level_rewards": torch.tensor([[0.0, 0.75], [0.0, -0.25]]),
+    })
+
+    sequence_score, sequence_reward = _compute_sequence_score_and_reward(batch)
+
+    assert sequence_score.tolist() == [1.0, 0.0]
+    assert sequence_reward.tolist() == [0.75, -0.25]
+
+
+def test_data_metrics_preserve_legacy_turn_reward_behavior():
+    batch = SimpleNamespace(batch={
+        "turn_level_reward": torch.tensor([[0.25, 0.75], [0.0, 0.5]]),
+        "token_level_scores": torch.zeros(2, 2),
+        "token_level_rewards": torch.zeros(2, 2),
+    })
+
+    sequence_score, sequence_reward = _compute_sequence_score_and_reward(batch)
+
+    assert sequence_score.tolist() == [1.0, 0.5]
+    assert sequence_reward.tolist() == [1.0, 0.5]
 
 
 def test_prefix_probe_gate_exempts_terminal_worker_output():

@@ -22,6 +22,37 @@ class PrefixProbeGate:
     upstream_clean_mask: List[bool]
 
 
+def extract_complete_boxed_answer(response: str) -> Optional[str]:
+    """Return the final non-empty balanced boxed answer, if present."""
+
+    if not isinstance(response, str):
+        return None
+    marker = "\\boxed"
+    marker_index = response.rfind(marker)
+    if marker_index < 0:
+        return None
+    left_brace = response.find("{", marker_index + len(marker))
+    if left_brace < 0:
+        return None
+    depth = 0
+    for index in range(left_brace, len(response)):
+        character = response[index]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                answer = response[left_brace + 1:index].strip()
+                return answer or None
+    return None
+
+
+def has_complete_boxed_answer(response: str) -> bool:
+    """Return whether a probe response contains a non-empty complete box."""
+
+    return extract_complete_boxed_answer(response) is not None
+
+
 def apply_prefix_probe_gate(
     raw_scores: Sequence[float],
     decomposer_scores: Sequence[float],
@@ -33,6 +64,8 @@ def apply_prefix_probe_gate(
     decomposer_role: str,
     selector_role: str,
     stage_roles: Sequence[str],
+    upstream_worker_requested: Optional[Sequence[bool]] = None,
+    upstream_worker_valid: Optional[Sequence[bool]] = None,
 ) -> PrefixProbeGate:
     """Build role-local outcomes from isolated-message leakage probes.
 
@@ -51,24 +84,48 @@ def apply_prefix_probe_gate(
         and len(terminal_roles) == size
     ):
         raise ValueError("All prefix-probe gate inputs must have equal lengths")
+    if upstream_worker_requested is None:
+        upstream_worker_requested = [
+            math.isfinite(float(score)) for score in upstream_worker_scores
+        ]
+    if upstream_worker_valid is None:
+        upstream_worker_valid = [
+            math.isfinite(float(score)) for score in upstream_worker_scores
+        ]
+    if not (
+        len(upstream_worker_requested) == size
+        and len(upstream_worker_valid) == size
+    ):
+        raise ValueError("Upstream probe masks must match the score length")
 
     stage_role_set = set(stage_roles)
     outcomes = []
     valid = []
     upstream_clean = []
-    for raw, plan_score, worker_score, upstream_score, terminal_role in zip(
+    for (
+        raw,
+        plan_score,
+        worker_score,
+        upstream_score,
+        terminal_role,
+        upstream_requested,
+        upstream_valid,
+    ) in zip(
         raw_scores,
         decomposer_scores,
         worker_scores,
         upstream_worker_scores,
         terminal_roles,
+        upstream_worker_requested,
+        upstream_worker_valid,
     ):
         raw = float(raw)
         plan_available = math.isfinite(float(plan_score))
         plan_clean = plan_available and float(plan_score) <= 0.0
-        prior_workers_clean = (
-            not math.isfinite(float(upstream_score))
-            or float(upstream_score) <= 0.0
+        prior_workers_clean = not bool(upstream_requested) or (
+            bool(upstream_valid)
+            and math.isfinite(float(upstream_score))
+            and float(upstream_score) <= 0.0
         )
         clean_prefix = plan_clean and prior_workers_clean
         upstream_clean.append(clean_prefix)
