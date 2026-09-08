@@ -332,6 +332,8 @@ algorithm:
         solver_role: decomposer
         max_new_tokens: 256
         diagnostic_samples: 2
+        # Zero disables validation probes while retaining the training gate.
+        validation_max_samples: 128
         system_prompt: >-
           Infer and solve the mathematical task recoverable from the provided
           information. Do not ask for more context. Show concise reasoning and

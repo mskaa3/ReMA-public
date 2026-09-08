@@ -166,6 +166,92 @@ def apply_prefix_probe_gate(
     )
 
 
+def apply_validation_prefix_probe_gate(
+    raw_scores: Sequence[float],
+    decomposer_scores: Sequence[float],
+    worker_scores: Sequence[float],
+    worker_requested: Sequence[bool],
+    worker_valid: Sequence[bool],
+) -> PrefixProbeGate:
+    """Gate validation outcomes on clean plans and all upstream workers."""
+
+    size = len(raw_scores)
+    if not (
+        len(decomposer_scores) == size
+        and len(worker_scores) == size
+        and len(worker_requested) == size
+        and len(worker_valid) == size
+    ):
+        raise ValueError(
+            "All validation prefix-probe gate inputs must have equal lengths"
+        )
+
+    outcomes = []
+    valid = []
+    upstream_clean = []
+    for raw, plan_score, workers_score, requested, workers_are_valid in zip(
+        raw_scores,
+        decomposer_scores,
+        worker_scores,
+        worker_requested,
+        worker_valid,
+    ):
+        raw = float(raw)
+        plan_available = math.isfinite(float(plan_score))
+        plan_clean = plan_available and float(plan_score) <= 0.0
+        workers_available = not bool(requested) or (
+            bool(workers_are_valid)
+            and math.isfinite(float(workers_score))
+        )
+        workers_clean = not bool(requested) or (
+            workers_available and float(workers_score) <= 0.0
+        )
+        all_valid = plan_available and workers_available
+        clean_prefix = plan_clean and workers_clean
+
+        valid.append(all_valid)
+        upstream_clean.append(clean_prefix)
+        outcomes.append(raw if all_valid and clean_prefix else 0.0)
+
+    return PrefixProbeGate(
+        outcome_scores=outcomes,
+        valid_mask=valid,
+        upstream_clean_mask=upstream_clean,
+    )
+
+
+def select_stratified_probe_indices(
+    labels: Sequence[str],
+    max_samples: int,
+) -> List[int]:
+    """Select a deterministic round-robin sample across validation subsets."""
+
+    if max_samples <= 0 or len(labels) == 0:
+        return []
+    if len(labels) <= max_samples:
+        return list(range(len(labels)))
+
+    buckets: Dict[str, List[int]] = {}
+    for index, label in enumerate(labels):
+        buckets.setdefault(str(label), []).append(index)
+
+    selected = []
+    depth = 0
+    while len(selected) < max_samples:
+        added = False
+        for bucket in buckets.values():
+            if depth >= len(bucket):
+                continue
+            selected.append(bucket[depth])
+            added = True
+            if len(selected) == max_samples:
+                break
+        if not added:
+            break
+        depth += 1
+    return sorted(selected)
+
+
 def _latest_executed_message(
     history: Iterable[Dict],
     role: str,
@@ -186,7 +272,7 @@ def collect_prefix_probe_requests(
     histories: Sequence[Iterable[Dict]],
     terminal_roles: Sequence[str],
     *,
-    focal_role: str,
+    focal_role: Optional[str],
     decomposer_role: str,
     stage_roles: Sequence[str],
 ) -> List[PrefixProbeRequest]:
@@ -217,21 +303,20 @@ def collect_prefix_probe_requests(
                 message=plan,
             ))
 
-        if not focal_is_worker:
+        if focal_role is not None and not focal_is_worker:
             continue
 
-        focal_index = stage_index[focal_role]
         terminal_index = stage_index.get(str(terminal_role), len(stage_roles))
         for worker_role in stage_roles[:terminal_index]:
             worker_index = stage_index[worker_role]
-            if worker_index > focal_index:
+            if focal_role is not None and worker_index > stage_index[focal_role]:
                 continue
             worker_message = _latest_executed_message(history, worker_role)
             if worker_message is None:
                 continue
             source_kind = (
                 "nonterminal_worker"
-                if worker_role == focal_role
+                if focal_role is None or worker_role == focal_role
                 else "upstream_worker"
             )
             requests.append(PrefixProbeRequest(

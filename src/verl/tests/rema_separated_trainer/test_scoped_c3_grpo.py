@@ -11,9 +11,11 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
 )
 from verl.rema_separated_trainer.ppo.prefix_probe import (
     apply_prefix_probe_gate,
+    apply_validation_prefix_probe_gate,
     collect_prefix_probe_requests,
     extract_complete_boxed_answer,
     has_complete_boxed_answer,
+    select_stratified_probe_indices,
 )
 from verl.rema_trainer.ppo.metric_utils import (
     _compute_sequence_score_and_reward,
@@ -116,6 +118,54 @@ def test_prefix_probe_collects_only_workers_upstream_of_terminal():
         ("upstream_worker", "worker_stage_1", "candidate"),
         ("upstream_worker", "worker_stage_2", "check"),
     ]
+
+
+def test_validation_prefix_probe_collects_all_nonterminal_workers():
+    requests = collect_prefix_probe_requests(
+        [[
+            {"role": "decomposer", "content": "plan"},
+            {"role": "worker_stage_1", "content": "part-a"},
+            {"role": "worker_stage_2", "content": "part-b"},
+            {"role": "worker_stage_3", "content": "final"},
+        ]],
+        ["worker_stage_3"],
+        focal_role=None,
+        decomposer_role="decomposer",
+        stage_roles=[
+            "worker_stage_1",
+            "worker_stage_2",
+            "worker_stage_3",
+        ],
+    )
+
+    assert [
+        (request.source_kind, request.source_role, request.message)
+        for request in requests
+    ] == [
+        ("decomposer", "decomposer", "plan"),
+        ("nonterminal_worker", "worker_stage_1", "part-a"),
+        ("nonterminal_worker", "worker_stage_2", "part-b"),
+    ]
+
+
+def test_validation_prefix_probe_gate_requires_every_source_to_be_clean():
+    gate = apply_validation_prefix_probe_gate(
+        raw_scores=[1.0, 1.0, 1.0, 0.0],
+        decomposer_scores=[0.0, 1.0, 0.0, 0.0],
+        worker_scores=[0.0, 0.0, 1.0, float("nan")],
+        worker_requested=[True, True, True, False],
+        worker_valid=[True, True, True, False],
+    )
+
+    assert gate.outcome_scores == [1.0, 0.0, 0.0, 0.0]
+    assert gate.valid_mask == [True, True, True, True]
+    assert gate.upstream_clean_mask == [True, False, False, True]
+
+
+def test_validation_probe_sampling_is_balanced_and_deterministic():
+    labels = ["gsm8k"] * 5 + ["math"] * 3 + ["aime"] * 2
+
+    assert select_stratified_probe_indices(labels, 6) == [0, 1, 5, 6, 8, 9]
 
 
 def test_prefix_probe_requires_nonempty_complete_box():

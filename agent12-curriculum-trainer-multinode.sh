@@ -41,6 +41,7 @@ export MAX_PLANNED_SUBTASKS=${MAX_PLANNED_SUBTASKS:-4}
 export WORKER_CHECKPOINT_ROLE=${WORKER_CHECKPOINT_ROLE:-worker_stage_${NUM_WORKER_STAGES}}
 export PREFIX_PROBE_ENABLE=${PREFIX_PROBE_ENABLE:-false}
 export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}
+export PREFIX_PROBE_VALIDATION_MAX_SAMPLES=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES:-128}
 
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-200}
 export WORKER_QUESTION_BOOTSTRAP_PROBABILITY=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY:-1.0}
@@ -276,6 +277,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.enable=${PREFIX_PROBE_ENABLE} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
+  algorithm.hierarchy.scoped_c3_grpo.prefix_probe.validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES} \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
   trainer.nnodes=${SLURM_NNODES} \
   trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
@@ -648,6 +650,7 @@ max_planned_subtasks=${MAX_PLANNED_SUBTASKS}
 worker_checkpoint_role=${WORKER_CHECKPOINT_ROLE}
 prefix_probe_enable=${PREFIX_PROBE_ENABLE}
 prefix_probe_max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS}
+prefix_probe_validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
 decomposer_use_remove_padding=${DECOMPOSER_USE_REMOVE_PADDING}

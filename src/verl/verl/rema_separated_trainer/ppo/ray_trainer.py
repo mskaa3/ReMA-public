@@ -55,8 +55,10 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
 )
 from verl.rema_separated_trainer.ppo.prefix_probe import (
     apply_prefix_probe_gate,
+    apply_validation_prefix_probe_gate,
     collect_prefix_probe_requests,
     extract_complete_boxed_answer,
+    select_stratified_probe_indices,
 )
 
 
@@ -979,6 +981,12 @@ class RayReMASeparatedTrainer(object):
             raise ValueError(
                 "Prefix-probe diagnostic_samples must be non-negative"
             )
+        if int(
+            self.prefix_probe_config.get('validation_max_samples', 128)
+        ) < 0:
+            raise ValueError(
+                "Prefix-probe validation_max_samples must be non-negative"
+            )
 
     @staticmethod
     def _prefix_probe_context_key(message, data_source, ground_truth, extra_info):
@@ -1034,7 +1042,13 @@ class RayReMASeparatedTrainer(object):
         )
         rollout.enter_generate_context(padded_dummy_batch)
         try:
-            outputs, num_gen_tokens, stop_reasons, _, _ = (
+            (
+                outputs,
+                num_gen_tokens,
+                stop_reasons,
+                _,
+                output_token_ids,
+            ) = (
                 self.multi_agent_rollout._generate_from_chat_list(
                     solver_role,
                     chats,
@@ -1050,6 +1064,19 @@ class RayReMASeparatedTrainer(object):
             )
         finally:
             rollout.exit_generate_context(padded_dummy_batch)
+
+        # Validation-style vLLM calls may return token ids while leaving
+        # ``RequestOutput.text`` empty when detokenization is disabled.
+        decoded_outputs = tokenizer.batch_decode(
+            output_token_ids,
+            skip_special_tokens=True,
+        )
+        outputs = [
+            output
+            if isinstance(output, str) and output.strip()
+            else decoded_output
+            for output, decoded_output in zip(outputs, decoded_outputs)
+        ]
         return outputs, num_gen_tokens, stop_reasons
 
     def _attach_prefix_probe_gate(
@@ -1097,9 +1124,27 @@ class RayReMASeparatedTrainer(object):
         data_batch.batch['prefix_probe_upstream_clean'] = upstream_clean
 
         metric_prefix = 'reward/leakage/all'
+        self._accumulate_prefix_probe_gate_metrics(
+            metrics,
+            metric_prefix,
+            outcome_scores,
+            gated_scores,
+            gate_valid,
+            upstream_clean,
+        )
+
+    @staticmethod
+    def _accumulate_prefix_probe_gate_metrics(
+        metrics,
+        metric_prefix,
+        outcome_scores,
+        gated_scores,
+        gate_valid,
+        upstream_clean,
+    ):
         trajectory_count_key = f'{metric_prefix}/trajectory_count'
         previous_count = float(metrics.get(trajectory_count_key, 0.0))
-        current_count = float(len(data_batch))
+        current_count = float(len(outcome_scores))
         total_count = previous_count + current_count
         batch_rates = {
             'raw_accuracy': float(outcome_scores.mean().item()),
@@ -1123,8 +1168,55 @@ class RayReMASeparatedTrainer(object):
             ) / total_count
         metrics[trajectory_count_key] = total_count
 
-    def _print_leakage_summary(self, metrics, scope):
-        metric_prefix = f'reward/leakage/{scope}'
+    def _attach_validation_prefix_probe_gate(
+        self,
+        data_batch,
+        outcome_scores,
+        plan_scores,
+        worker_scores,
+        metrics,
+    ):
+        worker_requested = data_batch.batch[
+            'prefix_probe_focal_worker_requested'
+        ].bool().cpu()
+        worker_valid = data_batch.batch[
+            'prefix_probe_focal_worker_valid'
+        ].bool().cpu()
+        outcome_scores = outcome_scores.detach().float().cpu()
+        gate = apply_validation_prefix_probe_gate(
+            outcome_scores.tolist(),
+            plan_scores.tolist(),
+            worker_scores.tolist(),
+            worker_requested.tolist(),
+            worker_valid.tolist(),
+        )
+        gated_scores = torch.tensor(
+            gate.outcome_scores,
+            dtype=outcome_scores.dtype,
+        )
+        gate_valid = torch.tensor(gate.valid_mask, dtype=torch.bool)
+        upstream_clean = torch.tensor(
+            gate.upstream_clean_mask,
+            dtype=torch.bool,
+        )
+        self._accumulate_prefix_probe_gate_metrics(
+            metrics,
+            'val/leakage',
+            outcome_scores,
+            gated_scores,
+            gate_valid,
+            upstream_clean,
+        )
+
+    def _print_leakage_summary(
+        self,
+        metrics,
+        scope,
+        metric_prefix=None,
+        worker_source='focal_worker',
+        include_upstream=True,
+    ):
+        metric_prefix = metric_prefix or f'reward/leakage/{scope}'
 
         def format_metric(name):
             value = metrics.get(f'{metric_prefix}/{name}')
@@ -1140,30 +1232,32 @@ class RayReMASeparatedTrainer(object):
                 f'n={count})'
             )
 
-        print(
-            ' '.join([
-                f'[leakage/{scope}]',
-                f'step={self.global_steps}',
-                f'role={self._current_train_agent}',
-                f'raw_acc={format_metric("raw_accuracy")}',
-                f'gated_acc={format_metric("gated_accuracy")}',
-                f'removed_correct={format_metric("removed_correct_rate")}',
-                f'gate_valid={format_metric("gate_valid_rate")}',
-                f'upstream_clean={format_metric("upstream_clean_rate")}',
-                format_source('decomposer'),
-                format_source('focal_worker'),
-                format_source('upstream_workers'),
-            ]),
-            flush=True,
-        )
+        fields = [
+            f'[leakage/{scope}]',
+            f'step={self.global_steps}',
+            f'role={self._current_train_agent}',
+            f'raw_acc={format_metric("raw_accuracy")}',
+            f'gated_acc={format_metric("gated_accuracy")}',
+            f'removed_correct={format_metric("removed_correct_rate")}',
+            f'gate_valid={format_metric("gate_valid_rate")}',
+            f'upstream_clean={format_metric("upstream_clean_rate")}',
+            format_source('decomposer'),
+            format_source(worker_source),
+        ]
+        if include_upstream:
+            fields.append(format_source('upstream_workers'))
+        print(' '.join(fields), flush=True)
 
     def _attach_prefix_probe_signals(
         self,
         data_batch,
         outcome_scores,
         metrics,
+        *,
+        validation=False,
+        probe_reward_fn=None,
     ):
-        """Measure leakage and attach the outcome used by scoped C3."""
+        """Measure isolated-message leakage for training or validation."""
 
         if not self.prefix_probe_enabled:
             return
@@ -1181,12 +1275,13 @@ class RayReMASeparatedTrainer(object):
         requests = collect_prefix_probe_requests(
             histories,
             terminal_roles,
-            focal_role=self._current_train_agent,
+            focal_role=None if validation else self._current_train_agent,
             decomposer_role=decomposer_role,
             stage_roles=stage_roles,
         )
 
-        metric_prefix = 'reward/leakage/all'
+        metric_prefix = 'val/leakage' if validation else 'reward/leakage/all'
+        probe_reward_fn = probe_reward_fn or self.reward_fn
 
         # DataProto requires every non-tensor column to use object dtype. These
         # values are converted back to float32 when gates and metrics use them.
@@ -1242,16 +1337,32 @@ class RayReMASeparatedTrainer(object):
 
         if not requests:
             attach_probe_metadata()
-            self._attach_prefix_probe_gate(
-                data_batch,
-                outcome_scores,
-                plan_scores,
-                worker_scores,
-                upstream_worker_scores,
-                terminal_roles,
-                metrics,
-            )
-            self._print_leakage_summary(metrics, 'all')
+            if validation:
+                self._attach_validation_prefix_probe_gate(
+                    data_batch,
+                    outcome_scores,
+                    plan_scores,
+                    worker_scores,
+                    metrics,
+                )
+                self._print_leakage_summary(
+                    metrics,
+                    'val',
+                    metric_prefix='val/leakage',
+                    worker_source='workers',
+                    include_upstream=False,
+                )
+            else:
+                self._attach_prefix_probe_gate(
+                    data_batch,
+                    outcome_scores,
+                    plan_scores,
+                    worker_scores,
+                    upstream_worker_scores,
+                    terminal_roles,
+                    metrics,
+                )
+                self._print_leakage_summary(metrics, 'all')
             return
 
         data_sources = data_batch.non_tensor_batch['data_source']
@@ -1324,7 +1435,7 @@ class RayReMASeparatedTrainer(object):
             if valid and not explicit_unknown[index]
         ]
         if valid_unique_indices:
-            valid_scores = self.reward_fn.score_responses(
+            valid_scores = probe_reward_fn.score_responses(
                 [unique_items[index][1] for index in valid_unique_indices],
                 [responses[index] for index in valid_unique_indices],
                 [unique_items[index][2] for index in valid_unique_indices],
@@ -1336,6 +1447,7 @@ class RayReMASeparatedTrainer(object):
 
         records_by_kind = defaultdict(list)
         records_by_role = defaultdict(list)
+        worker_scores_by_sample = defaultdict(list)
         upstream_scores_by_sample = defaultdict(list)
         diagnostic_limit = int(
             self.prefix_probe_config.get('diagnostic_samples', 2)
@@ -1388,9 +1500,21 @@ class RayReMASeparatedTrainer(object):
                 plan_scores[request.sample_index] = score
                 plan_responses[request.sample_index] = response
             elif request.source_kind == 'nonterminal_worker':
-                worker_scores[request.sample_index] = score
-                worker_responses[request.sample_index] = response
-                worker_roles[request.sample_index] = request.source_role
+                if validation:
+                    worker_scores_by_sample[request.sample_index].append(score)
+                    existing = worker_responses[request.sample_index]
+                    worker_responses[request.sample_index] = (
+                        f'{existing}\n\n[{request.source_role}]\n{response}'.strip()
+                    )
+                    existing_roles = str(worker_roles[request.sample_index])
+                    worker_roles[request.sample_index] = ','.join(filter(
+                        None,
+                        (existing_roles, request.source_role),
+                    ))
+                else:
+                    worker_scores[request.sample_index] = score
+                    worker_responses[request.sample_index] = response
+                    worker_roles[request.sample_index] = request.source_role
             else:
                 upstream_scores_by_sample[request.sample_index].append(score)
                 existing = upstream_worker_responses[request.sample_index]
@@ -1401,6 +1525,9 @@ class RayReMASeparatedTrainer(object):
         for sample_index, source_scores in upstream_scores_by_sample.items():
             if all(np.isfinite(score) for score in source_scores):
                 upstream_worker_scores[sample_index] = max(source_scores)
+        for sample_index, source_scores in worker_scores_by_sample.items():
+            if all(np.isfinite(score) for score in source_scores):
+                worker_scores[sample_index] = max(source_scores)
 
         def add_metrics(prefix, records):
             if not records:
@@ -1448,30 +1575,48 @@ class RayReMASeparatedTrainer(object):
             f'{metric_prefix}/decomposer',
             records_by_kind['decomposer'],
         )
+        worker_metric_name = 'workers' if validation else 'focal_worker'
         add_metrics(
-            f'{metric_prefix}/focal_worker',
+            f'{metric_prefix}/{worker_metric_name}',
             records_by_kind['nonterminal_worker'],
         )
-        add_metrics(
-            f'{metric_prefix}/upstream_workers',
-            records_by_kind['upstream_worker'],
-        )
+        if not validation:
+            add_metrics(
+                f'{metric_prefix}/upstream_workers',
+                records_by_kind['upstream_worker'],
+            )
         for role, records in records_by_role.items():
             if role == decomposer_role:
                 continue
             add_metrics(f'{metric_prefix}/roles/{role}', records)
 
         attach_probe_metadata()
-        self._attach_prefix_probe_gate(
-            data_batch,
-            outcome_scores,
-            plan_scores,
-            worker_scores,
-            upstream_worker_scores,
-            terminal_roles,
-            metrics,
-        )
-        self._print_leakage_summary(metrics, 'all')
+        if validation:
+            self._attach_validation_prefix_probe_gate(
+                data_batch,
+                outcome_scores,
+                plan_scores,
+                worker_scores,
+                metrics,
+            )
+            self._print_leakage_summary(
+                metrics,
+                'val',
+                metric_prefix='val/leakage',
+                worker_source='workers',
+                include_upstream=False,
+            )
+        else:
+            self._attach_prefix_probe_gate(
+                data_batch,
+                outcome_scores,
+                plan_scores,
+                worker_scores,
+                upstream_worker_scores,
+                terminal_roles,
+                metrics,
+            )
+            self._print_leakage_summary(metrics, 'all')
 
     def _update_prefix_probe_batch_metrics(self, data_batch, metrics):
         """Report leakage gates for the trajectories retained for training."""
@@ -2379,6 +2524,13 @@ class RayReMASeparatedTrainer(object):
         decision_valid_lst = []
         attempted_round_count_lst = []
         candidate_source_round_lst = []
+        probe_histories = []
+        probe_terminal_roles = []
+        probe_data_sources = []
+        probe_reward_models = []
+        probe_extra_infos = []
+        probe_strata = []
+        val_leakage_metrics = {}
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -2506,6 +2658,36 @@ class RayReMASeparatedTrainer(object):
             acc_tensor_lst.append(reward_tensor['acc'])
 
             histories = test_output_gen_batch.non_tensor_batch['history'].tolist()
+            if self.prefix_probe_enabled:
+                terminal_role_values = dynamic_score_roles
+                if terminal_role_values is None:
+                    terminal_role_values = np.array(
+                        [score_role] * len(test_batch),
+                        dtype=object,
+                    )
+                probe_histories.extend(histories)
+                probe_terminal_roles.extend(
+                    str(value) for value in terminal_role_values
+                )
+                probe_data_sources.extend(
+                    test_batch.non_tensor_batch['data_source'].tolist()
+                )
+                probe_reward_models.extend(
+                    test_batch.non_tensor_batch['reward_model'].tolist()
+                )
+                probe_extra_infos.extend(
+                    test_batch.non_tensor_batch.get(
+                        'extra_info',
+                        np.array([None] * len(test_batch), dtype=object),
+                    ).tolist()
+                )
+                probe_strata.extend(
+                    str(value)
+                    for value in test_batch.non_tensor_batch.get(
+                        'subset',
+                        test_batch.non_tensor_batch['data_source'],
+                    )
+                )
             turn_counts = [
                 int(value)
                 for value in test_output_gen_batch.non_tensor_batch['num_turns'].tolist()
@@ -2597,6 +2779,53 @@ class RayReMASeparatedTrainer(object):
             
             history_lst.append(histories)
 
+        validation_max_samples = int(
+            self.prefix_probe_config.get('validation_max_samples', 128)
+        ) if self.prefix_probe_enabled else 0
+        probe_indices = select_stratified_probe_indices(
+            probe_strata,
+            validation_max_samples,
+        )
+        if probe_indices:
+            def as_object_array(values):
+                result = np.empty(len(values), dtype=object)
+                result[:] = values
+                return result
+
+            probe_batch = DataProto.from_dict(
+                tensors={
+                    'batch_idx': torch.arange(len(probe_indices)),
+                },
+                non_tensors={
+                    'history': as_object_array([
+                        probe_histories[index] for index in probe_indices
+                    ]),
+                    'terminal_stage_role': as_object_array([
+                        probe_terminal_roles[index] for index in probe_indices
+                    ]),
+                    'data_source': as_object_array([
+                        probe_data_sources[index] for index in probe_indices
+                    ]),
+                    'reward_model': as_object_array([
+                        probe_reward_models[index] for index in probe_indices
+                    ]),
+                    'extra_info': as_object_array([
+                        probe_extra_infos[index] for index in probe_indices
+                    ]),
+                },
+            )
+            all_acc_scores = torch.cat(acc_tensor_lst, dim=0).cpu()
+            probe_outcome_scores = all_acc_scores[
+                torch.tensor(probe_indices, dtype=torch.long)
+            ]
+            self._attach_prefix_probe_signals(
+                probe_batch,
+                probe_outcome_scores,
+                val_leakage_metrics,
+                validation=True,
+                probe_reward_fn=self.val_reward_fn,
+            )
+
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, groundtruths=sample_groundtruths, histories=history_lst)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
@@ -2624,6 +2853,7 @@ class RayReMASeparatedTrainer(object):
                 metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
         for data_source, accs in data_source_acc.items():
             metric_dict[f'val/acc/{data_source}'] = np.mean(accs)
+        metric_dict.update(val_leakage_metrics)
 
         # ``round_N_acc`` is the correctness of the answer state after N
         # rounds. Samples that stopped earlier retain their latest candidate.
