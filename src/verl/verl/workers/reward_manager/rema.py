@@ -653,6 +653,100 @@ class ReMARewardManager:
             )
         return scores
 
+    def _score_scoped_c3_trajectories(
+        self,
+        data,
+        agent_roles,
+        hierarchy_config,
+    ):
+        """Return only terminal correctness for the scoped C3 pipeline.
+
+        Scoped C3 computes role credit in the trainer from fixed-prefix
+        counterfactual groups. Running the legacy role shaper here would only
+        produce unused, and often misleading, penalties and bonus metrics.
+        """
+
+        batch_size = len(data)
+        max_num_turns = data.meta_info['max_num_turns']
+        reward_tensor_map = {
+            f'{role}_turn_level_reward': torch.zeros(
+                batch_size,
+                max_num_turns,
+                dtype=torch.float32,
+            )
+            for role in agent_roles
+        }
+        scores = self.score_responses(
+            [data[i].non_tensor_batch['data_source'] for i in range(batch_size)],
+            [data[i].non_tensor_batch['response'] for i in range(batch_size)],
+            [
+                data[i].non_tensor_batch['reward_model']['ground_truth']
+                for i in range(batch_size)
+            ],
+            [
+                data[i].non_tensor_batch.get('extra_info', None)
+                for i in range(batch_size)
+            ],
+            show_progress=True,
+        )
+        reward_tensor_map['acc'] = torch.tensor(scores, dtype=torch.float32)
+
+        configured_score_role = hierarchy_config.get(
+            'score_role',
+            agent_roles[-1] if agent_roles else None,
+        )
+        terminal_worker_as_answer = bool(
+            hierarchy_config.get('terminal_worker_as_answer', False)
+        )
+        already_print_data_sources = {}
+
+        for sample_idx, raw_score in enumerate(scores):
+            data_item = data[sample_idx]
+            score_role = configured_score_role
+            if terminal_worker_as_answer:
+                dynamic_score_role = data_item.non_tensor_batch.get(
+                    'terminal_stage_role', ''
+                )
+                if dynamic_score_role in agent_roles:
+                    score_role = dynamic_score_role
+
+            num_turns = int(data_item.non_tensor_batch['num_turns'])
+            terminal_reward = float(raw_score)
+            if score_role in agent_roles and data_item.meta_info.get(
+                'mask_unfinished_reward', False
+            ):
+                turn_finished = int(
+                    data_item.batch[f'{score_role}_turn_finished'].item()
+                )
+                if turn_finished in {2, 3}:
+                    terminal_reward = 0.0
+            if score_role in agent_roles and num_turns > 0:
+                reward_tensor_map[
+                    f'{score_role}_turn_level_reward'
+                ][sample_idx, num_turns - 1] = terminal_reward
+
+            data_source = data_item.non_tensor_batch['data_source']
+            already_print_data_sources.setdefault(data_source, 0)
+            if already_print_data_sources[data_source] >= self.num_examine:
+                continue
+            already_print_data_sources[data_source] += 1
+            history = data_item.non_tensor_batch['history'][
+                :num_turns * len(agent_roles)
+            ]
+            print('[question]', data_item.non_tensor_batch['question'])
+            print(
+                '[ground_truth]',
+                data_item.non_tensor_batch['reward_model']['ground_truth'],
+            )
+            print('[answer]', data_item.non_tensor_batch['response'])
+            print('[raw_score]', raw_score)
+            print('[terminal_role]', score_role)
+            if terminal_reward != float(raw_score):
+                print('[terminal_reward]', terminal_reward)
+            print('[history]', history)
+
+        return reward_tensor_map
+
     def __call__(self, data: DataProto)-> Dict[str, torch.Tensor]:
         """We will expand this function gradually based on the available datasets"""
 
@@ -666,6 +760,13 @@ class ReMARewardManager:
         
         agent_roles = data.meta_info['agent_roles']
         hierarchy_config = data.meta_info.get('hierarchy', {})
+        scoped_c3_config = hierarchy_config.get('scoped_c3_grpo', {}) or {}
+        if bool(scoped_c3_config.get('enable', False)):
+            return self._score_scoped_c3_trajectories(
+                data,
+                agent_roles,
+                hierarchy_config,
+            )
         stage_roles = hierarchy_config.get('stage_roles')
         if stage_roles is None and hierarchy_config.get('num_worker_stages'):
             stage_roles = [

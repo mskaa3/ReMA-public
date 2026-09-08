@@ -976,13 +976,6 @@ class RayReMASeparatedTrainer(object):
             raise ValueError("Prefix-probe max_new_tokens must be positive")
 
     @staticmethod
-    def _prefix_probe_boxed(text):
-        if not isinstance(text, str):
-            return False
-        normalized = text.lower()
-        return "\\boxed" in normalized or "boxed(" in normalized
-
-    @staticmethod
     def _prefix_probe_context_key(message, data_source, ground_truth, extra_info):
         try:
             extra_key = json.dumps(extra_info, sort_keys=True, default=str)
@@ -1089,21 +1082,62 @@ class RayReMASeparatedTrainer(object):
         data_batch.batch['prefix_probe_gate_valid'] = gate_valid
         data_batch.batch['prefix_probe_upstream_clean'] = upstream_clean
 
-        metric_prefix = 'reward/prefix_probe'
-        metrics[f'{metric_prefix}/raw_outcome_mean'] = float(
-            outcome_scores.mean().item()
-        )
-        metrics[f'{metric_prefix}/gated_outcome_mean'] = float(
-            gated_scores.mean().item()
-        )
-        metrics[f'{metric_prefix}/gate_valid_rate'] = float(
-            gate_valid.float().mean().item()
-        )
-        metrics[f'{metric_prefix}/upstream_clean_rate'] = float(
-            upstream_clean.float().mean().item()
-        )
-        metrics[f'{metric_prefix}/removed_positive_count'] = float(
-            ((outcome_scores > 0.0) & (gated_scores <= 0.0)).sum().item()
+        metric_prefix = 'reward/leakage/all'
+        trajectory_count_key = f'{metric_prefix}/trajectory_count'
+        previous_count = float(metrics.get(trajectory_count_key, 0.0))
+        current_count = float(len(data_batch))
+        total_count = previous_count + current_count
+        batch_rates = {
+            'raw_accuracy': float(outcome_scores.mean().item()),
+            'gated_accuracy': float(gated_scores.mean().item()),
+            'gate_valid_rate': float(gate_valid.float().mean().item()),
+            'upstream_clean_rate': float(
+                upstream_clean.float().mean().item()
+            ),
+            'removed_correct_rate': float(
+                ((outcome_scores > 0.0) & (gated_scores <= 0.0))
+                .float()
+                .mean()
+                .item()
+            ),
+        }
+        for name, batch_rate in batch_rates.items():
+            key = f'{metric_prefix}/{name}'
+            previous_rate = float(metrics.get(key, 0.0))
+            metrics[key] = (
+                previous_rate * previous_count + batch_rate * current_count
+            ) / total_count
+        metrics[trajectory_count_key] = total_count
+
+    def _print_leakage_summary(self, metrics, scope):
+        metric_prefix = f'reward/leakage/{scope}'
+
+        def format_metric(name):
+            value = metrics.get(f'{metric_prefix}/{name}')
+            return 'n/a' if value is None else f'{float(value):.3f}'
+
+        def format_source(source):
+            count = int(metrics.get(f'{metric_prefix}/{source}/count', 0.0))
+            return (
+                f'{source}={format_metric(f"{source}/rate")}'
+                f'(n={count})'
+            )
+
+        print(
+            ' '.join([
+                f'[leakage/{scope}]',
+                f'step={self.global_steps}',
+                f'role={self._current_train_agent}',
+                f'raw_acc={format_metric("raw_accuracy")}',
+                f'gated_acc={format_metric("gated_accuracy")}',
+                f'removed_correct={format_metric("removed_correct_rate")}',
+                f'gate_valid={format_metric("gate_valid_rate")}',
+                f'upstream_clean={format_metric("upstream_clean_rate")}',
+                format_source('decomposer'),
+                format_source('focal_worker'),
+                format_source('upstream_workers'),
+            ]),
+            flush=True,
         )
 
     def _attach_prefix_probe_signals(
@@ -1135,16 +1169,14 @@ class RayReMASeparatedTrainer(object):
             stage_roles=stage_roles,
         )
 
-        metric_prefix = 'reward/prefix_probe'
-        metrics[f'{metric_prefix}/enabled'] = 1.0
-        metrics[f'{metric_prefix}/diagnostic_only'] = 0.0
-        metrics[f'{metric_prefix}/gate_enabled'] = 1.0
-        metrics[f'{metric_prefix}/request_count'] = float(len(requests))
+        metric_prefix = 'reward/leakage/all'
 
-        plan_scores = np.full(len(data_batch), np.nan, dtype=np.float32)
-        worker_scores = np.full(len(data_batch), np.nan, dtype=np.float32)
+        # DataProto requires every non-tensor column to use object dtype. These
+        # values are converted back to float32 when gates and metrics use them.
+        plan_scores = np.full(len(data_batch), np.nan, dtype=object)
+        worker_scores = np.full(len(data_batch), np.nan, dtype=object)
         upstream_worker_scores = np.full(
-            len(data_batch), np.nan, dtype=np.float32
+            len(data_batch), np.nan, dtype=object
         )
         plan_responses = np.full(len(data_batch), '', dtype=object)
         worker_responses = np.full(len(data_batch), '', dtype=object)
@@ -1152,7 +1184,6 @@ class RayReMASeparatedTrainer(object):
         worker_roles = np.full(len(data_batch), '', dtype=object)
 
         if not requests:
-            metrics[f'{metric_prefix}/unique_generation_count'] = 0.0
             data_batch.non_tensor_batch['prefix_probe_decomposer_score'] = plan_scores
             data_batch.non_tensor_batch['prefix_probe_decomposer_response'] = plan_responses
             data_batch.non_tensor_batch['prefix_probe_worker_score'] = worker_scores
@@ -1169,6 +1200,7 @@ class RayReMASeparatedTrainer(object):
                 terminal_roles,
                 metrics,
             )
+            self._print_leakage_summary(metrics, 'all')
             return
 
         data_sources = data_batch.non_tensor_batch['data_source']
@@ -1201,12 +1233,6 @@ class RayReMASeparatedTrainer(object):
                 ))
             request_unique_indices.append(unique_index)
 
-        metrics[f'{metric_prefix}/unique_generation_count'] = float(
-            len(unique_items)
-        )
-        metrics[f'{metric_prefix}/deduplication_rate'] = (
-            1.0 - float(len(unique_items)) / float(len(requests))
-        )
         responses = self._generate_prefix_probe_responses([
             item[0] for item in unique_items
         ])
@@ -1226,7 +1252,6 @@ class RayReMASeparatedTrainer(object):
             record = (
                 request.sample_index,
                 score,
-                self._prefix_probe_boxed(response),
             )
             records_by_kind[request.source_kind].append(record)
             records_by_role[request.source_role].append(record)
@@ -1254,42 +1279,36 @@ class RayReMASeparatedTrainer(object):
         def add_metrics(prefix, records):
             if not records:
                 return
-            sample_indices = torch.tensor(
-                [record[0] for record in records],
-                dtype=torch.long,
-            )
             leakage = torch.tensor(
                 [record[1] > 0.0 for record in records],
                 dtype=torch.bool,
             )
-            task_correct = outcome_scores[sample_indices] > 0.0
-            metrics[f'{prefix}/count'] = float(len(records))
-            metrics[f'{prefix}/leakage_rate'] = float(
-                leakage.float().mean().item()
-            )
-            metrics[f'{prefix}/boxed_rate'] = float(np.mean([
-                record[2] for record in records
-            ]))
-            metrics[f'{prefix}/task_correct_and_leaky_rate'] = float(
-                (task_correct & leakage).float().mean().item()
-            )
-            metrics[f'{prefix}/task_correct_and_nonleaky_rate'] = float(
-                (task_correct & ~leakage).float().mean().item()
-            )
+            count_key = f'{prefix}/count'
+            rate_key = f'{prefix}/rate'
+            previous_count = float(metrics.get(count_key, 0.0))
+            current_count = float(len(records))
+            total_count = previous_count + current_count
+            metrics[rate_key] = (
+                float(metrics.get(rate_key, 0.0)) * previous_count
+                + float(leakage.float().sum().item())
+            ) / total_count
+            metrics[count_key] = total_count
 
         add_metrics(
             f'{metric_prefix}/decomposer',
             records_by_kind['decomposer'],
         )
         add_metrics(
-            f'{metric_prefix}/nonterminal_worker',
+            f'{metric_prefix}/focal_worker',
             records_by_kind['nonterminal_worker'],
         )
         add_metrics(
-            f'{metric_prefix}/upstream_worker',
+            f'{metric_prefix}/upstream_workers',
             records_by_kind['upstream_worker'],
         )
         for role, records in records_by_role.items():
+            if role == decomposer_role:
+                continue
             add_metrics(f'{metric_prefix}/roles/{role}', records)
 
         data_batch.non_tensor_batch['prefix_probe_decomposer_score'] = plan_scores
@@ -1308,19 +1327,21 @@ class RayReMASeparatedTrainer(object):
             terminal_roles,
             metrics,
         )
+        self._print_leakage_summary(metrics, 'all')
 
     def _update_prefix_probe_batch_metrics(self, data_batch, metrics):
         """Report leakage gates for the trajectories retained for training."""
 
-        metric_prefix = 'reward/prefix_probe/retained'
+        metric_prefix = 'reward/leakage/train'
         raw_scores = data_batch.batch['scoped_c3_raw_outcome_score'].float()
         gated_scores = data_batch.batch['scoped_c3_outcome_score'].float()
         gate_valid = data_batch.batch['prefix_probe_gate_valid'].bool()
         upstream_clean = data_batch.batch['prefix_probe_upstream_clean'].bool()
-        metrics[f'{metric_prefix}/raw_outcome_mean'] = float(
+        metrics[f'{metric_prefix}/trajectory_count'] = float(len(data_batch))
+        metrics[f'{metric_prefix}/raw_accuracy'] = float(
             raw_scores.mean().item()
         )
-        metrics[f'{metric_prefix}/gated_outcome_mean'] = float(
+        metrics[f'{metric_prefix}/gated_accuracy'] = float(
             gated_scores.mean().item()
         )
         metrics[f'{metric_prefix}/gate_valid_rate'] = float(
@@ -1329,7 +1350,7 @@ class RayReMASeparatedTrainer(object):
         metrics[f'{metric_prefix}/upstream_clean_rate'] = float(
             upstream_clean.float().mean().item()
         )
-        metrics[f'{metric_prefix}/removed_positive_rate'] = float(
+        metrics[f'{metric_prefix}/removed_correct_rate'] = float(
             ((raw_scores > 0.0) & (gated_scores <= 0.0))
             .float()
             .mean()
@@ -1338,50 +1359,22 @@ class RayReMASeparatedTrainer(object):
 
         for source_kind, key in (
             ('decomposer', 'prefix_probe_decomposer_score'),
-            ('nonterminal_worker', 'prefix_probe_worker_score'),
-            ('upstream_worker', 'prefix_probe_upstream_worker_score'),
+            ('focal_worker', 'prefix_probe_worker_score'),
+            ('upstream_workers', 'prefix_probe_upstream_worker_score'),
         ):
             values = np.asarray(
                 data_batch.non_tensor_batch[key],
                 dtype=np.float32,
             )
             measured = np.isfinite(values)
-            metrics[f'{metric_prefix}/{source_kind}/measured_count'] = float(
+            metrics[f'{metric_prefix}/{source_kind}/count'] = float(
                 measured.sum()
             )
             if measured.any():
-                metrics[f'{metric_prefix}/{source_kind}/leakage_rate'] = float(
+                metrics[f'{metric_prefix}/{source_kind}/rate'] = float(
                     (values[measured] > 0.0).mean()
                 )
-
-        def format_rate(name):
-            value = metrics.get(f'{metric_prefix}/{name}')
-            return 'n/a' if value is None else f'{float(value):.3f}'
-
-        def format_leakage(source_kind):
-            count = int(metrics.get(
-                f'{metric_prefix}/{source_kind}/measured_count',
-                0.0,
-            ))
-            leakage = format_rate(f'{source_kind}/leakage_rate')
-            return f'{source_kind}={leakage}(n={count})'
-
-        print(
-            ' '.join([
-                '[prefix-probe]',
-                f'step={self.global_steps}',
-                f'role={self._current_train_agent}',
-                f'raw={format_rate("raw_outcome_mean")}',
-                f'gated={format_rate("gated_outcome_mean")}',
-                f'removed_positive={format_rate("removed_positive_rate")}',
-                f'gate_valid={format_rate("gate_valid_rate")}',
-                f'upstream_clean={format_rate("upstream_clean_rate")}',
-                format_leakage('decomposer'),
-                format_leakage('nonterminal_worker'),
-                format_leakage('upstream_worker'),
-            ]),
-            flush=True,
-        )
+        self._print_leakage_summary(metrics, 'train')
 
     @staticmethod
     def _unpad_role_messages(messages):
@@ -1448,12 +1441,8 @@ class RayReMASeparatedTrainer(object):
             exact_mask[indices] = True
             exact_group_count += 1
 
-        prefix = f'reward/scoped_c3_grpo/roles/{role}'
+        prefix = f'reward/c3/roles/{role}'
         group_count = len(uid_to_indices)
-        metrics[f'{prefix}/candidate_group_count'] = float(group_count)
-        metrics[f'{prefix}/exact_prefix_group_count'] = float(
-            exact_group_count
-        )
         metrics[f'{prefix}/exact_prefix_group_rate'] = (
             float(exact_group_count) / float(group_count)
             if group_count else 0.0
@@ -1555,41 +1544,29 @@ class RayReMASeparatedTrainer(object):
         data_batch.batch['scoped_c3_outcome_score'] = outcome_scores
         data_batch.batch['scoped_c3_causal_valid'] = causal_valid
 
-        prefix = f'reward/scoped_c3_grpo/roles/{role}'
-        metrics['reward/scoped_c3_grpo/enabled'] = 1.0
-        metrics['reward/scoped_c3_grpo/outcome_is_raw_acc'] = float(
-            not self.prefix_probe_enabled
+        prefix = f'reward/c3/roles/{role}'
+        metrics[f'{prefix}/action_present_rate'] = float(
+            action_present.float().mean().item()
         )
-        metrics[f'{prefix}/action_present_count'] = float(
-            action_present.sum().item()
+        metrics[f'{prefix}/rejected/missing_action_rate'] = float(
+            (~action_present).float().mean().item()
         )
-        metrics[f'{prefix}/selected_action_turn'] = float(
-            expected_branch_turn + 1
+        metrics[f'{prefix}/rejected/prefix_mismatch_rate'] = float(
+            (action_present & ~exact_prefix).float().mean().item()
         )
-        metrics[f'{prefix}/rejected_missing_action_count'] = float(
-            (~action_present).sum().item()
+        metrics[f'{prefix}/rejected/leakage_rate'] = float(
+            (action_present & exact_prefix & ~prefix_gate_valid)
+            .float()
+            .mean()
+            .item()
         )
-        metrics[f'{prefix}/rejected_prefix_mismatch_count'] = float(
-            (action_present & ~exact_prefix).sum().item()
+        metrics[f'{prefix}/rejected/no_outcome_contrast_rate'] = float(
+            (pre_mixed_valid & ~mixed_mask).float().mean().item()
         )
-        metrics[f'{prefix}/rejected_prefix_probe_count'] = float(
-            (action_present & exact_prefix & ~prefix_gate_valid).sum().item()
+        metrics[f'{prefix}/causal_valid_rate'] = float(
+            causal_valid.float().mean().item()
         )
-        metrics[f'{prefix}/rejected_no_outcome_contrast_count'] = float(
-            (pre_mixed_valid & ~mixed_mask).sum().item()
-        )
-        metrics[f'{prefix}/causal_valid_count'] = float(
-            causal_valid.sum().item()
-        )
-        if bool(causal_valid.any().item()):
-            valid_scores = outcome_scores[causal_valid]
-            metrics[f'{prefix}/outcome_mean'] = float(
-                valid_scores.mean().item()
-            )
-            metrics[f'{prefix}/outcome_std'] = (
-                float(valid_scores.std(unbiased=False).item())
-                if valid_scores.numel() > 1 else 0.0
-            )
+
     def _compute_scoped_c3_grpo_advantage(self, data_batch, metrics):
         """Build role-local fixed-prefix C3 LOO advantages."""
 
@@ -1651,14 +1628,11 @@ class RayReMASeparatedTrainer(object):
             data_batch.batch['returns'][ineffective_rows] = 0.0
 
         role = self._current_train_agent
-        prefix = f'reward/scoped_c3_grpo/roles/{role}'
+        prefix = f'reward/c3/roles/{role}'
         effective = estimate.effective_mask
         advantage = estimate.advantage
         positive = effective & (advantage > 0)
         negative = effective & (advantage < 0)
-        metrics[f'{prefix}/effective_sample_count'] = float(
-            effective.sum().item()
-        )
         metrics[f'{prefix}/effective_sample_rate'] = float(
             effective.float().mean().item()
         )
@@ -1669,20 +1643,32 @@ class RayReMASeparatedTrainer(object):
                 as_tuple=False,
             ).flatten().tolist()
         }))
-        metrics[f'{prefix}/positive_advantage_count'] = float(
-            positive.sum().item()
-        )
-        metrics[f'{prefix}/negative_advantage_count'] = float(
-            negative.sum().item()
-        )
+        metrics[f'{prefix}/positive_advantage_rate'] = 0.0
+        metrics[f'{prefix}/negative_advantage_rate'] = 0.0
+        metrics[f'{prefix}/advantage_std'] = 0.0
         if bool(effective.any().item()):
-            metrics[f'{prefix}/advantage_mean'] = float(
-                advantage[effective].mean().item()
+            effective_count = effective.float().sum()
+            metrics[f'{prefix}/positive_advantage_rate'] = float(
+                positive.float().sum().div(effective_count).item()
+            )
+            metrics[f'{prefix}/negative_advantage_rate'] = float(
+                negative.float().sum().div(effective_count).item()
             )
             metrics[f'{prefix}/advantage_std'] = (
                 float(advantage[effective].std(unbiased=False).item())
                 if int(effective.sum().item()) > 1 else 0.0
             )
+        print(
+            ' '.join([
+                '[c3]',
+                f'step={self.global_steps}',
+                f'role={role}',
+                f'effective={metrics[f"{prefix}/effective_sample_rate"]:.3f}',
+                f'groups={int(metrics[f"{prefix}/effective_group_count"])}',
+                f'adv_std={metrics.get(f"{prefix}/advantage_std", 0.0):.3f}',
+            ]),
+            flush=True,
+        )
         return data_batch
 
 
@@ -2238,6 +2224,12 @@ class RayReMASeparatedTrainer(object):
         rollout_meta_info = self._build_rollout_meta_info(max_num_turns)
         score_role = self._get_score_role()
         score_tokenizer = self._tokenizer_for_role(score_role)
+        accept_revise_config = (
+            self._get_hierarchy_config().get('accept_revise', {}) or {}
+        )
+        accept_revise_enabled = bool(
+            accept_revise_config.get('enable', False)
+        )
 
         for test_data in self.val_dataloader:
             # test_batch = DataProto.from_single_dict(test_data)
@@ -2462,31 +2454,39 @@ class RayReMASeparatedTrainer(object):
 
 
         metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+        if not self.scoped_c3_grpo_enabled:
+            for data_source, rewards in data_source_reward.items():
+                metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
         for data_source, accs in data_source_acc.items():
             metric_dict[f'val/acc/{data_source}'] = np.mean(accs)
 
         # ``round_N_acc`` is the correctness of the answer state after N
         # rounds. Samples that stopped earlier retain their latest candidate.
-        for turn_idx in range(max_num_turns):
-            round_number = turn_idx + 1
-            metric_dict[f'val/round_{round_number}_acc'] = (
-                round_state_scores[:, turn_idx].float().mean().item()
-            )
-            metric_dict[f'val/round_{round_number}_executed_rate'] = (
-                round_executed[:, turn_idx].float().mean().item()
-            )
-            for data_source in data_source_acc:
-                source_mask = torch.from_numpy(data_sources == data_source)
-                metric_dict[f'val/round_{round_number}_acc/{data_source}'] = (
-                    round_state_scores[source_mask, turn_idx].float().mean().item()
+        if max_num_turns > 1:
+            for turn_idx in range(max_num_turns):
+                round_number = turn_idx + 1
+                metric_dict[f'val/round_{round_number}_acc'] = (
+                    round_state_scores[:, turn_idx].float().mean().item()
                 )
+                metric_dict[f'val/round_{round_number}_executed_rate'] = (
+                    round_executed[:, turn_idx].float().mean().item()
+                )
+                for data_source in data_source_acc:
+                    source_mask = torch.from_numpy(data_sources == data_source)
+                    metric_dict[f'val/round_{round_number}_acc/{data_source}'] = (
+                        round_state_scores[source_mask, turn_idx]
+                        .float()
+                        .mean()
+                        .item()
+                    )
 
-        metric_dict.update(
-            compute_round_transition_metrics(round_state_scores, round_executed)
-        )
-        if accepted_lst:
+            metric_dict.update(
+                compute_round_transition_metrics(
+                    round_state_scores,
+                    round_executed,
+                )
+            )
+        if accept_revise_enabled and accepted_lst:
             metric_dict['val/accept_revise/accept_rate'] = float(np.mean(accepted_lst))
             metric_dict['val/accept_revise/decision_valid_rate'] = float(
                 np.mean(decision_valid_lst)
@@ -3489,31 +3489,37 @@ class RayReMASeparatedTrainer(object):
                             batch = batch[:traj_bsz]
 
                     if self.config.actor_rollout_ref.rollout.n > 1:
-                        metrics.update({
-                            'rollout/all_negative_cnt': all_negative_cnt,
-                            'rollout/all_positive_cnt': all_positive_cnt,
-                            'rollout/mixed_prompt_cnt': mixed_prompt_cnt,
-                            'rollout/kept_traj_cnt': kept_traj_cnt,
-                            'rollout/total_prompt_cnt': total_prompt_cnt,
-                            'rollout/num_gen_batches': num_gen_batches,
-                            'rollout/mixed_prompt_rate': (
-                                mixed_prompt_cnt / total_prompt_cnt
-                                if total_prompt_cnt > 0 else 0.0
-                            ),
-                            'rollout/c3_trainable_prompt_cnt': (
-                                c3_trainable_prompt_cnt
-                            ),
-                            'rollout/c3_ineligible_prompt_cnt': (
-                                c3_ineligible_prompt_cnt
-                            ),
-                            'rollout/c3_trainable_prompt_rate': (
-                                c3_trainable_prompt_cnt / total_prompt_cnt
-                                if total_prompt_cnt > 0 else 0.0
-                            ),
-                        })
+                        if self.scoped_c3_grpo_enabled:
+                            metrics.update({
+                                'rollout/c3/generation_batches': float(
+                                    num_gen_batches
+                                ),
+                                'rollout/c3/mixed_prompt_rate': (
+                                    mixed_prompt_cnt / total_prompt_cnt
+                                    if total_prompt_cnt > 0 else 0.0
+                                ),
+                                'rollout/c3/trainable_prompt_rate': (
+                                    c3_trainable_prompt_cnt / total_prompt_cnt
+                                    if total_prompt_cnt > 0 else 0.0
+                                ),
+                            })
+                        else:
+                            metrics.update({
+                                'rollout/all_negative_cnt': all_negative_cnt,
+                                'rollout/all_positive_cnt': all_positive_cnt,
+                                'rollout/mixed_prompt_cnt': mixed_prompt_cnt,
+                                'rollout/kept_traj_cnt': kept_traj_cnt,
+                                'rollout/total_prompt_cnt': total_prompt_cnt,
+                                'rollout/num_gen_batches': num_gen_batches,
+                                'rollout/mixed_prompt_rate': (
+                                    mixed_prompt_cnt / total_prompt_cnt
+                                    if total_prompt_cnt > 0 else 0.0
+                                ),
+                            })
                     if self.prefix_probe_enabled:
                         self._update_prefix_probe_batch_metrics(batch, metrics)
-                    metrics.update(compute_reward_diagnostic_metrics(batch))
+                    if not self.scoped_c3_grpo_enabled:
+                        metrics.update(compute_reward_diagnostic_metrics(batch))
                     
                     with _timer('save_train_generation', timing_raw):
                         # save train generation

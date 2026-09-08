@@ -94,17 +94,38 @@ question.
 
 ## Minimal metrics
 
-Current metrics are grouped under `reward/prefix_probe`:
+Scoped C3 bypasses the legacy manual role shaper. It does not emit manual
+bonuses, penalties, `shaped_score`, assignment heuristics, or LOCAL_RESULT
+parser metrics.
 
-- `request_count`, `unique_generation_count`, and `deduplication_rate`,
-- `decomposer/leakage_rate` and `decomposer/boxed_rate`,
-- `nonterminal_worker/leakage_rate` and `nonterminal_worker/boxed_rate`,
-- `upstream_worker/leakage_rate` for contamination before the focal role,
-- `roles/<role>/...` for role-specific views,
-- `task_correct_and_leaky_rate` and `task_correct_and_nonleaky_rate` for each
-  measured source kind,
-- `raw_outcome_mean`, `gated_outcome_mean`, and `removed_positive_count`,
-- `gate_valid_rate` and `upstream_clean_rate`.
+Leakage metrics use `reward/leakage/all` before group filtering and
+`reward/leakage/train` for trajectories retained for an update:
+
+- `raw_accuracy`, `gated_accuracy`, and `removed_correct_rate`,
+- `trajectory_count`, used to aggregate multiple generated chunks correctly,
+- `gate_valid_rate` and `upstream_clean_rate`,
+- `decomposer/{count,rate}`,
+- `focal_worker/{count,rate}`,
+- `upstream_workers/{count,rate}`,
+- `roles/<role>/{count,rate}` for the unfiltered role-specific view.
+
+C3 metrics use `reward/c3/roles/<role>`:
+
+- `action_present_rate` and `exact_prefix_group_rate`,
+- `causal_valid_rate`,
+- `rejected/{missing_action,prefix_mismatch,leakage,no_outcome_contrast}_rate`,
+- `effective_sample_rate`, `effective_group_count`, and `advantage_std`,
+- `positive_advantage_rate` and `negative_advantage_rate`.
+
+Rollout filtering keeps only `rollout/c3/generation_batches`,
+`rollout/c3/mixed_prompt_rate`, and `rollout/c3/trainable_prompt_rate`.
+
+The console emits one `[leakage/all]` line after probing, one
+`[leakage/train]` line after filtering, and one `[c3]` line after constructing
+the role-local advantages. Per-trajectory probe responses remain available in
+the replay JSONL when `trainer.save_train_generations=True`.
+Validation continues to report raw `val/acc/*`; online leakage probes are run
+only for training trajectories.
 
 For diagnosis, combine early answer recoverability with downstream C3 credit.
 High recoverability followed by near-zero downstream credit is evidence of role

@@ -40,18 +40,17 @@ comparison.
 
 ## Key metrics
 
-- `exact_prefix_group_rate`: verifies that C3 groups really share one state.
-- `selected_action_turn`: one-based round whose focal action is optimized.
-- `rejected_missing_action_count`: focal role did not emit an action.
-- `rejected_prefix_mismatch_count`: rollout construction failed exact pairing.
-- `rejected_no_outcome_contrast_count`: all exact alternatives had one outcome.
-- `effective_sample_count`: actions that actually reach PPO.
-- `positive_advantage_count` and `negative_advantage_count`: the sign of the
-  fixed-prefix LOO signal among effective actions.
-- `advantage_mean` and `advantage_std`: the role-local C3 signal distribution.
-- `rollout/c3_trainable_prompt_rate`: generated prompt groups with a nonzero
-  C3 training signal.
+Role-local metrics are grouped under `reward/c3/roles/<role>`:
+
+- `exact_prefix_group_rate`: verifies that C3 groups really share one state,
+- `action_present_rate` and `causal_valid_rate`,
+- `rejected/{missing_action,prefix_mismatch,leakage,no_outcome_contrast}_rate`,
+- `effective_sample_rate` and `effective_group_count`,
+- `positive_advantage_rate`, `negative_advantage_rate`, and `advantage_std`.
+
+Batch-level filtering uses `rollout/c3/mixed_prompt_rate` and
+`rollout/c3/trainable_prompt_rate`.
 
 The intended healthy run has an `exact_prefix_group_rate` near one. A low
-`c3_trainable_prompt_rate` with a high exact-prefix rate indicates sparse
+`trainable_prompt_rate` with a high exact-prefix rate indicates sparse
 outcome exploration rather than a rollout-construction bug.

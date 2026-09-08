@@ -316,9 +316,6 @@ algorithm:
     # This experiment uses one complete trajectory rather than repair rounds.
     accept_revise:
       enable: False
-    # Legacy manual-reward setting. Scoped C3 ignores the resulting role scores
-    # and consumes only terminal accuracy.
-    final_raw_score_usage_floor: 0.5
     # Exact fixed-prefix credit. Rollouts for one UID branch at the currently
     # trained role and independently generate the complete remaining suffix.
     scoped_c3_grpo:
