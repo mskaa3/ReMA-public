@@ -592,8 +592,9 @@ class ReMARewardManager:
         extra_infos=None,
         *,
         show_progress=False,
+        timeout_score=0.0,
     ):
-        """Score arbitrary responses with the same verifier used by ``__call__``."""
+        """Score responses, optionally preserving surfaced timeouts as unknown."""
 
         if extra_infos is None:
             extra_infos = [None] * len(responses)
@@ -631,10 +632,10 @@ class ReMARewardManager:
                         scores.append(next(iterator))
                     except TimeoutError:
                         print('Time Out')
-                        scores.append(0.0)
+                        scores.append(timeout_score)
                     except TimeoutException:
                         print('Math verify internal timeout')
-                        scores.append(0.0)
+                        scores.append(timeout_score)
                     except StopIteration:
                         break
                     except Exception as e:

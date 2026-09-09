@@ -325,8 +325,11 @@ algorithm:
       mixed_groups_only: True
       normalize_advantages: True
       normalization_epsilon: 1.0e-6
-      # Isolated-message leakage gate. It uses the model assigned to the
-      # decomposer as a greedy solver and never sees the original question.
+      # Require at least two routed subtasks and a valid plan probe with L_D=0
+      # for every role. Non-terminal workers also require a parsed LOCAL_RESULT
+      # not equivalent to the terminal answer (Math-Verify). Gates mask actor
+      # updates only: C3 baselines retain raw correctness for all alternatives.
+      # Only the plan is probed by an LLM; worker before/after probes are removed.
       prefix_probe:
         enable: False
         solver_role: decomposer

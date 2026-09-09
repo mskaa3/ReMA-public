@@ -355,8 +355,7 @@ def test_deterministic_selector_assignment_is_complete_but_not_generated():
     assert output == (
         "ASSIGNMENTS:\n"
         "- S1 -> general_math_worker\n"
-        "- S2 -> general_math_worker\n"
-        "- FINAL -> general_math_worker"
+        "- S2 -> general_math_worker"
     )
 
 
@@ -372,7 +371,6 @@ def test_deterministic_selector_assignment_supports_four_subtasks():
         "- S2 -> general_math_worker",
         "- S3 -> general_math_worker",
         "- S4 -> general_math_worker",
-        "- FINAL -> general_math_worker",
     ]
 
 
@@ -524,10 +522,9 @@ def test_final_context_uses_parsed_plan_and_worker_results_without_question():
         ],
     )
 
-    assert "PARSED PLAN:" in context
+    assert "PLAN:" in context
     assert "- S1: Compute the intermediate value." in context
-    assert "WORKER RESULTS:" in context
-    assert "worker_stage_1 as algebra_worker (S1)" in context
+    assert "WORK SO FAR:\nS1:\nREASONING: compute" in context
     assert "\\boxed{7}" in context
     assert original_question not in context
 

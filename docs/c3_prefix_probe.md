@@ -1,152 +1,132 @@
-# C3 with isolated-message prefix probes
+# C3 with plan probes and answer-equivalence gates
 
-This design combines fixed-prefix causal credit with a behavioral test for
-answer leakage. The probe is separate from normal multi-agent execution.
+The Agent-2-only experiment learns a shared worker model under a frozen
+decomposer. The teacher supplies solution attempts to the decomposer.
+Non-terminal workers see the question, their assigned subtask, and earlier
+LOCAL_RESULTs. The last planned worker is terminal: it sees its assigned
+subtask and earlier LOCAL_RESULTs, but no separately supplied full question.
+There is no separate finalizer.
 
-## C3 task utility
+## Raw outcome and C3
 
-For alternatives `k = 1, ..., K` sampled for focal role `r` from the same
-history `h_r`, complete the suffix and score the terminal answer:
+For alternatives j sampled at focal role r from exactly the same prefix:
 
-```text
-R[r,k] in {0, 1}
-A_task[r,k] = R[r,k] - mean_{j != k} R[r,j]
-```
+    Y_j = 1[terminal_answer_j is correct]
+    C_j = Y_j - mean_{l != j}(Y_l)
+    A_j = C_j / (std(C) + epsilon)
 
-The raw score remains a diagnostic measure of terminal correctness.
+Only mixed groups with at least two factual alternatives and at least one
+eligible focal action are used for optimization. Masked actions remain
+baseline donors. Their outcomes are not replaced by zero before computing
+C3, normalizing advantages, or checking outcome contrast.
 
-## Isolated-message probe
+## Plan gate
 
-For decomposer actions, give only the generated plan to an answer probe. For
-non-terminal worker actions, give only that worker's message. The probe sees no
-original question, prior messages, other worker results, or teacher solution.
-It must return one boxed final answer, using `\\boxed{UNKNOWN}` when the
-information is insufficient.
+Generate a greedy answer probe from the decomposer output alone. The probe
+does not receive the question or teacher attempt as separate inputs.
 
-```text
-probe_input[r,k] = focal_message[r,k]
-probe_correct[r,k] = 1[probe_answer == ground_truth]
-```
+    L_D = 1[probe_answer is correct]
+    G(P) = 1[number_of_routed_subtasks >= 2] * valid(L_D) * (1 - L_D)
 
-A correct answer means that the focal message alone makes the hidden task answer
-recoverable. The last planned worker is not probed because producing the final
-answer is its authorized responsibility. There is no separate finalizer role.
+This gate applies to every role, including the terminal worker. A one-subtask
+plan, a recoverable answer, or an invalid plan probe prevents updates from
+that plan. In Agent-2-only, the plan is shared by the focal worker's entire
+C3 group, so the whole group is excluded from optimization.
 
-The first implementation uses the model assigned to the decomposer (conceptual
-Agent 1) as a greedy solver for both message types. In the Agent-2-only stage
-that model is frozen, so the measurement remains stationary while workers are
-updated. The same neutral prompt is used for plans and worker messages; it does
-not identify the source role or mention leakage.
+The router records the actual subtask count in decomposer history metadata.
+The gate uses this count, including routing limits/fallbacks, rather than
+guessing the count from the number of available worker slots.
 
-Every training batch probes its latest decomposer message. It additionally
-probes the current C3 focal worker when that worker executed a non-terminal
-subtask, plus every non-terminal worker message lying before the focal role.
-Messages generated downstream of the focal role never affect its credit.
+The probe uses one greedy response per unique plan/scoring context in a
+generated batch. A complete boxed UNKNOWN is a valid negative recovery result;
+an empty, malformed, or unparseable mathematical answer is an invalid
+measurement. Surfaced verifier timeouts are also invalid, rather than evidence
+that the plan is clean. The generation limit remains configurable and defaults to 256
+tokens.
 
-The probe is part of the training gate. Raw task accuracy is still logged, but
-group filtering, C3 advantages, and PPO rewards use the gated outcome below.
+Plan gating currently happens after trajectory generation, before group
+selection and actor optimization. It saves optimizer work on rejected groups,
+not suffix generation. Moving it before branching is a separate performance
+optimization.
 
-The current implementation records binary matched-message correctness. A later
-calibration can add a shuffled-message control from another matched problem to
-estimate answer priors and probe artifacts:
+## Non-terminal worker gate
 
-```text
-L = clip((p_matched - p_shuffled) / (1 - p_shuffled + eps), 0, 1)
-```
+Extract the boxed answer z_k from the worker's LOCAL_RESULT, and compare it
+against the boxed terminal answer y_hat from the same trajectory:
 
-Multiple short probe samples could provide a lower-variance estimate when
-compute permits, but the current probe deliberately uses one greedy answer.
+    E_k = MathVerify(z_k, y_hat)
+    M_k = G(P) * valid(E_k) * (1 - E_k)
 
-A probe measurement is valid only when the receiver emits a non-empty,
-balanced `\\boxed{...}` answer. Empty, truncated, and malformed
-responses are not interpreted as evidence of a clean message. They invalidate
-the affected C3 sample (fail closed). A missing upstream worker is tracked
-separately and remains a valid case. The default generation budget remains 256
-tokens; health metrics expose whether that budget causes truncation.
+This comparison uses the generated terminal answer, not dataset ground truth.
+It does not read other boxes in the worker's reasoning. Missing LOCAL_RESULT,
+empty/incomplete boxes, parser failures, and comparison errors/timeouts are
+unknown measurements and exclude the affected action from updates.
 
-## Optimization objective
+Math-Verify 0.7's symbolic comparison is used with strict variable matching
+and without extraction fallback strings. Its public verify function converts
+comparison exceptions into False; the gate instead preserves those failures
+as unknown.
 
-Low leakage never compensates for an incorrect answer. For a decomposer action,
-the plan probe directly gates its task reward:
+For the terminal worker, no equality comparison is required:
 
-```text
-D[k] = R[k] * (1 - L_D[k])
-```
+    M_terminal = G(P)
 
-For a non-terminal worker, a leaky decomposer plan invalidates the fixed prefix
-rather than penalizing the receiver for information already present upstream.
-On a clean prefix, the worker's own leakage gates its outcome:
+For decomposer/selector updates, the same plan gate applies. The decomposer
+is frozen during Agent-2-only training.
 
-```text
-valid_prefix[k] = (1 - L_D[k]) * product_{j < r}(1 - L_W[j,k])
-W[r,k] = R[k] * (1 - L_W[r,k])
-```
+Worker before/after LLM probes and their information-gain metrics have been
+removed. Worker comparisons require no additional model generation.
 
-The terminal worker is allowed to reveal the answer, so it uses raw task reward
-when its upstream plan is clean:
+## Actor updates
 
-```text
-T[k] = R[k]
-A_train[r,k] = S_role[r,k] - mean_{j != k} S_role[r,j]
-```
+    A_train_j = M_j * A_j
 
-Within-group normalization can be applied after the leave-one-out comparison as
-introducing the probe, only `A_task` is exact C3 credit for raw task reward;
-`A_train` is C3 credit for the combined training objective.
+The actor's token mask is zeroed for excluded focal actions, for both positive
+and negative advantages. Other alternatives remain in the C3 baseline.
+No manual penalties, PRD, CPCR, or TSS enter this training path.
 
-Non-terminal workers may see the full question to recover task facts. The
-terminal worker never sees it and must synthesize the final answer from the
-planned subtask and previous `LOCAL_RESULT`s. The probe also never sees the
-question.
+This is selective policy optimization. Because M depends on generated
+outputs, it is not an unbiased policy gradient of raw accuracy alone.
 
-## Minimal metrics
+## Validation and logging
 
-Scoped C3 bypasses the legacy manual role shaper. It does not emit manual
-bonuses, penalties, `shaped_score`, assignment heuristics, or LOCAL_RESULT
-parser metrics.
+Raw val/acc/* continues to cover the full validation set, including one-task
+plans. Leakage diagnostics run on the configured validation sample budget,
+including examples printed live; those examples are not probed again later.
 
-Leakage metrics use `reward/leakage/all` before group filtering and
-`reward/leakage/train` for trajectories retained for an update:
+Training evaluates E only for the focal non-terminal role. Validation evaluates
+every executed non-terminal worker and requires all comparisons to be valid
+and unequal for a trajectory to pass. Thus validation gated accuracy is a
+trajectory-wide diagnostic, while training gated accuracy is role-local.
 
-- `raw_accuracy`, `gated_accuracy`, and `removed_correct_rate`,
-- `trajectory_count`, used to aggregate multiple generated chunks correctly,
-- `gate_valid_rate` and `upstream_clean_rate`,
-- `decomposer/{count,rate,valid_rate,nonempty_rate,length_stop_rate}`,
-- `focal_worker/{count,rate,valid_rate,nonempty_rate,length_stop_rate}`,
-- `upstream_workers/{count,rate,valid_rate,nonempty_rate,length_stop_rate}`,
-- `roles/<role>/{count,rate,valid_rate,nonempty_rate,length_stop_rate}` for
-  the unfiltered role-specific view.
+Metrics use reward/leakage/all, reward/leakage/train, and val/leakage:
 
-C3 metrics use `reward/c3/roles/<role>`:
+- trajectory_count, raw_accuracy, gated_accuracy, removed_correct_rate;
+- plan_eligible_rate, gate_valid_rate, update_eligible_rate, subtask_count_mean;
+- rejected/{single_subtask,plan_probe_invalid,plan_recoverable,
+  comparison_invalid,equivalent_answer}_rate (exclusive rejection reasons);
+- decomposer/rate and count: recovery rate over valid plan measurements;
+- decomposer_valid/rate and count: validity over requested plan probes;
+- decomposer_nonempty and decomposer_length_stopped: probe health;
+- worker_match/rate and count: equivalence over valid worker comparisons;
+- worker_match_valid/rate and count: validity over requested comparisons;
+- roles/<role>/worker_match and worker_match_valid: the same per role.
 
-- `action_present_rate` and `exact_prefix_group_rate`,
-- `causal_valid_rate`,
-- `rejected/{missing_action,prefix_mismatch,leakage,no_outcome_contrast}_rate`,
-- `effective_sample_rate`, `effective_group_count`, and `advantage_std`,
-- `positive_advantage_rate` and `negative_advantage_rate`.
+C3 metrics under reward/c3/roles/<role> additionally report positive and negative
+before_gate_count, after_gate_count, and removed_count. These counts are for
+the batch reaching advantage construction; leakage/all includes generated
+groups discarded before optimization.
 
-Rollout filtering keeps only `rollout/c3/generation_batches`,
-`rollout/c3/mixed_prompt_rate`, and `rollout/c3/trainable_prompt_rate`.
+The console prints [leakage/all], [leakage/train], [leakage/val], and live
+[leakage/example] lines with raw/gated scores, actual terminal role, subtask
+count, Ld, E per measured worker, plan/update eligibility, and rejection reason.
+Replay JSONL stores plan-probe responses, comparisons, counts, masks, and raw
+and diagnostic gated scores. Old B/A fields are no longer emitted.
 
-The console emits one `[leakage/all]` line after probing, one
-`[leakage/train]` line after filtering, and one `[c3]` line after constructing
-the role-local advantages. Leakage `rate` is conditional on valid probe
-answers, while `valid_rate` reports coverage. A bounded number of malformed
-responses is printed as `[prefix_probe/invalid]` diagnostics. Per-trajectory
-probe responses remain available in
-the replay JSONL when `trainer.save_train_generations=True`.
-Validation continues to report raw `val/acc/*`; online leakage probes are run
-only for training trajectories.
+## Interpretation
 
-For diagnosis, combine early answer recoverability with downstream C3 credit.
-High recoverability followed by near-zero downstream credit is evidence of role
-bypass; high recoverability followed by positive verifier credit can instead
-represent a useful candidate followed by meaningful checking.
-
-## Next steps
-
-1. Confirm probe calibration with shuffled controls and inspect role-wise
-   accuracy/leakage frontiers.
-2. Compare Agent-1 self-reconstruction with a frozen receiver-model probe.
-3. Calibrate how many upstream probes are needed before a cheaper learned
-   leakage predictor can replace part of the online probing cost.
+Equivalent non-terminal and terminal outputs are excluded by design, including
+accidental equality. Different answers do not prove subtask obedience.
+The plan probe measures answer recoverability by a particular solver, not
+literal answer disclosure. Partial answer leakage can escape it, and a
+sufficiently informative legitimate plan may also be rejected.

@@ -1789,6 +1789,13 @@ class MultiAgentRollout:
                         )
                     ordered_stages_by_idx[idx] = ordered_stages
                 parsed_subtasks[idx] = subtasks
+                for plan_record in reversed(history[idx]):
+                    if (
+                        plan_record.get("role") == decomposer_role
+                        and plan_record.get("executed", True) is not False
+                    ):
+                        plan_record["planned_subtask_count"] = len(subtasks)
+                        break
                 selector_chats_by_idx[idx] = build_prompt(
                     selector_role,
                     idx,

@@ -55,9 +55,13 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
 )
 from verl.rema_separated_trainer.ppo.prefix_probe import (
     apply_prefix_probe_gate,
-    apply_validation_prefix_probe_gate,
+    answer_round_records,
+    compare_worker_final_answers,
+    count_planned_subtasks,
     collect_prefix_probe_requests,
     extract_complete_boxed_answer,
+    parse_boxed_math_answer,
+    select_console_probe_indices,
     select_stratified_probe_indices,
 )
 
@@ -965,6 +969,15 @@ class RayReMASeparatedTrainer(object):
             return
         if not self.scoped_c3_grpo_enabled:
             raise ValueError("Prefix probe requires scoped C3 GRPO")
+        if int(self.config.actor_rollout_ref.rollout.get('max_num_turns', 1)) != 1:
+            raise ValueError(
+                "Plan/equivalence gates require max_num_turns=1; multi-round "
+                "C3 needs probes aligned to the selected branch action."
+            )
+        try:
+            from math_verify import parse, verify
+        except ImportError as exc:
+            raise ImportError("Leakage gates require math-verify on the trainer node") from exc
 
         solver_role = self.prefix_probe_config.get(
             'solver_role',
@@ -1079,174 +1092,122 @@ class RayReMASeparatedTrainer(object):
         ]
         return outputs, num_gen_tokens, stop_reasons
 
-    def _attach_prefix_probe_gate(
-        self,
-        data_batch,
-        outcome_scores,
-        plan_scores,
-        worker_scores,
-        upstream_worker_scores,
-        terminal_roles,
-        metrics,
-    ):
-        hierarchy_config = self._get_hierarchy_config()
-        outcome_scores = outcome_scores.detach().float().cpu()
-        gate = apply_prefix_probe_gate(
-            outcome_scores.tolist(),
-            plan_scores.tolist(),
-            worker_scores.tolist(),
-            upstream_worker_scores.tolist(),
-            terminal_roles,
-            focal_role=self._current_train_agent,
-            decomposer_role=hierarchy_config.get(
-                'decomposer_role', 'decomposer'
-            ),
-            selector_role=hierarchy_config.get('selector_role', 'selector'),
-            stage_roles=hierarchy_config.get('stage_roles', []),
-            upstream_worker_requested=data_batch.batch[
-                'prefix_probe_upstream_workers_requested'
-            ].bool().cpu().tolist(),
-            upstream_worker_valid=data_batch.batch[
-                'prefix_probe_upstream_workers_valid'
-            ].bool().cpu().tolist(),
-        )
-        gated_scores = torch.tensor(
-            gate.outcome_scores,
-            dtype=outcome_scores.dtype,
-        )
-        gate_valid = torch.tensor(gate.valid_mask, dtype=torch.bool)
-        upstream_clean = torch.tensor(
-            gate.upstream_clean_mask,
-            dtype=torch.bool,
-        )
-        data_batch.batch['prefix_probe_gated_outcome_score'] = gated_scores
-        data_batch.batch['prefix_probe_gate_valid'] = gate_valid
-        data_batch.batch['prefix_probe_upstream_clean'] = upstream_clean
+    @staticmethod
+    def _record_leakage_metrics(data_batch, metrics, prefix):
+        """Accumulate gates and comparison coverage over generation chunks."""
 
-        metric_prefix = 'reward/leakage/all'
-        self._accumulate_prefix_probe_gate_metrics(
-            metrics,
-            metric_prefix,
-            outcome_scores,
-            gated_scores,
-            gate_valid,
-            upstream_clean,
-        )
+        raw = data_batch.batch['prefix_probe_raw_outcome_score'].float().cpu().numpy()
+        gated = data_batch.batch['prefix_probe_gated_outcome_score'].float().cpu().numpy()
+        reasons = data_batch.non_tensor_batch['prefix_probe_rejection_reason']
+
+        def accumulate(name, values):
+            count_key = f'{prefix}/{name}/count'
+            previous = float(metrics.get(count_key, 0.0))
+            total = previous + len(values)
+            if not total:
+                return
+            key = f'{prefix}/{name}/rate'
+            metrics[key] = (
+                float(metrics.get(key, 0.0)) * previous + float(sum(values))
+            ) / total
+            metrics[count_key] = total
+
+        count_key = f'{prefix}/trajectory_count'
+        previous_count = float(metrics.get(count_key, 0.0))
+        total_count = previous_count + len(data_batch)
+        if not total_count:
+            return
+        rates = {
+            'raw_accuracy': float(raw.sum()),
+            'gated_accuracy': float(gated.sum()),
+            'removed_correct_rate': float(((raw > 0) & (gated <= 0)).sum()),
+            'plan_eligible_rate': float(data_batch.batch['prefix_probe_plan_eligible'].sum()),
+            'gate_valid_rate': float(data_batch.batch['prefix_probe_gate_valid'].sum()),
+            'update_eligible_rate': float(data_batch.batch['prefix_probe_collaboration_eligible'].sum()),
+            'subtask_count_mean': float(data_batch.batch['prefix_probe_subtask_count'].sum()),
+        }
+        for reason in (
+            'single_subtask', 'plan_probe_invalid', 'plan_recoverable',
+            'comparison_invalid', 'equivalent_answer',
+        ):
+            rates[f'rejected/{reason}_rate'] = float(sum(value == reason for value in reasons))
+        for key, summed_value in rates.items():
+            key = f'{prefix}/{key}'
+            metrics[key] = (
+                float(metrics.get(key, 0.0)) * previous_count + summed_value
+            ) / total_count
+        metrics[count_key] = total_count
+
+        requested = data_batch.batch['prefix_probe_decomposer_requested'].bool().cpu().numpy()
+        valid = data_batch.batch['prefix_probe_decomposer_valid'].bool().cpu().numpy()
+        ld = np.asarray(data_batch.non_tensor_batch['prefix_probe_decomposer_score'], dtype=float)
+        accumulate('decomposer', [float(value > 0) for value in ld[valid]])
+        accumulate('decomposer_valid', valid[requested].tolist())
+        for field in ('nonempty', 'length_stopped'):
+            values = data_batch.batch[f'prefix_probe_decomposer_{field}'].bool().cpu().numpy()
+            accumulate(f'decomposer_{field}', values[requested].tolist())
+
+        by_role = defaultdict(list)
+        for comparisons in data_batch.non_tensor_batch['prefix_probe_worker_comparisons']:
+            for comparison in comparisons:
+                by_role[comparison['role']].append(comparison['match'])
+        all_matches = [match for values in by_role.values() for match in values]
+        for name, matches in [('worker_match', all_matches)] + [
+            (f'roles/{role}/worker_match', values) for role, values in by_role.items()
+        ]:
+            accumulate(f'{name}_valid', [value is not None for value in matches])
+            accumulate(name, [float(value) for value in matches if value is not None])
 
     @staticmethod
-    def _accumulate_prefix_probe_gate_metrics(
-        metrics,
-        metric_prefix,
-        outcome_scores,
-        gated_scores,
-        gate_valid,
-        upstream_clean,
-    ):
-        trajectory_count_key = f'{metric_prefix}/trajectory_count'
-        previous_count = float(metrics.get(trajectory_count_key, 0.0))
-        current_count = float(len(outcome_scores))
-        total_count = previous_count + current_count
-        batch_rates = {
-            'raw_accuracy': float(outcome_scores.mean().item()),
-            'gated_accuracy': float(gated_scores.mean().item()),
-            'gate_valid_rate': float(gate_valid.float().mean().item()),
-            'upstream_clean_rate': float(
-                upstream_clean.float().mean().item()
-            ),
-            'removed_correct_rate': float(
-                ((outcome_scores > 0.0) & (gated_scores <= 0.0))
-                .float()
-                .mean()
-                .item()
-            ),
-        }
-        for name, batch_rate in batch_rates.items():
-            key = f'{metric_prefix}/{name}'
-            previous_rate = float(metrics.get(key, 0.0))
-            metrics[key] = (
-                previous_rate * previous_count + batch_rate * current_count
-            ) / total_count
-        metrics[trajectory_count_key] = total_count
+    def _print_validation_leakage_examples(data_batch, scope='val'):
+        """Print L_D, each measured E_k, and the exact gate rejection reason."""
 
-    def _attach_validation_prefix_probe_gate(
-        self,
-        data_batch,
-        outcome_scores,
-        plan_scores,
-        worker_scores,
-        metrics,
-    ):
-        worker_requested = data_batch.batch[
-            'prefix_probe_focal_worker_requested'
-        ].bool().cpu()
-        worker_valid = data_batch.batch[
-            'prefix_probe_focal_worker_valid'
-        ].bool().cpu()
-        outcome_scores = outcome_scores.detach().float().cpu()
-        gate = apply_validation_prefix_probe_gate(
-            outcome_scores.tolist(),
-            plan_scores.tolist(),
-            worker_scores.tolist(),
-            worker_requested.tolist(),
-            worker_valid.tolist(),
-        )
-        gated_scores = torch.tensor(
-            gate.outcome_scores,
-            dtype=outcome_scores.dtype,
-        )
-        gate_valid = torch.tensor(gate.valid_mask, dtype=torch.bool)
-        upstream_clean = torch.tensor(
-            gate.upstream_clean_mask,
-            dtype=torch.bool,
-        )
-        self._accumulate_prefix_probe_gate_metrics(
-            metrics,
-            'val/leakage',
-            outcome_scores,
-            gated_scores,
-            gate_valid,
-            upstream_clean,
-        )
+        def format_score(value):
+            return 'n/a' if not np.isfinite(float(value)) else f'{float(value):.1f}'
 
-    def _print_leakage_summary(
-        self,
-        metrics,
-        scope,
-        metric_prefix=None,
-        worker_source='focal_worker',
-        include_upstream=True,
-    ):
-        metric_prefix = metric_prefix or f'reward/leakage/{scope}'
-
-        def format_metric(name):
-            value = metrics.get(f'{metric_prefix}/{name}')
-            return 'n/a' if value is None else f'{float(value):.3f}'
-
-        def format_source(source):
-            count = int(metrics.get(f'{metric_prefix}/{source}/count', 0.0))
-            return (
-                f'{source}={format_metric(f"{source}/rate")}'
-                f'(valid={format_metric(f"{source}/valid_rate")},'
-                f'nonempty={format_metric(f"{source}/nonempty_rate")},'
-                f'length={format_metric(f"{source}/length_stop_rate")},'
-                f'n={count})'
+        for index in range(len(data_batch)):
+            comparisons = data_batch.non_tensor_batch['prefix_probe_worker_comparisons'][index]
+            matches = ','.join(
+                f"{item['role']}:" + ('n/a' if item['match'] is None else str(int(item['match'])))
+                for item in comparisons
+            ) or 'exempt'
+            questions = data_batch.non_tensor_batch.get('question', [''] * len(data_batch))
+            question = ' '.join(str(questions[index]).split())
+            print(
+                f'[leakage/example] scope={scope} '
+                f'raw_score={float(data_batch.batch["prefix_probe_raw_outcome_score"][index]):.1f} '
+                f'gated_score={float(data_batch.batch["prefix_probe_gated_outcome_score"][index]):.1f} '
+                f'terminal_role={data_batch.non_tensor_batch["terminal_stage_role"][index]} '
+                f'subtasks={int(data_batch.batch["prefix_probe_subtask_count"][index])} '
+                f'Ld={format_score(data_batch.non_tensor_batch["prefix_probe_decomposer_score"][index])} '
+                f'E=[{matches}] '
+                f'plan_eligible={int(data_batch.batch["prefix_probe_plan_eligible"][index])} '
+                f'update_eligible={int(data_batch.batch["prefix_probe_collaboration_eligible"][index])} '
+                f'reason={data_batch.non_tensor_batch["prefix_probe_rejection_reason"][index]} '
+                f'question={question!r}',
+                flush=True,
             )
 
-        fields = [
-            f'[leakage/{scope}]',
-            f'step={self.global_steps}',
-            f'role={self._current_train_agent}',
-            f'raw_acc={format_metric("raw_accuracy")}',
-            f'gated_acc={format_metric("gated_accuracy")}',
-            f'removed_correct={format_metric("removed_correct_rate")}',
-            f'gate_valid={format_metric("gate_valid_rate")}',
-            f'upstream_clean={format_metric("upstream_clean_rate")}',
-            format_source('decomposer'),
-            format_source(worker_source),
-        ]
-        if include_upstream:
-            fields.append(format_source('upstream_workers'))
-        print(' '.join(fields), flush=True)
+    def _print_leakage_summary(self, metrics, scope, metric_prefix=None):
+        prefix = metric_prefix or f'reward/leakage/{scope}'
+
+        def value(name):
+            result = metrics.get(f'{prefix}/{name}')
+            return 'n/a' if result is None else f'{float(result):.3f}'
+
+        print(
+            f'[leakage/{scope}] step={self.global_steps} role={self._current_train_agent} '
+            f'raw_acc={value("raw_accuracy")} gated_acc={value("gated_accuracy")} '
+            f'plan_eligible={value("plan_eligible_rate")} '
+            f'update_eligible={value("update_eligible_rate")} '
+            f'Ld={value("decomposer/rate")} '
+            f'Ld_valid={value("decomposer_valid/rate")} '
+            f'worker_match={value("worker_match/rate")} '
+            f'comparison_valid={value("worker_match_valid/rate")} '
+            f'single_subtask={value("rejected/single_subtask_rate")} '
+            f'removed_correct={value("removed_correct_rate")}',
+            flush=True,
+        )
 
     def _attach_prefix_probe_signals(
         self,
@@ -1257,433 +1218,179 @@ class RayReMASeparatedTrainer(object):
         validation=False,
         probe_reward_fn=None,
     ):
-        """Measure isolated-message leakage for training or validation."""
+        """Probe plans once per unique input and compare worker/final answers."""
 
         if not self.prefix_probe_enabled:
             return
-
-        hierarchy_config = self._get_hierarchy_config()
-        decomposer_role = hierarchy_config.get('decomposer_role', 'decomposer')
-        stage_roles = hierarchy_config.get('stage_roles', [])
+        hierarchy = self._get_hierarchy_config()
+        decomposer_role = hierarchy.get('decomposer_role', 'decomposer')
+        stage_roles = hierarchy.get('stage_roles', [])
+        focal_role = None if validation else self._current_train_agent
         histories = data_batch.non_tensor_batch.get('history')
         if histories is None:
             raise ValueError("Prefix probe requires rollout history metadata")
+        size = len(data_batch)
         terminal_roles = data_batch.non_tensor_batch.get(
             'terminal_stage_role',
-            np.array([hierarchy_config.get('score_role', '')] * len(data_batch)),
+            np.array([hierarchy.get('score_role', '')] * size, dtype=object),
         )
-        requests = collect_prefix_probe_requests(
-            histories,
-            terminal_roles,
-            focal_role=None if validation else self._current_train_agent,
-            decomposer_role=decomposer_role,
-            stage_roles=stage_roles,
-        )
-
-        metric_prefix = 'val/leakage' if validation else 'reward/leakage/all'
+        data_batch.non_tensor_batch['terminal_stage_role'] = np.asarray(terminal_roles, dtype=object)
         probe_reward_fn = probe_reward_fn or self.reward_fn
-
-        # DataProto requires every non-tensor column to use object dtype. These
-        # values are converted back to float32 when gates and metrics use them.
-        plan_scores = np.full(len(data_batch), np.nan, dtype=object)
-        worker_scores = np.full(len(data_batch), np.nan, dtype=object)
-        upstream_worker_scores = np.full(
-            len(data_batch), np.nan, dtype=object
+        requests = collect_prefix_probe_requests(
+            histories, terminal_roles, focal_role=focal_role,
+            decomposer_role=decomposer_role, stage_roles=stage_roles,
         )
-        plan_responses = np.full(len(data_batch), '', dtype=object)
-        worker_responses = np.full(len(data_batch), '', dtype=object)
-        upstream_worker_responses = np.full(len(data_batch), '', dtype=object)
-        worker_roles = np.full(len(data_batch), '', dtype=object)
+        plan_scores = np.full(size, np.nan, dtype=object)
+        plan_responses = np.full(size, '', dtype=object)
+        plan_requested = np.zeros(size, dtype=bool)
+        plan_nonempty = np.zeros(size, dtype=bool)
+        plan_length = np.zeros(size, dtype=bool)
 
-        source_health = {
-            source: {
-                'requested': np.zeros(len(data_batch), dtype=np.int64),
-                'valid': np.zeros(len(data_batch), dtype=np.int64),
-                'nonempty': np.zeros(len(data_batch), dtype=np.int64),
-                'length_stopped': np.zeros(len(data_batch), dtype=np.int64),
-            }
-            for source in ('decomposer', 'focal_worker', 'upstream_workers')
-        }
-
-        def attach_probe_metadata():
-            data_batch.non_tensor_batch['prefix_probe_decomposer_score'] = plan_scores
-            data_batch.non_tensor_batch['prefix_probe_decomposer_response'] = plan_responses
-            data_batch.non_tensor_batch['prefix_probe_worker_score'] = worker_scores
-            data_batch.non_tensor_batch['prefix_probe_worker_response'] = worker_responses
-            data_batch.non_tensor_batch['prefix_probe_worker_role'] = worker_roles
-            data_batch.non_tensor_batch['prefix_probe_upstream_worker_score'] = upstream_worker_scores
-            data_batch.non_tensor_batch['prefix_probe_upstream_worker_response'] = upstream_worker_responses
-            for source, health in source_health.items():
-                requested = health['requested'] > 0
-                valid = requested & (
-                    health['valid'] == health['requested']
-                )
-                nonempty = requested & (
-                    health['nonempty'] == health['requested']
-                )
-                length_stopped = health['length_stopped'] > 0
-                data_batch.batch[f'prefix_probe_{source}_requested'] = (
-                    torch.from_numpy(requested)
-                )
-                data_batch.batch[f'prefix_probe_{source}_valid'] = (
-                    torch.from_numpy(valid)
-                )
-                data_batch.batch[f'prefix_probe_{source}_nonempty'] = (
-                    torch.from_numpy(nonempty)
-                )
-                data_batch.batch[f'prefix_probe_{source}_length_stopped'] = (
-                    torch.from_numpy(length_stopped)
-                )
-
-        if not requests:
-            attach_probe_metadata()
-            if validation:
-                self._attach_validation_prefix_probe_gate(
-                    data_batch,
-                    outcome_scores,
-                    plan_scores,
-                    worker_scores,
-                    metrics,
-                )
-                self._print_leakage_summary(
-                    metrics,
-                    'val',
-                    metric_prefix='val/leakage',
-                    worker_source='workers',
-                    include_upstream=False,
-                )
-            else:
-                self._attach_prefix_probe_gate(
-                    data_batch,
-                    outcome_scores,
-                    plan_scores,
-                    worker_scores,
-                    upstream_worker_scores,
-                    terminal_roles,
-                    metrics,
-                )
-                self._print_leakage_summary(metrics, 'all')
-            return
-
-        data_sources = data_batch.non_tensor_batch['data_source']
-        reward_models = data_batch.non_tensor_batch['reward_model']
+        # Shared C3 prefixes produce identical plans. Probe each unique plan
+        # only once in this batch and broadcast the measurement to its group.
+        unique_items, unique_indices, index_by_key = [], [], {}
         extra_infos = data_batch.non_tensor_batch.get(
-            'extra_info',
-            np.array([None] * len(data_batch), dtype=object),
+            'extra_info', np.array([None] * size, dtype=object),
         )
-        unique_items = []
-        unique_index_by_key = {}
-        request_unique_indices = []
         for request in requests:
-            sample_index = request.sample_index
-            ground_truth = reward_models[sample_index]['ground_truth']
-            key = self._prefix_probe_context_key(
+            index = request.sample_index
+            item = (
                 request.message,
-                data_sources[sample_index],
-                ground_truth,
-                extra_infos[sample_index],
+                data_batch.non_tensor_batch['data_source'][index],
+                data_batch.non_tensor_batch['reward_model'][index]['ground_truth'],
+                extra_infos[index],
             )
-            unique_index = unique_index_by_key.get(key)
-            if unique_index is None:
-                unique_index = len(unique_items)
-                unique_index_by_key[key] = unique_index
-                unique_items.append((
-                    request.message,
-                    data_sources[sample_index],
-                    ground_truth,
-                    extra_infos[sample_index],
-                ))
-            request_unique_indices.append(unique_index)
+            key = self._prefix_probe_context_key(*item)
+            if key not in index_by_key:
+                index_by_key[key] = len(unique_items)
+                unique_items.append(item)
+            unique_indices.append(index_by_key[key])
 
-        responses, num_gen_tokens, stop_reasons = (
-            self._generate_prefix_probe_responses([
-                item[0] for item in unique_items
-            ])
-        )
-        if not (
-            len(responses) == len(unique_items)
-            and len(num_gen_tokens) == len(unique_items)
-            and len(stop_reasons) == len(unique_items)
-        ):
-            raise RuntimeError(
-                "Prefix probe returned an incomplete generation batch: "
-                f"requested={len(unique_items)}, responses={len(responses)}, "
-                f"token_counts={len(num_gen_tokens)}, "
-                f"stop_reasons={len(stop_reasons)}"
+        if unique_items:
+            responses, tokens, stops = self._generate_prefix_probe_responses(
+                [item[0] for item in unique_items]
             )
-        boxed_answers = [
-            extract_complete_boxed_answer(response)
-            for response in responses
-        ]
-        probe_valid = [answer is not None for answer in boxed_answers]
-        scores = np.full(len(unique_items), np.nan, dtype=np.float32)
-        explicit_unknown = [
-            answer is not None
-            and ''.join(answer.lower().split()) in {
-                'unknown',
-                r'\text{unknown}',
-                r'\mathrm{unknown}',
-            }
-            for answer in boxed_answers
-        ]
-        for index, is_unknown in enumerate(explicit_unknown):
-            if is_unknown:
-                scores[index] = 0.0
-        valid_unique_indices = [
-            index
-            for index, valid in enumerate(probe_valid)
-            if valid and not explicit_unknown[index]
-        ]
-        if valid_unique_indices:
-            valid_scores = probe_reward_fn.score_responses(
-                [unique_items[index][1] for index in valid_unique_indices],
-                [responses[index] for index in valid_unique_indices],
-                [unique_items[index][2] for index in valid_unique_indices],
-                [unique_items[index][3] for index in valid_unique_indices],
-                show_progress=False,
-            )
-            for index, score in zip(valid_unique_indices, valid_scores):
-                scores[index] = float(score)
-
-        records_by_kind = defaultdict(list)
-        records_by_role = defaultdict(list)
-        worker_scores_by_sample = defaultdict(list)
-        upstream_scores_by_sample = defaultdict(list)
-        diagnostic_limit = int(
-            self.prefix_probe_config.get('diagnostic_samples', 2)
-        )
-        diagnosed_unique_indices = set()
-        for request, unique_index in zip(requests, request_unique_indices):
-            response = responses[unique_index]
-            score = float(scores[unique_index])
-            valid = bool(probe_valid[unique_index])
-            nonempty = bool(response.strip())
-            stop_reason = stop_reasons[unique_index]
-            record = (
-                request.sample_index,
-                score,
-                valid,
-                nonempty,
-                stop_reason,
-            )
-            records_by_kind[request.source_kind].append(record)
-            records_by_role[request.source_role].append(record)
-            health_source = {
-                'decomposer': 'decomposer',
-                'nonterminal_worker': 'focal_worker',
-                'upstream_worker': 'upstream_workers',
-            }[request.source_kind]
-            health = source_health[health_source]
-            health['requested'][request.sample_index] += 1
-            health['valid'][request.sample_index] += int(valid)
-            health['nonempty'][request.sample_index] += int(nonempty)
-            health['length_stopped'][request.sample_index] += int(
-                stop_reason == 'length'
-            )
-
-            if (
-                not valid
-                and len(diagnosed_unique_indices) < diagnostic_limit
-                and unique_index not in diagnosed_unique_indices
-            ):
-                diagnosed_unique_indices.add(unique_index)
-                preview = ' '.join(response.split())[:240] or '<empty>'
-                print(
-                    f'[prefix_probe/invalid] source={request.source_kind} '
-                    f'role={request.source_role} stop={stop_reason} '
-                    f'tokens={num_gen_tokens[unique_index]} '
-                    f'response={preview!r}',
-                    flush=True,
+            if not (len(responses) == len(tokens) == len(stops) == len(unique_items)):
+                raise RuntimeError("Prefix probe returned an incomplete generation batch")
+            answers = [extract_complete_boxed_answer(response) for response in responses]
+            unknown = [
+                answer is not None and ''.join(answer.lower().split()) in {
+                    'unknown', r'\text{unknown}', r'\mathrm{unknown}',
+                }
+                for answer in answers
+            ]
+            scores = [0.0 if missing else float('nan') for missing in unknown]
+            valid_answers = [
+                missing or parse_boxed_math_answer(response) is not None
+                for missing, response in zip(unknown, responses)
+            ]
+            to_score = [i for i, valid in enumerate(valid_answers) if valid and not unknown[i]]
+            if to_score:
+                measured = probe_reward_fn.score_responses(
+                    [unique_items[i][1] for i in to_score],
+                    [responses[i] for i in to_score],
+                    [unique_items[i][2] for i in to_score],
+                    [unique_items[i][3] for i in to_score],
+                    show_progress=False,
+                    timeout_score=float('nan'),
                 )
-
-            if request.source_kind == 'decomposer':
-                plan_scores[request.sample_index] = score
-                plan_responses[request.sample_index] = response
-            elif request.source_kind == 'nonterminal_worker':
-                if validation:
-                    worker_scores_by_sample[request.sample_index].append(score)
-                    existing = worker_responses[request.sample_index]
-                    worker_responses[request.sample_index] = (
-                        f'{existing}\n\n[{request.source_role}]\n{response}'.strip()
+                if len(measured) != len(to_score):
+                    raise RuntimeError("Prefix-probe scorer returned an incomplete score batch")
+                for index, score in zip(to_score, measured):
+                    scores[index] = float(score)
+            diagnosed = 0
+            for i, valid in enumerate(valid_answers):
+                if not valid and diagnosed < int(self.prefix_probe_config.get('diagnostic_samples', 2)):
+                    diagnosed += 1
+                    print(
+                        f'[prefix_probe/invalid] source=decomposer stop={stops[i]} '
+                        f'tokens={tokens[i]} response={responses[i][:240]!r}', flush=True,
                     )
-                    existing_roles = str(worker_roles[request.sample_index])
-                    worker_roles[request.sample_index] = ','.join(filter(
-                        None,
-                        (existing_roles, request.source_role),
-                    ))
-                else:
-                    worker_scores[request.sample_index] = score
-                    worker_responses[request.sample_index] = response
-                    worker_roles[request.sample_index] = request.source_role
+            for request, source_index in zip(requests, unique_indices):
+                index = request.sample_index
+                plan_scores[index] = scores[source_index]
+                plan_responses[index] = responses[source_index]
+                plan_requested[index] = True
+                plan_nonempty[index] = bool(responses[source_index].strip())
+                plan_length[index] = stops[source_index] == 'length'
+
+        counts = []
+        comparison_scores = np.full(size, np.nan, dtype=object)
+        comparison_required = []
+        comparison_records = np.empty(size, dtype=object)
+        comparison_cache = {}
+        for index, (history, terminal_role) in enumerate(zip(histories, terminal_roles)):
+            records = answer_round_records(history, str(terminal_role), decomposer_role)
+            counts.append(count_planned_subtasks(records, decomposer_role))
+            executed = {
+                record.get('role'): record for record in records
+                if record.get('executed', True) is not False
+            }
+            terminal_output = executed.get(str(terminal_role), {}).get('content', '')
+            if validation:
+                roles = [
+                    role for role in stage_roles
+                    if role != str(terminal_role) and role in executed
+                ]
             else:
-                upstream_scores_by_sample[request.sample_index].append(score)
-                existing = upstream_worker_responses[request.sample_index]
-                upstream_worker_responses[request.sample_index] = (
-                    f'{existing}\n\n[{request.source_role}]\n{response}'.strip()
+                roles = (
+                    [focal_role] if focal_role in stage_roles
+                    and focal_role != str(terminal_role) else []
                 )
+            comparison_required.append(bool(roles))
+            comparisons = []
+            for role in roles:
+                output = executed.get(role, {}).get('content', '')
+                key = (output, terminal_output)
+                if key not in comparison_cache:
+                    comparison_cache[key] = compare_worker_final_answers(output, terminal_output)
+                comparisons.append({'role': role, 'match': comparison_cache[key]})
+            comparison_records[index] = comparisons
+            if comparisons and all(item['match'] is not None for item in comparisons):
+                comparison_scores[index] = float(any(item['match'] for item in comparisons))
 
-        for sample_index, source_scores in upstream_scores_by_sample.items():
-            if all(np.isfinite(score) for score in source_scores):
-                upstream_worker_scores[sample_index] = max(source_scores)
-        for sample_index, source_scores in worker_scores_by_sample.items():
-            if all(np.isfinite(score) for score in source_scores):
-                worker_scores[sample_index] = max(source_scores)
-
-        def add_metrics(prefix, records):
-            if not records:
-                return
-            count_key = f'{prefix}/count'
-            previous_count = float(metrics.get(count_key, 0.0))
-            current_count = float(len(records))
-            total_count = previous_count + current_count
-            valid = np.asarray([record[2] for record in records], dtype=bool)
-            nonempty = np.asarray(
-                [record[3] for record in records], dtype=bool
-            )
-            length_stopped = np.asarray(
-                [record[4] == 'length' for record in records], dtype=bool
-            )
-            previous_valid = (
-                float(metrics.get(f'{prefix}/valid_rate', 0.0))
-                * previous_count
-            )
-            current_valid = float(valid.sum())
-            total_valid = previous_valid + current_valid
-            for name, values in (
-                ('valid_rate', valid),
-                ('nonempty_rate', nonempty),
-                ('length_stop_rate', length_stopped),
-            ):
-                previous_rate = float(metrics.get(f'{prefix}/{name}', 0.0))
-                metrics[f'{prefix}/{name}'] = (
-                    previous_rate * previous_count + float(values.sum())
-                ) / total_count
-            if total_valid > 0:
-                previous_leakage = (
-                    float(metrics.get(f'{prefix}/rate', 0.0))
-                    * previous_valid
-                )
-                current_leakage = sum(
-                    record[1] > 0.0 for record in records if record[2]
-                )
-                metrics[f'{prefix}/rate'] = (
-                    previous_leakage + float(current_leakage)
-                ) / total_valid
-            metrics[count_key] = total_count
-
-        add_metrics(
-            f'{metric_prefix}/decomposer',
-            records_by_kind['decomposer'],
+        raw = outcome_scores.detach().float().cpu()
+        gate = apply_prefix_probe_gate(
+            raw.tolist(), plan_scores.tolist(), counts,
+            comparison_scores.tolist(), comparison_required,
         )
-        worker_metric_name = 'workers' if validation else 'focal_worker'
-        add_metrics(
-            f'{metric_prefix}/{worker_metric_name}',
-            records_by_kind['nonterminal_worker'],
-        )
+        data_batch.non_tensor_batch.update({
+            'prefix_probe_decomposer_score': plan_scores,
+            'prefix_probe_decomposer_response': plan_responses,
+            'prefix_probe_worker_match_score': comparison_scores,
+            'prefix_probe_worker_comparisons': comparison_records,
+            'prefix_probe_rejection_reason': np.asarray(gate.rejection_reasons, dtype=object),
+        })
+        tensor_values = {
+            'prefix_probe_raw_outcome_score': raw,
+            'prefix_probe_gated_outcome_score': torch.tensor(gate.outcome_scores, dtype=torch.float32),
+            'prefix_probe_gate_valid': torch.tensor(gate.valid_mask, dtype=torch.bool),
+            'prefix_probe_collaboration_eligible': torch.tensor(gate.collaboration_eligible_mask, dtype=torch.bool),
+            'prefix_probe_plan_eligible': torch.tensor(gate.plan_eligible_mask, dtype=torch.bool),
+            'prefix_probe_subtask_count': torch.tensor(counts, dtype=torch.long),
+            'prefix_probe_decomposer_requested': torch.from_numpy(plan_requested),
+            'prefix_probe_decomposer_valid': torch.tensor([bool(np.isfinite(float(v))) for v in plan_scores], dtype=torch.bool),
+            'prefix_probe_decomposer_nonempty': torch.from_numpy(plan_nonempty),
+            'prefix_probe_decomposer_length_stopped': torch.from_numpy(plan_length),
+            'prefix_probe_worker_match_requested': torch.tensor(comparison_required, dtype=torch.bool),
+            'prefix_probe_worker_match_valid': torch.tensor([bool(np.isfinite(float(v))) for v in comparison_scores], dtype=torch.bool),
+        }
+        for key, value in tensor_values.items():
+            data_batch.batch[key] = value
+        scope = 'val' if validation else 'all'
+        prefix = 'val/leakage' if validation else 'reward/leakage/all'
+        self._record_leakage_metrics(data_batch, metrics, prefix)
+        self._print_leakage_summary(metrics, scope, metric_prefix=prefix)
         if not validation:
-            add_metrics(
-                f'{metric_prefix}/upstream_workers',
-                records_by_kind['upstream_worker'],
+            indices = select_console_probe_indices(
+                data_batch.non_tensor_batch['data_source'].tolist(),
+                int(getattr(probe_reward_fn, 'num_examine', 1)),
             )
-        for role, records in records_by_role.items():
-            if role == decomposer_role:
-                continue
-            add_metrics(f'{metric_prefix}/roles/{role}', records)
-
-        attach_probe_metadata()
-        if validation:
-            self._attach_validation_prefix_probe_gate(
-                data_batch,
-                outcome_scores,
-                plan_scores,
-                worker_scores,
-                metrics,
-            )
-            self._print_leakage_summary(
-                metrics,
-                'val',
-                metric_prefix='val/leakage',
-                worker_source='workers',
-                include_upstream=False,
-            )
-        else:
-            self._attach_prefix_probe_gate(
-                data_batch,
-                outcome_scores,
-                plan_scores,
-                worker_scores,
-                upstream_worker_scores,
-                terminal_roles,
-                metrics,
-            )
-            self._print_leakage_summary(metrics, 'all')
+            if indices:
+                self._print_validation_leakage_examples(data_batch[indices], scope='train')
 
     def _update_prefix_probe_batch_metrics(self, data_batch, metrics):
-        """Report leakage gates for the trajectories retained for training."""
-
-        metric_prefix = 'reward/leakage/train'
-        raw_scores = data_batch.batch['scoped_c3_raw_outcome_score'].float()
-        gated_scores = data_batch.batch['scoped_c3_outcome_score'].float()
-        gate_valid = data_batch.batch['prefix_probe_gate_valid'].bool()
-        upstream_clean = data_batch.batch['prefix_probe_upstream_clean'].bool()
-        metrics[f'{metric_prefix}/trajectory_count'] = float(len(data_batch))
-        metrics[f'{metric_prefix}/raw_accuracy'] = float(
-            raw_scores.mean().item()
-        )
-        metrics[f'{metric_prefix}/gated_accuracy'] = float(
-            gated_scores.mean().item()
-        )
-        metrics[f'{metric_prefix}/gate_valid_rate'] = float(
-            gate_valid.float().mean().item()
-        )
-        metrics[f'{metric_prefix}/upstream_clean_rate'] = float(
-            upstream_clean.float().mean().item()
-        )
-        metrics[f'{metric_prefix}/removed_correct_rate'] = float(
-            ((raw_scores > 0.0) & (gated_scores <= 0.0))
-            .float()
-            .mean()
-            .item()
-        )
-
-        for source_kind, score_key in (
-            ('decomposer', 'prefix_probe_decomposer_score'),
-            ('focal_worker', 'prefix_probe_worker_score'),
-            ('upstream_workers', 'prefix_probe_upstream_worker_score'),
-        ):
-            values = np.asarray(
-                data_batch.non_tensor_batch[score_key],
-                dtype=np.float32,
-            )
-            requested = data_batch.batch[
-                f'prefix_probe_{source_kind}_requested'
-            ].bool().cpu().numpy()
-            valid = data_batch.batch[
-                f'prefix_probe_{source_kind}_valid'
-            ].bool().cpu().numpy()
-            nonempty = data_batch.batch[
-                f'prefix_probe_{source_kind}_nonempty'
-            ].bool().cpu().numpy()
-            length_stopped = data_batch.batch[
-                f'prefix_probe_{source_kind}_length_stopped'
-            ].bool().cpu().numpy()
-            metrics[f'{metric_prefix}/{source_kind}/count'] = float(
-                requested.sum()
-            )
-            if requested.any():
-                metrics[f'{metric_prefix}/{source_kind}/valid_rate'] = float(
-                    valid[requested].mean()
-                )
-                metrics[f'{metric_prefix}/{source_kind}/nonempty_rate'] = float(
-                    nonempty[requested].mean()
-                )
-                metrics[f'{metric_prefix}/{source_kind}/length_stop_rate'] = float(
-                    length_stopped[requested].mean()
-                )
-            if valid.any():
-                metrics[f'{metric_prefix}/{source_kind}/rate'] = float(
-                    (values[valid] > 0.0).mean()
-                )
+        self._record_leakage_metrics(data_batch, metrics, 'reward/leakage/train')
         self._print_leakage_summary(metrics, 'train')
 
     @staticmethod
@@ -1795,12 +1502,16 @@ class RayReMASeparatedTrainer(object):
             raw_outcome_scores,
             dtype=torch.bool,
         )
+        collaboration_eligible = torch.ones_like(
+            raw_outcome_scores,
+            dtype=torch.bool,
+        )
         if self.prefix_probe_enabled:
-            outcome_scores = data_batch.batch[
-                'prefix_probe_gated_outcome_score'
-            ].float().cpu()
             prefix_gate_valid = data_batch.batch[
                 'prefix_probe_gate_valid'
+            ].bool().cpu()
+            collaboration_eligible = data_batch.batch[
+                'prefix_probe_collaboration_eligible'
             ].bool().cpu()
         action_present = self._c3_action_present_mask(data_batch, role)
         action_turns = data_batch.non_tensor_batch.get('c3_action_turn')
@@ -1837,22 +1548,27 @@ class RayReMASeparatedTrainer(object):
             action_present,
             metrics,
         )
-        causal_valid = action_present & exact_prefix & prefix_gate_valid
-        pre_mixed_valid = causal_valid.clone()
-        mixed_mask = torch.ones_like(causal_valid)
+        # A failed gate removes gradients, never factual outcomes from the
+        # leave-one-out baseline (including failed mathematical comparisons).
+        baseline_valid = action_present & exact_prefix
+        update_valid = baseline_valid & prefix_gate_valid & collaboration_eligible
+        pre_mixed_valid = baseline_valid.clone()
+        mixed_mask = torch.ones_like(baseline_valid)
         if bool(
             self.scoped_c3_grpo_config.get('mixed_groups_only', True)
         ):
             mixed_mask = self._c3_mixed_group_mask(
                 outcome_scores,
                 data_batch.non_tensor_batch['uid'],
-                causal_valid,
+                baseline_valid,
             )
-            causal_valid &= mixed_mask
+            baseline_valid &= mixed_mask
+            update_valid &= mixed_mask
 
         data_batch.batch['scoped_c3_raw_outcome_score'] = raw_outcome_scores
         data_batch.batch['scoped_c3_outcome_score'] = outcome_scores
-        data_batch.batch['scoped_c3_causal_valid'] = causal_valid
+        data_batch.batch['scoped_c3_causal_valid'] = baseline_valid
+        data_batch.batch['scoped_c3_update_mask'] = update_valid
 
         prefix = f'reward/c3/roles/{role}'
         metrics[f'{prefix}/action_present_rate'] = float(
@@ -1864,7 +1580,18 @@ class RayReMASeparatedTrainer(object):
         metrics[f'{prefix}/rejected/prefix_mismatch_rate'] = float(
             (action_present & ~exact_prefix).float().mean().item()
         )
-        metrics[f'{prefix}/rejected/leakage_rate'] = float(
+        metrics[f'{prefix}/rejected/leakage_gate_rate'] = float(
+            (
+                action_present
+                & exact_prefix
+                & prefix_gate_valid
+                & ~collaboration_eligible
+            )
+            .float()
+            .mean()
+            .item()
+        )
+        metrics[f'{prefix}/rejected/probe_invalid_rate'] = float(
             (action_present & exact_prefix & ~prefix_gate_valid)
             .float()
             .mean()
@@ -1874,7 +1601,10 @@ class RayReMASeparatedTrainer(object):
             (pre_mixed_valid & ~mixed_mask).float().mean().item()
         )
         metrics[f'{prefix}/causal_valid_rate'] = float(
-            causal_valid.float().mean().item()
+            baseline_valid.float().mean().item()
+        )
+        metrics[f'{prefix}/update_eligible_rate'] = float(
+            update_valid.float().mean().item()
         )
 
     def _compute_scoped_c3_grpo_advantage(self, data_batch, metrics):
@@ -1884,6 +1614,7 @@ class RayReMASeparatedTrainer(object):
             data_batch.batch['scoped_c3_outcome_score'].float(),
             data_batch.non_tensor_batch['uid'],
             data_batch.batch['scoped_c3_causal_valid'].bool(),
+            update_mask=data_batch.batch['scoped_c3_update_mask'].bool(),
             normalize=bool(
                 self.scoped_c3_grpo_config.get(
                     'normalize_advantages',
@@ -1943,6 +1674,10 @@ class RayReMASeparatedTrainer(object):
         advantage = estimate.advantage
         positive = effective & (advantage > 0)
         negative = effective & (advantage < 0)
+        for sign, candidates in (('positive', advantage > 0), ('negative', advantage < 0)):
+            metrics[f'{prefix}/{sign}_before_gate_count'] = float(candidates.sum().item())
+            metrics[f'{prefix}/{sign}_after_gate_count'] = float((effective & candidates).sum().item())
+            metrics[f'{prefix}/{sign}_removed_count'] = float((~effective & candidates).sum().item())
         metrics[f'{prefix}/effective_sample_rate'] = float(
             effective.float().mean().item()
         )
@@ -2531,6 +2266,15 @@ class RayReMASeparatedTrainer(object):
         probe_extra_infos = []
         probe_strata = []
         val_leakage_metrics = {}
+        validation_max_samples = int(
+            self.prefix_probe_config.get('validation_max_samples', 128)
+        ) if self.prefix_probe_enabled else 0
+        live_probe_indices = set()
+
+        def as_object_array(values):
+            result = np.empty(len(values), dtype=object)
+            result[:] = values
+            return result
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -2659,6 +2403,7 @@ class RayReMASeparatedTrainer(object):
 
             histories = test_output_gen_batch.non_tensor_batch['history'].tolist()
             if self.prefix_probe_enabled:
+                probe_batch_offset = len(probe_histories)
                 terminal_role_values = dynamic_score_roles
                 if terminal_role_values is None:
                     terminal_role_values = np.array(
@@ -2688,6 +2433,74 @@ class RayReMASeparatedTrainer(object):
                         test_batch.non_tensor_batch['data_source'],
                     )
                 )
+
+                # Reproduce the reward manager's first-N selection so the
+                # leakage line immediately following its example describes
+                # the same trajectory. These probes count toward the global
+                # validation budget and are not generated again below.
+                remaining_live_budget = (
+                    validation_max_samples - len(live_probe_indices)
+                )
+                console_local_indices = select_console_probe_indices(
+                    test_batch.non_tensor_batch['data_source'].tolist(),
+                    int(getattr(self.val_reward_fn, 'num_examine', 1)),
+                )[:max(remaining_live_budget, 0)]
+                if console_local_indices:
+                    console_global_indices = [
+                        probe_batch_offset + index
+                        for index in console_local_indices
+                    ]
+                    live_probe_indices.update(console_global_indices)
+                    batch_extra_infos = test_batch.non_tensor_batch.get(
+                        'extra_info',
+                        np.array([None] * len(test_batch), dtype=object),
+                    )
+                    live_probe_batch = DataProto.from_dict(
+                        tensors={
+                            'batch_idx': torch.arange(
+                                len(console_local_indices)
+                            ),
+                        },
+                        non_tensors={
+                            'question': as_object_array([
+                                test_batch.non_tensor_batch['question'][index]
+                                for index in console_local_indices
+                            ]),
+                            'history': as_object_array([
+                                histories[index]
+                                for index in console_local_indices
+                            ]),
+                            'terminal_stage_role': as_object_array([
+                                terminal_role_values[index]
+                                for index in console_local_indices
+                            ]),
+                            'data_source': as_object_array([
+                                test_batch.non_tensor_batch['data_source'][index]
+                                for index in console_local_indices
+                            ]),
+                            'reward_model': as_object_array([
+                                test_batch.non_tensor_batch['reward_model'][index]
+                                for index in console_local_indices
+                            ]),
+                            'extra_info': as_object_array([
+                                batch_extra_infos[index]
+                                for index in console_local_indices
+                            ]),
+                        },
+                    )
+                    live_outcome_scores = reward_tensor['acc'][
+                        console_local_indices
+                    ].detach().cpu()
+                    self._attach_prefix_probe_signals(
+                        live_probe_batch,
+                        live_outcome_scores,
+                        val_leakage_metrics,
+                        validation=True,
+                        probe_reward_fn=self.val_reward_fn,
+                    )
+                    self._print_validation_leakage_examples(
+                        live_probe_batch
+                    )
             turn_counts = [
                 int(value)
                 for value in test_output_gen_batch.non_tensor_batch['num_turns'].tolist()
@@ -2779,19 +2592,24 @@ class RayReMASeparatedTrainer(object):
             
             history_lst.append(histories)
 
-        validation_max_samples = int(
-            self.prefix_probe_config.get('validation_max_samples', 128)
-        ) if self.prefix_probe_enabled else 0
-        probe_indices = select_stratified_probe_indices(
-            probe_strata,
-            validation_max_samples,
+        remaining_probe_budget = max(
+            validation_max_samples - len(live_probe_indices),
+            0,
         )
+        remaining_probe_indices = [
+            index
+            for index in range(len(probe_strata))
+            if index not in live_probe_indices
+        ]
+        selected_remaining_offsets = select_stratified_probe_indices(
+            [probe_strata[index] for index in remaining_probe_indices],
+            remaining_probe_budget,
+        )
+        probe_indices = [
+            remaining_probe_indices[offset]
+            for offset in selected_remaining_offsets
+        ]
         if probe_indices:
-            def as_object_array(values):
-                result = np.empty(len(values), dtype=object)
-                result[:] = values
-                return result
-
             probe_batch = DataProto.from_dict(
                 tensors={
                     'batch_idx': torch.arange(len(probe_indices)),
@@ -3728,6 +3546,9 @@ class RayReMASeparatedTrainer(object):
                             causal_valid = new_batch.batch[
                                 'scoped_c3_causal_valid'
                             ].bool().cpu()
+                            c3_update_mask = new_batch.batch[
+                                'scoped_c3_update_mask'
+                            ].bool().cpu()
                             c3_kept_prompt_uids = []
                             for key_uid, sample_indices in id2indices.items():
                                 causal_indices = [
@@ -3749,6 +3570,10 @@ class RayReMASeparatedTrainer(object):
                                     bool(torch.isfinite(causal_scores).all().item())
                                     and float(causal_scores.max().item())
                                     > float(causal_scores.min().item())
+                                    and any(
+                                        bool(c3_update_mask[index].item())
+                                        for index in causal_indices
+                                    )
                                 ):
                                     c3_kept_prompt_uids.append(key_uid)
                             kept_prompt_uids = c3_kept_prompt_uids
@@ -4117,15 +3942,15 @@ class RayReMASeparatedTrainer(object):
                     result.update({
                         "prefix_probe_decomposer_score": [],
                         "prefix_probe_decomposer_response": [],
-                        "prefix_probe_worker_score": [],
-                        "prefix_probe_worker_response": [],
-                        "prefix_probe_worker_role": [],
-                        "prefix_probe_upstream_worker_score": [],
-                        "prefix_probe_upstream_worker_response": [],
+                        "prefix_probe_worker_match_score": [],
+                        "prefix_probe_worker_comparisons": [],
+                        "prefix_probe_rejection_reason": [],
+                        "planned_subtask_count": [],
+                        "prefix_probe_plan_eligible": [],
                         "raw_outcome_score": [],
                         "gated_outcome_score": [],
                         "prefix_probe_gate_valid": [],
-                        "prefix_probe_upstream_clean": [],
+                        "prefix_probe_collaboration_eligible": [],
                     })
                 results_dict[uid] = result
 
@@ -4156,42 +3981,35 @@ class RayReMASeparatedTrainer(object):
                         'prefix_probe_decomposer_response', ''
                     )
                 )
-                results_dict[uid]['prefix_probe_worker_score'].append(
-                    float(data_item.non_tensor_batch.get(
-                        'prefix_probe_worker_score', float('nan')
-                    ))
+                for key in (
+                    'prefix_probe_worker_match_score',
+                    'prefix_probe_worker_comparisons',
+                    'prefix_probe_rejection_reason',
+                ):
+                    results_dict[uid][key].append(data_item.non_tensor_batch[key])
+                results_dict[uid]['planned_subtask_count'].append(
+                    int(data_item.batch['prefix_probe_subtask_count'].item())
                 )
-                results_dict[uid]['prefix_probe_worker_response'].append(
-                    data_item.non_tensor_batch.get(
-                        'prefix_probe_worker_response', ''
-                    )
+                results_dict[uid]['prefix_probe_plan_eligible'].append(
+                    bool(data_item.batch['prefix_probe_plan_eligible'].item())
                 )
-                results_dict[uid]['prefix_probe_worker_role'].append(
-                    data_item.non_tensor_batch.get(
-                        'prefix_probe_worker_role', ''
-                    )
-                )
-                results_dict[uid]['prefix_probe_upstream_worker_score'].append(
-                    float(data_item.non_tensor_batch.get(
-                        'prefix_probe_upstream_worker_score', float('nan')
-                    ))
-                )
-                results_dict[uid][
-                    'prefix_probe_upstream_worker_response'
-                ].append(data_item.non_tensor_batch.get(
-                    'prefix_probe_upstream_worker_response', ''
-                ))
                 results_dict[uid]['raw_outcome_score'].append(float(
                     data_item.batch['scoped_c3_raw_outcome_score'].item()
                 ))
                 results_dict[uid]['gated_outcome_score'].append(float(
-                    data_item.batch['scoped_c3_outcome_score'].item()
+                    data_item.batch[
+                        'prefix_probe_gated_outcome_score'
+                    ].item()
                 ))
                 results_dict[uid]['prefix_probe_gate_valid'].append(bool(
                     data_item.batch['prefix_probe_gate_valid'].item()
                 ))
-                results_dict[uid]['prefix_probe_upstream_clean'].append(bool(
-                    data_item.batch['prefix_probe_upstream_clean'].item()
+                results_dict[uid][
+                    'prefix_probe_collaboration_eligible'
+                ].append(bool(
+                    data_item.batch[
+                        'prefix_probe_collaboration_eligible'
+                    ].item()
                 ))
 
         results_to_save = []

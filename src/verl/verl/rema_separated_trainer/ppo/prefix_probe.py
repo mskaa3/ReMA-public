@@ -1,12 +1,13 @@
+"""Plan recoverability probes and non-terminal answer-equivalence gates."""
+
 import math
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
 
 @dataclass(frozen=True)
 class PrefixProbeRequest:
-    """One isolated role message to test for answer recoverability."""
-
     sample_index: int
     source_role: str
     source_kind: str
@@ -15,11 +16,13 @@ class PrefixProbeRequest:
 
 @dataclass(frozen=True)
 class PrefixProbeGate:
-    """Leakage-adjusted outcome and validity for one focal role."""
+    """Diagnostic gated outcomes and update eligibility, not C3 rewards."""
 
     outcome_scores: List[float]
     valid_mask: List[bool]
-    upstream_clean_mask: List[bool]
+    collaboration_eligible_mask: List[bool]
+    plan_eligible_mask: List[bool]
+    rejection_reasons: List[str]
 
 
 def extract_complete_boxed_answer(response: str) -> Optional[str]:
@@ -27,214 +30,195 @@ def extract_complete_boxed_answer(response: str) -> Optional[str]:
 
     if not isinstance(response, str):
         return None
-    marker = "\\boxed"
-    marker_index = response.rfind(marker)
-    if marker_index < 0:
+    matches = list(re.finditer(r"\\boxed\s*\{", response))
+    if not matches:
         return None
-    left_brace = response.find("{", marker_index + len(marker))
-    if left_brace < 0:
-        return None
+    start = matches[-1].end() - 1
     depth = 0
-    for index in range(left_brace, len(response)):
-        character = response[index]
-        if character == "{":
+    for index in range(start, len(response)):
+        if response[index] == "{":
             depth += 1
-        elif character == "}":
+        elif response[index] == "}":
             depth -= 1
             if depth == 0:
-                answer = response[left_brace + 1:index].strip()
-                return answer or None
+                return response[start + 1:index].strip() or None
     return None
 
 
 def has_complete_boxed_answer(response: str) -> bool:
-    """Return whether a probe response contains a non-empty complete box."""
-
     return extract_complete_boxed_answer(response) is not None
+
+
+def parse_boxed_math_answer(response: str):
+    """Parse a complete mathematical box without fallback strings."""
+
+    from math_verify import parse
+    from math_verify.parser import LatexExtractionConfig
+    from math_verify.utils import TimeoutException
+
+    answer = extract_complete_boxed_answer(response)
+    if answer is None or ''.join(answer.lower().split()) in {
+        'unknown', r'\text{unknown}', r'\mathrm{unknown}',
+    }:
+        return None
+    try:
+        parsed = parse(
+            "\\boxed{" + answer + "}",
+            extraction_config=[LatexExtractionConfig()],
+            fallback_mode="no_fallback",
+            extraction_mode="first_match",
+        )
+        if not parsed or any(isinstance(value, str) for value in parsed):
+            return None
+        return parsed
+    except (Exception, TimeoutException):
+        return None
+
+
+def compare_worker_final_answers(worker_output: str, terminal_output: str) -> Optional[bool]:
+    """Compare LOCAL_RESULT with the terminal box; None means unknown."""
+
+    from math_verify.grader import sympy_expr_eq
+    from math_verify.utils import TimeoutException, timeout
+
+    local = re.search(
+        r"local[_ ]result\s*:\s*(.*?)(?:\n\s*reasoning\s*:|\n\s*subtask\b|\Z)",
+        worker_output or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if local is None:
+        return None
+    candidate = parse_boxed_math_answer(local.group(1))
+    reference = parse_boxed_math_answer(terminal_output)
+    if candidate is None or reference is None:
+        return None
+
+    # Math-Verify 0.7 verify() swallows errors/timeouts as False. Call its
+    # symbolic comparator with an outer timeout so those remain unknown.
+    @timeout(timeout_seconds=5)
+    def equivalent():
+        return any(
+            sympy_expr_eq(gold, pred, float_rounding=6, numeric_precision=15, strict=True)
+            for gold in reference for pred in candidate
+        )
+
+    try:
+        return bool(equivalent())
+    except (Exception, TimeoutException):
+        return None
+
+
+def answer_round_records(history: Iterable[Dict], terminal_role: str, decomposer_role: str):
+    """Use the round that generated the answer, ignoring carried-forward copies."""
+
+    records = [record for record in history if isinstance(record, dict)]
+    terminal_indices = [
+        index for index, record in enumerate(records)
+        if record.get("role") == terminal_role
+        and record.get("executed", True) is not False
+    ]
+    end = terminal_indices[-1] + 1 if terminal_indices else len(records)
+    starts = [
+        index for index, record in enumerate(records[:end])
+        if record.get("role") == decomposer_role
+        and record.get("executed", True) is not False
+    ]
+    return records[starts[-1]:end] if starts else []
+
+
+def count_planned_subtasks(records: Sequence[Dict], decomposer_role: str) -> int:
+    """Prefer the executed router's count over re-parsing the generated plan."""
+
+    plan = next((record for record in records if record.get("role") == decomposer_role), {})
+    if "planned_subtask_count" in plan:
+        return max(int(plan["planned_subtask_count"]), 0)
+    # Compatibility with histories recorded before the router exposed counts.
+    ids = set()
+    for record in records:
+        for item in record.get("assigned_subtasks", []) or []:
+            label = item[0] if isinstance(item, (list, tuple)) else item
+            ids.add(str(label).upper())
+    return len(ids)
+
+
+def collect_prefix_probe_requests(
+    histories: Sequence[Iterable[Dict]],
+    terminal_roles: Sequence[str],
+    *,
+    focal_role: Optional[str],
+    decomposer_role: str,
+    stage_roles: Sequence[str],
+) -> List[PrefixProbeRequest]:
+    """Generate only plan probes. Worker comparisons never call an LLM."""
+
+    if len(histories) != len(terminal_roles):
+        raise ValueError("histories and terminal_roles must have equal lengths")
+    requests = []
+    for index, (history, terminal_role) in enumerate(zip(histories, terminal_roles)):
+        records = answer_round_records(history, str(terminal_role), decomposer_role)
+        plan = next((r.get("content", "") for r in records if r.get("role") == decomposer_role), "")
+        if isinstance(plan, str) and plan.strip():
+            requests.append(PrefixProbeRequest(index, decomposer_role, "decomposer", plan.strip()))
+    return requests
 
 
 def apply_prefix_probe_gate(
     raw_scores: Sequence[float],
     decomposer_scores: Sequence[float],
-    worker_scores: Sequence[float],
-    upstream_worker_scores: Sequence[float],
-    terminal_roles: Sequence[str],
-    *,
-    focal_role: str,
-    decomposer_role: str,
-    selector_role: str,
-    stage_roles: Sequence[str],
-    upstream_worker_requested: Optional[Sequence[bool]] = None,
-    upstream_worker_valid: Optional[Sequence[bool]] = None,
+    subtask_counts: Sequence[int],
+    comparison_scores: Sequence[float],
+    comparison_required: Sequence[bool],
 ) -> PrefixProbeGate:
-    """Build role-local outcomes from isolated-message leakage probes.
+    """Apply G(plan) and M(action), leaving raw C3 rewards to the caller.
 
-    A decomposer is credited only when its plan does not reveal a recoverable
-    answer. Downstream actions are excluded when the upstream plan is leaky,
-    because their fixed prefix is already contaminated. A non-terminal worker
-    additionally loses credit when its own isolated message reveals the final
-    answer. The terminal worker is exempt from that own-message check.
+    Validation supplies max(E_k) across all non-terminal workers, with NaN
+    if any required comparison failed. Training supplies the focal E_k only.
+    Terminal actions need no comparison but still require an eligible plan.
     """
 
     size = len(raw_scores)
-    if not (
-        len(decomposer_scores) == size
-        and len(worker_scores) == size
-        and len(upstream_worker_scores) == size
-        and len(terminal_roles) == size
+    if any(len(values) != size for values in (
+        decomposer_scores, subtask_counts, comparison_scores, comparison_required,
+    )):
+        raise ValueError("All leakage gate inputs must have equal lengths")
+    valid, eligible, plans, outcomes, reasons = [], [], [], [], []
+    for raw, ld, count, match, required in zip(
+        raw_scores, decomposer_scores, subtask_counts, comparison_scores, comparison_required,
     ):
-        raise ValueError("All prefix-probe gate inputs must have equal lengths")
-    if upstream_worker_requested is None:
-        upstream_worker_requested = [
-            math.isfinite(float(score)) for score in upstream_worker_scores
-        ]
-    if upstream_worker_valid is None:
-        upstream_worker_valid = [
-            math.isfinite(float(score)) for score in upstream_worker_scores
-        ]
-    if not (
-        len(upstream_worker_requested) == size
-        and len(upstream_worker_valid) == size
-    ):
-        raise ValueError("Upstream probe masks must match the score length")
-
-    stage_role_set = set(stage_roles)
-    outcomes = []
-    valid = []
-    upstream_clean = []
-    for (
-        raw,
-        plan_score,
-        worker_score,
-        upstream_score,
-        terminal_role,
-        upstream_requested,
-        upstream_valid,
-    ) in zip(
-        raw_scores,
-        decomposer_scores,
-        worker_scores,
-        upstream_worker_scores,
-        terminal_roles,
-        upstream_worker_requested,
-        upstream_worker_valid,
-    ):
-        raw = float(raw)
-        plan_available = math.isfinite(float(plan_score))
-        plan_clean = plan_available and float(plan_score) <= 0.0
-        prior_workers_clean = not bool(upstream_requested) or (
-            bool(upstream_valid)
-            and math.isfinite(float(upstream_score))
-            and float(upstream_score) <= 0.0
-        )
-        clean_prefix = plan_clean and prior_workers_clean
-        upstream_clean.append(clean_prefix)
-
-        if focal_role == decomposer_role:
-            valid.append(plan_available)
-            outcomes.append(raw if plan_clean else 0.0)
-            continue
-
-        if focal_role == selector_role:
-            valid.append(plan_clean)
-            outcomes.append(raw if plan_clean else 0.0)
-            continue
-
-        if focal_role in stage_role_set:
-            if not clean_prefix:
-                valid.append(False)
-                outcomes.append(0.0)
-                continue
-            if focal_role == str(terminal_role):
-                valid.append(True)
-                outcomes.append(raw)
-                continue
-
-            worker_available = math.isfinite(float(worker_score))
-            worker_clean = worker_available and float(worker_score) <= 0.0
-            valid.append(worker_available)
-            outcomes.append(raw if worker_clean else 0.0)
-            continue
-
-        valid.append(True)
-        outcomes.append(raw)
-
-    return PrefixProbeGate(
-        outcome_scores=outcomes,
-        valid_mask=valid,
-        upstream_clean_mask=upstream_clean,
-    )
+        plan_valid = math.isfinite(float(ld))
+        compare_valid = not required or math.isfinite(float(match))
+        plan_ok = int(count) >= 2 and plan_valid and float(ld) <= 0.0
+        if int(count) < 2:
+            reason = "single_subtask"
+        elif not plan_valid:
+            reason = "plan_probe_invalid"
+        elif float(ld) > 0.0:
+            reason = "plan_recoverable"
+        elif not compare_valid:
+            reason = "comparison_invalid"
+        elif required and float(match) > 0.0:
+            reason = "equivalent_answer"
+        else:
+            reason = "eligible"
+        allowed = reason == "eligible"
+        valid.append(plan_valid and compare_valid)
+        plans.append(plan_ok)
+        eligible.append(allowed)
+        outcomes.append(float(raw) if allowed else 0.0)
+        reasons.append(reason)
+    return PrefixProbeGate(outcomes, valid, eligible, plans, reasons)
 
 
-def apply_validation_prefix_probe_gate(
-    raw_scores: Sequence[float],
-    decomposer_scores: Sequence[float],
-    worker_scores: Sequence[float],
-    worker_requested: Sequence[bool],
-    worker_valid: Sequence[bool],
-) -> PrefixProbeGate:
-    """Gate validation outcomes on clean plans and all upstream workers."""
-
-    size = len(raw_scores)
-    if not (
-        len(decomposer_scores) == size
-        and len(worker_scores) == size
-        and len(worker_requested) == size
-        and len(worker_valid) == size
-    ):
-        raise ValueError(
-            "All validation prefix-probe gate inputs must have equal lengths"
-        )
-
-    outcomes = []
-    valid = []
-    upstream_clean = []
-    for raw, plan_score, workers_score, requested, workers_are_valid in zip(
-        raw_scores,
-        decomposer_scores,
-        worker_scores,
-        worker_requested,
-        worker_valid,
-    ):
-        raw = float(raw)
-        plan_available = math.isfinite(float(plan_score))
-        plan_clean = plan_available and float(plan_score) <= 0.0
-        workers_available = not bool(requested) or (
-            bool(workers_are_valid)
-            and math.isfinite(float(workers_score))
-        )
-        workers_clean = not bool(requested) or (
-            workers_available and float(workers_score) <= 0.0
-        )
-        all_valid = plan_available and workers_available
-        clean_prefix = plan_clean and workers_clean
-
-        valid.append(all_valid)
-        upstream_clean.append(clean_prefix)
-        outcomes.append(raw if all_valid and clean_prefix else 0.0)
-
-    return PrefixProbeGate(
-        outcome_scores=outcomes,
-        valid_mask=valid,
-        upstream_clean_mask=upstream_clean,
-    )
-
-
-def select_stratified_probe_indices(
-    labels: Sequence[str],
-    max_samples: int,
-) -> List[int]:
+def select_stratified_probe_indices(labels: Sequence[str], max_samples: int) -> List[int]:
     """Select a deterministic round-robin sample across validation subsets."""
 
     if max_samples <= 0 or len(labels) == 0:
         return []
     if len(labels) <= max_samples:
         return list(range(len(labels)))
-
     buckets: Dict[str, List[int]] = {}
     for index, label in enumerate(labels):
         buckets.setdefault(str(label), []).append(index)
-
     selected = []
     depth = 0
     while len(selected) < max_samples:
@@ -252,78 +236,18 @@ def select_stratified_probe_indices(
     return sorted(selected)
 
 
-def _latest_executed_message(
-    history: Iterable[Dict],
-    role: str,
-) -> Optional[str]:
-    latest = None
-    for record in history:
-        if not isinstance(record, dict) or record.get("role") != role:
+def select_console_probe_indices(labels: Sequence[str], samples_per_label: int) -> List[int]:
+    """Mirror the reward manager's first-N examples per data source."""
+
+    if samples_per_label <= 0:
+        return []
+    counts: Dict[str, int] = {}
+    selected = []
+    for index, label in enumerate(labels):
+        label = str(label)
+        count = counts.get(label, 0)
+        if count >= samples_per_label:
             continue
-        if record.get("executed", True) is False:
-            continue
-        content = record.get("content", "")
-        if isinstance(content, str) and content.strip():
-            latest = content.strip()
-    return latest
-
-
-def collect_prefix_probe_requests(
-    histories: Sequence[Iterable[Dict]],
-    terminal_roles: Sequence[str],
-    *,
-    focal_role: Optional[str],
-    decomposer_role: str,
-    stage_roles: Sequence[str],
-) -> List[PrefixProbeRequest]:
-    """Collect plan, focal, and causally upstream messages for probing.
-
-    The terminal worker is deliberately excluded because revealing the final
-    answer is its assigned responsibility.
-    """
-
-    if len(histories) != len(terminal_roles):
-        raise ValueError("histories and terminal_roles must have equal lengths")
-
-    requests = []
-    stage_role_set = set(stage_roles)
-    focal_is_worker = focal_role in stage_role_set
-    stage_index = {
-        role: index for index, role in enumerate(stage_roles)
-    }
-    for sample_index, (history, terminal_role) in enumerate(
-        zip(histories, terminal_roles)
-    ):
-        plan = _latest_executed_message(history, decomposer_role)
-        if plan is not None:
-            requests.append(PrefixProbeRequest(
-                sample_index=sample_index,
-                source_role=decomposer_role,
-                source_kind="decomposer",
-                message=plan,
-            ))
-
-        if focal_role is not None and not focal_is_worker:
-            continue
-
-        terminal_index = stage_index.get(str(terminal_role), len(stage_roles))
-        for worker_role in stage_roles[:terminal_index]:
-            worker_index = stage_index[worker_role]
-            if focal_role is not None and worker_index > stage_index[focal_role]:
-                continue
-            worker_message = _latest_executed_message(history, worker_role)
-            if worker_message is None:
-                continue
-            source_kind = (
-                "nonterminal_worker"
-                if focal_role is None or worker_role == focal_role
-                else "upstream_worker"
-            )
-            requests.append(PrefixProbeRequest(
-                sample_index=sample_index,
-                source_role=worker_role,
-                source_kind=source_kind,
-                message=worker_message,
-            ))
-
-    return requests
+        selected.append(index)
+        counts[label] = count + 1
+    return selected
