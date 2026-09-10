@@ -269,6 +269,46 @@ def test_validation_checks_all_nonterminal_results_and_logs_example(capsys):
     assert "worker_before" not in output
 
 
+@pytest.mark.parametrize("sources,num_examine,expected_indices", [
+    (["math"], 1, [0]),
+    (["math", "math", "gsm8k", "gsm8k"], 1, [0, 2]),
+    (["math", "math", "gsm8k", "gsm8k"], 2, [0, 1, 2, 3]),
+    (["math", "gsm8k"], 0, []),
+])
+def test_training_logs_selected_examples_without_changing_batch(
+    sources, num_examine, expected_indices, capsys,
+):
+    trainer = _trainer()
+    trainer.reward_fn.num_examine = num_examine
+    batch = _batch([_history("6") for _ in sources])
+    batch.non_tensor_batch["data_source"] = _object_array(sources)
+    batch.non_tensor_batch["question"] = _object_array([
+        f"question {index}" for index in range(len(sources))
+    ])
+    raw = torch.tensor([float(index % 2 == 0) for index in range(len(sources))])
+    metrics = {}
+
+    trainer._attach_prefix_probe_signals(batch, raw, metrics)
+
+    examples = [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[leakage/example] scope=train ")
+    ]
+    assert len(examples) == len(expected_indices)
+    for line, index in zip(examples, expected_indices):
+        assert f"question='question {index}'" in line
+        assert f"raw_score={raw[index].item():.1f}" in line
+        assert "Lt=0.0" in line
+        assert "E=[worker_stage_1:0]" in line
+        assert "reason=eligible" in line
+    assert len(batch) == len(sources)
+    assert batch.batch["batch_idx"].tolist() == list(range(len(sources)))
+    assert batch.batch["prefix_probe_raw_outcome_score"].tolist() == raw.tolist()
+    assert batch.batch["prefix_probe_gated_outcome_score"].tolist() == raw.tolist()
+    assert metrics["reward/leakage/all/raw_accuracy"] == pytest.approx(raw.mean().item())
+    assert all(column.dtype == object for column in batch.non_tensor_batch.values())
+
+
 def test_c3_trainer_keeps_rejected_and_unparseable_actions_as_baseline():
     trainer = _trainer()
     batch = _batch([_history("26"), _history("6"), _history()])

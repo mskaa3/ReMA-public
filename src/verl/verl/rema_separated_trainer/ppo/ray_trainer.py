@@ -1406,8 +1406,9 @@ class RayReMASeparatedTrainer(object):
                 data_batch.non_tensor_batch['data_source'].tolist(),
                 int(getattr(probe_reward_fn, 'num_examine', 1)),
             )
-            if indices:
-                self._print_validation_leakage_examples(data_batch[indices], scope='train')
+            for index in indices:
+                # Only slicing preserves DataProto; list indexing returns DataProtoItem.
+                self._print_validation_leakage_examples(data_batch[index:index + 1], scope='train')
 
     def _update_prefix_probe_batch_metrics(self, data_batch, metrics):
         self._record_leakage_metrics(data_batch, metrics, 'reward/leakage/train')
