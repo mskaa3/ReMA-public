@@ -1414,7 +1414,7 @@ class MultiAgentRollout:
             prompts.meta_info.get("teacher_attempt_key", "teacher_attempt")
         )
         teacher_attempt_probability = (
-            0.0
+            float(bool(prompts.meta_info.get("teacher_assisted_validation", False)))
             if is_validation
             else float(
                 prompts.meta_info.get("teacher_attempt_probability", 0.0)
@@ -1424,6 +1424,10 @@ class MultiAgentRollout:
             teacher_attempt_key,
             np.asarray([""] * batch_size, dtype=object),
         )
+        if is_validation and teacher_attempt_probability > 0 and not all(
+            isinstance(attempt, str) and attempt.strip() for attempt in sampled_teacher_attempts
+        ):
+            raise ValueError("Teacher-assisted validation requires a non-empty teacher_attempt for every question")
         teacher_attempt_max_chars = max(
             int(agent12_curriculum.get("teacher_attempt_max_chars", 8000)),
             1,
@@ -1893,6 +1897,7 @@ class MultiAgentRollout:
                 for idx in revise_indices
             }
             completed_results_by_idx = {idx: [] for idx in revise_indices}
+            terminal_probe_input_by_idx = {}
             max_stage_count = max(
                 [len(ordered_stages_by_idx[idx]) for idx in revise_indices],
                 default=0,
@@ -1996,6 +2001,10 @@ class MultiAgentRollout:
                                 "The terminal worker must receive the last planned subtask"
                             )
                         work_so_far_block = f"{work_so_far}\n\n" if work_so_far else ""
+                        task_block = (
+                            f"CURRENT TASK:\n{assigned_subtasks_text}\n\n"
+                            f"{stage_instruction}\n\n"
+                        )
                         dependency_instruction = (
                             "Use the PREVIOUS LOCAL RESULTS when the current task depends on them.\n\n"
                             if work_so_far and not is_finalizer_stage else ""
@@ -2008,12 +2017,15 @@ class MultiAgentRollout:
                                 f"{question_block}"
                                 f"{work_so_far_block}"
                                 f"{dependency_instruction}"
-                                f"CURRENT TASK:\n{assigned_subtasks_text}\n\n"
-                                f"{stage_instruction}\n\n"
+                                f"{task_block}"
                             ),
                             system_prompts.get("finalizer") if is_finalizer_stage else None,
                         )
                         worker_chats_by_idx[idx] = chat
+                        if is_terminal_stage and terminal_worker_as_answer:
+                            # Same static task input as the terminal, with only
+                            # upstream results and their wrapper withheld.
+                            terminal_probe_input_by_idx[idx] = question_block + task_block
                     stage_records = self._generate_from_hierarchical_chat_map(
                         stage_role,
                         stage_indices,
@@ -2118,6 +2130,8 @@ class MultiAgentRollout:
                         )
                         if history[idx] and history[idx][-1].get("role") == stage_role:
                             history[idx][-1]["assigned_subtasks"] = assigned_subtask_ids
+                            if stage_role == terminal_stage_roles[idx] and idx in terminal_probe_input_by_idx:
+                                history[idx][-1]["terminal_probe_input"] = terminal_probe_input_by_idx[idx]
 
             if i_turn + 1 < max_num_turns:
                 for idx in revise_indices:

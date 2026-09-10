@@ -41,7 +41,17 @@ export WORKER_QUESTION_EVAL_PROBABILITY=1.0
 export DECOMPOSER_TRANSFER_STEPS=0
 export WORKER_QUESTION_FADE_STEPS=0
 export JOINT_STEPS=0
-export TOTAL_STEPS=${TOTAL_STEPS:-${WORKER_BOOTSTRAP_STEPS}}
+export AGENT2_PILOT=${AGENT2_PILOT:-false}
+if [[ "$AGENT2_PILOT" == "true" || "$AGENT2_PILOT" == "1" ]]; then
+    # Reuse one complete cached teacher shard; never generate all 17 shards
+    # just to perform a short pilot. The common launcher creates a held-out split.
+    export ONLINE_TEACHER_GENERATION=false
+    export GENERATE_TEACHER_DATA=0
+    export TOTAL_STEPS=${TOTAL_STEPS:-20}
+    export TEST_FREQ=${TEST_FREQ:-5}
+else
+    export TOTAL_STEPS=${TOTAL_STEPS:-${WORKER_BOOTSTRAP_STEPS}}
+fi
 export AGENT12_RUN_NAME=${AGENT12_RUN_NAME:-agent2-only-${SLURM_JOB_ID}}
 export ONLINE_TEACHER_GENERATION=${ONLINE_TEACHER_GENERATION:-true}
 export TEACHER_SHARD_QUESTIONS=${TEACHER_SHARD_QUESTIONS:-512}

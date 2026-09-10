@@ -3,6 +3,9 @@ data:
   chat_template: null  # override in code
   train_files: /root/tmpdir/MATH/train_lv3to5_8k.parquet
   val_files: /root/tmpdir/overall_math/test.parquet
+  # Optional second evaluation on the same questions using a held-out
+  # teacher_attempt column. Standard val/acc remains question-only.
+  teacher_assisted_validation: False
   prompt_key: question
   reward_fn_key: data_source
   max_prompt_length: 6144
@@ -275,8 +278,8 @@ algorithm:
     worker_context_mode: full_question
     final_context_mode: plan_and_worker_results
     pass_question_to_workers: True
-    # The planner chooses the smallest useful number of dependent subtasks from
-    # one to four. A malformed empty plan falls back to one task.
+    # Prefer two to four useful computational stages. Indivisible problems and
+    # malformed empty plans may still route to one task, excluded by the gate.
     decomposer_max_new_tokens: 512
     # Local stages have enough room to complete their reasoning and still emit
     # the terminal LOCAL_RESULT required by downstream stages.
@@ -325,11 +328,12 @@ algorithm:
       mixed_groups_only: True
       normalize_advantages: True
       normalization_epsilon: 1.0e-6
-      # Require at least two routed subtasks and a valid plan probe with L_D=0
+      # Require at least two routed subtasks and a valid terminal-input L_T=0
       # for every role. Non-terminal workers also require a parsed LOCAL_RESULT
       # not equivalent to the terminal answer (Math-Verify). Gates mask actor
       # updates only: C3 baselines retain raw correctness for all alternatives.
-      # Only the plan is probed by an LLM; worker before/after probes are removed.
+      # L_T withholds previous LOCAL_RESULTs from the terminal instruction.
+      # Whole-plan L_D is diagnostic only. Worker comparisons need no LLM.
       prefix_probe:
         enable: False
         solver_role: decomposer

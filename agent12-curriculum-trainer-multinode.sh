@@ -42,6 +42,9 @@ export WORKER_CHECKPOINT_ROLE=${WORKER_CHECKPOINT_ROLE:-worker_stage_${NUM_WORKE
 export PREFIX_PROBE_ENABLE=${PREFIX_PROBE_ENABLE:-false}
 export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}
 export PREFIX_PROBE_VALIDATION_MAX_SAMPLES=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES:-128}
+export AGENT2_PILOT=${AGENT2_PILOT:-false}
+export AGENT12_VAL_FILE=${AGENT12_VAL_FILE:-/root/tmpdir/overall_math/test.parquet}
+export TEACHER_ASSISTED_VALIDATION=${TEACHER_ASSISTED_VALIDATION:-false}
 
 export WORKER_BOOTSTRAP_STEPS=${WORKER_BOOTSTRAP_STEPS:-200}
 export WORKER_QUESTION_BOOTSTRAP_PROBABILITY=${WORKER_QUESTION_BOOTSTRAP_PROBABILITY:-1.0}
@@ -64,6 +67,11 @@ export TEACHER_SHARD_QUESTIONS=${TEACHER_SHARD_QUESTIONS:-512}
 export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-phi4-mini-reasoning-n${TEACHER_ROLLOUT_N}-all-attempt-groups.parquet}
 export TEACHER_CANDIDATES_REMOTE=${TEACHER_CANDIDATES_REMOTE:-${TEACHER_TRAIN_REMOTE%.parquet}.generation-progress.parquet}
 export TEACHER_SHARD_REMOTE_ROOT=${TEACHER_SHARD_REMOTE_ROOT:-${TEACHER_TRAIN_REMOTE%.parquet}.shards/q${TEACHER_SHARD_QUESTIONS}}
+if [[ "$AGENT2_PILOT" == "true" || "$AGENT2_PILOT" == "1" ]]; then
+    export ONLINE_TEACHER_GENERATION=false
+    export GENERATE_TEACHER_DATA=0
+    export TEACHER_TRAIN_REMOTE=${PILOT_TEACHER_REMOTE:-${TEACHER_SHARD_REMOTE_ROOT}/train/shard-00000.parquet}
+fi
 
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/agent12}
 export RAY_NODE_TMP=${RAY_NODE_TMP:-${JOB_TMP}/ray}
@@ -255,6 +263,8 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   --config-path=/root/ReMA-public/config \
   --config-name=rema-rl.yaml \
   data.train_files=${train_file} \
+  data.val_files=${AGENT12_VAL_FILE} \
+  data.teacher_assisted_validation=${TEACHER_ASSISTED_VALIDATION} \
   data.train_batch_size=${BASE_QUESTION_BATCH_SIZE} \
   actor_rollout_ref.model.path=${DECOMPOSER_MODEL_PATH} \
   algorithm.switch_agent.model_paths=[${DECOMPOSER_MODEL_PATH},${WORKER_MODEL_PATH}] \
@@ -569,6 +579,18 @@ fi
 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
     test -s "$TEACHER_TRAIN_FILE"
 
+if [[ "$AGENT2_PILOT" == "true" || "$AGENT2_PILOT" == "1" ]]; then
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 /root/ReMA-public/scripts/prepare_agent2_pilot_data.py \
+            --input "$TEACHER_TRAIN_FILE" --output-dir "$JOB_TMP/agent2_pilot"
+    export TEACHER_TRAIN_FILE=${JOB_TMP}/agent2_pilot/train.parquet
+    export AGENT12_VAL_FILE=${JOB_TMP}/agent2_pilot/val.parquet
+    export TEACHER_ASSISTED_VALIDATION=true
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        rclone copy "$JOB_TMP/agent2_pilot" "$REMOTE_RUN/pilot_data" --s3-no-check-bucket
+fi
+
 start_ray
 run_agent12_training "$TEACHER_TRAIN_FILE" "$TOTAL_STEPS" True True
 stop_ray
@@ -651,6 +673,9 @@ worker_checkpoint_role=${WORKER_CHECKPOINT_ROLE}
 prefix_probe_enable=${PREFIX_PROBE_ENABLE}
 prefix_probe_max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS}
 prefix_probe_validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES}
+prefix_probe_gate=terminal_instruction
+agent2_pilot=${AGENT2_PILOT}
+teacher_assisted_validation=${TEACHER_ASSISTED_VALIDATION}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
 decomposer_use_remove_padding=${DECOMPOSER_USE_REMOVE_PADDING}

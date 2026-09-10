@@ -2,7 +2,7 @@
 
 This training mode assigns role-local credit from exact fixed-prefix rollouts
 and terminal correctness. The Agent-2-only launcher enables the gates described
-in [C3 with plan and answer gates](c3_prefix_probe.md).
+in [C3 with terminal-instruction and answer gates](c3_prefix_probe.md).
 
 ## Rollouts and baseline
 
@@ -27,7 +27,9 @@ focal action and raw trajectory outcome are available.
 
 ## Masks
 
-The combined leakage gate requires a multi-subtask plan and valid L_D=0.
+The combined leakage gate requires a multi-subtask plan and valid L_T=0:
+the terminal instruction alone must not recover the final answer when previous
+LOCAL_RESULTs are withheld. Whole-plan L_D is logged but does not gate training.
 Non-terminal actions also require a parsed LOCAL_RESULT not equivalent to
 the terminal answer. Terminal actions are exempt only from this comparison.
 

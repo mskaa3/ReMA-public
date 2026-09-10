@@ -1,4 +1,4 @@
-"""Plan recoverability probes and non-terminal answer-equivalence gates."""
+"""Terminal-instruction gates, plan diagnostics, and answer equivalence."""
 
 import math
 import re
@@ -149,7 +149,11 @@ def collect_prefix_probe_requests(
     decomposer_role: str,
     stage_roles: Sequence[str],
 ) -> List[PrefixProbeRequest]:
-    """Generate only plan probes. Worker comparisons never call an LLM."""
+    """Probe the recorded terminal input and the whole plan separately.
+
+    Missing terminal metadata is unknown, not a clean measurement. Never
+    reconstruct it from the plan or include earlier worker outputs.
+    """
 
     if len(histories) != len(terminal_roles):
         raise ValueError("histories and terminal_roles must have equal lengths")
@@ -159,12 +163,17 @@ def collect_prefix_probe_requests(
         plan = next((r.get("content", "") for r in records if r.get("role") == decomposer_role), "")
         if isinstance(plan, str) and plan.strip():
             requests.append(PrefixProbeRequest(index, decomposer_role, "decomposer", plan.strip()))
+        terminal = next((r for r in records if r.get("role") == terminal_role
+                         and r.get("executed", True) is not False), {})
+        instruction = terminal.get("terminal_probe_input")
+        if isinstance(instruction, str) and instruction.strip():
+            requests.append(PrefixProbeRequest(index, str(terminal_role), "terminal", instruction))
     return requests
 
 
 def apply_prefix_probe_gate(
     raw_scores: Sequence[float],
-    decomposer_scores: Sequence[float],
+    terminal_scores: Sequence[float],
     subtask_counts: Sequence[int],
     comparison_scores: Sequence[float],
     comparison_required: Sequence[bool],
@@ -173,27 +182,28 @@ def apply_prefix_probe_gate(
 
     Validation supplies max(E_k) across all non-terminal workers, with NaN
     if any required comparison failed. Training supplies the focal E_k only.
-    Terminal actions need no comparison but still require an eligible plan.
+    Terminal actions need no comparison but still require a valid negative
+    terminal-instruction probe. Whole-plan L_D never enters this gate.
     """
 
     size = len(raw_scores)
     if any(len(values) != size for values in (
-        decomposer_scores, subtask_counts, comparison_scores, comparison_required,
+        terminal_scores, subtask_counts, comparison_scores, comparison_required,
     )):
         raise ValueError("All leakage gate inputs must have equal lengths")
     valid, eligible, plans, outcomes, reasons = [], [], [], [], []
-    for raw, ld, count, match, required in zip(
-        raw_scores, decomposer_scores, subtask_counts, comparison_scores, comparison_required,
+    for raw, lt, count, match, required in zip(
+        raw_scores, terminal_scores, subtask_counts, comparison_scores, comparison_required,
     ):
-        plan_valid = math.isfinite(float(ld))
+        plan_valid = math.isfinite(float(lt))
         compare_valid = not required or math.isfinite(float(match))
-        plan_ok = int(count) >= 2 and plan_valid and float(ld) <= 0.0
+        plan_ok = int(count) >= 2 and plan_valid and float(lt) <= 0.0
         if int(count) < 2:
             reason = "single_subtask"
         elif not plan_valid:
-            reason = "plan_probe_invalid"
-        elif float(ld) > 0.0:
-            reason = "plan_recoverable"
+            reason = "terminal_probe_invalid"
+        elif float(lt) > 0.0:
+            reason = "terminal_recoverable"
         elif not compare_valid:
             reason = "comparison_invalid"
         elif required and float(match) > 0.0:

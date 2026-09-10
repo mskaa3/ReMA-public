@@ -84,10 +84,10 @@ def test_comparison_timeout_is_unknown(monkeypatch):
     (0, 2, 1, True, "equivalent_answer"),
     (0, 2, float("nan"), True, "comparison_invalid"),
     (0, 1, 0, True, "single_subtask"),
-    (1, 3, 0, True, "plan_recoverable"),
-    (float("nan"), 3, 0, True, "plan_probe_invalid"),
+    (1, 3, 0, True, "terminal_recoverable"),
+    (float("nan"), 3, 0, True, "terminal_probe_invalid"),
     (0, 2, float("nan"), False, "eligible"),
-    (1, 2, float("nan"), False, "plan_recoverable"),
+    (1, 2, float("nan"), False, "terminal_recoverable"),
     (0, 1, float("nan"), False, "single_subtask"),
 ])
 def test_plan_and_action_gate(ld, count, match, required, reason):
@@ -127,20 +127,25 @@ def _history(local="6", final="26", count=2):
     return [
         _record("decomposer", "PLAN:\n- S1: compute a\n- S2: finish", planned_subtask_count=count),
         _record("worker_stage_1", "LOCAL_RESULT: \\boxed{" + local + "}", "S1"),
-        _record("worker_stage_2", "LOCAL_RESULT: \\boxed{" + final + "}", "S2"),
+        _record("worker_stage_2", "LOCAL_RESULT: \\boxed{" + final + "}", "S2",
+                terminal_probe_input="CURRENT TASK:\nS2: Add 20 to the S1 LOCAL_RESULT."),
         dict(role="worker_stage_3", content="", executed=False),
     ]
 
 
-def test_only_plan_is_probed_and_terminal_is_dynamic():
+def test_plan_and_actual_terminal_instruction_are_separate_probes():
     history = _history()
     requests = collect_prefix_probe_requests(
         [history], ["worker_stage_2"], focal_role="worker_stage_1",
         decomposer_role="decomposer", stage_roles=["worker_stage_1", "worker_stage_2"],
     )
-    assert len(requests) == 1
+    assert len(requests) == 2
     assert requests[0].source_kind == "decomposer"
     assert requests[0].message == history[0]["content"]
+    assert requests[1].source_kind == "terminal"
+    assert requests[1].source_role == "worker_stage_2"
+    assert requests[1].message == history[2]["terminal_probe_input"]
+    assert "\\boxed{6}" not in requests[1].message
 
 
 def test_accepted_round_uses_original_plan_and_results():
@@ -186,7 +191,8 @@ def _batch(histories):
     )
 
 
-def _trainer(focal_role="worker_stage_1", plan_response=r"\boxed{UNKNOWN}"):
+def _trainer(focal_role="worker_stage_1", terminal_response=r"\boxed{UNKNOWN}",
+             plan_response=r"\boxed{UNKNOWN}"):
     from verl.rema_separated_trainer.ppo.ray_trainer import RayReMASeparatedTrainer
 
     trainer = RayReMASeparatedTrainer.__new__(RayReMASeparatedTrainer)
@@ -211,19 +217,22 @@ def _trainer(focal_role="worker_stage_1", plan_response=r"\boxed{UNKNOWN}"):
     def probe(messages):
         trainer.probe_calls.append(messages)
         assert all("hidden original Q" not in message for message in messages)
-        return [plan_response] * len(messages), [3] * len(messages), ["stop"] * len(messages)
+        return [
+            terminal_response if message.startswith("CURRENT TASK:") else plan_response
+            for message in messages
+        ], [3] * len(messages), ["stop"] * len(messages)
 
     trainer._generate_prefix_probe_responses = probe
     return trainer
 
 
-def test_trainer_probes_plan_once_and_preserves_object_columns_on_concat():
+def test_trainer_deduplicates_both_probes_and_preserves_object_columns_on_concat():
     trainer = _trainer()
     batch = _batch([_history("26"), _history("6"), _history("9", "9")])
     metrics = {}
     trainer._attach_prefix_probe_signals(batch, torch.tensor([1., 1., 0.]), metrics)
     assert len(trainer.probe_calls) == 1
-    assert len(trainer.probe_calls[0]) == 1
+    assert len(trainer.probe_calls[0]) == 2
     assert batch.batch["prefix_probe_collaboration_eligible"].tolist() == [False, True, False]
     assert batch.non_tensor_batch["prefix_probe_worker_match_score"].tolist() == [1., 0., 1.]
     combined = DataProto.concat([batch[:1], batch[1:]])
@@ -233,14 +242,14 @@ def test_trainer_probes_plan_once_and_preserves_object_columns_on_concat():
     assert metrics["reward/leakage/all/gated_accuracy"] == pytest.approx(1/3)
 
 
-@pytest.mark.parametrize("plan_response,count,allowed", [
+@pytest.mark.parametrize("terminal_response,count,allowed", [
     (r"\boxed{UNKNOWN}", 2, True),
     (r"\boxed{26}", 2, False),
     ("malformed", 2, False),
     (r"\boxed{UNKNOWN}", 1, False),
 ])
-def test_terminal_exempt_from_comparison_but_not_plan_gate(plan_response, count, allowed):
-    trainer = _trainer("worker_stage_2", plan_response)
+def test_terminal_exempt_from_comparison_but_not_instruction_gate(terminal_response, count, allowed):
+    trainer = _trainer("worker_stage_2", terminal_response)
     batch = _batch([_history(count=count)])
     trainer._attach_prefix_probe_signals(batch, torch.tensor([1.]), {})
     assert batch.non_tensor_batch["prefix_probe_worker_comparisons"].tolist() == [[]]
@@ -255,6 +264,7 @@ def test_validation_checks_all_nonterminal_results_and_logs_example(capsys):
     assert batch.batch["prefix_probe_gated_outcome_score"].tolist() == [0., 1.]
     output = capsys.readouterr().out
     assert "E=[worker_stage_1:1]" in output
+    assert "Lt=0.0" in output
     assert "reason=equivalent_answer" in output
     assert "worker_before" not in output
 
@@ -286,18 +296,18 @@ def test_c3_trainer_keeps_rejected_and_unparseable_actions_as_baseline():
     assert metrics[f"reward/c3/roles/{role}/negative_removed_count"] == 1
 
 
-def test_invalid_math_plan_probe_does_not_become_clean_plan(monkeypatch):
+def test_invalid_math_terminal_probe_does_not_become_clean_measurement(monkeypatch):
     from verl.rema_separated_trainer.ppo import ray_trainer
 
-    trainer = _trainer(plan_response=r"\boxed{unparseable}")
+    trainer = _trainer(terminal_response=r"\boxed{unparseable}")
     monkeypatch.setattr(ray_trainer, "parse_boxed_math_answer", lambda text: None)
     batch = _batch([_history()])
     trainer._attach_prefix_probe_signals(batch, torch.ones(1), {})
-    assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == ["plan_probe_invalid"]
+    assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == ["terminal_probe_invalid"]
 
 
-def test_plan_scorer_timeout_is_not_a_clean_measurement():
-    trainer = _trainer(plan_response=r"\boxed{26}")
+def test_terminal_scorer_timeout_is_not_a_clean_measurement():
+    trainer = _trainer(terminal_response=r"\boxed{26}")
 
     def timeout(*args, **kwargs):
         assert np.isnan(kwargs["timeout_score"])
@@ -306,7 +316,7 @@ def test_plan_scorer_timeout_is_not_a_clean_measurement():
     trainer.reward_fn.score_responses = timeout
     batch = _batch([_history()])
     trainer._attach_prefix_probe_signals(batch, torch.ones(1), {})
-    assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == ["plan_probe_invalid"]
+    assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == ["terminal_probe_invalid"]
     assert batch.batch["prefix_probe_collaboration_eligible"].tolist() == [False]
 
 
@@ -375,4 +385,46 @@ def test_chunk_metrics_are_weighted_and_replay_contains_new_gates(tmp_path):
     assert saved["prefix_probe_rejection_reason"] == ["equivalent_answer", "eligible", "eligible"]
     assert saved["gated_outcome_score"] == [0., 1., 1.]
     assert saved["raw_outcome_score"] == [1., 1., 1.]
+    assert saved["prefix_probe_gate_protocol"] == "terminal_instruction"
+    assert saved["prefix_probe_terminal_score"] == [0., 0., 0.]
+    assert saved["prefix_probe_terminal_response"] == [r"\boxed{UNKNOWN}"] * 3
+    assert all("S2: Add 20" in value for value in saved["prefix_probe_terminal_input"])
     assert "prefix_probe_worker_before_score" not in saved
+
+
+@pytest.mark.parametrize("plan_response", [r"\boxed{26}", "malformed plan probe"])
+def test_whole_plan_recoverability_or_invalidity_never_vetoes_updates(plan_response):
+    trainer = _trainer(plan_response=plan_response)
+    batch = _batch([_history()])
+    metrics = {}
+    trainer._attach_prefix_probe_signals(batch, torch.ones(1), metrics)
+    assert batch.batch["prefix_probe_collaboration_eligible"].tolist() == [True]
+    assert batch.batch["prefix_probe_gate_valid"].tolist() == [True]
+    assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == ["eligible"]
+    assert batch.non_tensor_batch["prefix_probe_terminal_score"].tolist() == [0.]
+    assert metrics["reward/leakage/all/terminal/rate"] == 0
+    assert metrics["reward/leakage/all/decomposer_valid/rate"] == float(plan_response.startswith(r"\boxed"))
+
+
+def test_missing_terminal_metadata_is_unknown_not_reconstructed_from_plan():
+    trainer = _trainer()
+    history = _history()
+    del history[2]["terminal_probe_input"]
+    batch = _batch([history])
+    trainer._attach_prefix_probe_signals(batch, torch.ones(1), {})
+    assert len(trainer.probe_calls[0]) == 1  # Whole-plan diagnostic only.
+    assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == ["terminal_probe_invalid"]
+    assert batch.batch["prefix_probe_terminal_requested"].tolist() == [False]
+    assert batch.batch["prefix_probe_collaboration_eligible"].tolist() == [False]
+
+
+def test_terminal_instructions_are_deduplicated_independently_of_whole_plan():
+    trainer = _trainer()
+    histories = [_history(), _history()]
+    histories[1][2]["terminal_probe_input"] = "CURRENT TASK:\nS2: Return 26."
+    batch = _batch(histories)
+    trainer._attach_prefix_probe_signals(batch, torch.ones(2), {})
+    assert len(trainer.probe_calls[0]) == 3  # One plan, two distinct terminal instructions.
+    assert batch.non_tensor_batch["prefix_probe_terminal_input"].tolist() == [
+        history[2]["terminal_probe_input"] for history in histories
+    ]

@@ -969,9 +969,11 @@ class RayReMASeparatedTrainer(object):
             return
         if not self.scoped_c3_grpo_enabled:
             raise ValueError("Prefix probe requires scoped C3 GRPO")
+        if not hierarchy_config.get('terminal_worker_as_answer', False):
+            raise ValueError("Terminal-instruction gates require terminal_worker_as_answer=True")
         if int(self.config.actor_rollout_ref.rollout.get('max_num_turns', 1)) != 1:
             raise ValueError(
-                "Plan/equivalence gates require max_num_turns=1; multi-round "
+                "Terminal/equivalence gates require max_num_turns=1; multi-round "
                 "C3 needs probes aligned to the selected branch action."
             )
         try:
@@ -1127,7 +1129,7 @@ class RayReMASeparatedTrainer(object):
             'subtask_count_mean': float(data_batch.batch['prefix_probe_subtask_count'].sum()),
         }
         for reason in (
-            'single_subtask', 'plan_probe_invalid', 'plan_recoverable',
+            'single_subtask', 'terminal_probe_invalid', 'terminal_recoverable',
             'comparison_invalid', 'equivalent_answer',
         ):
             rates[f'rejected/{reason}_rate'] = float(sum(value == reason for value in reasons))
@@ -1138,14 +1140,15 @@ class RayReMASeparatedTrainer(object):
             ) / total_count
         metrics[count_key] = total_count
 
-        requested = data_batch.batch['prefix_probe_decomposer_requested'].bool().cpu().numpy()
-        valid = data_batch.batch['prefix_probe_decomposer_valid'].bool().cpu().numpy()
-        ld = np.asarray(data_batch.non_tensor_batch['prefix_probe_decomposer_score'], dtype=float)
-        accumulate('decomposer', [float(value > 0) for value in ld[valid]])
-        accumulate('decomposer_valid', valid[requested].tolist())
-        for field in ('nonempty', 'length_stopped'):
-            values = data_batch.batch[f'prefix_probe_decomposer_{field}'].bool().cpu().numpy()
-            accumulate(f'decomposer_{field}', values[requested].tolist())
+        for source in ('decomposer', 'terminal'):
+            requested = data_batch.batch[f'prefix_probe_{source}_requested'].bool().cpu().numpy()
+            valid = data_batch.batch[f'prefix_probe_{source}_valid'].bool().cpu().numpy()
+            scores = np.asarray(data_batch.non_tensor_batch[f'prefix_probe_{source}_score'], dtype=float)
+            accumulate(source, [float(value > 0) for value in scores[valid]])
+            accumulate(f'{source}_valid', valid[requested].tolist())
+            for field in ('nonempty', 'length_stopped'):
+                values = data_batch.batch[f'prefix_probe_{source}_{field}'].bool().cpu().numpy()
+                accumulate(f'{source}_{field}', values[requested].tolist())
 
         by_role = defaultdict(list)
         for comparisons in data_batch.non_tensor_batch['prefix_probe_worker_comparisons']:
@@ -1160,7 +1163,7 @@ class RayReMASeparatedTrainer(object):
 
     @staticmethod
     def _print_validation_leakage_examples(data_batch, scope='val'):
-        """Print L_D, each measured E_k, and the exact gate rejection reason."""
+        """Print diagnostic L_D, gate L_T, E_k, and the rejection reason."""
 
         def format_score(value):
             return 'n/a' if not np.isfinite(float(value)) else f'{float(value):.1f}'
@@ -1180,6 +1183,7 @@ class RayReMASeparatedTrainer(object):
                 f'terminal_role={data_batch.non_tensor_batch["terminal_stage_role"][index]} '
                 f'subtasks={int(data_batch.batch["prefix_probe_subtask_count"][index])} '
                 f'Ld={format_score(data_batch.non_tensor_batch["prefix_probe_decomposer_score"][index])} '
+                f'Lt={format_score(data_batch.non_tensor_batch["prefix_probe_terminal_score"][index])} '
                 f'E=[{matches}] '
                 f'plan_eligible={int(data_batch.batch["prefix_probe_plan_eligible"][index])} '
                 f'update_eligible={int(data_batch.batch["prefix_probe_collaboration_eligible"][index])} '
@@ -1196,12 +1200,14 @@ class RayReMASeparatedTrainer(object):
             return 'n/a' if result is None else f'{float(result):.3f}'
 
         print(
-            f'[leakage/{scope}] step={self.global_steps} role={self._current_train_agent} '
+            f'[leakage/{scope}] step={self.global_steps} role={self._current_train_agent} gate=terminal_instruction '
             f'raw_acc={value("raw_accuracy")} gated_acc={value("gated_accuracy")} '
             f'plan_eligible={value("plan_eligible_rate")} '
             f'update_eligible={value("update_eligible_rate")} '
             f'Ld={value("decomposer/rate")} '
             f'Ld_valid={value("decomposer_valid/rate")} '
+            f'Lt={value("terminal/rate")} '
+            f'Lt_valid={value("terminal_valid/rate")} '
             f'worker_match={value("worker_match/rate")} '
             f'comparison_valid={value("worker_match_valid/rate")} '
             f'single_subtask={value("rejected/single_subtask_rate")} '
@@ -1218,7 +1224,7 @@ class RayReMASeparatedTrainer(object):
         validation=False,
         probe_reward_fn=None,
     ):
-        """Probe plans once per unique input and compare worker/final answers."""
+        """Probe terminal instructions and plans, then compare worker answers."""
 
         if not self.prefix_probe_enabled:
             return
@@ -1240,14 +1246,20 @@ class RayReMASeparatedTrainer(object):
             histories, terminal_roles, focal_role=focal_role,
             decomposer_role=decomposer_role, stage_roles=stage_roles,
         )
-        plan_scores = np.full(size, np.nan, dtype=object)
-        plan_responses = np.full(size, '', dtype=object)
-        plan_requested = np.zeros(size, dtype=bool)
-        plan_nonempty = np.zeros(size, dtype=bool)
-        plan_length = np.zeros(size, dtype=bool)
+        probe_values = {
+            source: {
+                'score': np.full(size, np.nan, dtype=object),
+                'response': np.full(size, '', dtype=object),
+                'input': np.full(size, '', dtype=object),
+                'requested': np.zeros(size, dtype=bool),
+                'nonempty': np.zeros(size, dtype=bool),
+                'length_stopped': np.zeros(size, dtype=bool),
+            }
+            for source in ('decomposer', 'terminal')
+        }
 
-        # Shared C3 prefixes produce identical plans. Probe each unique plan
-        # only once in this batch and broadcast the measurement to its group.
+        # Both probes use the same solver. Deduplicate identical inputs and
+        # scoring contexts, then broadcast each measurement to its recipients.
         unique_items, unique_indices, index_by_key = [], [], {}
         extra_infos = data_batch.non_tensor_batch.get(
             'extra_info', np.array([None] * size, dtype=object),
@@ -1302,17 +1314,23 @@ class RayReMASeparatedTrainer(object):
             for i, valid in enumerate(valid_answers):
                 if not valid and diagnosed < int(self.prefix_probe_config.get('diagnostic_samples', 2)):
                     diagnosed += 1
+                    sources = sorted({
+                        request.source_kind for request, source_index in zip(requests, unique_indices)
+                        if source_index == i
+                    })
                     print(
-                        f'[prefix_probe/invalid] source=decomposer stop={stops[i]} '
+                        f'[prefix_probe/invalid] source={"/".join(sources)} stop={stops[i]} '
                         f'tokens={tokens[i]} response={responses[i][:240]!r}', flush=True,
                     )
             for request, source_index in zip(requests, unique_indices):
                 index = request.sample_index
-                plan_scores[index] = scores[source_index]
-                plan_responses[index] = responses[source_index]
-                plan_requested[index] = True
-                plan_nonempty[index] = bool(responses[source_index].strip())
-                plan_length[index] = stops[source_index] == 'length'
+                values = probe_values[request.source_kind]
+                values['score'][index] = scores[source_index]
+                values['response'][index] = responses[source_index]
+                values['input'][index] = request.message
+                values['requested'][index] = True
+                values['nonempty'][index] = bool(responses[source_index].strip())
+                values['length_stopped'][index] = stops[source_index] == 'length'
 
         counts = []
         comparison_scores = np.full(size, np.nan, dtype=object)
@@ -1351,12 +1369,10 @@ class RayReMASeparatedTrainer(object):
 
         raw = outcome_scores.detach().float().cpu()
         gate = apply_prefix_probe_gate(
-            raw.tolist(), plan_scores.tolist(), counts,
+            raw.tolist(), probe_values['terminal']['score'].tolist(), counts,
             comparison_scores.tolist(), comparison_required,
         )
         data_batch.non_tensor_batch.update({
-            'prefix_probe_decomposer_score': plan_scores,
-            'prefix_probe_decomposer_response': plan_responses,
             'prefix_probe_worker_match_score': comparison_scores,
             'prefix_probe_worker_comparisons': comparison_records,
             'prefix_probe_rejection_reason': np.asarray(gate.rejection_reasons, dtype=object),
@@ -1368,16 +1384,20 @@ class RayReMASeparatedTrainer(object):
             'prefix_probe_collaboration_eligible': torch.tensor(gate.collaboration_eligible_mask, dtype=torch.bool),
             'prefix_probe_plan_eligible': torch.tensor(gate.plan_eligible_mask, dtype=torch.bool),
             'prefix_probe_subtask_count': torch.tensor(counts, dtype=torch.long),
-            'prefix_probe_decomposer_requested': torch.from_numpy(plan_requested),
-            'prefix_probe_decomposer_valid': torch.tensor([bool(np.isfinite(float(v))) for v in plan_scores], dtype=torch.bool),
-            'prefix_probe_decomposer_nonempty': torch.from_numpy(plan_nonempty),
-            'prefix_probe_decomposer_length_stopped': torch.from_numpy(plan_length),
             'prefix_probe_worker_match_requested': torch.tensor(comparison_required, dtype=torch.bool),
             'prefix_probe_worker_match_valid': torch.tensor([bool(np.isfinite(float(v))) for v in comparison_scores], dtype=torch.bool),
         }
+        for source, values in probe_values.items():
+            for field in ('score', 'response', 'input'):
+                data_batch.non_tensor_batch[f'prefix_probe_{source}_{field}'] = values[field]
+            for field in ('requested', 'nonempty', 'length_stopped'):
+                tensor_values[f'prefix_probe_{source}_{field}'] = torch.from_numpy(values[field])
+            tensor_values[f'prefix_probe_{source}_valid'] = torch.tensor(
+                [bool(np.isfinite(float(v))) for v in values['score']], dtype=torch.bool,
+            )
         for key, value in tensor_values.items():
             data_batch.batch[key] = value
-        scope = 'val' if validation else 'all'
+        scope = data_batch.meta_info.get('validation_context', 'val') if validation else 'all'
         prefix = 'val/leakage' if validation else 'reward/leakage/all'
         self._record_leakage_metrics(data_batch, metrics, prefix)
         self._print_leakage_summary(metrics, scope, metric_prefix=prefix)
@@ -2183,6 +2203,20 @@ class RayReMASeparatedTrainer(object):
                                     #    truncation=self.config.data.get('truncation', 'error'),
                                     #    filter_overlong_prompts=self.config.data.filter_overlong_prompts
                                        )
+        if self.config.data.get('teacher_assisted_validation', False):
+            teacher_key = self._get_hierarchy_config().get('agent12_curriculum', {}).get(
+                'teacher_attempt_key', 'teacher_attempt',
+            )
+            frame = self.val_dataset.dataframe
+            if teacher_key not in frame or not all(
+                isinstance(value, str) and value.strip() for value in frame[teacher_key]
+            ):
+                raise ValueError("Paired validation requires a non-empty teacher_attempt column")
+            prompt_key = self.config.data.prompt_key
+            train_questions = {" ".join(str(q).split()) for q in self.train_dataset.dataframe[prompt_key]}
+            val_questions = {" ".join(str(q).split()) for q in frame[prompt_key]}
+            if train_questions & val_questions:
+                raise ValueError("Paired validation questions must be held out from worker training")
         # TODO(ziyu): try to check data in dataset.     
         ##### UNUSED NOW
         # assert self.val_dataset.truncation == self.config.data.get(
@@ -2246,6 +2280,18 @@ class RayReMASeparatedTrainer(object):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
+        metrics = self._validate_context(teacher_assisted=False)
+        if self.config.data.get('teacher_assisted_validation', False):
+            assisted = self._validate_context(teacher_assisted=True)
+            metrics.update({
+                key.replace('val/', 'val/teacher_assisted/', 1): value
+                for key, value in assisted.items()
+            })
+        return metrics
+
+    def _validate_context(self, *, teacher_assisted=False):
+        validation_context = 'val_teacher_assisted' if teacher_assisted else 'val'
+        print(f'[validation/context] {validation_context}', flush=True)
         reward_tensor_lst = []
         acc_tensor_lst = []
         round_state_score_lst = []
@@ -2283,6 +2329,10 @@ class RayReMASeparatedTrainer(object):
 
         max_num_turns = self.config.actor_rollout_ref.rollout.max_num_turns
         rollout_meta_info = self._build_rollout_meta_info(max_num_turns)
+        rollout_meta_info['teacher_assisted_validation'] = teacher_assisted
+        teacher_key = self._get_hierarchy_config().get('agent12_curriculum', {}).get(
+            'teacher_attempt_key', 'teacher_attempt',
+        )
         score_role = self._get_score_role()
         score_tokenizer = self._tokenizer_for_role(score_role)
         accept_revise_config = (
@@ -2324,10 +2374,18 @@ class RayReMASeparatedTrainer(object):
                     non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
                 )
             else:
+                prompt_columns = ['question']
+                if teacher_assisted:
+                    if teacher_key not in test_batch.non_tensor_batch or not all(
+                        isinstance(value, str) and value.strip()
+                        for value in test_batch.non_tensor_batch[teacher_key]
+                    ):
+                        raise ValueError("Teacher-assisted validation requires non-empty teacher_attempts in the held-out dataset")
+                    prompt_columns.append(teacher_key)
                 test_gen_batch = test_batch.select(
                         batch_keys=['batch_idx'], 
-                        non_tensor_batch_keys=['question'], 
-                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'hierarchy'],
+                        non_tensor_batch_keys=prompt_columns,
+                        meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'hierarchy', 'teacher_assisted_validation'],
                         deepcopy=True
                     )
             
@@ -2337,6 +2395,7 @@ class RayReMASeparatedTrainer(object):
                 'recompute_log_prob': False,
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
+                'teacher_attempt_key': teacher_key,
             })
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 
@@ -2491,6 +2550,7 @@ class RayReMASeparatedTrainer(object):
                     live_outcome_scores = reward_tensor['acc'][
                         console_local_indices
                     ].detach().cpu()
+                    live_probe_batch.meta_info['validation_context'] = validation_context
                     self._attach_prefix_probe_signals(
                         live_probe_batch,
                         live_outcome_scores,
@@ -2499,7 +2559,7 @@ class RayReMASeparatedTrainer(object):
                         probe_reward_fn=self.val_reward_fn,
                     )
                     self._print_validation_leakage_examples(
-                        live_probe_batch
+                        live_probe_batch, scope=validation_context,
                     )
             turn_counts = [
                 int(value)
@@ -2636,6 +2696,7 @@ class RayReMASeparatedTrainer(object):
             probe_outcome_scores = all_acc_scores[
                 torch.tensor(probe_indices, dtype=torch.long)
             ]
+            probe_batch.meta_info['validation_context'] = validation_context
             self._attach_prefix_probe_signals(
                 probe_batch,
                 probe_outcome_scores,
@@ -2644,7 +2705,8 @@ class RayReMASeparatedTrainer(object):
                 probe_reward_fn=self.val_reward_fn,
             )
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, groundtruths=sample_groundtruths, histories=history_lst)
+        if not teacher_assisted:
+            self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, groundtruths=sample_groundtruths, histories=history_lst)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         acc_tensor = torch.cat(acc_tensor_lst, dim=0).cpu() #(batch_size,)
@@ -2735,7 +2797,7 @@ class RayReMASeparatedTrainer(object):
         if self.config.trainer.get('save_val_generations', False):
             output_dir = Path(self.config.trainer.default_local_dir) / 'eval_records'
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_file = output_dir / f'val_step_{self.global_steps}.jsonl'
+            output_file = output_dir / f'{validation_context}_step_{self.global_steps}.jsonl'
             
             # Concatenate history lists from different batches
             all_histories = []
@@ -3940,8 +4002,12 @@ class RayReMASeparatedTrainer(object):
                 }
                 if self.prefix_probe_enabled:
                     result.update({
+                        "prefix_probe_gate_protocol": "terminal_instruction",
                         "prefix_probe_decomposer_score": [],
                         "prefix_probe_decomposer_response": [],
+                        "prefix_probe_terminal_score": [],
+                        "prefix_probe_terminal_response": [],
+                        "prefix_probe_terminal_input": [],
                         "prefix_probe_worker_match_score": [],
                         "prefix_probe_worker_comparisons": [],
                         "prefix_probe_rejection_reason": [],
@@ -3982,6 +4048,9 @@ class RayReMASeparatedTrainer(object):
                     )
                 )
                 for key in (
+                    'prefix_probe_terminal_score',
+                    'prefix_probe_terminal_response',
+                    'prefix_probe_terminal_input',
                     'prefix_probe_worker_match_score',
                     'prefix_probe_worker_comparisons',
                     'prefix_probe_rejection_reason',
