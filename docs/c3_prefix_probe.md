@@ -68,9 +68,14 @@ against the boxed terminal answer y_hat from the same trajectory:
     M_k = G(P) * valid(E_k) * (1 - E_k)
 
 This comparison uses the generated terminal answer, not dataset ground truth.
-It does not read other boxes in the worker's reasoning. Missing LOCAL_RESULT,
-empty/incomplete boxes, parser failures, and comparison errors/timeouts are
-unknown measurements and exclude the affected action from updates.
+Worker communication and this comparison share one result extractor. An explicit
+LOCAL_RESULT section takes precedence over reasoning. Without that marker,
+exactly one complete box in the output is accepted and only that box is routed.
+Multiple LOCAL_RESULT declarations, multiple boxes in the selected section,
+empty/incomplete boxes, and unboxed prose are not guessed at. Results exceeding
+the existing 600-character communication limit are rejected rather than truncated.
+Parser failures and comparison errors/timeouts remain unknown measurements and
+exclude the affected action from updates.
 
 Math-Verify 0.7's symbolic comparison is used with strict variable matching
 and without extraction fallback strings. Its public verify function converts
@@ -95,8 +100,48 @@ The actor's token mask is zeroed for excluded focal actions, for both positive
 and negative advantages. Other alternatives remain in the C3 baseline.
 No manual penalties, PRD, CPCR, or TSS enter this training path.
 
+After C3 estimation, a non-divisible actor batch is padded to the next multiple
+of the actor world size. For example, 32 real trajectories on 12 ranks become
+36 transport rows. The extra rows have masked labels and zero advantages/rewards;
+they do not become C3 alternatives. Loss normalization excludes these rows and
+accounts for the actual token/turn/trajectory denominators across ranks.
+Data metrics likewise exclude transport padding. The batch is still skipped if
+there are fewer real trainable trajectories than ranks: padding never invents
+eligible actions. `rollout/actor_padding_rows` reports the transport overhead.
+
 This is selective policy optimization. Because M depends on generated
 outputs, it is not an unbiased policy gradient of raw accuracy alone.
+
+## Training progress
+
+The trainer distinguishes attempted batches from completed actor updates:
+
+- `train/rollout_step`: the existing attempt/event index, including skipped updates;
+- `train/actor_update_step`: completed actor-update calls, unchanged on a skip;
+- `train/actor_updated`: whether this attempt updated the actor;
+- `train/roles/<role>/actor_update_count`: completed updates per focal role;
+- `train/actor_update_count_origin_step`: legacy-resume origin, normally zero.
+
+One actor-update call may contain multiple PPO minibatches/epochs; this counter
+is not a count of individual optimizer.step calls. Curriculum/context schedules
+and periodic validation/checkpoint frequencies use completed actor updates.
+Role rotation within the active phase remains attempt-based, so a role with
+no eligible groups does not prevent the trainer from trying other roles.
+W&B `val/*` and `actor/*` curves use
+`train/actor_update_step` as their default x-axis. Console `[training/progress]`
+lines show both counters and whether an update occurred.
+
+For compatibility with chunked teacher generation, `total_training_steps`,
+`session_stop_step`, W&B's event index, and `global_step_N` checkpoint/file names
+still use rollout attempts. A session remains bounded when no groups qualify;
+its update count can therefore be smaller than its attempt budget. The existing
+critic-only warmup also remains attempt-based, allowing actor training to start.
+Session-end checkpoints are still saved even without an update.
+
+New checkpoints store both counters in `training_progress.json`. On resuming
+an old checkpoint without this file, the trainer warns and starts the new update
+counter and update-based schedules from zero, recording the attempt index as its
+origin. It does not equate historical skipped attempts with completed updates.
 
 ## Validation and logging
 
@@ -166,7 +211,8 @@ incorrect ones. Validation uses the first non-empty attempt per held-out questio
 without correctness filtering. Split files and their manifest are uploaded under
 the run's pilot_data directory. A shard needs at least 192 unique questions.
 
-Default pilot duration is 20 steps, with validation initially and every 5 steps.
+Default pilot duration is 20 rollout attempts, with validation initially and
+every 5 completed actor updates (also at the overall training endpoint).
 The 16 teacher attempts x 16 worker rollouts and the resource allocation are
 unchanged. TOTAL_STEPS and TEST_FREQ can override the pilot defaults. No Slurm
 job is submitted by the data preparation or CPU tests.

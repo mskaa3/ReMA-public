@@ -10,6 +10,7 @@ import torch
 import unicodedata
 import re
 import hashlib
+from verl.rema_separated_trainer.ppo.local_results import extract_local_result
 
 
 def curriculum_context_is_visible(
@@ -1198,36 +1199,7 @@ class MultiAgentRollout:
 
     @staticmethod
     def _extract_local_result(output: str) -> str:
-        if not output:
-            return ""
-        match = re.search(
-            r"local[_ ]result\s*:\s*(.*?)(?:\n\s*reasoning\s*:|\n\s*subtask\b|\Z)",
-            output,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            result = match.group(1).strip()
-        else:
-            result = ""
-            boxed_starts = list(re.finditer(r"\\boxed\s*\{", output))
-            for boxed_start in reversed(boxed_starts):
-                brace_start = output.find("{", boxed_start.start())
-                depth = 0
-                for char_idx in range(brace_start, len(output)):
-                    if output[char_idx] == "{":
-                        depth += 1
-                    elif output[char_idx] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            result = output[boxed_start.start():char_idx + 1]
-                            break
-                if result:
-                    break
-            if not result:
-                lines = [line.strip() for line in output.splitlines() if line.strip()]
-                result = lines[-1] if lines else ""
-        result = " ".join(result.split())
-        return result[:600]
+        return extract_local_result(output)
 
     @staticmethod
     def _extract_reasoning(output: str) -> str:

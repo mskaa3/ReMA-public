@@ -41,7 +41,7 @@ def test_only_local_result_is_compared_not_reasoning():
 
 
 @pytest.mark.parametrize("worker, final", [
-    ("REASONING: \\boxed{26}", "\\boxed{26}"),
+    ("REASONING: \\boxed{6} then \\boxed{26}", "\\boxed{26}"),
     ("LOCAL_RESULT: \\boxed{}", "\\boxed{26}"),
     ("LOCAL_RESULT: \\boxed{\\frac{1}{2}", "\\boxed{0.5}"),
     ("LOCAL_RESULT: \\boxed{6}", ""),

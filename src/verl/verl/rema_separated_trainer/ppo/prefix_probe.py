@@ -1,9 +1,13 @@
 """Terminal-instruction gates, plan diagnostics, and answer equivalence."""
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
+
+from verl.rema_separated_trainer.ppo.local_results import (
+    extract_complete_boxed_answer,
+    extract_local_result,
+)
 
 
 @dataclass(frozen=True)
@@ -23,26 +27,6 @@ class PrefixProbeGate:
     collaboration_eligible_mask: List[bool]
     plan_eligible_mask: List[bool]
     rejection_reasons: List[str]
-
-
-def extract_complete_boxed_answer(response: str) -> Optional[str]:
-    """Return the final non-empty balanced boxed answer, if present."""
-
-    if not isinstance(response, str):
-        return None
-    matches = list(re.finditer(r"\\boxed\s*\{", response))
-    if not matches:
-        return None
-    start = matches[-1].end() - 1
-    depth = 0
-    for index in range(start, len(response)):
-        if response[index] == "{":
-            depth += 1
-        elif response[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return response[start + 1:index].strip() or None
-    return None
 
 
 def has_complete_boxed_answer(response: str) -> bool:
@@ -81,14 +65,7 @@ def compare_worker_final_answers(worker_output: str, terminal_output: str) -> Op
     from math_verify.grader import sympy_expr_eq
     from math_verify.utils import TimeoutException, timeout
 
-    local = re.search(
-        r"local[_ ]result\s*:\s*(.*?)(?:\n\s*reasoning\s*:|\n\s*subtask\b|\Z)",
-        worker_output or "",
-        re.IGNORECASE | re.DOTALL,
-    )
-    if local is None:
-        return None
-    candidate = parse_boxed_math_answer(local.group(1))
+    candidate = parse_boxed_math_answer(extract_local_result(worker_output))
     reference = parse_boxed_math_answer(terminal_output)
     if candidate is None or reference is None:
         return None

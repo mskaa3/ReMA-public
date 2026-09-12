@@ -19,11 +19,15 @@ import itertools
 from typing import Dict, Iterable, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.rema_trainer.ppo import core_algos
+from verl.rema_separated_trainer.ppo.actor_batch import (
+    actor_loss_denominators, padded_microbatch_loss_scale,
+)
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
@@ -268,6 +272,8 @@ class DataParallelReMAPPOActor(BasePPOActor):
         agent_roles = data.meta_info.get('agent_roles', None)
 
         select_keys = ['labels', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'step_ids']
+        if 'actor_padding_mask' in data.batch:
+            select_keys.append('actor_padding_mask')
         if 'agent_role_ids' in data.batch.keys():
             select_keys.append('agent_role_ids')
         if self.config.use_kl_loss:
@@ -304,6 +310,14 @@ class DataParallelReMAPPOActor(BasePPOActor):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
                 mini_batch = data
+                has_transport_padding = 'actor_padding_mask' in mini_batch
+                if has_transport_padding:
+                    global_loss_counts = actor_loss_denominators(
+                        mini_batch['labels'], mini_batch['step_ids'], self.config.agg_mode,
+                    ).to(torch.cuda.current_device())
+                    padding_world_size = dist.get_world_size() if dist.is_initialized() else 1
+                    if dist.is_initialized():
+                        dist.all_reduce(global_loss_counts, op=dist.ReduceOp.SUM)
                 if has_multi_modal_inputs:
                     raise NotImplementedError('multi_modal_inputs is not implemented yet')
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -347,6 +361,18 @@ class DataParallelReMAPPOActor(BasePPOActor):
 
                     # all return: (bsz, sequence_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+
+                    if has_transport_padding:
+                        real_rows = ~data['actor_padding_mask'] & label_mask.any(-1)
+                        # Still forward every transport row for collective safety,
+                        # but exclude dummy rows from all loss denominators.
+                        entropy, log_prob = entropy[real_rows], log_prob[real_rows]
+                        label_mask = label_mask[real_rows]
+                        old_log_prob = old_log_prob[real_rows]
+                        advantages = advantages[real_rows]
+                        step_id = step_id[real_rows]
+                        if agent_role_ids is not None:
+                            agent_role_ids = agent_role_ids[real_rows]
 
                     if not has_train_tokens:
                         # Every FSDP rank must execute the same forward/backward
@@ -403,9 +429,12 @@ class DataParallelReMAPPOActor(BasePPOActor):
                         role_entropy_metrics['actor/entropy_regularizer'] = entropy_regularizer.detach().item()
 
                     policy_loss = pg_loss - entropy_regularizer
+                    regularizer = -entropy_regularizer
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
+                        if has_transport_padding:
+                            ref_log_prob = ref_log_prob[real_rows]
                         # compute kl loss
                         kld = core_algos.kl_penalty(logprob=log_prob,
                                                     ref_logprob=ref_log_prob,
@@ -413,11 +442,20 @@ class DataParallelReMAPPOActor(BasePPOActor):
                         kl_loss = masked_mean(kld, label_mask)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        regularizer = regularizer + kl_loss * self.config.kl_loss_coef
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
                         metrics['actor/kl_coef'] = self.config.kl_loss_coef
                         # print("#### KL LOSS: {} #####".format(kl_loss))
 
-                    if self.config.use_dynamic_bsz:
+                    if has_transport_padding:
+                        micro_loss_counts = actor_loss_denominators(
+                            data['labels'], data['step_ids'], agg_mode,
+                        )
+                        scales = padded_microbatch_loss_scale(
+                            micro_loss_counts, global_loss_counts, padding_world_size,
+                        )
+                        loss = pg_loss * scales[0] + regularizer * scales[1]
+                    elif self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (
                             len(data) / effective_ppo_mini_batch_size

@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Type, Dict, Tuple
+from typing import Type, Dict, Optional, Tuple
 from copy import deepcopy
 from collections import defaultdict
 
@@ -50,6 +50,10 @@ from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils import torch_functional as verl_F
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
+from verl.rema_separated_trainer.ppo.actor_batch import (
+    pad_scoped_actor_batch,
+    without_actor_padding,
+)
 from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
     estimate_scoped_c3_grpo,
 )
@@ -227,19 +231,21 @@ def select_agent12_training_role(
     worker_roles,
     switch_freq: int,
     train_decomposer: bool,
+    role_step: Optional[int] = None,
 ) -> str:
     """Choose the role updated by one Agent 1/2 curriculum step."""
     if not worker_roles:
         raise ValueError("Agent 1/2 curriculum requires worker roles")
     switch_freq = max(int(switch_freq), 1)
+    role_step = curriculum_state.phase_step if role_step is None else max(int(role_step), 0)
 
     if curriculum_state.phase == 'worker_bootstrap' or not train_decomposer:
-        role_index = curriculum_state.phase_step // switch_freq
+        role_index = role_step // switch_freq
         return worker_roles[role_index % len(worker_roles)]
     if curriculum_state.phase == 'decomposer_transfer':
         return decomposer_role
 
-    block_index = curriculum_state.phase_step // switch_freq
+    block_index = role_step // switch_freq
     if block_index % 2 == 0:
         return decomposer_role
     worker_index = (block_index // 2) % len(worker_roles)
@@ -1200,7 +1206,9 @@ class RayReMASeparatedTrainer(object):
             return 'n/a' if result is None else f'{float(result):.3f}'
 
         print(
-            f'[leakage/{scope}] step={self.global_steps} role={self._current_train_agent} gate=terminal_instruction '
+            f'[leakage/{scope}] step={self.global_steps} '
+            f'actor_update_step={getattr(self, "actor_update_steps", 0)} '
+            f'role={self._current_train_agent} gate=terminal_instruction '
             f'raw_acc={value("raw_accuracy")} gated_acc={value("gated_accuracy")} '
             f'plan_eligible={value("plan_eligible_rate")} '
             f'update_eligible={value("update_eligible_rate")} '
@@ -1797,7 +1805,7 @@ class RayReMASeparatedTrainer(object):
     def _get_agent12_curriculum_state(self) -> Agent12CurriculumState:
         curriculum = self._get_agent12_curriculum_config()
         return compute_agent12_curriculum_state(
-            self.global_steps,
+            self._get_schedule_step(),
             worker_bootstrap_steps=curriculum.get(
                 'worker_bootstrap_steps', 0
             ),
@@ -2946,6 +2954,66 @@ class RayReMASeparatedTrainer(object):
             self.actor_rollout_wg,
         )
 
+    def _get_schedule_step(self):
+        """One-based next actor update, distinct from bounded rollout attempts."""
+        if hasattr(self, 'actor_update_steps'):
+            return self.actor_update_steps + 1
+        return self.global_steps
+
+    def _record_actor_update(self):
+        self.actor_update_steps += 1
+        role = self._current_train_agent
+        self.actor_updates_by_role[role] = self.actor_updates_by_role.get(role, 0) + 1
+
+    def _progress_metrics(self, actor_updated=False):
+        metrics = {
+            'train/rollout_step': self.global_steps,
+            'train/actor_update_step': self.actor_update_steps,
+            'train/actor_updated': float(actor_updated),
+            'train/actor_update_count_origin_step': self.actor_update_count_origin_step,
+        }
+        metrics.update({
+            f'train/roles/{role}/actor_update_count': count
+            for role, count in self.actor_updates_by_role.items()
+        })
+        return metrics
+
+    def _save_training_progress(self, folder):
+        path = Path(folder) / 'training_progress.json'
+        temporary = path.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps({
+            'rollout_step': self.global_steps,
+            'actor_update_steps': self.actor_update_steps,
+            'actor_updates_by_role': self.actor_updates_by_role,
+            'actor_update_count_origin_step': self.actor_update_count_origin_step,
+        }))
+        temporary.replace(path)
+
+    def _load_training_progress(self, folder):
+        path = Path(folder) / 'training_progress.json'
+        if not path.exists():
+            self.actor_update_steps = 0
+            self.actor_updates_by_role = {}
+            self.actor_update_count_origin_step = self.global_steps
+            print(
+                'Legacy checkpoint has no actor-update counter. Counting real '
+                'updates from zero after resume; update-based schedules restart '
+                f'from zero (rollout step {self.global_steps}).'
+            )
+            return
+        progress = json.loads(path.read_text())
+        if int(progress['rollout_step']) != self.global_steps:
+            raise ValueError('Training progress does not match checkpoint rollout step')
+        self.actor_update_steps = int(progress['actor_update_steps'])
+        self.actor_updates_by_role = progress['actor_updates_by_role']
+        self.actor_update_count_origin_step = int(progress['actor_update_count_origin_step'])
+
+    def _update_frequency_due(self, frequency, actor_updated):
+        return (
+            actor_updated and int(frequency) > 0
+            and self.actor_update_steps % int(frequency) == 0
+        )
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
@@ -2977,6 +3045,7 @@ class RayReMASeparatedTrainer(object):
         dataloader_local_path = os.path.join(local_global_step_folder, 'data.pt')
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        self._save_training_progress(local_global_step_folder)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
@@ -3014,6 +3083,7 @@ class RayReMASeparatedTrainer(object):
         print(f'Load from checkpoint folder: {global_step_folder}')
         # set global step
         self.global_steps = int(global_step_folder.split('global_step_')[-1])
+        self._load_training_progress(global_step_folder)
 
         print(f'Setting global step to {self.global_steps}')
         print(f'Resuming from {global_step_folder}')
@@ -3143,6 +3213,8 @@ class RayReMASeparatedTrainer(object):
                 worker_roles=worker_roles,
                 switch_freq=switch_freq,
                 train_decomposer=train_decomposer,
+                # Keep visiting roles even when one has no eligible C3 group.
+                role_step=max(self.global_steps - 1, 0),
             )
 
             self._current_train_agent_idx = agent_roles.index(new_agent)
@@ -3159,7 +3231,7 @@ class RayReMASeparatedTrainer(object):
         final_worker_warmup_steps = int(final_worker_curriculum.get('warmup_steps', 0))
         if (
             final_worker_curriculum.get('enable', False)
-            and self.global_steps < final_worker_warmup_steps
+            and self._get_schedule_step() < final_worker_warmup_steps
         ):
             score_role = self._get_score_role()
             self._current_train_agent_idx = agent_roles.index(score_role)
@@ -3209,6 +3281,9 @@ class RayReMASeparatedTrainer(object):
         from omegaconf import OmegaConf
 
         self.global_steps = 0
+        self.actor_update_steps = 0
+        self.actor_updates_by_role = {}
+        self.actor_update_count_origin_step = 0
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -3232,7 +3307,8 @@ class RayReMASeparatedTrainer(object):
             return
         print(
             f'Training session target: {session_stop_step}; '
-            f'global training target: {self.total_training_steps}'
+            f'global rollout-attempt target: {self.total_training_steps}; '
+            f'completed actor-update steps: {self.actor_update_steps}'
         )
 
         if self.config.trainer.get('fork_wandb_id', None) is not None:
@@ -3262,11 +3338,20 @@ class RayReMASeparatedTrainer(object):
                           config=OmegaConf.to_container(self.config, resolve=True),
                           wandb_kwargs=wandb_kwargs
                           )
+        # Keep W&B's event index monotonic across skipped attempts and shards,
+        # but plot learning curves against actual optimization progress.
+        for backend in ('wandb', 'vemlp_wandb'):
+            tracker = logger.logger.get(backend)
+            if tracker is not None:
+                tracker.define_metric('train/actor_update_step')
+                for pattern in ('val/*', 'actor/*'):
+                    tracker.define_metric(pattern, step_metric='train/actor_update_step')
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
             val_metrics = self._validate()
+            val_metrics.update(self._progress_metrics())
             pprint(f'Initial validation metrics: {val_metrics}')
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get('val_only', False):
@@ -3303,6 +3388,7 @@ class RayReMASeparatedTrainer(object):
                 metrics = {}
                 timing_raw = {}
                 skip_filtered_actor_update = False
+                actor_updated = False
 
                 curriculum_state = self._get_agent12_curriculum_state()
                 teacher_attempts_key = str(
@@ -3376,7 +3462,7 @@ class RayReMASeparatedTrainer(object):
                 gen_batch.meta_info['c3_focal_role'] = self._current_train_agent
                 gen_batch.meta_info['validate'] = False
                 if agent12_curriculum_enabled:
-                    gen_batch.meta_info['curriculum_step'] = self.global_steps
+                    gen_batch.meta_info['curriculum_step'] = self._get_schedule_step()
                     gen_batch.meta_info['curriculum_phase'] = curriculum_state.phase
                     gen_batch.meta_info['teacher_attempt_key'] = teacher_attempt_key
                     gen_batch.meta_info['teacher_attempt_probability'] = (
@@ -3867,19 +3953,20 @@ class RayReMASeparatedTrainer(object):
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     collective_safe_update = not skip_filtered_actor_update
+                    if collective_safe_update and self.scoped_c3_grpo_enabled:
+                        batch, padding = pad_scoped_actor_batch(
+                            batch, self.actor_rollout_wg[self._current_train_agent].world_size,
+                        )
+                        metrics['rollout/actor_padding_rows'] = float(padding)
                     if collective_safe_update and self.config.trainer.balance_batch:
                         collective_safe_update = self._balance_batch(
                             batch,
                             metrics=metrics,
                         )
                     elif collective_safe_update and self.scoped_c3_grpo_enabled:
-                        trainable_count = int(
-                            batch.batch['labels'].ne(-100).any(dim=-1).sum().item()
-                        )
-                        world_size = self.actor_rollout_wg[
-                            self._current_train_agent
-                        ].world_size
-                        collective_safe_update = trainable_count >= world_size
+                        # Even without token balancing, every rank needs a real
+                        # action and the dispatcher requires equal row counts.
+                        collective_safe_update = self._balance_batch(batch, metrics)
 
                     metrics['rollout/skipped_sparse_actor_update'] = float(
                         not collective_safe_update
@@ -3922,10 +4009,12 @@ class RayReMASeparatedTrainer(object):
                             actor_output = self.actor_rollout_wg[self._current_train_agent].update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                        self._record_actor_update()
+                        actor_updated = True
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        (is_training_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+                        (is_training_last_step or self._update_frequency_due(self.config.trainer.test_freq, actor_updated)):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                             if is_training_last_step:
@@ -3933,8 +4022,7 @@ class RayReMASeparatedTrainer(object):
                         metrics.update(val_metrics)
 
                     if is_session_last_step or (
-                        self.config.trainer.save_freq > 0
-                        and self.global_steps % self.config.trainer.save_freq == 0
+                        self._update_frequency_due(self.config.trainer.save_freq, actor_updated)
                     ):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
@@ -3944,11 +4032,18 @@ class RayReMASeparatedTrainer(object):
                     'train/current_agent_idx': self._current_train_agent_idx,
                     'train/final_worker_curriculum_active': float(
                         final_worker_curriculum.get('enable', False)
-                        and self.global_steps < final_worker_warmup_steps
+                        and self._get_schedule_step() < final_worker_warmup_steps
                     ),
                 })
+                metrics.update(self._progress_metrics(actor_updated))
+                print(
+                    f'[training/progress] rollout_step={self.global_steps} '
+                    f'actor_update_step={self.actor_update_steps} '
+                    f'actor_updated={int(actor_updated)} role={self._current_train_agent}',
+                    flush=True,
+                )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics(batch=without_actor_padding(batch), use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
