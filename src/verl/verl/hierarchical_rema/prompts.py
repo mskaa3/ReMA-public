@@ -79,6 +79,12 @@ Handle divisibility, parity, gcd/lcm structure, invariants, contradiction argume
 """
 
 
+DEFAULT_EXECUTOR_WORKER_PROMPT = """You are an executor worker.
+Solve the current mathematical subtask carefully using the provided task context and dependency results. Keep intermediate reasoning precise, preserve reusable symbolic state when needed, and return the exact node artifact requested by the instruction.
+
+"""
+
+
 # Backward-compatible aliases for older imports and any stale configs.
 DEFAULT_ARITHMETIC_PREALGEBRA_WORKER_PROMPT = DEFAULT_CALCULATION_WORKER_PROMPT
 DEFAULT_ALGEBRA_SYMBOLIC_WORKER_PROMPT = DEFAULT_SYMBOLIC_MANIPULATION_WORKER_PROMPT

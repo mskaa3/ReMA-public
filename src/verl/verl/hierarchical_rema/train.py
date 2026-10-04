@@ -259,7 +259,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--mode", choices=["joint", "alternating"], default="joint")
-    parser.add_argument("--phase", choices=["selector", "decomposer"], default="selector", help="Starting phase when mode=alternating")
+    parser.add_argument(
+        "--phase",
+        choices=["executor", "selector", "decomposer"],
+        default="executor",
+        help="Starting phase when mode=alternating. `selector` is kept as a deprecated alias for `executor`.",
+    )
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--parameter-sharing", action="store_true")
     parser.add_argument("--shared-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
@@ -286,10 +291,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
+    parser.add_argument(
+        "--num-executor-rollouts",
+        type=int,
+        default=0,
+        help="Preferred name for repeated executor rollouts per decomposition. 0 falls back to --num-selections.",
+    )
     parser.add_argument("--alternating-selector-num-decompositions", type=int, default=4)
     parser.add_argument("--alternating-selector-num-selections", type=int, default=4)
+    parser.add_argument(
+        "--alternating-executor-num-decompositions",
+        type=int,
+        default=0,
+        help="Preferred name for alternating executor-phase decompositions. 0 falls back to --alternating-selector-num-decompositions.",
+    )
+    parser.add_argument(
+        "--alternating-executor-num-rollouts",
+        type=int,
+        default=0,
+        help="Preferred name for alternating executor-phase executor rollouts. 0 falls back to --alternating-selector-num-selections.",
+    )
     parser.add_argument("--alternating-decomposer-num-decompositions", type=int, default=8)
     parser.add_argument("--alternating-decomposer-num-selections", type=int, default=2)
+    parser.add_argument(
+        "--alternating-decomposer-num-executor-rollouts",
+        type=int,
+        default=0,
+        help="Preferred name for alternating decomposer-phase executor rollouts. 0 falls back to --alternating-decomposer-num-selections.",
+    )
     parser.add_argument(
         "--gfam-decomposer-max-selections",
         type=int,
@@ -298,6 +327,12 @@ def parse_args() -> argparse.Namespace:
             "When GFAM reward scoring is enabled, cap decomposer-phase selector rollouts "
             "per decomposition to this many downstream samples. Set to 0 to disable."
         ),
+    )
+    parser.add_argument(
+        "--gfam-decomposer-max-executor-rollouts",
+        type=int,
+        default=0,
+        help="Preferred name for the GFAM decomposer-phase executor-rollout cap. 0 falls back to --gfam-decomposer-max-selections.",
     )
     parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
     parser.add_argument("--soft-max-hops", type=int, default=None)
@@ -400,6 +435,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
     parser.add_argument("--val-num-decompositions", type=int, default=1)
     parser.add_argument("--val-num-selections", type=int, default=1)
+    parser.add_argument(
+        "--val-num-executor-rollouts",
+        type=int,
+        default=0,
+        help="Preferred name for validation executor rollouts per decomposition. 0 falls back to --val-num-selections.",
+    )
     parser.add_argument("--val-temperature", type=float, default=0.0)
     parser.add_argument("--val-controller-temperature", type=float, default=None)
     parser.add_argument("--val-worker-temperature", type=float, default=None)
@@ -1096,39 +1137,47 @@ def _rollout_config_for_schedule(
     use_gfam_reward_model: bool = False,
 ) -> RolloutConfig:
     num_decompositions = base_rollout_config.num_decompositions
-    num_selections = base_rollout_config.num_selections_per_decomposition
+    num_executor_rollouts = base_rollout_config.resolved_num_executor_rollouts_per_decomposition()
     if schedule.mode == TrainingMode.ALTERNATING:
-        if schedule.alternating_phase == AlternatingPhase.SELECTOR:
+        if schedule.alternating_phase.uses_executor:
             num_decompositions = min(
                 num_decompositions,
-                max(int(base_rollout_config.alternating_selector_num_decompositions), 1),
+                base_rollout_config.resolved_alternating_executor_num_decompositions(),
             )
-            num_selections = min(
-                num_selections,
-                max(int(base_rollout_config.alternating_selector_num_selections), 1),
+            num_executor_rollouts = min(
+                num_executor_rollouts,
+                base_rollout_config.resolved_alternating_executor_num_rollouts(),
             )
         elif schedule.alternating_phase == AlternatingPhase.DECOMPOSER:
             num_decompositions = min(
                 num_decompositions,
                 max(int(base_rollout_config.alternating_decomposer_num_decompositions), 1),
             )
-            num_selections = min(
-                num_selections,
-                max(int(base_rollout_config.alternating_decomposer_num_selections), 1),
+            num_executor_rollouts = min(
+                num_executor_rollouts,
+                base_rollout_config.resolved_alternating_decomposer_num_executor_rollouts(),
             )
-            if use_gfam_reward_model and int(base_rollout_config.gfam_decomposer_max_selections) > 0:
-                num_selections = min(
-                    num_selections,
-                    max(int(base_rollout_config.gfam_decomposer_max_selections), 1),
+            if (
+                use_gfam_reward_model
+                and base_rollout_config.resolved_gfam_decomposer_max_executor_rollouts() > 0
+            ):
+                num_executor_rollouts = min(
+                    num_executor_rollouts,
+                    base_rollout_config.resolved_gfam_decomposer_max_executor_rollouts(),
                 )
     return RolloutConfig(
         num_decompositions=num_decompositions,
-        num_selections_per_decomposition=num_selections,
+        num_selections_per_decomposition=num_executor_rollouts,
+        num_executor_rollouts_per_decomposition=num_executor_rollouts,
         alternating_selector_num_decompositions=base_rollout_config.alternating_selector_num_decompositions,
         alternating_selector_num_selections=base_rollout_config.alternating_selector_num_selections,
+        alternating_executor_num_decompositions=base_rollout_config.alternating_executor_num_decompositions,
+        alternating_executor_num_rollouts=base_rollout_config.alternating_executor_num_rollouts,
         alternating_decomposer_num_decompositions=base_rollout_config.alternating_decomposer_num_decompositions,
         alternating_decomposer_num_selections=base_rollout_config.alternating_decomposer_num_selections,
+        alternating_decomposer_num_executor_rollouts=base_rollout_config.alternating_decomposer_num_executor_rollouts,
         gfam_decomposer_max_selections=base_rollout_config.gfam_decomposer_max_selections,
+        gfam_decomposer_max_executor_rollouts=base_rollout_config.gfam_decomposer_max_executor_rollouts,
         max_nodes_per_decomposition=base_rollout_config.max_nodes_per_decomposition,
         soft_max_hops=base_rollout_config.soft_max_hops,
         hard_max_hops=base_rollout_config.hard_max_hops,
@@ -1382,7 +1431,7 @@ def build_schedule(mode: str, phase: AlternatingPhase) -> TrainingScheduleConfig
 
 
 def next_phase(phase: AlternatingPhase) -> AlternatingPhase:
-    return AlternatingPhase.DECOMPOSER if phase == AlternatingPhase.SELECTOR else AlternatingPhase.SELECTOR
+    return AlternatingPhase.DECOMPOSER if phase.uses_executor else AlternatingPhase.EXECUTOR
 
 
 def rollout_workload_estimate(
@@ -1391,16 +1440,16 @@ def rollout_workload_estimate(
     schedule: TrainingScheduleConfig,
 ) -> Dict[str, int]:
     num_decompositions = rollout_config.num_decompositions
-    num_selections = rollout_config.num_selections_per_decomposition
+    num_executor_rollouts = rollout_config.resolved_num_executor_rollouts_per_decomposition()
 
     max_nodes = max(int(rollout_config.max_nodes_per_decomposition), 1)
-    selector_decisions_per_task_upper_bound = num_decompositions * num_selections * max_nodes
-    controller_generations_per_task = num_decompositions + selector_decisions_per_task_upper_bound
-    worker_generations_per_task_upper_bound = num_decompositions * num_selections * max_nodes
+    controller_generations_per_task = num_decompositions
+    worker_generations_per_task_upper_bound = (
+        num_decompositions * num_executor_rollouts * max_nodes
+    )
     return {
         "num_decompositions": num_decompositions,
-        "num_selections": num_selections,
-        "selector_decisions_per_task_upper_bound": selector_decisions_per_task_upper_bound,
+        "num_executor_rollouts": num_executor_rollouts,
         "controller_generations_per_task": controller_generations_per_task,
         "worker_generations_per_task_upper_bound": worker_generations_per_task_upper_bound,
         "controller_generations_total": controller_generations_per_task * num_tasks,
@@ -1410,7 +1459,7 @@ def rollout_workload_estimate(
 
 def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
     best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
-    selection_rewards = [
+    executor_rollout_rewards = [
         selection.reward.total_reward
         for decomposition in rollout.decompositions
         for selection in decomposition.selections
@@ -1424,6 +1473,10 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         for decomposition in rollout.decompositions
         for selection in decomposition.selections
         for assignment in selection.selection.assignments
+        if not (
+            isinstance(selection.selection.raw_payload, dict)
+            and selection.selection.raw_payload.get("synthetic_executor_rollout")
+        )
     ]
     worker_rewards = [
         (
@@ -1443,8 +1496,18 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
     return {
         "best_decomposition_id": best_decomposition.decomposition.decomposition_id,
         "best_decomposition_reward": best_decomposition.decomposition_reward,
-        "best_selection_reward": max(selection_rewards) if selection_rewards else 0.0,
-        "mean_selection_reward": sum(selection_rewards) / max(len(selection_rewards), 1),
+        "best_executor_rollout_reward": (
+            max(executor_rollout_rewards) if executor_rollout_rewards else 0.0
+        ),
+        "mean_executor_rollout_reward": (
+            sum(executor_rollout_rewards) / max(len(executor_rollout_rewards), 1)
+        ),
+        "best_selection_reward": (
+            max(executor_rollout_rewards) if executor_rollout_rewards else 0.0
+        ),
+        "mean_selection_reward": (
+            sum(executor_rollout_rewards) / max(len(executor_rollout_rewards), 1)
+        ),
         "best_selector_decision_reward": (
             max(selector_decision_rewards) if selector_decision_rewards else 0.0
         ),
@@ -1540,6 +1603,8 @@ def epoch_rollout_summary(
     summary = {
         "num_tasks": len(rollouts),
         "mean_best_decomposition_reward": sum(best_decomposition_rewards) / max(len(best_decomposition_rewards), 1),
+        "mean_best_executor_rollout_reward": sum(best_selection_rewards) / max(len(best_selection_rewards), 1),
+        "mean_executor_rollout_reward": sum(mean_selection_rewards) / max(len(mean_selection_rewards), 1),
         "mean_best_selection_reward": sum(best_selection_rewards) / max(len(best_selection_rewards), 1),
         "mean_selection_reward": sum(mean_selection_rewards) / max(len(mean_selection_rewards), 1),
         "mean_best_selector_decision_reward": (
@@ -1570,6 +1635,8 @@ def epoch_rollout_summary(
                 "num_tasks": bucket["num_tasks"],
                 "num_correct": bucket["num_correct"],
                 "mean_best_decomposition_reward": sum(bucket["best_decomposition_rewards"]) / max(bucket["num_tasks"], 1),
+                "mean_best_executor_rollout_reward": sum(bucket["best_selection_rewards"]) / max(bucket["num_tasks"], 1),
+                "mean_executor_rollout_reward": sum(bucket["mean_selection_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_best_selection_reward": sum(bucket["best_selection_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_selection_reward": sum(bucket["mean_selection_rewards"]) / max(bucket["num_tasks"], 1),
                 "mean_best_selector_decision_reward": (
@@ -1666,6 +1733,8 @@ def combine_rollout_summaries(
     summary = {
         "num_tasks": total_tasks,
         "mean_best_decomposition_reward": total_best_decomposition_reward / max(total_tasks, 1),
+        "mean_best_executor_rollout_reward": total_best_selection_reward / max(total_tasks, 1),
+        "mean_executor_rollout_reward": total_mean_selection_reward / max(total_tasks, 1),
         "mean_best_selection_reward": total_best_selection_reward / max(total_tasks, 1),
         "mean_selection_reward": total_mean_selection_reward / max(total_tasks, 1),
         "mean_best_selector_decision_reward": total_best_selector_decision_reward / max(total_tasks, 1),
@@ -1680,6 +1749,8 @@ def combine_rollout_summaries(
                 "num_tasks": int(bucket["num_tasks"]),
                 "num_correct": bucket["num_correct"],
                 "mean_best_decomposition_reward": bucket["best_decomposition_reward_sum"] / max(bucket["num_tasks"], 1.0),
+                "mean_best_executor_rollout_reward": bucket["best_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
+                "mean_executor_rollout_reward": bucket["mean_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_best_selection_reward": bucket["best_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_selection_reward": bucket["mean_selection_reward_sum"] / max(bucket["num_tasks"], 1.0),
                 "mean_best_selector_decision_reward": (
@@ -2003,6 +2074,9 @@ def run_external_validation(
     validation_rollout_config = RolloutConfig(
         num_decompositions=args.val_num_decompositions,
         num_selections_per_decomposition=args.val_num_selections,
+        num_executor_rollouts_per_decomposition=(
+            args.val_num_executor_rollouts or args.val_num_selections
+        ),
         max_nodes_per_decomposition=base_rollout_config.max_nodes_per_decomposition,
         soft_max_hops=base_rollout_config.soft_max_hops,
         hard_max_hops=base_rollout_config.hard_max_hops,
@@ -2215,11 +2289,30 @@ def main() -> None:
     base_rollout_config = RolloutConfig(
         num_decompositions=args.num_decompositions,
         num_selections_per_decomposition=args.num_selections,
+        num_executor_rollouts_per_decomposition=(
+            args.num_executor_rollouts or args.num_selections
+        ),
         alternating_selector_num_decompositions=args.alternating_selector_num_decompositions,
         alternating_selector_num_selections=args.alternating_selector_num_selections,
+        alternating_executor_num_decompositions=(
+            args.alternating_executor_num_decompositions
+            or args.alternating_selector_num_decompositions
+        ),
+        alternating_executor_num_rollouts=(
+            args.alternating_executor_num_rollouts
+            or args.alternating_selector_num_selections
+        ),
         alternating_decomposer_num_decompositions=args.alternating_decomposer_num_decompositions,
         alternating_decomposer_num_selections=args.alternating_decomposer_num_selections,
+        alternating_decomposer_num_executor_rollouts=(
+            args.alternating_decomposer_num_executor_rollouts
+            or args.alternating_decomposer_num_selections
+        ),
         gfam_decomposer_max_selections=args.gfam_decomposer_max_selections,
+        gfam_decomposer_max_executor_rollouts=(
+            args.gfam_decomposer_max_executor_rollouts
+            or args.gfam_decomposer_max_selections
+        ),
         max_nodes_per_decomposition=max_nodes_per_decomposition,
         soft_max_hops=args.soft_max_hops,
         hard_max_hops=args.hard_max_hops,
@@ -2288,13 +2381,13 @@ def main() -> None:
         )
         if (
             rollout_config.num_decompositions != base_rollout_config.num_decompositions
-            or rollout_config.num_selections_per_decomposition
-            != base_rollout_config.num_selections_per_decomposition
+            or rollout_config.resolved_num_executor_rollouts_per_decomposition()
+            != base_rollout_config.resolved_num_executor_rollouts_per_decomposition()
         ):
             _print_console_line(
                 f"[hierarchical-rema][integrated] adjusted_rollout_counts "
                 f"decompositions={rollout_config.num_decompositions} "
-                f"selections={rollout_config.num_selections_per_decomposition}"
+                f"executor_rollouts={rollout_config.resolved_num_executor_rollouts_per_decomposition()}"
             )
         workload = rollout_workload_estimate(
             num_tasks=len(epoch_tasks),
@@ -2306,7 +2399,7 @@ def main() -> None:
             f"controller_total={workload['controller_generations_total']} "
             f"worker_total_upper_bound={workload['worker_generations_total_upper_bound']} "
             f"controller_per_task={workload['controller_generations_per_task']} "
-            f"selector_decisions_per_task_upper_bound={workload['selector_decisions_per_task_upper_bound']} "
+            f"executor_rollouts_per_task={workload['num_executor_rollouts']} "
             f"worker_per_task_upper_bound={workload['worker_generations_per_task_upper_bound']} "
             f"task_batch_size={args.rollout_task_batch_size} "
             f"controller_batch_size={args.controller_batch_size} "
@@ -2318,7 +2411,7 @@ def main() -> None:
         segment_summaries: List[Dict[str, Any]] = []
         training_skipped_messages: List[str] = []
         rollout_start_time = time.time()
-        running_best_selection_reward = 0.0
+        running_best_executor_rollout_reward = 0.0
         running_best_decomposition_reward = 0.0
         running_mean_worker_reward = 0.0
         running_best_correctness = 0.0
@@ -2443,7 +2536,7 @@ def main() -> None:
                             for decomposition in rollout.decompositions
                             for selection in decomposition.selections
                         ]
-                        running_best_selection_reward += max(selection_rewards)
+                        running_best_executor_rollout_reward += max(selection_rewards)
                         running_best_decomposition_reward += best_decomposition.decomposition_reward
                         worker_rewards = [
                             (
@@ -2483,7 +2576,9 @@ def main() -> None:
                             "progress_fraction": tasks_completed / max(len(epoch_tasks), 1),
                             "elapsed_s": elapsed,
                             "eta_s": eta_seconds,
-                            "avg_best_selection_reward": running_best_selection_reward / tasks_completed,
+                            "avg_best_executor_rollout_reward": (
+                                running_best_executor_rollout_reward / tasks_completed
+                            ),
                             "avg_best_decomposition_reward": running_best_decomposition_reward / tasks_completed,
                             "avg_mean_worker_reward": running_mean_worker_reward / tasks_completed,
                             "avg_best_final_correctness": running_best_correctness / tasks_completed,
@@ -2496,7 +2591,7 @@ def main() -> None:
                             f"{_progress_bar(progress_metrics['progress_fraction'])} "
                             f"tasks={tasks_completed}/{len(epoch_tasks)} "
                             f"elapsed={elapsed:.1f}s eta={eta_seconds:.1f}s "
-                            f"sel={progress_metrics['avg_best_selection_reward']:.4f} "
+                            f"exec={progress_metrics['avg_best_executor_rollout_reward']:.4f} "
                             f"dec={progress_metrics['avg_best_decomposition_reward']:.4f} "
                             f"wrk={progress_metrics['avg_mean_worker_reward']:.4f} "
                             f"acc={progress_metrics['avg_best_final_correctness']:.4f}"
@@ -2516,7 +2611,9 @@ def main() -> None:
                                     "rollout_progress/fraction": progress_metrics["progress_fraction"],
                                     "rollout_progress/elapsed_s": progress_metrics["elapsed_s"],
                                     "rollout_progress/eta_s": progress_metrics["eta_s"],
-                                    "rollout_progress/avg_best_selection_reward": progress_metrics["avg_best_selection_reward"],
+                                    "rollout_progress/avg_best_executor_rollout_reward": progress_metrics[
+                                        "avg_best_executor_rollout_reward"
+                                    ],
                                     "rollout_progress/avg_best_decomposition_reward": progress_metrics["avg_best_decomposition_reward"],
                                     "rollout_progress/avg_mean_worker_reward": progress_metrics["avg_mean_worker_reward"],
                                     "rollout_progress/avg_best_final_correctness": progress_metrics["avg_best_final_correctness"],

@@ -34,8 +34,13 @@ class TrainingMode(str, Enum):
 
 
 class AlternatingPhase(str, Enum):
+    EXECUTOR = "executor"
     SELECTOR = "selector"
     DECOMPOSER = "decomposer"
+
+    @property
+    def uses_executor(self) -> bool:
+        return self in {AlternatingPhase.EXECUTOR, AlternatingPhase.SELECTOR}
 
 
 class WorkerRewardMode(str, Enum):
@@ -87,11 +92,16 @@ class RewardWeights:
 class RolloutConfig:
     num_decompositions: int = 3
     num_selections_per_decomposition: int = 2
+    num_executor_rollouts_per_decomposition: int = 0
     alternating_selector_num_decompositions: int = 4
     alternating_selector_num_selections: int = 4
+    alternating_executor_num_decompositions: int = 0
+    alternating_executor_num_rollouts: int = 0
     alternating_decomposer_num_decompositions: int = 8
     alternating_decomposer_num_selections: int = 2
+    alternating_decomposer_num_executor_rollouts: int = 0
     gfam_decomposer_max_selections: int = 2
+    gfam_decomposer_max_executor_rollouts: int = 0
     max_nodes_per_decomposition: int = 4
     soft_max_hops: Optional[int] = None
     hard_max_hops: Optional[int] = None
@@ -104,11 +114,36 @@ class RolloutConfig:
     node_count_target_penalty_per_step: float = 0.1
     node_count_target_max_penalty: float = 0.4
 
+    def resolved_num_executor_rollouts_per_decomposition(self) -> int:
+        preferred = int(self.num_executor_rollouts_per_decomposition or 0)
+        legacy = int(self.num_selections_per_decomposition or 0)
+        return max(preferred or legacy, 1)
+
+    def resolved_alternating_executor_num_decompositions(self) -> int:
+        preferred = int(self.alternating_executor_num_decompositions or 0)
+        legacy = int(self.alternating_selector_num_decompositions or 0)
+        return max(preferred or legacy, 1)
+
+    def resolved_alternating_executor_num_rollouts(self) -> int:
+        preferred = int(self.alternating_executor_num_rollouts or 0)
+        legacy = int(self.alternating_selector_num_selections or 0)
+        return max(preferred or legacy, 1)
+
+    def resolved_alternating_decomposer_num_executor_rollouts(self) -> int:
+        preferred = int(self.alternating_decomposer_num_executor_rollouts or 0)
+        legacy = int(self.alternating_decomposer_num_selections or 0)
+        return max(preferred or legacy, 1)
+
+    def resolved_gfam_decomposer_max_executor_rollouts(self) -> int:
+        preferred = int(self.gfam_decomposer_max_executor_rollouts or 0)
+        legacy = int(self.gfam_decomposer_max_selections or 0)
+        return max(preferred or legacy, 0)
+
 
 @dataclass
 class TrainingScheduleConfig:
     mode: TrainingMode = TrainingMode.JOINT
-    alternating_phase: AlternatingPhase = AlternatingPhase.SELECTOR
+    alternating_phase: AlternatingPhase = AlternatingPhase.EXECUTOR
 
 
 @dataclass

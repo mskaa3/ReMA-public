@@ -21,6 +21,7 @@ from .rewarding import (
     WORKER_INVALID_RESULT_PENALTY,
     WorkerPerformanceMemory,
     build_selection_reward,
+    compatibility_score,
     group_relative_advantages,
 )
 from .schema import (
@@ -133,6 +134,56 @@ class HierarchicalReMAOrchestrator:
                 "</selector_answer>",
             ]
         )
+
+    @staticmethod
+    def _shared_executor_worker(worker_pool: WorkerPoolConfig):
+        if not worker_pool.workers:
+            raise ValueError("Worker pool must contain at least one executor worker")
+        return worker_pool.workers[0]
+
+    def _build_executor_rollout_candidate(
+        self,
+        *,
+        decomposition: DecompositionCandidate,
+        worker_pool: WorkerPoolConfig,
+        worker_performance: Dict[str, object],
+        rollout_index: int,
+    ) -> SelectionCandidate:
+        executor_worker = self._shared_executor_worker(worker_pool)
+        assignments = []
+        for node in decomposition.nodes:
+            assignments.append(
+                WorkerAssignment(
+                    node_id=node.node_id,
+                    worker_id=executor_worker.worker_id,
+                    rationale="Single shared executor assigned to every node.",
+                    compatibility=round(
+                        compatibility_score(
+                            node.required_skills,
+                            executor_worker,
+                            worker_performance,
+                        ),
+                        4,
+                    ),
+                )
+            )
+        candidate = SelectionCandidate(
+            selection_id=f"executor-rollout-{rollout_index}",
+            assignments=assignments,
+            raw_text=format_selection_plan(
+                SelectionCandidate(
+                    selection_id=f"executor-rollout-{rollout_index}",
+                    assignments=assignments,
+                ),
+                node_order=[node.node_id for node in decomposition.nodes],
+            ),
+            raw_payload={
+                "synthetic_executor_rollout": True,
+                "executor_rollout_index": rollout_index,
+                "executor_worker_id": executor_worker.worker_id,
+            },
+        )
+        return candidate
 
     @staticmethod
     def _normalized_instruction_key(instruction: str) -> str:
@@ -339,6 +390,10 @@ class HierarchicalReMAOrchestrator:
         if self.gfam_reward_scorer is None:
             return reward, {}
 
+        synthetic_executor_rollout = bool(
+            isinstance(selection.raw_payload, dict)
+            and selection.raw_payload.get("synthetic_executor_rollout")
+        )
         scored = self.gfam_reward_scorer.score_rollout(
             task=task,
             decomposition=decomposition,
@@ -352,12 +407,13 @@ class HierarchicalReMAOrchestrator:
         selector_decision_payloads = compiled_rewards.get("selector_decisions", {})
         worker_payloads = compiled_rewards.get("workers", {})
         selector_decision_rewards: List[float] = []
-        for assignment in selection.assignments:
-            assignment_payload = selector_decision_payloads.get(assignment.node_id)
-            if assignment_payload is None or "reward" not in assignment_payload:
-                continue
-            assignment.reward_model_reward = float(assignment_payload["reward"])
-            selector_decision_rewards.append(assignment.reward_model_reward)
+        if not synthetic_executor_rollout:
+            for assignment in selection.assignments:
+                assignment_payload = selector_decision_payloads.get(assignment.node_id)
+                if assignment_payload is None or "reward" not in assignment_payload:
+                    continue
+                assignment.reward_model_reward = float(assignment_payload["reward"])
+                selector_decision_rewards.append(assignment.reward_model_reward)
         # Under GFAM, keep the selection-level reward aligned with whole-rollout
         # quality, not the mean selector-action reward. Per-assignment selector
         # rewards already flow through assignment.reward_model_reward.
@@ -429,7 +485,7 @@ class HierarchicalReMAOrchestrator:
             if self.track_workers_history
             else {}
         )
-        num_decompositions, num_selections = self._effective_rollout_counts(
+        num_decompositions, num_executor_rollouts = self._effective_rollout_counts(
             rollout_config=rollout_config,
             schedule=schedule,
         )
@@ -462,42 +518,32 @@ class HierarchicalReMAOrchestrator:
             task_decompositions[task_index].append(decomposition)
 
         print(
-            f"[hierarchical-rema][rollout] stage=selector "
-            f"tasks={len(tasks)}{progress_suffix} selections_per_decomposition={num_selections} "
-            f"requests={len(tasks) * num_decompositions * num_selections}"
+            f"[hierarchical-rema][rollout] stage=executor_rollouts "
+            f"tasks={len(tasks)}{progress_suffix} executor_rollouts_per_decomposition={num_executor_rollouts} "
+            f"requests={len(tasks) * num_decompositions * num_executor_rollouts}"
         )
-        selection_requests: List[SelectionRequest] = []
         request_metadata: List[tuple[int, int, int]] = []
         for task_index, task in enumerate(tasks):
             for decomposition_index, decomposition in enumerate(task_decompositions[task_index]):
-                for selection_index in range(num_selections):
-                    selection_requests.append(
-                        SelectionRequest(
-                            task=task,
-                            decomposition=decomposition,
-                            worker_pool=worker_pool,
-                            policy_config=policy_config,
-                            selection_index=selection_index,
-                            worker_performance=frozen_worker_performance,
-                        )
-                    )
-                    request_metadata.append((task_index, decomposition_index, selection_index))
+                for rollout_index in range(num_executor_rollouts):
+                    request_metadata.append((task_index, decomposition_index, rollout_index))
 
-        selection_candidates = self.backend.sample_selections_batch(selection_requests)
         selection_states: List[_SelectionExecutionState] = []
-        for (task_index, decomposition_index, selection_index), selection in zip(
-            request_metadata,
-            selection_candidates,
-        ):
+        for task_index, decomposition_index, rollout_index in request_metadata:
             decomposition = task_decompositions[task_index][decomposition_index]
             selection_states.append(
                 _SelectionExecutionState(
                     task_index=task_index,
                     decomposition_index=decomposition_index,
-                    selection_index=selection_index,
+                    selection_index=rollout_index,
                     task=tasks[task_index],
                     decomposition=decomposition,
-                    selection=selection,
+                    selection=self._build_executor_rollout_candidate(
+                        decomposition=decomposition,
+                        worker_pool=worker_pool,
+                        worker_performance=frozen_worker_performance,
+                        rollout_index=rollout_index,
+                    ),
                     topo_order=decomposition.topological_order(),
                 )
             )
@@ -514,78 +560,8 @@ class HierarchicalReMAOrchestrator:
             for decomposition_index, decomposition in enumerate(task_decompositions[task_index]):
                 selection_rollouts = [
                     selection_rollout_map[(task_index, decomposition_index, selection_index)]
-                    for selection_index in range(num_selections)
+                    for selection_index in range(num_executor_rollouts)
                 ]
-                uses_action_level_selector_rewards = any(
-                    any(
-                        assignment.prompt_text
-                        or assignment.reward_model_reward is not None
-                        for assignment in selection_rollout.selection.assignments
-                    )
-                    for selection_rollout in selection_rollouts
-                )
-                if uses_action_level_selector_rewards:
-                    selector_advantages_by_selection: Dict[int, List[float]] = {
-                        id(selection_rollout): []
-                        for selection_rollout in selection_rollouts
-                    }
-                    for node in decomposition.nodes:
-                        grouped_assignments = [
-                            (
-                                selection_rollout,
-                                selection_rollout.selection.assignment_for(node.node_id),
-                            )
-                            for selection_rollout in selection_rollouts
-                        ]
-                        selector_training_rewards = [
-                            self._format_adjusted_reward(
-                                (
-                                    float(assignment.reward_model_reward)
-                                    if assignment.reward_model_reward is not None
-                                    else float(selection_rollout.reward.total_reward)
-                                ),
-                                assignment.raw_payload,
-                                role="selector",
-                                upstream_payloads=(decomposition.raw_payload,),
-                            )
-                            for selection_rollout, assignment in grouped_assignments
-                        ]
-                        selection_advantages = group_relative_advantages(
-                            selector_training_rewards
-                        )
-                        for (selection_rollout, assignment), advantage in zip(
-                            grouped_assignments,
-                            selection_advantages,
-                        ):
-                            assignment.selector_advantage = advantage
-                            selector_advantages_by_selection[id(selection_rollout)].append(
-                                advantage
-                            )
-                    for selection_rollout in selection_rollouts:
-                        grouped_advantages = selector_advantages_by_selection.get(
-                            id(selection_rollout),
-                            [],
-                        )
-                        selection_rollout.selector_advantage = (
-                            sum(grouped_advantages) / len(grouped_advantages)
-                            if grouped_advantages
-                            else 0.0
-                        )
-                else:
-                    selector_training_rewards = [
-                        self._format_adjusted_reward(
-                            selection.reward.total_reward,
-                            selection.selection.raw_payload,
-                            role="selector",
-                            upstream_payloads=(decomposition.raw_payload,),
-                        )
-                        for selection in selection_rollouts
-                    ]
-                    selection_advantages = group_relative_advantages(
-                        selector_training_rewards
-                    )
-                    for selection_rollout, advantage in zip(selection_rollouts, selection_advantages):
-                        selection_rollout.selector_advantage = advantage
 
                 decomposer_selection_rewards = [
                     self._decomposer_reward_for_selection(selection_rollout)
@@ -648,35 +624,35 @@ class HierarchicalReMAOrchestrator:
         schedule: TrainingScheduleConfig,
     ) -> tuple[int, int]:
         num_decompositions = rollout_config.num_decompositions
-        num_selections = rollout_config.num_selections_per_decomposition
+        num_executor_rollouts = rollout_config.resolved_num_executor_rollouts_per_decomposition()
         if schedule.mode == TrainingMode.ALTERNATING:
-            if schedule.alternating_phase == AlternatingPhase.SELECTOR:
+            if schedule.alternating_phase.uses_executor:
                 num_decompositions = min(
                     num_decompositions,
-                    max(int(rollout_config.alternating_selector_num_decompositions), 1),
+                    rollout_config.resolved_alternating_executor_num_decompositions(),
                 )
-                num_selections = min(
-                    num_selections,
-                    max(int(rollout_config.alternating_selector_num_selections), 1),
+                num_executor_rollouts = min(
+                    num_executor_rollouts,
+                    rollout_config.resolved_alternating_executor_num_rollouts(),
                 )
             else:
                 num_decompositions = min(
                     num_decompositions,
                     max(int(rollout_config.alternating_decomposer_num_decompositions), 1),
                 )
-                num_selections = min(
-                    num_selections,
-                    max(int(rollout_config.alternating_decomposer_num_selections), 1),
+                num_executor_rollouts = min(
+                    num_executor_rollouts,
+                    rollout_config.resolved_alternating_decomposer_num_executor_rollouts(),
                 )
                 if (
                     self.gfam_reward_scorer is not None
-                    and int(rollout_config.gfam_decomposer_max_selections) > 0
+                    and rollout_config.resolved_gfam_decomposer_max_executor_rollouts() > 0
                 ):
-                    num_selections = min(
-                        num_selections,
-                        max(int(rollout_config.gfam_decomposer_max_selections), 1),
+                    num_executor_rollouts = min(
+                        num_executor_rollouts,
+                        rollout_config.resolved_gfam_decomposer_max_executor_rollouts(),
                     )
-        return num_decompositions, num_selections
+        return num_decompositions, num_executor_rollouts
 
     def _finalize_task_rollout(
         self,
@@ -906,14 +882,11 @@ class HierarchicalReMAOrchestrator:
             schedule.mode == TrainingMode.ALTERNATING
             and schedule.alternating_phase == AlternatingPhase.DECOMPOSER
         )
-        include_selector = schedule.mode == TrainingMode.JOINT or (
-            schedule.mode == TrainingMode.ALTERNATING
-            and schedule.alternating_phase == AlternatingPhase.SELECTOR
-        )
+        include_selector = False
         include_worker = self.train_worker_model and (
             schedule.mode == TrainingMode.JOINT or (
                 schedule.mode == TrainingMode.ALTERNATING
-                and schedule.alternating_phase == AlternatingPhase.SELECTOR
+                and schedule.alternating_phase.uses_executor
             )
         )
 
@@ -1222,10 +1195,10 @@ class HierarchicalReMAOrchestrator:
 
         frozen_roles: List[str] = []
         if schedule.mode == TrainingMode.ALTERNATING:
-            if schedule.alternating_phase == AlternatingPhase.SELECTOR:
+            if schedule.alternating_phase.uses_executor:
                 frozen_roles.append("decomposer")
             else:
-                frozen_roles.append("selector")
+                frozen_roles.append("worker")
 
         return HierarchicalTrainingBatch(
             decomposer_samples=decomposer_samples,
@@ -1286,7 +1259,7 @@ class HierarchicalGRPOTrainer:
             min_worker_grpo_group_size=self.min_worker_grpo_group_size,
             gfam_reward_scorer=self.gfam_reward_scorer,
         )
-        self._current_phase = AlternatingPhase.SELECTOR
+        self._current_phase = AlternatingPhase.EXECUTOR
 
     def run(
         self,
@@ -1343,7 +1316,7 @@ class HierarchicalGRPOTrainer:
         )
         self._current_phase = (
             AlternatingPhase.DECOMPOSER
-            if self._current_phase == AlternatingPhase.SELECTOR
-            else AlternatingPhase.SELECTOR
+            if self._current_phase.uses_executor
+            else AlternatingPhase.EXECUTOR
         )
         return schedule

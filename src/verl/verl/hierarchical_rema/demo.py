@@ -5,14 +5,10 @@ import json
 
 from .orchestrator import HierarchicalGRPOTrainer
 from .prompts import (
-    DEFAULT_CALCULATION_WORKER_PROMPT,
-    DEFAULT_COUNTING_CASEWORK_WORKER_PROMPT,
-    DEFAULT_FUNCTION_ANALYSIS_WORKER_PROMPT,
-    DEFAULT_GEOMETRY_RELATION_WORKER_PROMPT,
-    DEFAULT_LOGIC_CONSTRAINTS_WORKER_PROMPT,
-    DEFAULT_SYMBOLIC_MANIPULATION_WORKER_PROMPT,
+    DEFAULT_EXECUTOR_WORKER_PROMPT,
 )
 from .schema import (
+    CANONICAL_SKILL_TAGS,
     AlternatingPhase,
     ControllerPolicyConfig,
     HFBackendConfig,
@@ -58,45 +54,10 @@ def make_worker_pool(base_model_path: str | None) -> WorkerPoolConfig:
         enable_role_lora=False,
         workers=[
             WorkerSpec(
-                worker_id="calculation_worker",
-                description="Careful arithmetic, numeric evaluation, and simple formula specialist.",
-                skills=["arithmetic", "prealgebra", "simplification"],
-                system_prompt=DEFAULT_CALCULATION_WORKER_PROMPT,
-                base_model_path=base_model_path,
-            ),
-            WorkerSpec(
-                worker_id="symbolic_manipulation_worker",
-                description="Exact symbolic rewriting, equation solving, and algebra specialist.",
-                skills=["algebra", "equations", "polynomials", "symbolic_manipulation", "simplification"],
-                system_prompt=DEFAULT_SYMBOLIC_MANIPULATION_WORKER_PROMPT,
-                base_model_path=base_model_path,
-            ),
-            WorkerSpec(
-                worker_id="geometry_relation_worker",
-                description="Geometry, diagram relations, and trigonometric setup specialist.",
-                skills=["geometry", "trigonometry", "coordinate_geometry"],
-                system_prompt=DEFAULT_GEOMETRY_RELATION_WORKER_PROMPT,
-                base_model_path=base_model_path,
-            ),
-            WorkerSpec(
-                worker_id="function_analysis_worker",
-                description="Limits, derivatives, integrals, and function behavior specialist.",
-                skills=["calculus", "analysis", "functions", "limits"],
-                system_prompt=DEFAULT_FUNCTION_ANALYSIS_WORKER_PROMPT,
-                base_model_path=base_model_path,
-            ),
-            WorkerSpec(
-                worker_id="counting_casework_worker",
-                description="Counting, combinatorics, probability, and casework specialist.",
-                skills=["combinatorics", "probability", "discrete_math"],
-                system_prompt=DEFAULT_COUNTING_CASEWORK_WORKER_PROMPT,
-                base_model_path=base_model_path,
-            ),
-            WorkerSpec(
-                worker_id="logic_constraints_worker",
-                description="Divisibility, invariants, contradiction, and constraint reasoning specialist.",
-                skills=["number_theory", "discrete_math"],
-                system_prompt=DEFAULT_LOGIC_CONSTRAINTS_WORKER_PROMPT,
+                worker_id="executor_worker",
+                description="Shared executor that solves planner nodes one by one.",
+                skills=list(CANONICAL_SKILL_TAGS),
+                system_prompt=DEFAULT_EXECUTOR_WORKER_PROMPT,
                 base_model_path=base_model_path,
             ),
         ],
@@ -108,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--task", choices=["all", "algebra", "analysis", "calculus_analysis"], default="all")
     parser.add_argument("--mode", choices=["joint", "alternating"], default="joint")
-    parser.add_argument("--phase", choices=["selector", "decomposer"], default="selector")
+    parser.add_argument("--phase", choices=["executor", "selector", "decomposer"], default="executor")
     parser.add_argument("--parameter-sharing", action="store_true")
     parser.add_argument("--shared-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--decomposer-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
@@ -116,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-base-model-path", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
+    parser.add_argument("--num-executor-rollouts", type=int, default=0)
     parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
@@ -171,13 +133,15 @@ def _rollout_summary(rollout) -> dict:
     return {
         "task_id": rollout.task.task_id,
         "num_decompositions": len(rollout.decompositions),
-        "num_total_selections": sum(len(decomposition.selections) for decomposition in rollout.decompositions),
+        "num_total_executor_rollouts": sum(
+            len(decomposition.selections) for decomposition in rollout.decompositions
+        ),
         "best_decomposition_id": best_decomposition.decomposition.decomposition_id,
         "best_decomposition_reward": best_decomposition.decomposition_reward,
         "mean_decomposition_reward": sum(
             decomposition.decomposition_reward for decomposition in rollout.decompositions
         ) / max(len(rollout.decompositions), 1),
-        "best_selection_reward": best_selection_reward,
+        "best_executor_rollout_reward": best_selection_reward,
     }
 
 
@@ -207,6 +171,7 @@ def main() -> None:
     rollout_config = RolloutConfig(
         num_decompositions=args.num_decompositions,
         num_selections_per_decomposition=args.num_selections,
+        num_executor_rollouts_per_decomposition=args.num_executor_rollouts,
         max_nodes_per_decomposition=max_nodes_per_decomposition,
         soft_max_hops=args.soft_max_hops,
         hard_max_hops=args.hard_max_hops,
