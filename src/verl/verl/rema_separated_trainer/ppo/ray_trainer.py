@@ -920,6 +920,15 @@ class RayReMASeparatedTrainer(object):
             raise ValueError("Scoped C3 GRPO requires rollout.temperature > 0")
 
         max_num_turns = int(rollout_config.get('max_num_turns', 1))
+        if (
+            self.scoped_c3_grpo_config.get('positive_only_nonterminal_workers', False)
+            and hierarchy_config.get('terminal_worker_as_answer', False)
+            and max_num_turns != 1
+        ):
+            raise ValueError(
+                "Positive-only dynamic workers require max_num_turns=1; "
+                "terminal roles must describe the selected C3 action's round."
+            )
         configured_branch_turn = self.scoped_c3_grpo_config.get(
             'branch_turn',
             'latest',
@@ -1513,6 +1522,44 @@ class RayReMASeparatedTrainer(object):
                 mixed_mask[indices] = True
         return mixed_mask
 
+    def _c3_positive_only_mask(self, data_batch, role, action_present):
+        mask = torch.zeros_like(action_present)
+        if not self.scoped_c3_grpo_config.get('positive_only_nonterminal_workers', False):
+            return mask
+        hierarchy = self._get_hierarchy_config()
+        stage_roles = list(hierarchy.get('stage_roles', []))
+        if role not in stage_roles:
+            return mask
+        if hierarchy.get('terminal_worker_as_answer', False):
+            terminal_roles = data_batch.non_tensor_batch.get('terminal_stage_role')
+            if terminal_roles is None or len(terminal_roles) != len(data_batch):
+                raise ValueError("Positive-only workers require per-trajectory terminal_stage_role")
+            for index, terminal_role in enumerate(terminal_roles):
+                if bool(action_present[index].item()):
+                    if terminal_role not in stage_roles:
+                        raise ValueError(f"Invalid terminal_stage_role: {terminal_role!r}")
+                    mask[index] = role != terminal_role
+        elif role != hierarchy.get('score_role', stage_roles[-1]):
+            mask = action_present.clone()
+        return mask
+
+    def _estimate_scoped_c3_advantages(self, data_batch):
+        # Use the same policy in early group filtering and final actor masking.
+        return estimate_scoped_c3_grpo(
+            data_batch.batch['scoped_c3_outcome_score'].float(),
+            data_batch.non_tensor_batch['uid'],
+            data_batch.batch['scoped_c3_causal_valid'].bool(),
+            update_mask=data_batch.batch.get(
+                'scoped_c3_gate_update_mask', data_batch.batch['scoped_c3_update_mask'],
+            ).bool(),
+            positive_only_mask=data_batch.batch.get('scoped_c3_positive_only_mask'),
+            require_eligible_success=bool(
+                self.scoped_c3_grpo_config.get('require_eligible_success', False)
+            ),
+            normalize=bool(self.scoped_c3_grpo_config.get('normalize_advantages', True)),
+            epsilon=float(self.scoped_c3_grpo_config.get('normalization_epsilon', 1e-6)),
+        )
+
     def _attach_scoped_c3_grpo_signals(
         self,
         data_batch,
@@ -1597,6 +1644,13 @@ class RayReMASeparatedTrainer(object):
         data_batch.batch['scoped_c3_raw_outcome_score'] = raw_outcome_scores
         data_batch.batch['scoped_c3_outcome_score'] = outcome_scores
         data_batch.batch['scoped_c3_causal_valid'] = baseline_valid
+        data_batch.batch['scoped_c3_gate_update_mask'] = update_valid.clone()
+        data_batch.batch['scoped_c3_positive_only_mask'] = self._c3_positive_only_mask(
+            data_batch, role, action_present,
+        )
+        data_batch.batch['scoped_c3_update_mask'] = update_valid
+        estimate = self._estimate_scoped_c3_advantages(data_batch)
+        update_valid = estimate.effective_mask
         data_batch.batch['scoped_c3_update_mask'] = update_valid
 
         prefix = f'reward/c3/roles/{role}'
@@ -1635,28 +1689,26 @@ class RayReMASeparatedTrainer(object):
         metrics[f'{prefix}/update_eligible_rate'] = float(
             update_valid.float().mean().item()
         )
+        no_eligible_success = (
+            baseline_valid & ~estimate.eligible_success_group_mask
+            & (estimate.advantage.abs() > float(
+                self.scoped_c3_grpo_config.get('normalization_epsilon', 1e-6)
+            ))
+        )
+        if not self.scoped_c3_grpo_config.get('require_eligible_success', False):
+            no_eligible_success.zero_()
+        metrics[f'{prefix}/rejected/no_eligible_success_rate'] = float(
+            no_eligible_success.float().mean().item()
+        )
+        metrics[f'{prefix}/no_eligible_success_group_count'] = float(len({
+            data_batch.non_tensor_batch['uid'][index]
+            for index in torch.nonzero(no_eligible_success, as_tuple=False).flatten().tolist()
+        }))
 
     def _compute_scoped_c3_grpo_advantage(self, data_batch, metrics):
         """Build role-local fixed-prefix C3 LOO advantages."""
 
-        estimate = estimate_scoped_c3_grpo(
-            data_batch.batch['scoped_c3_outcome_score'].float(),
-            data_batch.non_tensor_batch['uid'],
-            data_batch.batch['scoped_c3_causal_valid'].bool(),
-            update_mask=data_batch.batch['scoped_c3_update_mask'].bool(),
-            normalize=bool(
-                self.scoped_c3_grpo_config.get(
-                    'normalize_advantages',
-                    True,
-                )
-            ),
-            epsilon=float(
-                self.scoped_c3_grpo_config.get(
-                    'normalization_epsilon',
-                    1e-6,
-                )
-            ),
-        )
+        estimate = self._estimate_scoped_c3_advantages(data_batch)
         step_mask = data_batch.batch['step_ids'] != -100
         advantages = (
             estimate.advantage.unsqueeze(-1)
@@ -1703,10 +1755,17 @@ class RayReMASeparatedTrainer(object):
         advantage = estimate.advantage
         positive = effective & (advantage > 0)
         negative = effective & (advantage < 0)
+        gate_mask = data_batch.batch.get(
+            'scoped_c3_gate_update_mask', data_batch.batch['scoped_c3_update_mask'],
+        ).bool()
         for sign, candidates in (('positive', advantage > 0), ('negative', advantage < 0)):
             metrics[f'{prefix}/{sign}_before_gate_count'] = float(candidates.sum().item())
-            metrics[f'{prefix}/{sign}_after_gate_count'] = float((effective & candidates).sum().item())
-            metrics[f'{prefix}/{sign}_removed_count'] = float((~effective & candidates).sum().item())
+            metrics[f'{prefix}/{sign}_after_gate_count'] = float((gate_mask & candidates).sum().item())
+            metrics[f'{prefix}/{sign}_removed_count'] = float((~gate_mask & candidates).sum().item())
+            metrics[f'{prefix}/{sign}_after_policy_count'] = float((effective & candidates).sum().item())
+            metrics[f'{prefix}/{sign}_policy_removed_count'] = float(
+                (gate_mask & ~effective & candidates).sum().item()
+            )
         metrics[f'{prefix}/effective_sample_rate'] = float(
             effective.float().mean().item()
         )
@@ -1739,6 +1798,8 @@ class RayReMASeparatedTrainer(object):
                 f'role={role}',
                 f'effective={metrics[f"{prefix}/effective_sample_rate"]:.3f}',
                 f'groups={int(metrics[f"{prefix}/effective_group_count"])}',
+                f'positive={int(positive.sum().item())}',
+                f'negative={int(negative.sum().item())}',
                 f'adv_std={metrics.get(f"{prefix}/advantage_std", 0.0):.3f}',
             ]),
             flush=True,

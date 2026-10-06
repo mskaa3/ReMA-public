@@ -326,6 +326,10 @@ algorithm:
       # The single round is indexed as turn 0.
       branch_turn: 0
       mixed_groups_only: True
+      # Never optimize a group whose successful actions are all ineligible.
+      require_eligible_success: True
+      # Terminal workers retain signed C3; other workers only reinforce success.
+      positive_only_nonterminal_workers: True
       normalize_advantages: True
       normalization_epsilon: 1.0e-6
       # Require at least two routed subtasks and a valid terminal-input L_T=0

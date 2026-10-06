@@ -14,11 +14,14 @@ def pad_scoped_actor_batch(batch: DataProto, world_size: int):
     if not len(batch) or trainable < world_size:
         return batch, 0
     padded, padding = pad_dataproto_to_divisor(batch, world_size)
-    if not padding:
-        return batch, 0
     mask = torch.zeros(len(padded), dtype=torch.bool, device=padded.batch['labels'].device)
-    mask[-padding:] = True
+    if padding:
+        mask[-padding:] = True
+    # Enable the actor's masked-row loss normalization even for divisible
+    # batches: rejected C3 actions must not enter trajectory denominators.
     padded.batch['actor_padding_mask'] = mask
+    if not padding:
+        return padded, 0
     padded.batch['labels'][-padding:] = -100
     padded.batch['step_ids'][-padding:] = -100
     for key in ('advantages', 'returns', 'token_level_scores', 'token_level_rewards'):

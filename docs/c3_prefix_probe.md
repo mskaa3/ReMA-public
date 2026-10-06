@@ -16,7 +16,7 @@ For alternatives j sampled at focal role r from exactly the same prefix:
     A_j = C_j / (std(C) + epsilon)
 
 Only mixed groups with at least two factual alternatives and at least one
-eligible focal action are used for optimization. Masked actions remain
+eligible successful focal action are used for optimization. Masked actions remain
 baseline donors. Their outcomes are not replaced by zero before computing
 C3, normalizing advantages, or checking outcome contrast.
 
@@ -94,17 +94,48 @@ removed. Worker comparisons require no additional model generation.
 
 ## Actor updates
 
-    A_train_j = M_j * A_j
+The current configuration enables two conservative update rules:
 
-The actor's token mask is zeroed for excluded focal actions, for both positive
-and negative advantages. Other alternatives remain in the C3 baseline.
+    require_eligible_success: true
+    positive_only_nonterminal_workers: true
+
+A group is skipped when every successful action is ineligible, even if failed
+actions pass their gates. This check is made before collecting optimizer groups
+and enforced again during advantage construction. One group's eligible success
+cannot qualify another group.
+
+After computing the signed C3 advantages and their original normalization:
+
+    A_train_j = M_j * max(A_j, 0)  # non-terminal workers
+    A_train_j = M_j * A_j          # terminal worker, decomposer, selector
+
+The terminal role is determined per trajectory from terminal_stage_role, not
+from a fixed stage number: worker_stage_2 can be terminal in a two-task plan
+and non-terminal in a three-task plan. Positive-only dynamic workers currently
+require one round so terminal metadata corresponds to the selected action.
+
+The actor's labels and token masks are masked out for rejected actions and for
+negative non-terminal actions. These actions receive neither a policy-loss nor
+an entropy/KL-loss contribution. No second normalization is applied after
+masking. Other alternatives, including failures and rejected successes, remain
+in the C3 baseline. Baselines and outcome-contrast checks always use raw scores.
 No manual penalties, PRD, CPCR, or TSS enter this training path.
+
+Set either flag to false in algorithm.hierarchy.scoped_c3_grpo for an ablation;
+setting both to false restores the previous signed update policy. These flags
+do not change prompts, communication/result extraction, leakage measurements,
+or validation gated accuracy. Positive-only updates avoid negative attribution
+from downstream failures, but can still reinforce incorrect intermediate work
+inside a successful trajectory. Fewer actions may qualify for each update.
 
 After C3 estimation, a non-divisible actor batch is padded to the next multiple
 of the actor world size. For example, 32 real trajectories on 12 ranks become
 36 transport rows. The extra rows have masked labels and zero advantages/rewards;
 they do not become C3 alternatives. Loss normalization excludes these rows and
 accounts for the actual token/turn/trajectory denominators across ranks.
+Even divisible C3 batches carry an all-false transport-padding mask to select
+this normalization path: rejected real actions must also be excluded from
+trajectory denominators, whether or not extra transport rows were needed.
 Data metrics likewise exclude transport padding. The batch is still skipped if
 there are fewer real trainable trajectories than ranks: padding never invents
 eligible actions. `rollout/actor_padding_rows` reports the transport overhead.
@@ -170,9 +201,20 @@ Metrics use reward/leakage/all, reward/leakage/train, and val/leakage:
 - roles/<role>/worker_match and worker_match_valid: the same per role.
 
 C3 metrics under reward/c3/roles/<role> additionally report positive and negative
-before_gate_count, after_gate_count, and removed_count. These counts are for
-the batch reaching advantage construction; leakage/all includes generated
-groups discarded before optimization.
+before_gate_count, after_gate_count, and removed_count for the existing leakage
+gates. New after_policy_count and policy_removed_count separate the conservative
+update policy from leakage rejection. For a purely non-terminal batch,
+negative_after_policy_count must be zero; a stage containing terminal actions
+can still have negative updates. Console [c3] lines print the actual retained
+positive and negative counts. These counts are for the batch reaching advantage
+construction; leakage/all includes generated groups discarded before optimization.
+
+no_eligible_success_group_count and rejected/no_eligible_success_rate are
+computed when attaching signals to a generated batch, before group filtering.
+As with the other attach-time C3 metrics, a step that generates several batches
+reports the latest batch, not a cumulative count of all generation attempts.
+update_eligible_rate includes the conservative policy, whereas leakage
+update_eligible_rate still describes only the leakage gate.
 
 The console prints [leakage/all], [leakage/train], [leakage/val], and live
 [leakage/example] lines with raw/gated scores, actual terminal role, subtask
@@ -231,5 +273,5 @@ data.teacher_assisted_validation only with a held-out teacher_attempt column;
 the loader rejects empty attempts and overlap with worker training questions.
 Pilot accuracies describe this small held-out shard split, not the full benchmarks.
 
-Inspect C3 positive_after_gate_count per focal role before a long run. Requiring
-an eligible success in every optimizer group is not enabled by this change.
+Inspect C3 positive_after_policy_count per focal role before a long run. Every
+optimizer group must now contain an eligible success under the default config.

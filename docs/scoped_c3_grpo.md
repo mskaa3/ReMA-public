@@ -35,8 +35,16 @@ the terminal answer. Terminal actions are exempt only from this comparison.
 
 C3 uses raw correctness, not gated correctness. Apply the gate after computing
 advantages by masking the focal action's training tokens. Both positive and
-negative updates are skipped for rejected actions. A group must contain at
-least one eligible nonzero advantage to contribute to the optimizer.
+negative updates are skipped for rejected actions.
+
+The default config also requires an eligible success in each optimizer group
+(require_eligible_success). Mixed raw outcomes alone are insufficient if every
+success is gated out. With positive_only_nonterminal_workers, negative
+non-terminal actions are masked after normalization, while terminal actions
+retain signed advantages. The actual terminal role is read per trajectory,
+not inferred from a fixed final slot. Decomposer/selector actions remain signed.
+All factual alternatives remain baseline donors; advantages are not re-centered
+after masking. Disabling both flags restores the previous signed C3 policy.
 
 The gates require one round, branch_turn=0; initialization rejects multi-round
 configurations with these gates enabled. Generic C3 without the gates still
@@ -53,7 +61,14 @@ Under reward/c3/roles/<role>:
   no_outcome_contrast}_rate;
 - effective_sample_rate, effective_group_count, and advantage_std;
 - positive_advantage_rate and negative_advantage_rate;
-- positive/negative_before_gate_count, after_gate_count, and removed_count.
+- positive/negative_before_gate_count, after_gate_count, and removed_count;
+- positive/negative_after_policy_count and policy_removed_count;
+- no_eligible_success_group_count and rejected/no_eligible_success_rate.
+
+The gate counters refer only to leakage eligibility; after_policy_count records
+the actions actually retained by the conservative update rule. Attach-time
+rejection counters describe the latest generated batch, while advantage-time
+counters describe the collected optimizer batch.
 
 Batch filtering uses rollout/c3/mixed_prompt_rate and trainable_prompt_rate.
 A high mixed-group rate but low update eligibility points to gate rejection;

@@ -78,6 +78,8 @@ def test_agent2_actual_launcher_configuration(launch_trainer):
     assert hierarchy["terminal_worker_as_answer"]
     assert hierarchy["routing_mode"] == "sequential_plan"
     assert trainer.scoped_c3_grpo_enabled and trainer.prefix_probe_enabled
+    assert trainer.scoped_c3_grpo_config["require_eligible_success"]
+    assert trainer.scoped_c3_grpo_config["positive_only_nonterminal_workers"]
     assert cfg.actor_rollout_ref.rollout.max_num_turns == 1
     assert cfg.actor_rollout_ref.rollout.n == 16
     assert cfg.trainer.nnodes == 6 and cfg.trainer.n_gpus_per_node == 2
@@ -88,6 +90,12 @@ def test_agent2_actual_launcher_configuration(launch_trainer):
     assert cfg.trainer.val_before_train
     assert cfg.trainer.test_freq == 10
     assert cfg.trainer.wandb_run_id == "agent2-only-123"
+
+
+def test_dynamic_positive_only_policy_rejects_ambiguous_multi_round_metadata(launch_trainer):
+    launch_trainer.config.actor_rollout_ref.rollout.max_num_turns = 2
+    with pytest.raises(ValueError, match="Positive-only dynamic workers require max_num_turns=1"):
+        launch_trainer._init_scoped_c3_grpo()
 
 
 @pytest.mark.parametrize("task_count,focal_index,validation", [
