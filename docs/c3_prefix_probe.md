@@ -11,11 +11,17 @@ There is no separate finalizer.
 
 For alternatives j sampled at focal role r from exactly the same prefix:
 
-    Y_j = 1[terminal_answer_j is correct]
-    C_j = Y_j - mean_{l != j}(Y_l)
+    Y_jm = 1[terminal_answer_jm is correct]
+    q_j = mean_m(Y_jm)
+    C_j = q_j - mean_{l != j}(q_l)
     A_j = C_j / (std(C) + epsilon)
 
-Only mixed groups with at least two factual alternatives and at least one
+Agent-2-only now samples 8 focal actions x 4 continuations (32 trajectory slots).
+Each focal action appears once in the baseline and actor loss. Generic M=1
+retains the previous estimator. See [Scoped C3-GRPO](scoped_c3_grpo.md) for
+sampling, costs, and limitations. Raw accuracy still uses individual Y_jm.
+
+Only groups with differing action means, at least two factual alternatives, and at least one
 eligible successful focal action are used for optimization. Masked actions remain
 baseline donors. Their outcomes are not replaced by zero before computing
 C3, normalizing advantages, or checking outcome contrast.
@@ -86,6 +92,12 @@ For the terminal worker, no equality comparison is required:
 
     M_terminal = G(P)
 
+With repeated suffixes, all continuation-level gates must pass for the shared
+focal action to be update-eligible. Never select a favorable suffix or omit a
+rejected suffix's raw outcome from the action mean. This is conservative and can
+reduce coverage. Gate rejection does not remove a complete action mean from the
+baseline. Continuation rows other than the first are masked actor copies.
+
 For decomposer/selector updates, the same plan gate applies. The decomposer
 is frozen during Agent-2-only training.
 
@@ -118,7 +130,8 @@ The actor's labels and token masks are masked out for rejected actions and for
 negative non-terminal actions. These actions receive neither a policy-loss nor
 an entropy/KL-loss contribution. No second normalization is applied after
 masking. Other alternatives, including failures and rejected successes, remain
-in the C3 baseline. Baselines and outcome-contrast checks always use raw scores.
+in the C3 baseline. Baselines and outcome-contrast checks use means of raw
+outcomes, not gated scores.
 No manual penalties, PRD, CPCR, or TSS enter this training path.
 
 Set either flag to false in algorithm.hierarchy.scoped_c3_grpo for an ablation;

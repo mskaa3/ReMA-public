@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import runpy
 import shlex
 import subprocess
 from types import SimpleNamespace
@@ -81,9 +82,10 @@ def test_agent2_actual_launcher_configuration(launch_trainer):
     assert trainer.scoped_c3_grpo_config["require_eligible_success"]
     assert trainer.scoped_c3_grpo_config["positive_only_nonterminal_workers"]
     assert cfg.actor_rollout_ref.rollout.max_num_turns == 1
-    assert cfg.actor_rollout_ref.rollout.n == 16
+    assert cfg.actor_rollout_ref.rollout.n == 32
+    assert trainer.scoped_c3_grpo_config["continuations_per_action"] == 4
     assert cfg.trainer.nnodes == 6 and cfg.trainer.n_gpus_per_node == 2
-    assert cfg.data.train_batch_size * 16 * cfg.actor_rollout_ref.rollout.n == 768
+    assert cfg.data.train_batch_size * 16 * cfg.actor_rollout_ref.rollout.n == 1536
     assert cfg.actor_rollout_ref.rollout.prompt_length + cfg.data.max_response_length <= cfg.actor_rollout_ref.rollout.max_model_len
     assert cfg.algorithm.filter_groups.skip_update_on_zero_trainable
     assert cfg.algorithm.filter_groups.allow_sub_minibatch_on_exhaustion
@@ -94,26 +96,40 @@ def test_agent2_actual_launcher_configuration(launch_trainer):
 
 def test_dynamic_positive_only_policy_rejects_ambiguous_multi_round_metadata(launch_trainer):
     launch_trainer.config.actor_rollout_ref.rollout.max_num_turns = 2
-    with pytest.raises(ValueError, match="Positive-only dynamic workers require max_num_turns=1"):
+    with pytest.raises(ValueError, match="Repeated C3 continuations currently require one round"):
+        launch_trainer._init_scoped_c3_grpo()
+
+
+@pytest.mark.parametrize("slots,continuations", [(32, 0), (31, 4), (4, 4)])
+def test_invalid_repeated_continuation_configuration_fails_early(launch_trainer, slots, continuations):
+    launch_trainer.config.actor_rollout_ref.rollout.n = slots
+    launch_trainer.config.algorithm.hierarchy.scoped_c3_grpo.continuations_per_action = continuations
+    with pytest.raises(ValueError, match="at least two actions"):
         launch_trainer._init_scoped_c3_grpo()
 
 
 @pytest.mark.parametrize("task_count,focal_index,validation", [
     (1, 1, False), (2, 1, False), (3, 2, False), (4, 4, False),
-    (2, 3, False), (3, 2, True), (3, 2, "teacher_assisted"),
+    (2, 3, False), (3, 2, True), (3, 2, "teacher_assisted"), (3, 0, False),
 ])
 def test_routed_rollout_visibility_and_c3(launch_trainer, task_count, focal_index, validation):
     trainer = launch_trainer
     hierarchy = trainer._get_hierarchy_config()
     roles = hierarchy["agent_roles"]
-    focal = f"worker_stage_{focal_index}"
+    focal = f"worker_stage_{focal_index}" if focal_index else "decomposer"
     terminal = f"worker_stage_{task_count}"
-    size = 4
+    size = trainer.config.actor_rollout_ref.rollout.n
+    continuations = hierarchy["scoped_c3_grpo"]["continuations_per_action"]
     question = "ORIGINAL_QUESTION_SENTINEL"
     teacher = "PRIVATE_TEACHER_SENTINEL"
+    terminal_constraints = " Return an integer residue modulo 73 in the range 0 to 72."
     plan = "REASONING: PRIVATE_PLANNER_REASONING\nPLAN:\n" + "\n".join(
-        f"- S{i}: Compute intermediate {i}." for i in range(1, task_count + 1)
+        f"- S{i}: Compute intermediate {i}."
+        + (terminal_constraints if i == task_count else "")
+        for i in range(1, task_count + 1)
     )
+    prompt_module = runpy.run_path(str(ROOT / "prompt/math/hierarchical_mamrp.py"))
+    system_prompts = prompt_module["build_hierarchical_system_prompts"](hierarchy["stage_roles"])
     prompts = DataProto.from_dict(
         tensors={"batch_idx": torch.arange(size)},
         non_tensors={
@@ -131,7 +147,10 @@ def test_routed_rollout_visibility_and_c3(launch_trainer, task_count, focal_inde
 
     def generate(role, chats, tokenizers, meta_info, response_length, max_new_tokens=None):
         generated_chats[role] = chats
-        outputs = [plan] * len(chats) if role == "decomposer" else [
+        outputs = [
+            plan.replace("PRIVATE_PLANNER_REASONING", f"PRIVATE_PLANNER_REASONING {i}")
+            for i in range(len(chats))
+        ] if role == "decomposer" else [
             f"REASONING: PRIVATE_{role}_REASONING\nLOCAL_RESULT: \\boxed{{{i + 10}}}"
             for i in range(len(chats))
         ]
@@ -142,7 +161,7 @@ def test_routed_rollout_visibility_and_c3(launch_trainer, task_count, focal_inde
     rollout._generate_from_chat_list = generate
     history, flags, reasons = rollout._initialize_conversation_state(size)
     outputs, conversations, actions, state = rollout._run_hierarchical_conversation(
-        prompts, {}, 1, roles, {role: "role instructions" for role in roles},
+        prompts, {}, 1, roles, system_prompts,
         hierarchy, history, flags, reasons, 1024, None,
     )
     assert "selector" not in generated_chats
@@ -160,6 +179,7 @@ def test_routed_rollout_visibility_and_c3(launch_trainer, task_count, focal_inde
         )
         terminal_input = next(r.message for r in requests if r.source_kind == "terminal")
         assert f"Compute intermediate {task_count}" in terminal_input
+        assert terminal_constraints in terminal_input
         assert "CURRENT TASK:" in terminal_input
         assert "PREVIOUS LOCAL RESULTS:" not in terminal_input
         assert "PRIVATE_" not in terminal_input and question not in terminal_input
@@ -169,24 +189,43 @@ def test_routed_rollout_visibility_and_c3(launch_trainer, task_count, focal_inde
     for chat in generated_chats["decomposer"]:
         text = "\n".join(message["content"] for message in chat)
         assert question in text
-        assert (teacher in text) is (not validation or validation == "teacher_assisted")
+        teacher_visible = not validation or validation == "teacher_assisted"
+        assert (teacher in text) is teacher_visible
+        assert "domain, modulus, allowed range, or units" in chat[0]["content"]
+        assert "leave the value of u to S1" in chat[0]["content"]
+        assert ("Assign doubtful calculations for checking" in text) is teacher_visible
+        assert ("reference earlier subtask results rather than supplying their values" in text) is teacher_visible
+        assert "repair possible mistakes" not in text
     for index, role in enumerate(hierarchy["stage_roles"][:task_count], 1):
         for chat in generated_chats[role]:
             text = "\n".join(message["content"] for message in chat)
             assert (question in text) is (index < task_count)
             assert teacher not in text and "PRIVATE_PLANNER_REASONING" not in text
             assert "Compute intermediate " + str(index) in text
+            assert (terminal_constraints in text) is (index == task_count)
             assert "PRIVATE_worker" not in text
             assert ("PREVIOUS LOCAL RESULTS:" in text) is (index > 1)
-        expected_count = size if validation or index >= focal_index else 1
+        expected_count = (
+            size if validation or index > focal_index
+            else size // continuations if index == focal_index else 1
+        )
         assert len(generated_chats[role]) == expected_count
-    assert len(generated_chats["decomposer"]) == (size if validation else 1)
+    assert len(generated_chats["decomposer"]) == (
+        size if validation else size // continuations if focal_index == 0 else 1
+    )
+    if not validation:
+        assert prompts.non_tensor_batch["c3_action_index"].tolist() == [i // continuations for i in range(size)]
+        assert prompts.non_tensor_batch["c3_suffix_index"].tolist() == [i % continuations for i in range(size)]
+    else:
+        assert "c3_action_index" not in prompts.non_tensor_batch
     if validation or focal_index > task_count:
         assert actions == [None] * size
     else:
         assert all(action["role"] == focal for action in actions)
         assert all(action["chat"] == actions[0]["chat"] for action in actions)
-        assert len({action["output"] for action in actions}) == size
+        assert len({action["output"] for action in actions}) == size // continuations
+        for start in range(0, size, continuations):
+            assert all(action == actions[start] for action in actions[start:start + continuations])
 
 
 @pytest.mark.parametrize("launch_trainer", [True], indirect=True)
@@ -194,7 +233,7 @@ def test_pilot_preserves_rollouts_and_shortens_training(launch_trainer):
     cfg = launch_trainer.config
     assert cfg.trainer.total_training_steps == 20
     assert cfg.trainer.test_freq == 5
-    assert cfg.actor_rollout_ref.rollout.n == 16
+    assert cfg.actor_rollout_ref.rollout.n == 32
     assert cfg.algorithm.hierarchy.agent12_curriculum.worker_bootstrap_steps == 800
     assert cfg.data.teacher_assisted_validation
     assert cfg.data.val_files.endswith("/agent2_pilot/val.parquet")

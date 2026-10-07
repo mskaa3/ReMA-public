@@ -55,6 +55,7 @@ from verl.rema_separated_trainer.ppo.actor_batch import (
     without_actor_padding,
 )
 from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
+    aggregate_scoped_c3_actions,
     estimate_scoped_c3_grpo,
 )
 from verl.rema_separated_trainer.ppo.prefix_probe import (
@@ -914,12 +915,18 @@ class RayReMASeparatedTrainer(object):
         rollout_config = self.config.actor_rollout_ref.rollout
         if int(rollout_config.get('n', 1)) < 2:
             raise ValueError("Scoped C3 GRPO requires rollout.n >= 2")
+        continuations = int(self.scoped_c3_grpo_config.get('continuations_per_action', 1))
+        slots = int(rollout_config.get('n', 1))
+        if continuations < 1 or slots % continuations or slots // continuations < 2:
+            raise ValueError("C3 rollout.n must equal at least two actions x continuations_per_action")
         if not bool(rollout_config.get('do_sample', True)):
             raise ValueError("Scoped C3 GRPO requires stochastic rollouts")
         if float(rollout_config.get('temperature', 1.0)) <= 0.0:
             raise ValueError("Scoped C3 GRPO requires rollout.temperature > 0")
 
         max_num_turns = int(rollout_config.get('max_num_turns', 1))
+        if continuations > 1 and max_num_turns != 1:
+            raise ValueError("Repeated C3 continuations currently require one round")
         if (
             self.scoped_c3_grpo_config.get('positive_only_nonterminal_workers', False)
             and hierarchy_config.get('terminal_worker_as_answer', False)
@@ -1628,6 +1635,44 @@ class RayReMASeparatedTrainer(object):
         # leave-one-out baseline (including failed mathematical comparisons).
         baseline_valid = action_present & exact_prefix
         update_valid = baseline_valid & prefix_gate_valid & collaboration_eligible
+        positive_only = self._c3_positive_only_mask(data_batch, role, action_present)
+        continuations = int(self.scoped_c3_grpo_config.get('continuations_per_action', 1))
+        if continuations > 1:
+            for key in ('c3_action_index', 'c3_suffix_index'):
+                if key not in data_batch.non_tensor_batch:
+                    raise ValueError(f"Repeated C3 rollout did not return {key}")
+            grouped = aggregate_scoped_c3_actions(
+                raw_outcome_scores,
+                data_batch.non_tensor_batch['uid'],
+                data_batch.non_tensor_batch['c3_action_index'],
+                data_batch.non_tensor_batch['c3_suffix_index'],
+                data_batch.non_tensor_batch[f'{role}_action_token_ids'],
+                baseline_valid,
+                update_valid,
+                continuations_per_action=continuations,
+                positive_only_mask=positive_only,
+            )
+            outcome_scores = grouped.outcome_scores
+            baseline_valid = grouped.valid_mask
+            update_valid = grouped.update_mask
+            data_batch.batch['scoped_c3_action_representative'] = grouped.representative_mask
+            prefix = f'reward/c3/roles/{role}'
+            representatives = grouped.representative_mask
+            action_count = int(representatives.sum().item())
+            metrics[f'{prefix}/action_count'] = float(action_count)
+            metrics[f'{prefix}/continuations_per_action'] = float(continuations)
+            metrics[f'{prefix}/continuation_row_count'] = float(len(data_batch))
+            metrics[f'{prefix}/valid_action_count'] = float(baseline_valid.sum().item())
+            metrics[f'{prefix}/all_suffix_gate_eligible_action_count'] = float(update_valid.sum().item())
+            metrics[f'{prefix}/action_success_mean'] = float(outcome_scores[baseline_valid].mean().item()) if baseline_valid.any() else 0.0
+            metrics[f'{prefix}/action_success_std'] = float(outcome_scores[baseline_valid].std(unbiased=False).item()) if baseline_valid.any() else 0.0
+            metrics[f'{prefix}/within_action_outcome_variance'] = float(grouped.within_action_variance[baseline_valid].mean().item()) if baseline_valid.any() else 0.0
+            metrics[f'{prefix}/suffix_gate_disagreement_rate'] = float(grouped.gate_disagreement_mask.sum().item()) / max(action_count, 1)
+            print(
+                f"[c3/action_means] role={role} actions={action_count} "
+                f"continuations_per_action={continuations} "
+                f"gate_eligible_actions={int(update_valid.sum().item())}"
+            )
         pre_mixed_valid = baseline_valid.clone()
         mixed_mask = torch.ones_like(baseline_valid)
         if bool(
@@ -1645,9 +1690,7 @@ class RayReMASeparatedTrainer(object):
         data_batch.batch['scoped_c3_outcome_score'] = outcome_scores
         data_batch.batch['scoped_c3_causal_valid'] = baseline_valid
         data_batch.batch['scoped_c3_gate_update_mask'] = update_valid.clone()
-        data_batch.batch['scoped_c3_positive_only_mask'] = self._c3_positive_only_mask(
-            data_batch, role, action_present,
-        )
+        data_batch.batch['scoped_c3_positive_only_mask'] = positive_only
         data_batch.batch['scoped_c3_update_mask'] = update_valid
         estimate = self._estimate_scoped_c3_advantages(data_batch)
         update_valid = estimate.effective_mask
@@ -1769,6 +1812,12 @@ class RayReMASeparatedTrainer(object):
         metrics[f'{prefix}/effective_sample_rate'] = float(
             effective.float().mean().item()
         )
+        representatives = data_batch.batch.get('scoped_c3_action_representative', None)
+        if representatives is not None:
+            action_count = int(representatives.sum().item())
+            metrics[f'{prefix}/optimizer_action_count'] = float(action_count)
+            metrics[f'{prefix}/effective_action_rate'] = float(effective.sum().item()) / max(action_count, 1)
+            metrics[f'{prefix}/masked_replica_row_count'] = float((~representatives).sum().item())
         metrics[f'{prefix}/effective_group_count'] = float(len({
             str(data_batch.non_tensor_batch['uid'][sample_idx])
             for sample_idx in torch.nonzero(
@@ -1800,6 +1849,7 @@ class RayReMASeparatedTrainer(object):
                 f'groups={int(metrics[f"{prefix}/effective_group_count"])}',
                 f'positive={int(positive.sum().item())}',
                 f'negative={int(negative.sum().item())}',
+                f'continuations={self.scoped_c3_grpo_config.get("continuations_per_action", 1)}',
                 f'adv_std={metrics.get(f"{prefix}/advantage_std", 0.0):.3f}',
             ]),
             flush=True,
@@ -4157,6 +4207,15 @@ class RayReMASeparatedTrainer(object):
                     "finish_reason": [],
                     "terminal_stage_role": [],
                 }
+                if 'scoped_c3_action_representative' in batch.batch:
+                    result.update({
+                        "c3_continuations_per_action": int(self.scoped_c3_grpo_config['continuations_per_action']),
+                        "c3_action_index": [],
+                        "c3_suffix_index": [],
+                        "c3_action_mean_score": [],
+                        "c3_action_representative": [],
+                        "c3_action_update_eligible": [],
+                    })
                 if self.prefix_probe_enabled:
                     result.update({
                         "prefix_probe_gate_protocol": "terminal_instruction",
@@ -4193,6 +4252,18 @@ class RayReMASeparatedTrainer(object):
                 data_item.non_tensor_batch['finish_reason']
             )
             results_dict[uid]['terminal_stage_role'].append(score_role)
+            if 'scoped_c3_action_representative' in batch.batch:
+                for key in ('c3_action_index', 'c3_suffix_index'):
+                    results_dict[uid][key].append(int(data_item.non_tensor_batch[key]))
+                results_dict[uid]['c3_action_mean_score'].append(float(
+                    data_item.batch['scoped_c3_outcome_score'].item()
+                ))
+                results_dict[uid]['c3_action_representative'].append(bool(
+                    data_item.batch['scoped_c3_action_representative'].item()
+                ))
+                results_dict[uid]['c3_action_update_eligible'].append(bool(
+                    data_item.batch['scoped_c3_update_mask'].item()
+                ))
             if self.prefix_probe_enabled:
                 results_dict[uid]['prefix_probe_decomposer_score'].append(
                     float(data_item.non_tensor_batch.get(

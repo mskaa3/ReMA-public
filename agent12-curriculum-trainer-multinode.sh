@@ -30,6 +30,7 @@ export TEACHER_SAMPLES_PER_CALL=${TEACHER_SAMPLES_PER_CALL:-${TEACHER_ROLLOUT_N}
 export TEACHER_CHECKPOINT_EVERY_BATCHES=${TEACHER_CHECKPOINT_EVERY_BATCHES:-5}
 export TEACHER_GENERATION_MAX_ATTEMPTS=${TEACHER_GENERATION_MAX_ATTEMPTS:-3}
 export ROLLOUT_N=${ROLLOUT_N:-16}
+export C3_CONTINUATIONS_PER_ACTION=${C3_CONTINUATIONS_PER_ACTION:-1}
 export TEACHER_ATTEMPT_MAX_CHARS=${TEACHER_ATTEMPT_MAX_CHARS:-8000}
 export BASE_QUESTION_BATCH_SIZE=${BASE_QUESTION_BATCH_SIZE:-3}
 export OPTIMIZER_PROMPT_BATCH_SIZE=${OPTIMIZER_PROMPT_BATCH_SIZE:-$((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N))}
@@ -99,7 +100,12 @@ if (( TEACHER_SHARD_QUESTIONS <= 0 )); then
     echo "TEACHER_SHARD_QUESTIONS must be positive" >&2
     exit 1
 fi
+if (( C3_CONTINUATIONS_PER_ACTION < 1 || ROLLOUT_N % C3_CONTINUATIONS_PER_ACTION != 0 || ROLLOUT_N / C3_CONTINUATIONS_PER_ACTION < 2 )); then
+    echo "C3 requires rollout slots = at least two actions x positive continuations_per_action" >&2
+    exit 1
+fi
 echo "Agent 1/2 batch: ${BASE_QUESTION_BATCH_SIZE} questions x ${TEACHER_ROLLOUT_N} attempts x ${ROLLOUT_N} rollouts = $((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N * ROLLOUT_N)) trajectories"
+echo "C3 per group: $((ROLLOUT_N / C3_CONTINUATIONS_PER_ACTION)) focal actions x ${C3_CONTINUATIONS_PER_ACTION} continuations"
 echo "Train decomposer: ${TRAIN_DECOMPOSER}; train roles: ${TRAIN_AGENT_ROLES}"
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
@@ -286,6 +292,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.max_planned_subtasks=${MAX_PLANNED_SUBTASKS} \
   algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.enable=${PREFIX_PROBE_ENABLE} \
+  algorithm.hierarchy.scoped_c3_grpo.continuations_per_action=${C3_CONTINUATIONS_PER_ACTION} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES} \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
@@ -663,6 +670,8 @@ teacher_attempt_max_chars=${TEACHER_ATTEMPT_MAX_CHARS}
 base_question_batch_size=${BASE_QUESTION_BATCH_SIZE}
 teacher_attempts_per_question=${TEACHER_ROLLOUT_N}
 rollouts_per_attempt=${ROLLOUT_N}
+c3_continuations_per_action=${C3_CONTINUATIONS_PER_ACTION}
+c3_actions_per_attempt=$((ROLLOUT_N / C3_CONTINUATIONS_PER_ACTION))
 optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE}
 train_decomposer=${TRAIN_DECOMPOSER}
 train_agent_roles=${TRAIN_AGENT_ROLES}

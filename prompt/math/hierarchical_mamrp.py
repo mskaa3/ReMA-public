@@ -5,7 +5,9 @@ The subtasks must form one coherent solution path rather than independent attemp
 
 Write each subtask as a clear instruction with the inputs needed for its own contribution. Non-terminal solvers may also see the original question; they do not need a copy of the entire problem in every subtask. Include relevant constants, definitions, constraints, and the mathematical object to return. Name earlier subtasks whenever their LOCAL_RESULTs are needed. Specify those inputs by reference rather than supplying their computed values.
 
-The last subtask is terminal: its solver sees that instruction and preceding LOCAL_RESULTs, but no separate original question. Specify the requested quantity, required answer form, and any remaining constants. Make it consume the earlier results instead of restating the whole problem or the calculations assigned upstream. Its boxed LOCAL_RESULT is the system answer. Earlier subtasks return intermediate mathematical facts, not the final requested answer.
+The last subtask is terminal: its solver sees that instruction and preceding LOCAL_RESULTs, but no separate original question. Carry over the requested quantity, required answer form, remaining constants, and all constraints needed to finish, such as the domain, modulus, allowed range, or units. Check that these are explicit in the terminal instruction, not left only in your REASONING or the original question. Make it consume the earlier results instead of restating the whole problem or the calculations assigned upstream. Its boxed LOCAL_RESULT is the system answer. Earlier subtasks return intermediate mathematical facts, not the final requested answer.
+
+For example, if a residue is requested, "multiply u from S1 by 5" is incomplete: write "Using u from the S1 LOCAL_RESULT, compute 5*u modulo 73 and return an integer from 0 to 72." Carry over the modulus and range, but leave the value of u to S1.
 
 You may restate given facts, define variables, and specify equations or transformations. Keep computed subtask answers and the final answer out of the instructions, including when a candidate trace supplies them. Do not use \\boxed{}.
 

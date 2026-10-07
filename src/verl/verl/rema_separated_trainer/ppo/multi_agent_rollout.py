@@ -1465,10 +1465,31 @@ class MultiAgentRollout:
                     f"[0, {max_num_turns})"
                 )
         if c3_active:
+            continuations_per_action = int(scoped_c3_config.get("continuations_per_action", 1))
+            if continuations_per_action < 1:
+                raise ValueError("C3 continuations_per_action must be positive")
+            if continuations_per_action > 1 and max_num_turns != 1:
+                raise ValueError("Repeated C3 continuations currently require one round")
+            group_offsets = {}
+            action_indices, suffix_indices = [], []
+            for group_id in c3_group_ids:
+                offset = group_offsets.get(group_id, 0)
+                action_indices.append(offset // continuations_per_action)
+                suffix_indices.append(offset % continuations_per_action)
+                group_offsets[group_id] = offset + 1
+            if continuations_per_action > 1 and any(
+                count % continuations_per_action or count // continuations_per_action < 2
+                for count in group_offsets.values()
+            ):
+                raise ValueError("Repeated C3 requires complete groups with at least two focal actions")
+            c3_action_group_ids = list(zip(c3_group_ids, action_indices))
+            prompts.non_tensor_batch["c3_action_index"] = np.array(action_indices, dtype=object)
+            prompts.non_tensor_batch["c3_suffix_index"] = np.array(suffix_indices, dtype=object)
             print(
                 "scoped C3 rollout: "
                 f"focal_role={c3_focal_role}, "
-                f"branch_turn={c3_branch_turn + 1}/{max_num_turns}"
+                f"branch_turn={c3_branch_turn + 1}/{max_num_turns}, "
+                f"continuations_per_action={continuations_per_action}"
             )
         worker_spec_text = self._format_worker_specs(worker_specs, worker_types)
 
@@ -1594,8 +1615,13 @@ class MultiAgentRollout:
                 if i_turn > c3_branch_turn:
                     return set()
                 if role == c3_focal_role:
-                    return set()
+                    return {c3_action_group_ids[int(idx)] for idx in indices}
                 return present_groups - branch_open_group_ids
+
+            def generation_group_ids(role):
+                if c3_active and i_turn == c3_branch_turn and role == c3_focal_role:
+                    return c3_action_group_ids
+                return c3_group_ids
 
             def mark_branch_open(role, indices):
                 if (
@@ -1617,11 +1643,16 @@ class MultiAgentRollout:
                         "\n\nCandidate serial reasoning trace "
                         "(planning scaffold):\n"
                         f"{teacher_scaffold}\n\n"
-                        "Analyze this attempt critically: preserve useful "
-                        "reasoning, repair possible mistakes, and do not assume "
-                        "its final answer is correct. Produce a useful sequence "
-                        "of dependent subtasks that remains executable when "
-                        "this scaffold is absent."
+                        "The attempt may be incorrect. Use it to identify a "
+                        "solution method and turn its calculations into "
+                        "dependent subtask instructions. Assign doubtful "
+                        "calculations for checking instead of repairing them "
+                        "in the plan. Copy required givens and answer constraints "
+                        "from the question, but reference earlier subtask "
+                        "results rather than supplying their values. The terminal "
+                        "subtask must remain executable from its instruction "
+                        "and those results, without this trace or the original "
+                        "question."
                     )
                 if previous_feedback[idx]:
                     content += f"\n\n{previous_feedback[idx]}"
@@ -1650,7 +1681,7 @@ class MultiAgentRollout:
                 prompts.meta_info,
                 response_length,
                 max_new_tokens=decomposer_max_new_tokens,
-                group_ids=c3_group_ids,
+                group_ids=generation_group_ids(decomposer_role),
                 coupled_group_ids=coupled_groups_for(
                     decomposer_role,
                     unfinished_indices,
@@ -1808,7 +1839,7 @@ class MultiAgentRollout:
                     prompts.meta_info,
                     response_length,
                     max_new_tokens=selector_max_new_tokens,
-                    group_ids=c3_group_ids,
+                    group_ids=generation_group_ids(selector_role),
                     coupled_group_ids=coupled_groups_for(
                         selector_role,
                         revise_indices,
@@ -2013,7 +2044,7 @@ class MultiAgentRollout:
                             )
                             else worker_max_new_tokens
                         ),
-                        group_ids=c3_group_ids,
+                        group_ids=generation_group_ids(stage_role),
                         coupled_group_ids=coupled_groups_for(
                             stage_role,
                             stage_indices,

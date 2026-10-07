@@ -18,6 +18,75 @@ class ScopedC3Estimate:
     eligible_success_group_mask: torch.Tensor
 
 
+@dataclass(frozen=True)
+class ScopedC3ActionMeans:
+    outcome_scores: torch.Tensor
+    representative_mask: torch.Tensor
+    valid_mask: torch.Tensor
+    update_mask: torch.Tensor
+    within_action_variance: torch.Tensor
+    gate_disagreement_mask: torch.Tensor
+
+
+def aggregate_scoped_c3_actions(
+    outcome_scores: torch.Tensor,
+    group_ids: Sequence[object],
+    action_indices: Sequence[int],
+    suffix_indices: Sequence[int],
+    action_token_ids: Sequence[Sequence[int]],
+    valid_mask: torch.Tensor,
+    update_mask: torch.Tensor,
+    *,
+    continuations_per_action: int,
+    positive_only_mask: torch.Tensor,
+) -> ScopedC3ActionMeans:
+    """Average complete repeated actions before LOO, retaining one actor row.
+
+    All suffix outcomes enter the mean, even when a leakage gate rejects one.
+    A rejected or unknown gate vetoes the shared action's update, not its
+    baseline contribution. Never choose only successful/eligible suffixes.
+    """
+    size = outcome_scores.numel()
+    if continuations_per_action < 1 or outcome_scores.ndim != 1:
+        raise ValueError("C3 aggregation requires 1-D scores and a positive continuation count")
+    if any(len(values) != size for values in (
+        group_ids, action_indices, suffix_indices, action_token_ids,
+        valid_mask, update_mask, positive_only_mask,
+    )):
+        raise ValueError("C3 continuation arrays must have equal lengths")
+    means = outcome_scores.clone()
+    representatives = torch.zeros_like(valid_mask, dtype=torch.bool)
+    valid = torch.zeros_like(representatives)
+    updates = torch.zeros_like(representatives)
+    variance = torch.zeros_like(outcome_scores)
+    disagreement = torch.zeros_like(representatives)
+    by_action = defaultdict(list)
+    for index, (group, action) in enumerate(zip(group_ids, action_indices)):
+        if int(action) < 0:
+            raise ValueError("C3 action indices must be nonnegative")
+        by_action[(group, int(action))].append(index)
+
+    with torch.no_grad():
+        for indices in by_action.values():
+            if len(indices) != continuations_per_action or {
+                int(suffix_indices[i]) for i in indices
+            } != set(range(continuations_per_action)):
+                raise ValueError("C3 action must contain every continuation exactly once")
+            if len({tuple(action_token_ids[i]) for i in indices}) != 1:
+                raise ValueError("C3 continuations must share the exact sampled focal action")
+            if len({bool(positive_only_mask[i]) for i in indices}) != 1:
+                raise ValueError("C3 continuations disagree on the focal action's terminal status")
+            representative = next(i for i in indices if int(suffix_indices[i]) == 0)
+            representatives[representative] = True
+            scores = outcome_scores[indices]
+            means[indices] = scores.mean()
+            variance[representative] = scores.var(unbiased=False)
+            valid[representative] = valid_mask[indices].all() & torch.isfinite(scores).all()
+            updates[representative] = valid[representative] & update_mask[indices].all()
+            disagreement[representative] = update_mask[indices].any() & ~update_mask[indices].all()
+    return ScopedC3ActionMeans(means, representatives, valid, updates, variance, disagreement)
+
+
 def estimate_scoped_c3_grpo(
     outcome_scores: torch.Tensor,
     group_ids: Sequence[object],
@@ -35,7 +104,8 @@ def estimate_scoped_c3_grpo(
     from one shared prefix. ``update_mask`` may exclude an action from policy
     optimization without removing it from the leave-one-out baseline.
     Positive-only actions are masked after normalization; ``advantage`` retains
-    the signed factual credit for diagnostics. Success means a positive binary
+    the signed factual credit for diagnostics. Scores may be binary outcomes
+    or action means over repeated continuations. Success requires a positive
     outcome with an eligible positive advantage, not just a positive raw reward.
     """
 

@@ -323,6 +323,9 @@ algorithm:
     # trained role and independently generate the complete remaining suffix.
     scoped_c3_grpo:
       enable: True
+      # rollout.n is total trajectory slots: actions * continuations. The
+      # Agent-2 launcher uses 32 slots = 8 actions * 4 independent suffixes.
+      continuations_per_action: 1
       # The single round is indexed as turn 0.
       branch_turn: 0
       mixed_groups_only: True
