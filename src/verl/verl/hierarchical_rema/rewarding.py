@@ -590,6 +590,18 @@ def build_selection_reward(
         ground_truth,
         task_metadata=task_metadata,
     )
+    # A matching intermediate value is not proof of a role violation. Keep the
+    # reference-based observation separate from delivered text and validity.
+    for execution in executions:
+        execution.reference_answer_match = bool(
+            final_node_id is not None
+            and execution.node_id != final_node_id
+            and str(ground_truth or "").strip()
+            and execution.output_text.strip()
+            and is_non_final_answer_leak(
+                execution.output_text, ground_truth, task_metadata=task_metadata,
+            )
+        )
     hierarchy_stats = _compute_hierarchy_reward_stats(
         executions=executions,
         final_node_id=final_node_id,

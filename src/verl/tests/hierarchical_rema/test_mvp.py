@@ -724,6 +724,7 @@ def test_selection_reward_penalizes_final_answer_that_ignores_dependencies() -> 
 def test_decomposer_reward_gets_dependency_usage_bonus_only_for_gated_correct_selections() -> None:
     trainer = HierarchicalGRPOTrainer(
         reward_weights=RewardWeights(decomposer_dependency_usage_bonus=0.05),
+        decomposer_reward_aggregation="best",
     )
     gated_selection = SelectionRollout(
         selection=SelectionCandidate(selection_id="sel-1", assignments=[]),
@@ -850,7 +851,7 @@ def test_alternating_selector_phase_freezes_decomposer() -> None:
     assert rollout.training_batch.frozen_roles == ["decomposer"]
 
 
-def test_alternating_decomposer_phase_freezes_selector() -> None:
+def test_alternating_decomposer_phase_freezes_executor() -> None:
     trainer = HierarchicalGRPOTrainer(
         train_worker_model=True,
         min_worker_grpo_group_size=1,
@@ -868,11 +869,11 @@ def test_alternating_decomposer_phase_freezes_selector() -> None:
     )
 
     assert len(rollout.decompositions) == 4
-    assert all(len(decomposition.selections) == 2 for decomposition in rollout.decompositions)
+    assert all(len(decomposition.selections) == 3 for decomposition in rollout.decompositions)
     assert len(rollout.training_batch.decomposer_samples) == 4
     assert len(rollout.training_batch.selector_samples) == 0
     assert rollout.training_batch.worker_samples == []
-    assert rollout.training_batch.frozen_roles == ["selector"]
+    assert rollout.training_batch.frozen_roles == ["worker"]
 
 
 def test_alternating_rollout_counts_use_wider_phase_specific_caps() -> None:
@@ -906,7 +907,7 @@ def test_alternating_rollout_counts_use_wider_phase_specific_caps() -> None:
         ),
     )
     assert len(decomposer_rollout.decompositions) == 8
-    assert all(len(decomposition.selections) == 2 for decomposition in decomposer_rollout.decompositions)
+    assert all(len(decomposition.selections) == 4 for decomposition in decomposer_rollout.decompositions)
 
 
 def test_controller_prompts_include_worker_performance_history() -> None:
@@ -1286,7 +1287,7 @@ def test_non_final_worker_output_stays_strict_when_text_sits_outside_tags() -> N
     assert success is False
 
 
-def test_non_final_worker_output_blanks_explicit_final_answer_clause() -> None:
+def test_non_final_worker_output_preserves_explicit_final_answer_clause() -> None:
     task = make_task(
         "algebra",
         "Find the integer solution.",
@@ -1319,14 +1320,14 @@ def test_non_final_worker_output_blanks_explicit_final_answer_clause() -> None:
         )
     )
 
-    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
-    assert invalid_reason == "non_final_contains_ground_truth"
-    assert final_answer_leak is True
+    assert normalized_output == "After simplifying, the answer is 3."
+    assert invalid_reason == ""
+    assert final_answer_leak is False
     assert answer_containment is False
-    assert success is False
+    assert success is True
 
 
-def test_non_final_worker_output_blanks_boxed_final_answer() -> None:
+def test_non_final_worker_output_preserves_boxed_final_answer() -> None:
     task = make_task(
         "algebra",
         "Find the integer solution.",
@@ -1359,14 +1360,14 @@ def test_non_final_worker_output_blanks_boxed_final_answer() -> None:
         )
     )
 
-    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
-    assert invalid_reason == "non_final_contains_ground_truth"
-    assert final_answer_leak is True
+    assert normalized_output == "\\boxed{3}"
+    assert invalid_reason == ""
+    assert final_answer_leak is False
     assert answer_containment is False
-    assert success is False
+    assert success is True
 
 
-def test_non_final_worker_output_blanks_named_value_clause() -> None:
+def test_non_final_worker_output_preserves_named_value_clause() -> None:
     task = make_task(
         "algebra",
         "Solve for y.",
@@ -1399,14 +1400,14 @@ def test_non_final_worker_output_blanks_named_value_clause() -> None:
         )
     )
 
-    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
-    assert invalid_reason == "non_final_contains_ground_truth"
-    assert final_answer_leak is True
+    assert normalized_output == "The value of y is $\\frac{4}{13}$."
+    assert invalid_reason == ""
+    assert final_answer_leak is False
     assert answer_containment is False
-    assert success is False
+    assert success is True
 
 
-def test_non_final_worker_output_blanks_multiline_named_result_clause() -> None:
+def test_non_final_worker_output_preserves_multiline_named_result_clause() -> None:
     task = make_task(
         "algebra",
         "Find the matrix.",
@@ -1446,11 +1447,11 @@ def test_non_final_worker_output_blanks_multiline_named_result_clause() -> None:
         )
     )
 
-    assert normalized_output == REDACTED_FINAL_ANSWER_LEAK_OUTPUT
-    assert invalid_reason == "non_final_contains_ground_truth"
-    assert final_answer_leak is True
+    assert normalized_output == "Thus, the matrix M is:\n\\[\n\\begin{pmatrix} 2 & -3 \\\\ 0 & 3 \\end{pmatrix}\n\\]"
+    assert invalid_reason == ""
+    assert final_answer_leak is False
     assert answer_containment is False
-    assert success is False
+    assert success is True
 
 
 def test_worker_prompt_explains_redacted_dependency_outputs() -> None:

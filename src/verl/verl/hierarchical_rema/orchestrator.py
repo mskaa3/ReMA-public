@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import math
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -76,7 +77,7 @@ class HierarchicalReMAOrchestrator:
         controller_format_fallback_penalty: float = 0.0,
         controller_fallback_positive_reward_scale: float = 0.0,
         selector_partial_completion_penalty: float = 0.0,
-        decomposer_reward_aggregation: str = "best",
+        decomposer_reward_aggregation: str = "mean",
         decomposer_no_correct_selection_scale: float = 0.25,
         track_workers_history: bool = True,
         train_worker_model: bool = False,
@@ -192,6 +193,8 @@ class HierarchicalReMAOrchestrator:
 
     @staticmethod
     def _worker_training_reward(selection: SelectionRollout, execution: WorkerExecution) -> float:
+        if selection.reward.total_reward is None:
+            raise ValueError("Unscored rollout cannot produce a training reward")
         if execution.reward_model_reward is not None:
             return float(execution.reward_model_reward)
         reward = float(selection.reward.total_reward)
@@ -394,13 +397,34 @@ class HierarchicalReMAOrchestrator:
             isinstance(selection.raw_payload, dict)
             and selection.raw_payload.get("synthetic_executor_rollout")
         )
+        outcome_kwargs = {}
+        if getattr(self.gfam_reward_scorer, "supports_verified_final_correctness", False):
+            if task.ground_truth is not None and str(task.ground_truth).strip():
+                verifier_score = float(reward.final_answer_correctness)
+                if not math.isfinite(verifier_score):
+                    raise ValueError("Final-answer verifier returned a nonfinite result")
+                # Some general verifiers award partial/format credit. Only full
+                # correctness counts as binary success for the planner bonus.
+                outcome_kwargs["verified_final_correctness"] = float(verifier_score >= 1.0)
         scored = self.gfam_reward_scorer.score_rollout(
             task=task,
             decomposition=decomposition,
             selection=selection,
             executions=executions,
             final_answer=final_answer,
+            **outcome_kwargs,
         )
+        if scored.get("status") == "unscored":
+            print(f"[graphprm] unscored task={task.task_id} plan={decomposition.decomposition_id} "
+                  f"executor_rollout={selection.selection_id} error={scored['error']}", flush=True)
+            reward.total_reward = None
+            reward.reward_model_source = "gfam_v1"
+            for execution in executions:
+                execution.reward_model_reward = None
+            return reward, {"source": "gfam_v1", "status": "unscored",
+                            "backend": scored.get("backend"), "error": scored["error"],
+                            "selection_reward": None, "compiled_rewards": {},
+                            "graph_summary": scored.get("graph_summary", {})}
         compiled_rewards = scored.get("compiled_rewards", {})
         selector_payload = compiled_rewards.get("selector", {})
         final_payload = compiled_rewards.get("final", {})
@@ -428,6 +452,10 @@ class HierarchicalReMAOrchestrator:
                 execution.reward_model_reward = float(worker_payload["reward"])
         return reward, {
             "source": "gfam_v1",
+            "status": "scored",
+            "backend": scored.get("backend", "gfam_v1"),
+            "model_predictions": scored.get("model_predictions", {}),
+            "prm_step_scores": scored.get("prm_step_scores", []),
             "selection_reward": reward.total_reward,
             "selector_reward_mean": (
                 sum(selector_decision_rewards) / len(selector_decision_rewards)
@@ -563,6 +591,13 @@ class HierarchicalReMAOrchestrator:
                     for selection_index in range(num_executor_rollouts)
                 ]
 
+                # A partial mean would preferentially reward plans whose short repeats fit.
+                if any(sel.reward.total_reward is None for sel in selection_rollouts):
+                    decomposition_rollouts.append(DecompositionRollout(
+                        decomposition=decomposition, selections=selection_rollouts,
+                        base_decomposition_reward=None, decomposition_reward=None,
+                        decomposer_advantage=None))
+                    continue
                 decomposer_selection_rewards = [
                     self._decomposer_reward_for_selection(selection_rollout)
                     for selection_rollout in selection_rollouts
@@ -588,17 +623,19 @@ class HierarchicalReMAOrchestrator:
                     )
                 )
 
+            scored_decompositions = [item for item in decomposition_rollouts
+                                     if item.decomposition_reward is not None]
             decomposition_training_rewards = [
                 self._format_adjusted_reward(
                     decomposition_rollout.decomposition_reward,
                     decomposition_rollout.decomposition.raw_payload,
                     role="decomposer",
                 )
-                for decomposition_rollout in decomposition_rollouts
+                for decomposition_rollout in scored_decompositions
             ]
             decomposition_advantages = group_relative_advantages(decomposition_training_rewards)
             for decomposition_rollout, advantage in zip(
-                decomposition_rollouts,
+                scored_decompositions,
                 decomposition_advantages,
             ):
                 decomposition_rollout.decomposer_advantage = advantage
@@ -845,6 +882,8 @@ class HierarchicalReMAOrchestrator:
     ) -> None:
         for decomposition_rollout in decompositions:
             for selection_rollout in decomposition_rollout.selections:
+                if selection_rollout.reward.total_reward is None:
+                    continue
                 for execution in selection_rollout.executions:
                     self.worker_memory.record_execution(
                         task_id=task.task_id,
@@ -875,6 +914,8 @@ class HierarchicalReMAOrchestrator:
             "num_decompositions_skipped_fallback": 0,
             "num_worker_samples_skipped_fallback": 0,
             "num_worker_samples_skipped_final_answer_leak": 0,
+            "num_worker_samples_skipped_unscored": 0,
+            "num_decomposer_samples_skipped_unscored": 0,
             "mean_group_size_used": 0.0,
         }
 
@@ -892,6 +933,9 @@ class HierarchicalReMAOrchestrator:
 
         if include_decomposer:
             for decomposition_rollout in decompositions:
+                if decomposition_rollout.decomposition_reward is None:
+                    worker_grpo_stats["num_decomposer_samples_skipped_unscored"] += 1
+                    continue
                 adjusted_reward, reward_after_fallback_mask, format_penalty = (
                     self._controller_training_reward_components(
                         decomposition_rollout.decomposition_reward,
@@ -1068,6 +1112,9 @@ class HierarchicalReMAOrchestrator:
                     continue
                 node_map = decomposition_rollout.decomposition.nodes_by_id()
                 for selection_rollout in decomposition_rollout.selections:
+                    if selection_rollout.reward.total_reward is None:
+                        worker_grpo_stats["num_worker_samples_skipped_unscored"] += len(selection_rollout.executions)
+                        continue
                     for execution in selection_rollout.executions:
                         if (
                             execution.final_answer_leak
@@ -1162,6 +1209,7 @@ class HierarchicalReMAOrchestrator:
                                 "invalid_reason": execution.invalid_reason,
                                 "final_answer_leak": execution.final_answer_leak,
                                 "answer_containment": execution.answer_containment,
+                                "reference_answer_match": execution.reference_answer_match,
                                 "reward_before_local_penalties": selection_rollout.reward.total_reward,
                                 "final_answer_correctness": selection_rollout.reward.final_answer_correctness,
                                 "worker_format_penalty": WORKER_INVALID_RESULT_PENALTY if execution.invalid_reason else 0.0,
@@ -1223,7 +1271,7 @@ class HierarchicalGRPOTrainer:
     controller_format_fallback_penalty: float = 0.0
     controller_fallback_positive_reward_scale: float = 0.0
     selector_partial_completion_penalty: float = 0.0
-    decomposer_reward_aggregation: str = "best"
+    decomposer_reward_aggregation: str = "mean"
     decomposer_no_correct_selection_scale: float = 0.25
     track_workers_history: bool = True
     train_worker_model: bool = False

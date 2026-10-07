@@ -77,9 +77,16 @@ else
 fi
 SIF_IMAGE_PATH=${SIF_IMAGE_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v3.sif}
 GFAM_REWARD_MODEL_PKL_PATH=${GFAM_REWARD_MODEL_PKL_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/jmoska/hierarchical_rema/best_overall_model.pkl}
-GFAM_REWARD_MODEL_DEVICE=${GFAM_REWARD_MODEL_DEVICE:-cpu}
+GFAM_REWARD_GPU_RESERVATION=${GFAM_REWARD_GPU_RESERVATION:-1}
+GFAM_REWARD_MODEL_DEVICE=${GFAM_REWARD_MODEL_DEVICE:-cuda:0}
 GFAM_REWARD_MODEL_ENCODER_BACKEND=${GFAM_REWARD_MODEL_ENCODER_BACKEND:-}
 GFAM_REWARD_MODEL_ENCODER_MODEL=${GFAM_REWARD_MODEL_ENCODER_MODEL:-}
+GFAM_PRM_DEVICE=${GFAM_PRM_DEVICE:-cuda:0}
+GFAM_BAD_CLASS_PENALTY=${GFAM_BAD_CLASS_PENALTY:-1.0}
+GFAM_PRM_TORCH_DTYPE=${GFAM_PRM_TORCH_DTYPE:-auto}
+GFAM_PRM_MAX_LENGTH=${GFAM_PRM_MAX_LENGTH:-0}
+GFAM_ENCODER_DEVICE=${GFAM_ENCODER_DEVICE:-$GFAM_REWARD_MODEL_DEVICE}
+GFAM_FEATURE_CACHE_DIR=${GFAM_FEATURE_CACHE_DIR:-}
 
 # Frequently adjusted: high-level experiment shape.
 BACKEND=${BACKEND:-mock}
@@ -137,7 +144,7 @@ ALTERNATING_SELECTOR_NUM_SELECTIONS=${ALTERNATING_SELECTOR_NUM_SELECTIONS:-4}
 ALTERNATING_EXECUTOR_NUM_DECOMPOSITIONS=${ALTERNATING_EXECUTOR_NUM_DECOMPOSITIONS:-$ALTERNATING_SELECTOR_NUM_DECOMPOSITIONS}
 ALTERNATING_EXECUTOR_NUM_ROLLOUTS=${ALTERNATING_EXECUTOR_NUM_ROLLOUTS:-$ALTERNATING_SELECTOR_NUM_SELECTIONS}
 ALTERNATING_DECOMPOSER_NUM_DECOMPOSITIONS=${ALTERNATING_DECOMPOSER_NUM_DECOMPOSITIONS:-8}
-ALTERNATING_DECOMPOSER_NUM_SELECTIONS=${ALTERNATING_DECOMPOSER_NUM_SELECTIONS:-2}
+ALTERNATING_DECOMPOSER_NUM_SELECTIONS=${ALTERNATING_DECOMPOSER_NUM_SELECTIONS:-4}
 ALTERNATING_DECOMPOSER_NUM_EXECUTOR_ROLLOUTS=${ALTERNATING_DECOMPOSER_NUM_EXECUTOR_ROLLOUTS:-$ALTERNATING_DECOMPOSER_NUM_SELECTIONS}
 HARD_MAX_HOPS=${HARD_MAX_HOPS:-8}
 MAX_NODES_PER_DECOMPOSITION=${MAX_NODES_PER_DECOMPOSITION:-$HARD_MAX_HOPS}
@@ -164,7 +171,8 @@ else
     DEFAULT_RAY_N_GPUS_PER_NODE=${SLURM_GPUS_RAW}
 fi
 RAY_NNODES=${RAY_NNODES:-${SLURM_JOB_NUM_NODES:-1}}
-RAY_N_GPUS_PER_NODE=${RAY_N_GPUS_PER_NODE:-$DEFAULT_RAY_N_GPUS_PER_NODE}
+POLICY_GPU_CAPACITY=$((DEFAULT_RAY_N_GPUS_PER_NODE - GFAM_REWARD_GPU_RESERVATION))
+RAY_N_GPUS_PER_NODE=${RAY_N_GPUS_PER_NODE:-$POLICY_GPU_CAPACITY}
 VLLM_TENSOR_PARALLEL_SIZE=${VLLM_TENSOR_PARALLEL_SIZE:-1}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
 VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-16384}
@@ -174,7 +182,7 @@ VLLM_ENABLE_SLEEP_MODE=${VLLM_ENABLE_SLEEP_MODE:-false}
 RAY_PORT=${RAY_PORT:-6379}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 RAY_NAMESPACE=${RAY_NAMESPACE:-verl}
-OFFLINE_GRPO_DISTRIBUTED=${OFFLINE_GRPO_DISTRIBUTED:-false}
+OFFLINE_GRPO_DISTRIBUTED=${OFFLINE_GRPO_DISTRIBUTED:-true}
 OFFLINE_GRPO_NNODES=${OFFLINE_GRPO_NNODES:-$RAY_NNODES}
 OFFLINE_GRPO_GPUS_PER_NODE=${OFFLINE_GRPO_GPUS_PER_NODE:-$RAY_N_GPUS_PER_NODE}
 OFFLINE_GRPO_MASTER_PORT=${OFFLINE_GRPO_MASTER_PORT:-29501}
@@ -187,7 +195,7 @@ UPDATE_EVERY_N_ROLLOUT_BATCHES=${UPDATE_EVERY_N_ROLLOUT_BATCHES:-4}
 ROLLOUT_PROGRESS_EVERY=${ROLLOUT_PROGRESS_EVERY:-10}
 ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-best}
 ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-compact}
-GFAM_DECOMPOSER_MAX_SELECTIONS=${GFAM_DECOMPOSER_MAX_SELECTIONS:-2}
+GFAM_DECOMPOSER_MAX_SELECTIONS=${GFAM_DECOMPOSER_MAX_SELECTIONS:-4}
 GFAM_DECOMPOSER_MAX_EXECUTOR_ROLLOUTS=${GFAM_DECOMPOSER_MAX_EXECUTOR_ROLLOUTS:-$GFAM_DECOMPOSER_MAX_SELECTIONS}
 
 TASK_SOURCE=${TASK_SOURCE:-$TASK_SOURCE_ARG}
@@ -249,7 +257,7 @@ TRAIN_MIN_ADVANTAGE=${TRAIN_MIN_ADVANTAGE:-}
 #   allow_local_repair = keep only clean or locally repaired controller samples
 #   clean_only = keep only clean controller samples
 CONTROLLER_SAMPLE_QUALITY_FILTER=${CONTROLLER_SAMPLE_QUALITY_FILTER:-all}
-DECOMPOSER_REWARD_AGGREGATION=${DECOMPOSER_REWARD_AGGREGATION:-best}
+DECOMPOSER_REWARD_AGGREGATION=${DECOMPOSER_REWARD_AGGREGATION:-mean}
 DECOMPOSER_NO_CORRECT_SELECTION_SCALE=${DECOMPOSER_NO_CORRECT_SELECTION_SCALE:-0.25}
 CONTROLLER_FORMAT_RETRY_PENALTY=${CONTROLLER_FORMAT_RETRY_PENALTY:-0.05}
 CONTROLLER_FORMAT_FALLBACK_PENALTY=${CONTROLLER_FORMAT_FALLBACK_PENALTY:-0.25}
@@ -314,7 +322,9 @@ STREAM_RUNTIME_LOG_TO_STDOUT=${STREAM_RUNTIME_LOG_TO_STDOUT:-$DEFAULT_STREAM_RUN
 # Usually leave alone: runtime paths / artifact plumbing.
 LOCAL_VERL_DIR=${LOCAL_VERL_DIR:-$TMPDIR/verl}
 LOCAL_SIF_IMAGE_PATH=${LOCAL_SIF_IMAGE_PATH:-$TMPDIR/verl-rema-v3.sif}
-LOCAL_GFAM_REWARD_MODEL_PKL_PATH=${LOCAL_GFAM_REWARD_MODEL_PKL_PATH:-$TMPDIR/gfam_reward_model.pkl}
+# The S3 alias can change between jobs. Keep staging markers/job artifacts scoped
+# to this job so a previous .stage_complete cannot silently reuse old weights.
+LOCAL_GFAM_REWARD_MODEL_PKL_PATH=${LOCAL_GFAM_REWARD_MODEL_PKL_PATH:-$TMPDIR/gfam_reward_model_${SLURM_JOB_ID:-$$}.pkl}
 DEFAULT_RAY_TMP_BASE=${TMPDIR_LOCAL:-/tmp/${USER:-user}}
 RAY_LOCAL_TMPDIR=${RAY_LOCAL_TMPDIR:-$DEFAULT_RAY_TMP_BASE/ray_${JOB_ID}}
 
@@ -479,6 +489,11 @@ fi
 GFAM_REWARD_MODEL_FLAGS=""
 if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
     GFAM_REWARD_MODEL_FLAGS="--gfam-reward-model-pkl ${LOCAL_GFAM_REWARD_MODEL_PKL_PATH} --gfam-reward-model-device ${GFAM_REWARD_MODEL_DEVICE}"
+    GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-bad-class-penalty ${GFAM_BAD_CLASS_PENALTY}"
+    GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-prm-device ${GFAM_PRM_DEVICE} --gfam-prm-torch-dtype ${GFAM_PRM_TORCH_DTYPE} --gfam-prm-max-length ${GFAM_PRM_MAX_LENGTH} --gfam-encoder-device ${GFAM_ENCODER_DEVICE}"
+    if [[ -n "$GFAM_FEATURE_CACHE_DIR" ]]; then
+        GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-feature-cache-dir ${GFAM_FEATURE_CACHE_DIR}"
+    fi
     if [[ -n "$GFAM_REWARD_MODEL_ENCODER_BACKEND" ]]; then
         GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-reward-model-encoder-backend ${GFAM_REWARD_MODEL_ENCODER_BACKEND}"
     fi
@@ -493,8 +508,29 @@ if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
 fi
 
 MULTINODE_RAY_ENABLED=0
-if [[ "$BACKEND" == "vllm" && "${RAY_NNODES:-1}" -gt 1 ]]; then
+if [[ "$BACKEND" == "vllm" && ( "${RAY_NNODES:-1}" -gt 1 || "$GFAM_REWARD_GPU_RESERVATION" == "1" ) ]]; then
     MULTINODE_RAY_ENABLED=1
+fi
+GPU_PARTITION="python3 /verl/verl/hierarchical_rema/gpu_partition.py --reserve ${GFAM_REWARD_GPU_RESERVATION}"
+if [[ "$GFAM_REWARD_GPU_RESERVATION" != "0" && "$GFAM_REWARD_GPU_RESERVATION" != "1" ]]; then
+    echo "GFAM_REWARD_GPU_RESERVATION must be 0 or 1" >&2; exit 1
+fi
+if [[ "$GFAM_REWARD_GPU_RESERVATION" == "1" ]]; then
+    if [[ "$BACKEND" != "vllm" || "$POLICY_GPU_CAPACITY" -lt 1 || -z "${SLURM_JOB_NODELIST:-}" ]]; then
+        echo "Dedicated reward GPU requires Slurm, vllm/Ray, and at least two GPUs per node" >&2; exit 1
+    fi
+    if [[ "$RAY_N_GPUS_PER_NODE" -gt "$POLICY_GPU_CAPACITY" || "$OFFLINE_GRPO_GPUS_PER_NODE" -gt "$RAY_N_GPUS_PER_NODE" ]]; then
+        echo "Policy/learner GPU counts overlap the reserved reward GPU; lower RAY_N_GPUS_PER_NODE and OFFLINE_GRPO_GPUS_PER_NODE" >&2; exit 1
+    fi
+    if [[ "$RUN_KIND" == "train" && "$OFFLINE_GRPO_DISTRIBUTED_FLAG" == "" ]]; then
+        echo "Use OFFLINE_GRPO_DISTRIBUTED=true so policy training stays in Ray's isolated GPU pool" >&2; exit 1
+    fi
+    if [[ "$GFAM_REWARD_MODEL_DEVICE" != "cuda:0" || "$GFAM_PRM_DEVICE" != "cuda:0" || "$GFAM_ENCODER_DEVICE" != "cuda:0" ]]; then
+        echo "Dedicated reward driver sees only its reserved GPU: use cuda:0 for GNN, Qwen and BGE" >&2; exit 1
+    fi
+    if (( RAY_N_GPUS_PER_NODE % VLLM_TENSOR_PARALLEL_SIZE != 0 )); then
+        echo "VLLM_TENSOR_PARALLEL_SIZE must divide the isolated policy GPU count" >&2; exit 1
+    fi
 fi
 if [[ -n "${SLURM_JOB_NUM_NODES:-}" && "${RAY_NNODES:-1}" -gt "${SLURM_JOB_NUM_NODES:-1}" ]]; then
     echo "RAY_NNODES=${RAY_NNODES} exceeds allocated SLURM_JOB_NUM_NODES=${SLURM_JOB_NUM_NODES}" >&2
@@ -704,7 +740,7 @@ start_ray_cluster() {
         --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
         --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
         "$LOCAL_SIF_IMAGE_PATH" \
-        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+        bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; ${GPU_PARTITION} --role policy -- python3 -m ray.scripts.scripts start --head --node-ip-address='$RAY_HEAD_NODE_IP' --port='${RAY_PORT}' --dashboard-host=0.0.0.0 --dashboard-port='${RAY_DASHBOARD_PORT}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
     RAY_CLUSTER_PIDS+=("$!")
     wait_for_ray_head
 
@@ -720,7 +756,7 @@ start_ray_cluster() {
             --mount type=bind,src=$TMPDIR,dst=/root/tmpdir \
             --mount type=bind,src=$LOCAL_VERL_DIR,dst=/verl \
             "$LOCAL_SIF_IMAGE_PATH" \
-            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; python3 -m ray.scripts.scripts start --address '${RAY_ADDRESS_VALUE}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
+            bash -lc "export TMPDIR='${RAY_LOCAL_TMPDIR}'; export RAY_TMPDIR='${RAY_LOCAL_TMPDIR}'; export PYTHONPATH='/verl/verl':\$PYTHONPATH; python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true; ${GPU_PARTITION} --role policy -- python3 -m ray.scripts.scripts start --address '${RAY_ADDRESS_VALUE}' --temp-dir='${RAY_LOCAL_TMPDIR}' --num-cpus='${RAY_CPUS_PER_NODE}' --num-gpus='${RAY_N_GPUS_PER_NODE}' --block" &
         RAY_CLUSTER_PIDS+=("$!")
         sleep 5
         idx=$((idx + 1))
@@ -945,6 +981,10 @@ RAY_CPUS_PER_NODE=$RAY_CPUS_PER_NODE
 MULTINODE_RAY_ENABLED=$MULTINODE_RAY_ENABLED
 RAY_NNODES=$RAY_NNODES
 RAY_N_GPUS_PER_NODE=$RAY_N_GPUS_PER_NODE
+GFAM_REWARD_GPU_RESERVATION=$GFAM_REWARD_GPU_RESERVATION
+GFAM_REWARD_MODEL_DEVICE=$GFAM_REWARD_MODEL_DEVICE
+GFAM_PRM_DEVICE=$GFAM_PRM_DEVICE
+GFAM_ENCODER_DEVICE=$GFAM_ENCODER_DEVICE
 RAY_PORT=$RAY_PORT
 RAY_DASHBOARD_PORT=$RAY_DASHBOARD_PORT
 RAY_NAMESPACE=$RAY_NAMESPACE
@@ -1254,6 +1294,7 @@ echo "[hierarchical-rema] starting run"
 echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
 echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
 echo "[hierarchical-rema] DISTRIBUTED_OFFLINE_INPUT_ROOT=$DISTRIBUTED_OFFLINE_INPUT_ROOT"
+echo "[hierarchical-rema] reward_gpu_reservation_per_node=$GFAM_REWARD_GPU_RESERVATION policy_gpus_per_node=$RAY_N_GPUS_PER_NODE reward_device=$GFAM_PRM_DEVICE"
 echo "[hierarchical-rema] SHARED_RUNTIME_MODEL_ROOT=$SHARED_RUNTIME_MODEL_ROOT"
 echo "[hierarchical-rema] RUNTIME_LOG=$RUNTIME_LOG"
 echo "[hierarchical-rema] S3_OUTPUT_PATH=$S3_OUTPUT_PATH"
@@ -1288,7 +1329,7 @@ export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
 export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
-python3 -m hierarchical_rema.demo \
+${GPU_PARTITION} --role reward -- python3 -m hierarchical_rema.demo \
   --backend ${BACKEND} \
   --task ${TASK} \
   --mode ${MODE} \
@@ -1342,7 +1383,7 @@ export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
 export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
-python3 -m hierarchical_rema.train \
+${GPU_PARTITION} --role reward -- python3 -m hierarchical_rema.train \
   --task-source ${TASK_SOURCE_RUNTIME} \
   --task-format ${TASK_FORMAT} \
   --prompt-key ${PROMPT_KEY} \

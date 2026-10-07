@@ -20,14 +20,12 @@ from .prompts import (
 from .rewarding import (
     compatibility_score,
     entropy_to_confidence_reward,
-    is_non_final_answer_leak,
     skill_match_score,
 )
 from .schema import (
     ControllerPolicyConfig,
     DecompositionCandidate,
     HFBackendConfig,
-    REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
     RolloutConfig,
     SelectionCandidate,
     SubtaskNode,
@@ -160,6 +158,12 @@ def _postprocess_worker_output(
     node: SubtaskNode,
     raw_output_text: str,
 ) -> tuple[str, str, bool, bool, bool]:
+    """Validate the result protocol without consulting reference answers.
+
+    Reference matching belongs to post-rollout evaluation, never to the
+    delivered artifact, protocol validity, or downstream execution context.
+    """
+    del task  # Kept in the signature for backend compatibility.
     normalized_output = extract_worker_result_text(raw_output_text).strip()
     invalid_reason = ""
     final_answer_leak = False
@@ -180,22 +184,6 @@ def _postprocess_worker_output(
     if "i don't know" in raw_output_text.lower():
         invalid_reason = "explicit_unknown"
         return "", invalid_reason, final_answer_leak, answer_containment, False
-
-    if node.node_id != decomposition.final_node_id:
-        if is_non_final_answer_leak(
-            normalized_output,
-            task.ground_truth,
-            task_metadata=task.metadata,
-        ):
-            final_answer_leak = True
-            invalid_reason = "non_final_contains_ground_truth"
-            return (
-                REDACTED_FINAL_ANSWER_LEAK_OUTPUT,
-                invalid_reason,
-                final_answer_leak,
-                answer_containment,
-                False,
-            )
 
     return normalized_output, invalid_reason, final_answer_leak, answer_containment, True
 

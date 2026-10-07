@@ -98,9 +98,9 @@ class RolloutConfig:
     alternating_executor_num_decompositions: int = 0
     alternating_executor_num_rollouts: int = 0
     alternating_decomposer_num_decompositions: int = 8
-    alternating_decomposer_num_selections: int = 2
+    alternating_decomposer_num_selections: int = 4
     alternating_decomposer_num_executor_rollouts: int = 0
-    gfam_decomposer_max_selections: int = 2
+    gfam_decomposer_max_selections: int = 4
     gfam_decomposer_max_executor_rollouts: int = 0
     max_nodes_per_decomposition: int = 4
     soft_max_hops: Optional[int] = None
@@ -395,6 +395,8 @@ class WorkerExecution:
     dependency_used: bool = False
     reward_model_reward: Optional[float] = None
     invalid_reason: str = ""
+    # Post-rollout oracle diagnostic, not a protocol error or a model feature.
+    reference_answer_match: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -410,7 +412,7 @@ class SelectionRewardBreakdown:
     final_answer_correctness: float
     confidence_reward: float
     compatibility_reward: float
-    total_reward: float
+    total_reward: Optional[float]
     worker_format_penalty: float = 0.0
     intermediate_final_answer_penalty: float = 0.0
     non_final_answer_containment_penalty: float = 0.0
@@ -431,6 +433,7 @@ class SelectionRewardBreakdown:
             return {
                 "total_reward": self.total_reward,
                 "reward_model_source": self.reward_model_source,
+                "final_answer_correctness": self.final_answer_correctness,
             }
         return asdict(self)
 
@@ -459,9 +462,9 @@ class SelectionRollout:
 class DecompositionRollout:
     decomposition: DecompositionCandidate
     selections: List[SelectionRollout]
-    base_decomposition_reward: float
-    decomposition_reward: float
-    decomposer_advantage: float = 0.0
+    base_decomposition_reward: Optional[float]
+    decomposition_reward: Optional[float]
+    decomposer_advantage: Optional[float] = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {

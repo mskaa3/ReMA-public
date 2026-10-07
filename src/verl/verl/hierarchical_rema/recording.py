@@ -25,6 +25,16 @@ class RolloutRecorder:
 
     def record_task_rollout(self, rollout: TaskRollout) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
+        for decomposition in rollout.decompositions:
+            for selection in decomposition.selections:
+                if selection.reward.total_reward is None:
+                    # Always persisted, even when only best rollouts are requested.
+                    self._append_jsonl(self.output_dir / "reward_scoring_failures.jsonl", {
+                        "timestamp": timestamp, "task_id": rollout.task.task_id,
+                        "task_prompt": rollout.task.prompt,
+                        "decomposition": decomposition.decomposition.to_dict(),
+                        "executor_rollout": self._strip_worker_prompts(selection.to_dict()),
+                    })
         task_payload = self._task_payload(rollout=rollout, timestamp=timestamp)
         if self.config.save_all_rollouts:
             self._append_jsonl(self.output_dir / "all_rollouts.jsonl", task_payload)
@@ -33,25 +43,32 @@ class RolloutRecorder:
             return
 
         best_decomposition = max(
-            rollout.decompositions,
+            (item for item in rollout.decompositions if item.decomposition_reward is not None),
             key=lambda item: item.decomposition_reward,
+            default=None,
         )
-        self._append_jsonl(
-            self.output_dir / "best_decompositions.jsonl",
-            self._decomposition_payload(
-                task_rollout=rollout,
-                decomposition_rollout=best_decomposition,
-                timestamp=timestamp,
-            ),
-        )
-        best_selection_decomposition, best_selection = max(
+        if best_decomposition is not None:
+            self._append_jsonl(
+                self.output_dir / "best_decompositions.jsonl",
+                self._decomposition_payload(
+                    task_rollout=rollout,
+                    decomposition_rollout=best_decomposition,
+                    timestamp=timestamp,
+                ),
+            )
+        best_pair = max(
             (
                 (decomposition, selection)
                 for decomposition in rollout.decompositions
                 for selection in decomposition.selections
+                if selection.reward.total_reward is not None
             ),
             key=lambda item: item[1].reward.total_reward,
+            default=None,
         )
+        if best_pair is None:
+            return
+        best_selection_decomposition, best_selection = best_pair
         self._append_jsonl(
             self.output_dir / "best_selections.jsonl",
             self._selection_payload(
@@ -97,6 +114,8 @@ class RolloutRecorder:
         )
 
     def _push_best(self, bucket: List[_RankedRecord], score: float, payload: Dict) -> None:
+        if score is None:
+            return
         bucket.append(_RankedRecord(score=score, payload=payload))
         bucket.sort(key=lambda record: record.score, reverse=True)
         del bucket[self.config.best_k :]
@@ -172,14 +191,18 @@ class RolloutRecorder:
                 "task_id": rollout.task.task_id,
                 "rollout": rollout_payload,
             }
-        best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
+        best_decomposition = max(
+            (item for item in rollout.decompositions if item.decomposition_reward is not None),
+            key=lambda item: item.decomposition_reward, default=None)
         best_selection = max(
             (
                 selection
                 for decomposition in rollout.decompositions
                 for selection in decomposition.selections
+                if selection.reward.total_reward is not None
             ),
             key=lambda item: item.reward.total_reward,
+            default=None,
         )
         return {
             "timestamp": timestamp,
@@ -190,11 +213,12 @@ class RolloutRecorder:
                 "mode": rollout.schedule.mode.value,
                 "phase": rollout.schedule.alternating_phase.value,
             },
-            "best_decomposition_id": best_decomposition.decomposition.decomposition_id,
-            "best_decomposition_reward": best_decomposition.decomposition_reward,
-            "best_selection_id": best_selection.selection.selection_id,
-            "best_selection_reward": best_selection.reward.total_reward,
-            "best_final_correctness": best_selection.reward.final_answer_correctness,
+            "best_decomposition_id": best_decomposition.decomposition.decomposition_id if best_decomposition else None,
+            "best_decomposition_reward": best_decomposition.decomposition_reward if best_decomposition else None,
+            "best_selection_id": best_selection.selection.selection_id if best_selection else None,
+            "best_selection_reward": best_selection.reward.total_reward if best_selection else None,
+            "best_final_correctness": best_selection.reward.final_answer_correctness if best_selection else None,
+            "unscored_rollouts": sum(sel.reward.total_reward is None for dec in rollout.decompositions for sel in dec.selections),
         }
 
     def _decomposition_payload(

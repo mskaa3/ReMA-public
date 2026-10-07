@@ -4,6 +4,7 @@ import copy
 import json
 import re
 import statistics
+from functools import lru_cache
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -1765,8 +1766,40 @@ class GFAMRewardScorer:
     device: str = "auto"
     encoder_backend: Optional[str] = None
     encoder_model: Optional[str] = None
+    prm_device: str = "cpu"
+    prm_torch_dtype: str = "auto"
+    prm_max_length: int = 0
+    feature_cache_dir: Optional[str] = None
+    encoder_device: Optional[str] = None
+    bad_class_penalty: float = 1.0
 
     def __post_init__(self) -> None:
+        checkpoint = torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
+        self.graphprm = None
+        if checkpoint.get("encoder_spec", {}).get("backend") == "graphprm_hybrid":
+            schema = checkpoint.get("feature_schema")
+            if schema == "graphprm_declared_provided_v2":
+                from .graphprm_v2.runtime import GraphPRMV2RewardScorer as GraphPRMRewardScorer
+                prm_dtype, prm_length = self.prm_torch_dtype, self.prm_max_length
+            elif schema is None:
+                from .graphprm_reward import GraphPRMRewardScorer
+                # Preserve legacy checkpoint inputs. v2 defaults come from its manifest.
+                prm_dtype = "float32" if self.prm_torch_dtype == "auto" else self.prm_torch_dtype
+                prm_length = self.prm_max_length or 512
+            else:
+                raise ValueError(f"Unsupported Graph+PRM feature schema: {schema}")
+
+            self.graphprm = GraphPRMRewardScorer(
+                self.checkpoint_path, device=self.device,
+                encoder_backend=self.encoder_backend, encoder_model=self.encoder_model,
+                prm_device=self.prm_device, prm_torch_dtype=prm_dtype,
+                prm_max_length=prm_length, cache_dir=self.feature_cache_dir,
+                encoder_device=self.encoder_device,
+                bad_class_penalty=self.bad_class_penalty,
+            )
+            self.checkpoint = self.graphprm.checkpoint
+            self.checkpoint_path = self.graphprm.checkpoint_path
+            return
         self.bundle = load_reward_model_bundle(
             model_pkl=self.checkpoint_path,
             device_name=self.device,
@@ -1780,6 +1813,10 @@ class GFAMRewardScorer:
         self.worker_bucket_count = self.bundle.worker_bucket_count
         self.checkpoint_path = str(self.bundle.checkpoint_path)
 
+    @property
+    def supports_verified_final_correctness(self):
+        return self.checkpoint.get("feature_schema") == "graphprm_declared_provided_v2"
+
     def score_rollout(
         self,
         *,
@@ -1788,7 +1825,16 @@ class GFAMRewardScorer:
         selection: SelectionCandidate,
         executions: list[WorkerExecution],
         final_answer: str,
+        verified_final_correctness: float | None = None,
     ) -> dict[str, Any]:
+        if self.graphprm is not None:
+            outcome = ({"verified_final_correctness": verified_final_correctness}
+                       if self.supports_verified_final_correctness else {})
+            return self.graphprm.score_rollout(
+                task=task, decomposition=decomposition, selection=selection,
+                executions=executions, final_answer=final_answer,
+                **outcome,
+            )
         record = _build_inference_record(
             task=task,
             decomposition=decomposition,
@@ -1802,3 +1848,9 @@ class GFAMRewardScorer:
             "record": record,
             **scored,
         }
+
+
+@lru_cache(maxsize=1)
+def load_cached_reward_scorer(**kwargs) -> GFAMRewardScorer:
+    """Keep frozen encoders resident across rollout segments and validation."""
+    return GFAMRewardScorer(**kwargs)
