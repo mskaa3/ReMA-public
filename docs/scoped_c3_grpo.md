@@ -49,6 +49,58 @@ Raw trajectory scores remain unchanged for accuracy and diagnostics. The mean
 is used only for role-local C3 credit. Validation remains ordinary generation,
 not a vote or a best-of-32 evaluation.
 
+## Per-action credit audit
+
+C3 training automatically appends an audit trail under
+`trainer.default_local_dir/credit_audit/train_step_<rollout_step>.jsonl`.
+This is local driver output, not an additional S3 upload. Each generated focal
+action is recorded once, not four times for its continuations. It requires no
+new rollouts, probes, or changes to reward/advantage computation.
+
+Join records by `audit_id = <uid>:<role>:<action_index>`:
+
+- `event=generated` is written before group filtering. It includes all suffix
+  outcomes and gate decisions, the action mean, candidate advantage, effective
+  C3 mask, question, exact focal conversation, a representative history, and
+  terminal responses from each suffix. This preserves evidence even for groups
+  subsequently discarded or when the process crashes. Full text can take
+  substantial disk space; it is not retained in the pending in-memory ledger.
+- `event=disposition` is appended after the actor-update attempt, before
+  validation/checkpointing. It reports final batch selection, trainable tokens,
+  final masked advantage, actor-update completion, positive/negative training
+  participation, and an exclusion reason. The ledger spans all generation
+  batches accumulated for an optimizer attempt, including filtered/truncated
+  groups. Action IDs survive role splitting, rank balancing, and padding;
+  transport duplicates and suffix replicas are not counted again.
+
+An action has `positive_training_signal=true` only when it is in the final
+batch, has unmasked label/step tokens with positive advantage, and the actor
+update completes. This means participation in the positive-advantage policy
+objective, not proof of a nonzero per-action gradient or increased probability:
+PPO clipping and shared parameters still apply. Negative terminal updates are
+recorded separately. If the actor call fails, potentially partially applied
+actions have `update_outcome_unknown=true` and null participation flags. A
+generated record without a disposition is pending/unknown, never evidence that
+an update occurred or did not occur. Resumed sessions append rather than erase
+old records; new prompt UIDs distinguish the attempts.
+
+Console output adds `uid`, `action`, and `suffix` to `[leakage/example]`.
+`[credit/example]` prints up to two action dispositions per optimizer attempt
+(preferring included actions); `[credit/summary]` prints action counts.
+All action details remain in JSONL, so console sampling is not the audit sample.
+W&B receives `train/credit/generated_actions`, `gate_passing_actions`,
+`positive_advantage_actions`, `used_positive_actions`, `used_negative_actions`,
+`excluded_actions`, `unknown_update_actions`, and `status/<reason>` counts.
+These are counts over the whole optimizer attempt, not fractions over replicated
+trajectory rows. Existing `positive_after_policy_count` metrics are computed
+before the collective-safety check and do not certify update completion.
+
+To estimate misleading positive credit, manually audit the *focal action*, join
+its generated record to the disposition, and compute the fraction of audited
+`positive_training_signal=true` actions that are substantively incorrect.
+Logging supplies the participation label, not a mathematical correctness judge.
+Correct final answers and passed gates are not intermediate-correctness labels.
+
 Action presence and exact-prefix agreement determine baseline validity.
 Leakage measurements determine actor-update eligibility separately. Even an
 unparseable or equivalent worker result can remain a baseline donor if its

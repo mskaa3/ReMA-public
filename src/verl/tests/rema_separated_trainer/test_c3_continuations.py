@@ -131,7 +131,10 @@ def _objects(values):
 @pytest.mark.parametrize("terminal", ["worker_stage_2", "worker_stage_3"])
 @pytest.mark.parametrize("duplicate_actions", [False, True])
 def test_trainer_masks_copies_after_mean_credit_and_preserves_raw_scores(terminal, duplicate_actions, tmp_path):
+    from verl.rema_separated_trainer.ppo.credit_audit import CreditAudit
+
     trainer = RayReMASeparatedTrainer.__new__(RayReMASeparatedTrainer)
+    trainer._credit_audit = CreditAudit(tmp_path / 'credit_audit')
     trainer.scoped_c3_grpo_enabled = True
     trainer.prefix_probe_enabled = True
     trainer.scoped_c3_grpo_config = {
@@ -204,6 +207,11 @@ def test_trainer_masks_copies_after_mean_credit_and_preserves_raw_scores(termina
     assert metrics[f"{prefix}/action_count"] == 8
     assert metrics[f"{prefix}/continuation_row_count"] == 32
     assert metrics[f"{prefix}/unique_action_rate"] == (1 / 8 if duplicate_actions else 1)
+    audit_metrics = trainer._credit_audit.finish(batch, actor_updated=True, actor_update_step=1)
+    assert audit_metrics['train/credit/generated_actions'] == 8
+    assert audit_metrics['train/credit/used_positive_actions'] == int(
+        (expected.effective_mask & (expected.advantage > 0)).sum()
+    )
 
     # Replay exposes action identity/means even when probe diagnostics are disabled.
     import json

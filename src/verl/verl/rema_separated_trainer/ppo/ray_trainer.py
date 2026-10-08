@@ -58,6 +58,7 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
     aggregate_scoped_c3_actions,
     estimate_scoped_c3_grpo,
 )
+from verl.rema_separated_trainer.ppo.credit_audit import CreditAudit
 from verl.rema_separated_trainer.ppo.prefix_probe import (
     apply_prefix_probe_gate,
     answer_round_records,
@@ -797,6 +798,8 @@ def split_batch_for_agents(data: DataProto) -> Dict[str, DataProto]:
     uid_list = data.non_tensor_batch['uid'].tolist()
     for role in agent_roles:
         new_non_tensor_batches[role]['uid'] = np.array(uid_list, dtype=object)
+        if 'credit_audit_id' in data.non_tensor_batch:
+            new_non_tensor_batches[role]['credit_audit_id'] = data.non_tensor_batch['credit_audit_id'].copy()
     
     all_agent_batches = {}
     for role in agent_roles:
@@ -1200,6 +1203,10 @@ class RayReMASeparatedTrainer(object):
             question = ' '.join(str(questions[index]).split())
             print(
                 f'[leakage/example] scope={scope} '
+                f'uid={data_batch.non_tensor_batch.get("uid", ["n/a"] * len(data_batch))[index]} '
+                f'focal_role={data_batch.meta_info.get("c3_focal_role", "n/a")} '
+                f'action={data_batch.non_tensor_batch.get("c3_action_index", ["n/a"] * len(data_batch))[index]} '
+                f'suffix={data_batch.non_tensor_batch.get("c3_suffix_index", ["n/a"] * len(data_batch))[index]} '
                 f'raw_score={float(data_batch.batch["prefix_probe_raw_outcome_score"][index]):.1f} '
                 f'gated_score={float(data_batch.batch["prefix_probe_gated_outcome_score"][index]):.1f} '
                 f'terminal_role={data_batch.non_tensor_batch["terminal_stage_role"][index]} '
@@ -1705,6 +1712,10 @@ class RayReMASeparatedTrainer(object):
         estimate = self._estimate_scoped_c3_advantages(data_batch)
         update_valid = estimate.effective_mask
         data_batch.batch['scoped_c3_update_mask'] = update_valid
+        if getattr(self, '_credit_audit', None) is not None:
+            self._credit_audit.capture(
+                data_batch, estimate, step=self.global_steps, role=role,
+            )
 
         prefix = f'reward/c3/roles/{role}'
         metrics[f'{prefix}/action_present_rate'] = float(
@@ -3503,6 +3514,13 @@ class RayReMASeparatedTrainer(object):
         c3_trainable_prompt_cnt = 0
         c3_ineligible_prompt_cnt = 0
 
+        self._credit_audit = (
+            CreditAudit(Path(self.config.trainer.default_local_dir) / 'credit_audit')
+            if self.scoped_c3_grpo_enabled else None
+        )
+        if self._credit_audit is not None:
+            print(f'[credit/audit] directory={self._credit_audit.directory}', flush=True)
+
         for epoch in range(self.config.trainer.total_epochs):
             self._update_current_train_agent(epoch)
             for batch_dict in self.train_dataloader:
@@ -4127,11 +4145,31 @@ class RayReMASeparatedTrainer(object):
                     ):
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg[self._current_train_agent].update_actor(batch)
+                            try:
+                                actor_output = self.actor_rollout_wg[self._current_train_agent].update_actor(batch)
+                            except Exception:
+                                if self._credit_audit is not None:
+                                    self._credit_audit.finish(
+                                        batch, actor_updated=False,
+                                        actor_update_step=self.actor_update_steps,
+                                        skip_reason='actor_update_failed_or_partial',
+                                    )
+                                raise
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
                         self._record_actor_update()
                         actor_updated = True
+
+                    if self._credit_audit is not None:
+                        metrics.update(self._credit_audit.finish(
+                            batch, actor_updated=actor_updated,
+                            actor_update_step=self.actor_update_steps,
+                            skip_reason=(
+                                'zero_trainable_batch' if skip_filtered_actor_update else
+                                'sparse_batch' if not collective_safe_update else
+                                'critic_warmup' if not actor_updated else None
+                            ),
+                        ))
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
