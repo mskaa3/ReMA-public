@@ -14,7 +14,8 @@
 # from . import gsm8k, math, prime_math, prime_code
 
 
-def _default_compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info=None) -> float:
+def _default_compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info=None,
+                           *, answer_only: bool = False) -> float:
     if data_source == 'openai/gsm8k':
         from . import gsm8k
         res = gsm8k.compute_score(solution_str, ground_truth)
@@ -28,7 +29,8 @@ def _default_compute_score(data_source: str, solution_str: str, ground_truth: st
         # To use it, override the `compute_score` function with the following implementation:
 
         from . import math_verify
-        res = math_verify.compute_score(solution_str, ground_truth)
+        scorer = math_verify.compute_answer_score if answer_only else math_verify.compute_score
+        res = scorer(solution_str, ground_truth)
     elif data_source in [
             'numina_aops_forum', 'numina_synthetic_math', 'numina_amc_aime', 'numina_synthetic_amc', 'numina_cn_k12',
             'numina_olympiads'

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import importlib
+import math
 import re
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -68,61 +70,72 @@ def _contains_normalized_reference(text: str, reference: str) -> bool:
 
 
 def _extract_answer_like_candidates(text: str) -> List[str]:
+    """Extract the terminal answer without consulting the reference.
+
+    Searching intermediate lines for any matching value rewards answer spraying
+    and can turn a wrong final answer into a successful rollout.
+    """
     stripped = str(text or "").strip()
     if not stripped:
         return []
 
-    candidates: List[str] = [stripped]
-    seen = {stripped}
+    results = re.findall(r"<worker_result>(.*?)</worker_result>", stripped, flags=re.S)
+    if results:
+        stripped = results[-1].strip()
+    elif "<worker_scratchpad>" in stripped or "<worker_result>" in stripped:
+        return []
+    if not stripped:
+        return []
 
-    def _add(candidate: str) -> None:
-        cleaned = candidate.strip()
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            candidates.append(cleaned)
+    # Balanced braces preserve nested fractions/roots inside the last box.
+    for match in reversed(list(re.finditer(r"\\boxed\s*\{", stripped))):
+        start, depth = match.end(), 1
+        for end in range(start, len(stripped)):
+            if stripped[end] == "{":
+                depth += 1
+            elif stripped[end] == "}":
+                depth -= 1
+            if depth == 0:
+                suffix = stripped[end + 1:].strip()
+                if not suffix.strip("$\\()[] .,:;\n\t"):
+                    return [stripped[start:end].strip()]
+                break
 
-    def _strip_outer_math_delimiters(candidate: str) -> str:
-        cleaned = candidate.strip()
-        if len(cleaned) >= 2 and cleaned.startswith("$") and cleaned.endswith("$"):
-            cleaned = cleaned[1:-1].strip()
-        if cleaned.startswith("\\(") and cleaned.endswith("\\)"):
-            cleaned = cleaned[2:-2].strip()
-        if cleaned.startswith("\\[") and cleaned.endswith("\\]"):
-            cleaned = cleaned[2:-2].strip()
-        if cleaned.startswith("$"):
-            cleaned = cleaned[1:].strip()
-        if cleaned.endswith("$"):
-            cleaned = cleaned[:-1].strip()
-        cleaned = cleaned.rstrip(".,;:")
-        return cleaned
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if len(lines) > 1 and all(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", line) for line in lines):
+        return []  # Several unqualified answers are not a single final answer.
+    candidate = lines[-1]
+    candidate = re.sub(r"^(?:therefore|thus|hence|so)\b\s*[:,]?\s*", "", candidate, flags=re.I)
+    explicit = list(re.finditer(
+        r"\b(?:final\s+answer|answer)\s*(?:is\b|equals\b|:|=)\s*", candidate, flags=re.I
+    ))
+    if explicit:
+        candidate = candidate[explicit[-1].end():]
+    named = re.match(
+        r"^(?:(?:the\s+)?(?:final\s+)?(?:answer|result|value)\s*(?:is|equals|:|=)\s*"
+        r"|the\s+.{1,160}?\s+(?:is|equals)\s+)(.*)$",
+        candidate, flags=re.I,
+    )
+    if named:
+        candidate = named.group(1)
+    if r"\boxed" in candidate:
+        return []  # A nonterminal/unfinished box must not override later text.
+    candidate = _strip_outer_math_delimiters(candidate.strip().rstrip(".,;:"))
 
-    def _add_with_variants(candidate: str) -> None:
-        _add(candidate)
-        stripped_candidate = _strip_outer_math_delimiters(candidate)
-        if stripped_candidate != candidate.strip():
-            _add(stripped_candidate)
-
-    for match in _BOXED_ANSWER_PATTERN.finditer(stripped):
-        _add_with_variants(match.group(1))
-
-    lines = [line.strip(" -*\t") for line in stripped.splitlines() if line.strip()]
-    if lines:
-        _add_with_variants(lines[-1])
-    for line in lines[-3:]:
-        match = _FINAL_CLAUSE_PATTERN.search(line)
-        if match:
-            _add_with_variants(match.group(1))
-        if ":" in line:
-            _add_with_variants(line.rsplit(":", 1)[-1])
-        if "=" in line:
-            _add_with_variants(line.rsplit("=", 1)[-1])
-
-    for segment in re.split(r"[;\n]", stripped):
-        candidate = segment.strip()
-        if 0 < len(candidate) <= 64:
-            _add_with_variants(candidate)
-
-    return candidates
+    # For a terminal calculation/assignment, compare its claimed RHS, not an
+    # earlier value in the equality chain. Preserve equalities inside containers.
+    depth, rhs_start = 0, 0
+    for index, char in enumerate(candidate):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "=" and depth == 0 and (index == 0 or candidate[index - 1] not in "<>!"):
+            rhs_start = index + 1
+    if re.search(r"[,;]|\b(?:and|or)\b", candidate):
+        rhs_start = 0  # Preserve multiple solutions/assignments as a whole.
+    candidate = _strip_outer_math_delimiters(candidate[rhs_start:].strip())
+    return [candidate] if candidate else []
 
 
 def _extract_non_final_leak_candidates(text: str) -> List[str]:
@@ -222,12 +235,15 @@ def _load_default_compute_score():
     global _DEFAULT_COMPUTE_SCORE, _DEFAULT_COMPUTE_SCORE_LOADED
     if _DEFAULT_COMPUTE_SCORE_LOADED:
         return _DEFAULT_COMPUTE_SCORE
+    # HPC launches python -m hierarchical_rema.train, without the verl prefix.
+    parent = __package__.rpartition(".")[0]
+    module_name = f"{parent + '.' if parent else ''}utils.reward_score"
     try:
-        from ..utils.reward_score import _default_compute_score
-
-        _DEFAULT_COMPUTE_SCORE = _default_compute_score
-    except Exception:
-        _DEFAULT_COMPUTE_SCORE = None
+        _DEFAULT_COMPUTE_SCORE = importlib.import_module(module_name)._default_compute_score
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            f"Cannot load answer verifier {module_name}; refusing silent exact-match fallback."
+        ) from exc
     _DEFAULT_COMPUTE_SCORE_LOADED = True
     return _DEFAULT_COMPUTE_SCORE
 
@@ -240,25 +256,22 @@ def _score_single_prediction_candidate(
     if not str(prediction or "").strip() or not str(reference or "").strip():
         return 0.0
 
+    if exact_match(prediction, reference):
+        return 1.0
     compute_score = _load_default_compute_score()
     metadata = task_metadata if isinstance(task_metadata, dict) else {}
     data_source = str(metadata.get("data_source") or "ReMA-math")
     extra_info = metadata.get("extra_info")
-    if compute_score is not None:
-        try:
-            score = float(
-                compute_score(
-                    data_source=data_source,
-                    solution_str=str(prediction),
-                    ground_truth=str(reference),
-                    extra_info=extra_info,
-                )
-            )
-            return min(max(score, 0.0), 1.0)
-        except Exception:
-            pass
-
-    return exact_match(prediction, reference)
+    score = float(compute_score(
+        data_source=data_source,
+        solution_str=str(prediction),
+        ground_truth=str(reference),
+        extra_info=extra_info,
+        answer_only=True,
+    ))
+    if not math.isfinite(score):
+        raise RuntimeError("Answer verifier returned a nonfinite score")
+    return min(max(score, 0.0), 1.0)
 
 
 def compute_final_answer_correctness(
@@ -270,6 +283,9 @@ def compute_final_answer_correctness(
     reference_text = str(reference or "").strip()
     if not prediction_text or not reference_text:
         return 0.0
+    reference_candidates = _extract_answer_like_candidates(reference_text)
+    if reference_candidates:
+        reference_text = reference_candidates[0]
 
     best_score = 0.0
     for candidate in _extract_answer_like_candidates(prediction_text):
@@ -648,14 +664,18 @@ def build_selection_reward(
             if execution.node_id == final_node_id or execution.final_answer_leak or not execution.output_text.strip():
                 execution.answer_containment = False
                 continue
-            execution.answer_containment = (
-                compute_final_answer_correctness(
+            try:
+                matches_generated_final = compute_final_answer_correctness(
                     execution.output_text,
                     final_answer,
                     task_metadata=task_metadata,
-                )
-                > 0.0
-                or compute_final_answer_correctness(
+                ) > 0.0
+            except ValueError:
+                # This comparison target is generated text, not ground truth;
+                # an unparsable final artifact is not evidence of containment.
+                matches_generated_final = False
+            execution.answer_containment = (
+                matches_generated_final or compute_final_answer_correctness(
                     execution.output_text,
                     ground_truth,
                     task_metadata=task_metadata,
