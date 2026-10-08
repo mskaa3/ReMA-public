@@ -18,6 +18,14 @@ launcher now defaults to rollout.n=32 and continuations_per_action=4: K=8
 independently sampled focal actions, each followed by M=4 continuations. Samples
 can coincide in content; they are not forced to be textually unique.
 
+The vLLM engine retains the configured run-level seed, but it is not copied into
+SamplingParams.seed for every request. Expanded action and continuation requests
+consume the advancing RNG stream rather than each restarting from the same seed.
+The FSDP sharding manager maintains separate generation RNG states per data-parallel
+rank and shared states within tensor-parallel groups. Greedy validation and probes
+are unchanged. This preserves seeded execution, not bitwise reproducibility across
+different hardware, batching, or checkpoint restarts.
+
 For K valid actions:
 
     q_j = mean_m(Y_jm)
@@ -132,7 +140,7 @@ Under reward/c3/roles/<role>:
 
 Repeated-continuation runs additionally log action_count, continuation_row_count,
 continuations_per_action, valid_action_count, all_suffix_gate_eligible_action_count,
-action_success_mean, action_success_std, within_action_outcome_variance, and
+unique_action_rate, action_success_mean, action_success_std, within_action_outcome_variance, and
 suffix_gate_disagreement_rate for the latest generated batch. Actor-batch
 metrics optimizer_action_count, effective_action_rate, and masked_replica_row_count
 count actual action representatives. Existing effective_sample_rate still uses
@@ -141,6 +149,13 @@ all trajectory rows as its denominator and is therefore at most 1/M. Console
 positive/negative action counts. Replay JSONL records action/suffix indices,
 action mean scores, representative masks, and action update eligibility. The
 latter is eligibility, not proof that a distributed optimizer step occurred.
+
+unique_action_rate counts distinct focal token sequences within each prompt group,
+divided by the number of valid action representatives, before gates or mixed-group
+filtering. Copied continuation slots are excluded. For eight valid actions per group,
+0.125 means all eight are identical, and 1.0 means all eight differ. It is a diagnostic,
+not a uniqueness reward; equivalent mathematics can have different token sequences.
+It is also included in the console [c3/action_means] line.
 
 The gate counters refer only to leakage eligibility; after_policy_count records
 the actions actually retained by the conservative update rule. Attach-time

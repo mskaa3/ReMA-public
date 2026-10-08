@@ -1663,6 +1663,15 @@ class RayReMASeparatedTrainer(object):
             metrics[f'{prefix}/continuations_per_action'] = float(continuations)
             metrics[f'{prefix}/continuation_row_count'] = float(len(data_batch))
             metrics[f'{prefix}/valid_action_count'] = float(baseline_valid.sum().item())
+            unique_actions_by_group = defaultdict(set)
+            for index in baseline_valid.nonzero(as_tuple=True)[0].tolist():
+                unique_actions_by_group[data_batch.non_tensor_batch['uid'][index]].add(
+                    tuple(data_batch.non_tensor_batch[f'{role}_action_token_ids'][index])
+                )
+            metrics[f'{prefix}/unique_action_rate'] = (
+                sum(len(actions) for actions in unique_actions_by_group.values())
+                / max(int(baseline_valid.sum().item()), 1)
+            )
             metrics[f'{prefix}/all_suffix_gate_eligible_action_count'] = float(update_valid.sum().item())
             metrics[f'{prefix}/action_success_mean'] = float(outcome_scores[baseline_valid].mean().item()) if baseline_valid.any() else 0.0
             metrics[f'{prefix}/action_success_std'] = float(outcome_scores[baseline_valid].std(unbiased=False).item()) if baseline_valid.any() else 0.0
@@ -1671,6 +1680,7 @@ class RayReMASeparatedTrainer(object):
             print(
                 f"[c3/action_means] role={role} actions={action_count} "
                 f"continuations_per_action={continuations} "
+                f"unique_action_rate={metrics[f'{prefix}/unique_action_rate']:.3f} "
                 f"gate_eligible_actions={int(update_valid.sum().item())}"
             )
         pre_mixed_valid = baseline_valid.clone()

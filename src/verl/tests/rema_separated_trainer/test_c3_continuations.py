@@ -129,7 +129,8 @@ def _objects(values):
 
 
 @pytest.mark.parametrize("terminal", ["worker_stage_2", "worker_stage_3"])
-def test_trainer_masks_copies_after_mean_credit_and_preserves_raw_scores(terminal, tmp_path):
+@pytest.mark.parametrize("duplicate_actions", [False, True])
+def test_trainer_masks_copies_after_mean_credit_and_preserves_raw_scores(terminal, duplicate_actions, tmp_path):
     trainer = RayReMASeparatedTrainer.__new__(RayReMASeparatedTrainer)
     trainer.scoped_c3_grpo_enabled = True
     trainer.prefix_probe_enabled = True
@@ -165,7 +166,9 @@ def test_trainer_masks_copies_after_mean_credit_and_preserves_raw_scores(termina
             "c3_action_turn": _objects([0] * 32),
             "c3_action_index": _objects([i // 4 for i in range(32)]),
             "c3_suffix_index": _objects([i % 4 for i in range(32)]),
-            "worker_stage_2_action_token_ids": _objects([[i // 4 + 100] for i in range(32)]),
+            "worker_stage_2_action_token_ids": _objects([
+                [100 if duplicate_actions else i // 4 + 100] for i in range(32)
+            ]),
             "worker_stage_2_conversation_history": _objects([
                 [{"role": "user", "content": "shared prefix"},
                  {"role": "assistant", "content": f"action {i // 4}"}]
@@ -200,6 +203,7 @@ def test_trainer_masks_copies_after_mean_credit_and_preserves_raw_scores(termina
     prefix = "reward/c3/roles/worker_stage_2"
     assert metrics[f"{prefix}/action_count"] == 8
     assert metrics[f"{prefix}/continuation_row_count"] == 32
+    assert metrics[f"{prefix}/unique_action_rate"] == (1 / 8 if duplicate_actions else 1)
 
     # Replay exposes action identity/means even when probe diagnostics are disabled.
     import json

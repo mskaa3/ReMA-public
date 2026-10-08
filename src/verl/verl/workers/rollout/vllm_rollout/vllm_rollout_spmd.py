@@ -146,6 +146,10 @@ class vLLMRollout(BaseRollout):
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
+            # The engine seed initializes the RNG once. A request seed resets it
+            # for every prompt, collapsing already-expanded C3/GRPO alternatives.
+            if k == "seed":
+                continue
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
