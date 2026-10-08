@@ -39,6 +39,13 @@ except ModuleNotFoundError:
     ("0.005", r".5\%"),
     ("-0.325", r"-32.5\%"),
     ("0.32", r"+32\%"),
+    ("1/29322216", r"\dfrac{1}{29,\!322,\!216}"),
+    (r"\boxed{\dfrac{1}{29,\!322,\!216}}", "1/29322216"),
+    (r"\frac{1}{29322216}", r"\dfrac{1}{29,322,216}"),
+    (r"\frac{1234}{5}", r"\tfrac{1,\!234}{5}"),
+    (r"\frac{-1234}{5}", r"\frac{-1,234}{5}"),
+    (r"\frac{\sqrt{2}}{29322216}", r"\frac{\sqrt{2}}{29,\!322,\!216}"),
+    (r"\frac{\frac{1}{1234}}{5678}", r"\frac{\frac{1}{1,234}}{5,678}"),
 ])
 def test_equivalent_answers(prediction, reference):
     assert rewarding.compute_final_answer_correctness(prediction, reference) == 1.0
@@ -76,6 +83,10 @@ def test_equivalent_answers(prediction, reference):
     (r"32\text{\%}", "32"),
     ("32.5%", r"32\%"),
     ("3% or 32%", r"32\%"),
+    ("1/29322215", r"\dfrac{1}{29,\!322,\!216}"),
+    ("29322216", r"\dfrac{1}{29,\!322,\!216}"),
+    ("-1/29322216", r"\dfrac{1}{29,\!322,\!216}"),
+    ("1234", "(1,234)"),
 ])
 def test_wrong_or_ambiguous_answers_do_not_match(prediction, reference):
     assert rewarding.compute_final_answer_correctness(prediction, reference) == 0.0
@@ -95,6 +106,25 @@ def test_percentage_normalization_preserves_modulo_expression():
     parent = rewarding.__package__.rpartition(".")[0]
     backend = importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
     assert backend._normalize_notation("15015 % 16") == "15015 % 16"
+
+
+@pytest.mark.parametrize("answer", [
+    "(1,234)", "[1,234]", r"\{1,234\}", "1, 2, 3", "x=1, y=234",
+    r"\frac{(1,234)}{5}", r"\frac{\{1,234\}}{5}",
+    r"\frac{1}{29,32,216}", r"\frac{1}{1,234x}",
+])
+def test_grouping_normalization_preserves_non_scalar_commas(answer):
+    parent = rewarding.__package__.rpartition(".")[0]
+    backend = importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
+    assert backend._normalize_notation(answer) == answer
+
+
+@pytest.mark.parametrize("separator", [",", r",\!", r",\,", r",\thinspace ", ", "])
+def test_grouped_fraction_arguments_normalize_without_changing_values(separator):
+    parent = rewarding.__package__.rpartition(".")[0]
+    backend = importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
+    answer = r"\dfrac{1}{29" + separator + "322" + separator + "216}"
+    assert backend._normalize_notation(answer) == r"\dfrac{1}{29322216}"
 
 
 def test_unparseable_reference_is_not_silently_scored_as_wrong(monkeypatch):

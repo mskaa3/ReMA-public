@@ -30,6 +30,38 @@ def _verifier():
     return parse, verify, LatexExtractionConfig
 
 
+def _normalize_fraction_grouping(text: str) -> str:
+    """Remove thousands separators only in complete numeric fraction arguments."""
+    replacements = []
+    for match in re.finditer(r"\\(?:frac|dfrac|tfrac)\b", text):
+        cursor = match.end()
+        for _ in range(2):
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor >= len(text) or text[cursor] != "{":
+                break
+            start = cursor + 1
+            depth = 1
+            cursor += 1
+            while cursor < len(text) and depth:
+                if text[cursor] == "{":
+                    depth += 1
+                elif text[cursor] == "}":
+                    depth -= 1
+                cursor += 1
+            if depth:
+                break
+            end = cursor - 1
+            argument = text[start:end].strip()
+            argument = re.sub(r"\\(?:[!,;:]|(?:thinspace|negthinspace)\b)\s*", "", argument)
+            if re.fullmatch(r"[+-]?\d{1,3}(?:,\s*\d{3})+(?:\.\d+)?", argument):
+                replacements.append((start, end, re.sub(r"[,\s]", "", argument)))
+    # Never remove commas globally: they can delimit coordinates, sets or answers.
+    for start, end, value in sorted(replacements, reverse=True):
+        text = text[:start] + value + text[end:]
+    return text
+
+
 def _normalize_notation(text: str) -> str:
     # Evaluation-only normalization: never modify downstream/model artifacts.
     text = str(text or "").strip().translate(str.maketrans({
@@ -43,6 +75,7 @@ def _normalize_notation(text: str) -> str:
     for opening, closing in ((r"\(", r"\)"), (r"\[", r"\]")):
         if text.startswith(opening) and text.endswith(closing):
             text = text[len(opening):-len(closing)].strip()
+    text = _normalize_fraction_grouping(text)
     # Parse standalone percentages as exact fractions. LaTeX parsers can reject
     # the percent suffix or silently strip it when wrapped in \text{...}.
     percentage = re.fullmatch(
