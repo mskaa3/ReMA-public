@@ -26,6 +26,19 @@ except ModuleNotFoundError:
     ("Final answer: C", r"\text{C}"),
     ("0.5", "Therefore, the answer is $\\frac{1}{2}$."),
     ("<worker_scratchpad>Wrong guess: 9</worker_scratchpad><worker_result>0.5</worker_result>", r"\frac{1}{2}"),
+    ("0.32", r"32 \%"),
+    (r"\frac{8}{25}", r"32 \%"),
+    ("32%", "0.32"),
+    (r"32 \%", r"\frac{8}{25}"),
+    (r"\boxed{32\%}", "0.32"),
+    (r"\(32\%\)", "0.32"),
+    (r"32\text{\%}", "0.32"),
+    ("0.32", r"32\mathrm{\%}"),
+    ("0", r"0\%"),
+    ("1", r"100\%"),
+    ("0.005", r".5\%"),
+    ("-0.325", r"-32.5\%"),
+    ("0.32", r"+32\%"),
 ])
 def test_equivalent_answers(prediction, reference):
     assert rewarding.compute_final_answer_correctness(prediction, reference) == 1.0
@@ -57,9 +70,39 @@ def test_equivalent_answers(prediction, reference):
     ("<worker_scratchpad>4</worker_scratchpad>", "4"),
     (r"\boxed{\frac{1}{2}", r"\frac{1}{2}"),
     ("", "0"),
+    ("32", r"32 \%"),
+    ("0.33", r"32 \%"),
+    ("32%", "32"),
+    (r"32\text{\%}", "32"),
+    ("32.5%", r"32\%"),
+    ("3% or 32%", r"32\%"),
 ])
 def test_wrong_or_ambiguous_answers_do_not_match(prediction, reference):
     assert rewarding.compute_final_answer_correctness(prediction, reference) == 0.0
+
+
+@pytest.mark.parametrize("answer", [
+    r"32 \%", "32%", r"$32 \%$", r"\(32 \%\)",
+    r"32\text{\%}", r"32\mathrm{\%}",
+])
+def test_numeric_percentages_are_normalized_before_parsing(answer):
+    parent = rewarding.__package__.rpartition(".")[0]
+    backend = importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
+    assert backend._normalize_notation(answer) == r"\frac{32}{100}"
+
+
+def test_percentage_normalization_preserves_modulo_expression():
+    parent = rewarding.__package__.rpartition(".")[0]
+    backend = importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
+    assert backend._normalize_notation("15015 % 16") == "15015 % 16"
+
+
+def test_unparseable_reference_is_not_silently_scored_as_wrong(monkeypatch):
+    parent = rewarding.__package__.rpartition(".")[0]
+    backend = importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
+    monkeypatch.setattr(backend, "_verifier", lambda: (lambda *a, **kw: [], None, lambda: None))
+    with pytest.raises(ValueError, match="Cannot parse ground-truth"):
+        backend.compute_answer_score("0.32", "unparseable reference")
 
 
 @pytest.mark.parametrize("package,module", [

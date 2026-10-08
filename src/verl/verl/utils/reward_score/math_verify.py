@@ -43,6 +43,15 @@ def _normalize_notation(text: str) -> str:
     for opening, closing in ((r"\(", r"\)"), (r"\[", r"\]")):
         if text.startswith(opening) and text.endswith(closing):
             text = text[len(opening):-len(closing)].strip()
+    # Parse standalone percentages as exact fractions. LaTeX parsers can reject
+    # the percent suffix or silently strip it when wrapped in \text{...}.
+    percentage = re.fullmatch(
+        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*"
+        r"(?:\\?%|\\(?:text|mathrm)\{\s*\\?%\s*\})",
+        text,
+    )
+    if percentage:
+        return r"\frac{" + percentage.group(1) + "}{100}"
     return text
 
 
