@@ -67,6 +67,7 @@ export GENERATE_TEACHER_DATA=${GENERATE_TEACHER_DATA:-1}
 export ONLINE_TEACHER_GENERATION=${ONLINE_TEACHER_GENERATION:-false}
 export TEACHER_SHARD_QUESTIONS=${TEACHER_SHARD_QUESTIONS:-512}
 export TEACHER_TRAIN_REMOTE=${TEACHER_TRAIN_REMOTE:-${AGENT12_S3_REMOTE%/}/teacher_data/math-phi4-mini-reasoning-n${TEACHER_ROLLOUT_N}-all-attempt-groups.parquet}
+export TEACHER_TRAIN_SHARDS_REMOTE=${TEACHER_TRAIN_SHARDS_REMOTE:-}
 export TEACHER_CANDIDATES_REMOTE=${TEACHER_CANDIDATES_REMOTE:-${TEACHER_TRAIN_REMOTE%.parquet}.generation-progress.parquet}
 export TEACHER_SHARD_REMOTE_ROOT=${TEACHER_SHARD_REMOTE_ROOT:-${TEACHER_TRAIN_REMOTE%.parquet}.shards/q${TEACHER_SHARD_QUESTIONS}}
 if [[ "$AGENT2_PILOT" == "true" || "$AGENT2_PILOT" == "1" ]]; then
@@ -75,11 +76,24 @@ if [[ "$AGENT2_PILOT" == "true" || "$AGENT2_PILOT" == "1" ]]; then
     export TEACHER_TRAIN_REMOTE=${PILOT_TEACHER_REMOTE:-${TEACHER_SHARD_REMOTE_ROOT}/train/shard-00000.parquet}
 fi
 
+# sbatch can inherit scratch paths exported while inspecting an earlier job.
+# Those paths belong to that allocation, not to this job's nodes.
+for path_var in JOB_TMP RAY_NODE_TMP CHECKPOINT_ROOT TEACHER_TRAIN_FILE TEACHER_CANDIDATES_FILE; do
+    inherited_path=${!path_var:-}
+    if [[ "$inherited_path" =~ ^/mnt/lscratch/slurm/([^/]+)(/|$) ]] && \
+            [[ "${BASH_REMATCH[1]}" != "$SLURM_JOB_ID" ]]; then
+        echo "Ignoring ${path_var} from another Slurm job: ${inherited_path}"
+        unset "$path_var"
+    fi
+done
+unset path_var inherited_path
+
 export JOB_TMP=${JOB_TMP:-/mnt/lscratch/slurm/${SLURM_JOB_ID}/agent12}
 export RAY_NODE_TMP=${RAY_NODE_TMP:-${JOB_TMP}/ray}
 export CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-${JOB_TMP}/checkpoints/agent12}
 export TEACHER_TRAIN_FILE=${TEACHER_TRAIN_FILE:-${JOB_TMP}/agent12_data/train.parquet}
 export TEACHER_CANDIDATES_FILE=${TEACHER_CANDIDATES_FILE:-${JOB_TMP}/agent12_data/teacher_candidates.parquet}
+echo "Agent 1/2 scratch: job=${SLURM_JOB_ID}; JOB_TMP=${JOB_TMP}"
 
 if (( GPUS_PER_NODE % 2 != 0 )); then
     echo "GPUS_PER_NODE must be even because Agent 1 and Agent 2 use separate pools" >&2
@@ -271,6 +285,41 @@ download_remote_file_on_head() {
         return 0
     fi
     return 1
+}
+
+reuse_teacher_data() {
+    if [[ -n "$TEACHER_TRAIN_SHARDS_REMOTE" ]]; then
+        export TEACHER_CACHE_DIR=${JOB_TMP}/agent12_data/cached_teacher_shards
+        echo "Reusing available teacher shards from ${TEACHER_TRAIN_SHARDS_REMOTE}"
+        echo "No teacher generation; cached shards may cover only part of the original dataset"
+        srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" bash -lc '
+            set -euo pipefail
+            mkdir -p "$(dirname "$TEACHER_CACHE_DIR")"
+            mkdir "$TEACHER_CACHE_DIR"
+            rclone copy "$TEACHER_TRAIN_SHARDS_REMOTE" "$TEACHER_CACHE_DIR" \
+                --filter "+ /shard-*.parquet" --filter "- **" \
+                --stats=30s --stats-one-line
+        '
+        srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+            apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+            python3 /root/ReMA-public/scripts/merge_agent12_teacher_shards.py \
+                --input-dir "$TEACHER_CACHE_DIR" --output "$TEACHER_TRAIN_FILE" \
+                --expected-attempts "$TEACHER_ROLLOUT_N"
+        # Do not publish a partial collection as the full teacher cache.
+    else
+        if [[ -z "$TEACHER_TRAIN_REMOTE" ]]; then
+            echo "Set TEACHER_TRAIN_REMOTE or TEACHER_TRAIN_SHARDS_REMOTE to reuse teacher data" >&2
+            return 1
+        fi
+        echo "Reusing teacher data from ${TEACHER_TRAIN_REMOTE}"
+        if ! download_remote_file_on_head \
+                "$TEACHER_TRAIN_REMOTE" "$TEACHER_TRAIN_FILE" \
+                "the cached teacher dataset"; then
+            echo "Teacher data is missing or empty at ${TEACHER_TRAIN_REMOTE}" >&2
+            echo "For a shard cache, set TEACHER_TRAIN_SHARDS_REMOTE to its train directory" >&2
+            return 1
+        fi
+    fi
 }
 
 run_agent12_training() {
@@ -593,17 +642,7 @@ python3 -m verl.trainer.main_generation \
     fi
     stop_ray
 else
-    if [[ -z "$TEACHER_TRAIN_REMOTE" ]]; then
-        echo "TEACHER_TRAIN_REMOTE is required when GENERATE_TEACHER_DATA=0" >&2
-        exit 1
-    fi
-    echo "Reusing teacher data from ${TEACHER_TRAIN_REMOTE}"
-    if ! download_remote_file_on_head \
-            "$TEACHER_TRAIN_REMOTE" "$TEACHER_TRAIN_FILE" \
-            "the full teacher dataset"; then
-        echo "Teacher data is missing or empty at ${TEACHER_TRAIN_REMOTE}" >&2
-        exit 1
-    fi
+    reuse_teacher_data
 fi
 
 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
@@ -711,6 +750,7 @@ teacher_assisted_validation=${TEACHER_ASSISTED_VALIDATION}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
 worker_model_remote=${WORKER_MODEL_REMOTE}
+teacher_train_shards_remote=${TEACHER_TRAIN_SHARDS_REMOTE}
 decomposer_use_remove_padding=${DECOMPOSER_USE_REMOVE_PADDING}
 worker_use_remove_padding=${WORKER_USE_REMOVE_PADDING}
 worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS}

@@ -23,6 +23,11 @@ incomplete export stops the job; there is no fallback to the base Qwen model.
 Preflight verifies file presence and index completeness, not numerical weight
 integrity or whether the model fits GPU memory. Existing staging directories
 are rejected; resubmit with a fresh job-local `JOB_TMP` rather than mixing exports.
+Paths under `/mnt/lscratch/slurm/<other-job-id>/` inherited in `JOB_TMP`,
+`RAY_NODE_TMP`, `CHECKPOINT_ROOT`, `TEACHER_TRAIN_FILE`, or
+`TEACHER_CANDIDATES_FILE` are discarded before workspace preparation. Defaults
+are rebuilt for the current Slurm allocation. Current-job and shared-directory
+overrides remain supported; the S3 `WORKER_MODEL_REMOTE` is not changed.
 
 The default decomposer is `Qwen/Qwen2.5-7B-Instruct`. Set `DECOMPOSER_MODEL_PATH`
 to override it. Resource allocation remains 6 nodes with 4 GPUs per node, split
@@ -76,11 +81,27 @@ before completing the fade. Check `curriculum/teacher_attempt_probability` and
 `train/actor_update_step`; the launcher does not claim that 800 attempts imply
 800 successful updates.
 
-The wrapper disables teacher generation and reuses the full cached dataset at
-the common launcher's `TEACHER_TRAIN_REMOTE`. All 16 attempts per question,
-correct or incorrect, are retained. To use another complete cache or one shard,
-also set `TEACHER_TRAIN_REMOTE`. Missing cached data fails explicitly rather than
-silently invoking Agent 0. Teacher visibility is shared within each C3 group.
+The wrapper disables teacher generation. By default it reuses the cached file at
+`TEACHER_TRAIN_REMOTE`. To use another complete cache or one shard, set that
+variable to its file path. For all available completed shards, set:
+
+```bash
+export TEACHER_TRAIN_SHARDS_REMOTE="s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/teacher_data/math-phi4-mini-reasoning-n16-all-attempt-groups.shards/q512/train"
+```
+
+The shard-directory option takes precedence over the single file. The launcher
+downloads the shards once to the head node, validates and merges them locally,
+then trains on the combined dataset with normal shuffling. Both `shard-00000.parquet`
+and `shard-00000.train.parquet` names are supported; duplicate IDs are rejected.
+Empty/corrupt shards, inconsistent columns, and incorrect attempt counts stop
+the run. All 16 attempt slots, including incorrect or empty attempts, are retained.
+Missing cached data fails explicitly rather than silently invoking Agent 0.
+
+An interrupted Agent-2 run may have produced only some shards: the launcher
+reports the merged question count and does not assume full-dataset coverage or
+upload the partial collection over the full cache. The full cache is normally
+created only after the entire Agent-2 online shard loop finishes. Teacher
+visibility is shared within each C3 group.
 
 ## Logging and exports
 

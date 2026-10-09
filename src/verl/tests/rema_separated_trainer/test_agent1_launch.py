@@ -132,6 +132,47 @@ def test_wrapper_from_slurm_spool_reuses_data_and_disables_worker_updates(tmp_pa
     assert env["AGENT12_RUN_NAME"] == "agent1-only-999"
 
 
+@pytest.mark.parametrize("path_case", ["old_job", "current_job", "shared", "mixed"])
+def test_launcher_drops_only_paths_from_other_slurm_jobs(path_case):
+    defaults = {
+        "JOB_TMP": "",
+        "RAY_NODE_TMP": "/ray",
+        "CHECKPOINT_ROOT": "/checkpoints/agent12",
+        "TEACHER_TRAIN_FILE": "/agent12_data/train.parquet",
+        "TEACHER_CANDIDATES_FILE": "/agent12_data/teacher_candidates.parquet",
+    }
+    root = {
+        "old_job": "/mnt/lscratch/slurm/6055460/agent12",
+        "current_job": "/mnt/lscratch/slurm/999/custom",
+        "shared": "/shared/custom",
+        "mixed": "/mnt/lscratch/slurm/6055460/agent12",
+    }[path_case]
+    overrides = {key: root + suffix for key, suffix in defaults.items()}
+    if path_case == "mixed":
+        overrides["JOB_TMP"] = "/mnt/lscratch/slurm/999/custom"
+    expected_root = (
+        "/mnt/lscratch/slurm/999/agent12" if path_case == "old_job"
+        else overrides["JOB_TMP"]
+    )
+    shell = LAUNCHER[:LAUNCHER.index("\nif (( GPUS_PER_NODE")].replace(
+        "source ./env.sh", ": # No cluster credentials in tests"
+    )
+    worker_remote = "s3:bucket/agent2-only-6055460/workers/huggingface"
+    result = subprocess.run(["bash", "-c", shell + "\nenv"],
+        check=True, capture_output=True, text=True, env={
+            "PATH": os.environ["PATH"], "SLURM_JOB_ID": "999",
+            "WORKER_MODEL_REMOTE": worker_remote, **overrides,
+        })
+    env = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    for key, suffix in defaults.items():
+        assert env[key] == expected_root + suffix
+    assert env["WORKER_MODEL_REMOTE"] == worker_remote
+    if path_case in ("old_job", "mixed"):
+        assert "Ignoring" in result.stdout
+    else:
+        assert "Ignoring" not in result.stdout
+
+
 def _model(directory, sharded=False):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text('{"model_type":"qwen2"}')
