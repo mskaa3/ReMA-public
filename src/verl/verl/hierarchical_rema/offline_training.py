@@ -632,6 +632,7 @@ def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_s
             token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
             for row_idx, sample_index in enumerate(batch["sample_index"]):
                 cached[sample_index] = token_log_probs[row_idx][loss_mask[row_idx].bool()].detach().cpu()
+            del outputs, token_log_probs, input_ids, attention_mask, position_ids, loss_mask
     local_rows = len(cached)
     if context.enabled:
         import torch.distributed as dist
@@ -772,6 +773,38 @@ def _update_role_reward_stats(
 def _all_finite(*tensors) -> bool:
     torch = _lazy_torch()
     return all(bool(torch.isfinite(tensor).all().item()) for tensor in tensors)
+
+
+def _grpo_batch_objective(model, batch, device, old_log_prob_cache, config, core_algos, context):
+    """Scope vocabulary-sized tensors to one objective, not the next forward."""
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    position_ids = batch["position_ids"].to(device)
+    loss_mask = batch["loss_mask"][:, :-1].to(device).float()
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                    position_ids=position_ids, use_cache=False)
+    if _distributed_any_true(not _all_finite(outputs.logits), device, context):
+        return None, "logits"
+    token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
+    old_log_probs = _gather_old_log_probs(
+        sample_indices=batch["sample_index"], old_log_prob_cache=old_log_prob_cache,
+        loss_mask=loss_mask, device=device, dtype=token_log_probs.dtype)
+    advantages = batch["advantage"].to(device).unsqueeze(-1).expand_as(token_log_probs)
+    if _distributed_any_true(
+        not _all_finite(token_log_probs, old_log_probs, advantages, loss_mask), device, context
+    ):
+        return None, "batch tensors"
+    pg_loss, clipfrac, approx_kl, clipfrac_lower = core_algos.compute_policy_loss(
+        old_log_prob=old_log_probs, log_prob=token_log_probs, advantages=advantages,
+        eos_mask=loss_mask, cliprange=config.clip_range, clip_ratio_c=config.clip_ratio_c)
+    entropy = core_algos.compute_entropy_loss(outputs.logits[:, :-1, :], loss_mask)
+    loss = pg_loss - config.entropy_coeff * entropy
+    if _distributed_any_true(
+        not _all_finite(pg_loss, clipfrac, approx_kl, clipfrac_lower, entropy, loss), device, context
+    ):
+        return None, "objective"
+    return {"loss": loss, "clipfrac": clipfrac, "approx_kl": approx_kl,
+            "clipfrac_lower": clipfrac_lower, "entropy": entropy}, None
 
 
 def run_offline_policy_training(
@@ -978,74 +1011,16 @@ def run_offline_policy_training(
             if local_has_invalid_rows:
                 skipped_empty_batches += 1
 
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            position_ids = batch["position_ids"].to(device)
-            loss_mask = batch["loss_mask"][:, :-1].to(device).float()
-
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-            if _distributed_any_true(not _all_finite(outputs.logits), device, distributed_context):
+            objective, nonfinite_reason = _grpo_batch_objective(
+                model, batch, device, old_log_prob_cache, config, core_algos, distributed_context)
+            if nonfinite_reason is not None:
                 skipped_non_finite_batches += 1
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
                 step_role_reward_stats = _empty_role_reward_stats()
                 if is_primary:
                     print(
-                        f"[hierarchical-rema][grpo] skipping non-finite logits "
-                        f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
-                    )
-                continue
-            token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
-            old_log_probs = _gather_old_log_probs(
-                sample_indices=batch["sample_index"],
-                old_log_prob_cache=old_log_prob_cache,
-                loss_mask=loss_mask,
-                device=device,
-                dtype=token_log_probs.dtype,
-            )
-            advantages = batch["advantage"].to(device).unsqueeze(-1).expand_as(token_log_probs)
-            if _distributed_any_true(
-                not _all_finite(token_log_probs, old_log_probs, advantages, loss_mask),
-                device,
-                distributed_context,
-            ):
-                skipped_non_finite_batches += 1
-                optimizer.zero_grad(set_to_none=True)
-                step_selector_format_counts = _empty_selector_format_counts()
-                step_role_reward_stats = _empty_role_reward_stats()
-                if is_primary:
-                    print(
-                        f"[hierarchical-rema][grpo] skipping non-finite batch tensors "
-                        f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)}"
-                    )
-                continue
-            pg_loss, clipfrac, approx_kl, clipfrac_lower = core_algos.compute_policy_loss(
-                old_log_prob=old_log_probs,
-                log_prob=token_log_probs,
-                advantages=advantages,
-                eos_mask=loss_mask,
-                cliprange=config.clip_range,
-                clip_ratio_c=config.clip_ratio_c,
-            )
-            entropy = core_algos.compute_entropy_loss(outputs.logits[:, :-1, :], loss_mask)
-            loss = pg_loss - config.entropy_coeff * entropy
-            if _distributed_any_true(
-                not _all_finite(pg_loss, clipfrac, approx_kl, clipfrac_lower, entropy, loss),
-                device,
-                distributed_context,
-            ):
-                skipped_non_finite_batches += 1
-                optimizer.zero_grad(set_to_none=True)
-                step_selector_format_counts = _empty_selector_format_counts()
-                step_role_reward_stats = _empty_role_reward_stats()
-                if is_primary:
-                    print(
-                        f"[hierarchical-rema][grpo] skipping non-finite objective "
+                        f"[hierarchical-rema][grpo] skipping non-finite {nonfinite_reason} "
                         f"epoch={epoch + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)} "
                         f"mean_reward={float(batch['reward'].mean().item()):.4f} "
                         f"mean_advantage={float(batch['advantage'].mean().item()):.4f}"
@@ -1062,8 +1037,15 @@ def run_offline_policy_training(
                 rewards=batch["reward"],
                 roles=batch["role"],
             )
-            loss = loss / max(config.grad_accum_steps, 1)
+            loss = objective["loss"] / max(config.grad_accum_steps, 1)
             loss.backward()
+            # Only detached scalar metrics survive into the next forward/eval.
+            loss = loss.detach()
+            clipfrac = objective["clipfrac"].detach()
+            approx_kl = objective["approx_kl"].detach()
+            clipfrac_lower = objective["clipfrac_lower"].detach()
+            entropy = objective["entropy"].detach()
+            del objective
 
             should_step = (batch_idx + 1) % max(config.grad_accum_steps, 1) == 0 or (batch_idx + 1) == len(train_loader)
             if should_step:
@@ -1417,6 +1399,7 @@ def evaluate_controller_model(
                 use_cache=False,
             )
             if not bool(torch.isfinite(outputs.logits).all().item()):
+                del outputs
                 continue
             labels = input_ids[:, 1:]
             per_token_loss = torch.nn.functional.cross_entropy(
@@ -1427,6 +1410,7 @@ def evaluate_controller_model(
             masked_loss = per_token_loss * loss_mask
             total_loss_sum += masked_loss.sum()
             total_weight_sum += torch.clamp(loss_mask.sum(), min=0.0)
+            del outputs, per_token_loss, masked_loss, labels, input_ids, attention_mask, position_ids, loss_mask
     if distributed_context.enabled:
         import torch.distributed as dist
 
