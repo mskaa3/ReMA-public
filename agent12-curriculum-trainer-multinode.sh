@@ -23,6 +23,7 @@ export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka
 export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-microsoft/Phi-4-mini-reasoning}
 export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
 export WORKER_MODEL_PATH=${WORKER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
+export WORKER_MODEL_REMOTE=${WORKER_MODEL_REMOTE:-}
 export DECOMPOSER_USE_REMOVE_PADDING=${DECOMPOSER_USE_REMOVE_PADDING:-true}
 export WORKER_USE_REMOVE_PADDING=${WORKER_USE_REMOVE_PADDING:-true}
 export TEACHER_ROLLOUT_N=${TEACHER_ROLLOUT_N:-16}
@@ -148,6 +149,28 @@ COMMON_MOUNTS=(
     --mount "type=bind,src=${JOB_TMP}/config,dst=/root/ReMA-public/config"
     --mount "type=bind,src=${RAY_NODE_TMP},dst=${RAY_NODE_TMP}"
 )
+
+if [[ -n "$WORKER_MODEL_REMOTE" ]]; then
+    # An explicit export takes precedence over the base model. Stage into an
+    # empty directory so stale weights cannot hide an incomplete S3 export.
+    export WORKER_MODEL_PATH=${JOB_TMP}/worker_model
+    echo "Staging trained Agent 2 from ${WORKER_MODEL_REMOTE} on all nodes"
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+        set -euo pipefail
+        if [[ -e "$WORKER_MODEL_PATH" || -e "$WORKER_MODEL_PATH.partial" ]]; then
+            echo "Refusing to reuse worker staging directory; use a fresh JOB_TMP: $WORKER_MODEL_PATH" >&2
+            exit 1
+        fi
+        mkdir -p "$WORKER_MODEL_PATH.partial"
+        rclone copy "$WORKER_MODEL_REMOTE" "$WORKER_MODEL_PATH.partial" \
+            --s3-no-check-bucket --stats=30s --stats-one-line
+        test -s "$WORKER_MODEL_PATH.partial/config.json"
+        mv "$WORKER_MODEL_PATH.partial" "$WORKER_MODEL_PATH"
+    '
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 /root/ReMA-public/scripts/validate_hf_model_dir.py "$WORKER_MODEL_PATH"
+fi
 
 RAY_JOB_PIDS=()
 
@@ -623,8 +646,8 @@ srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
         if [[ -d "$actor_dir" ]]; then
             rclone copy "$actor_dir" "$REMOTE_RUN/raw/${export_name}/${node_name}/actor" \
                 --s3-no-check-bucket \
-                --include "/model_world_size_*_rank_*.pt" \
-                --include "/huggingface/**" --exclude "*" \
+                --filter "+ /model_world_size_*_rank_*.pt" \
+                --filter "+ /huggingface/**" --filter "- **" \
                 --stats=30s --stats-one-line
         fi
     done
@@ -687,6 +710,7 @@ agent2_pilot=${AGENT2_PILOT}
 teacher_assisted_validation=${TEACHER_ASSISTED_VALIDATION}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
+worker_model_remote=${WORKER_MODEL_REMOTE}
 decomposer_use_remove_padding=${DECOMPOSER_USE_REMOVE_PADDING}
 worker_use_remove_padding=${WORKER_USE_REMOVE_PADDING}
 worker_bootstrap_steps=${WORKER_BOOTSTRAP_STEPS}

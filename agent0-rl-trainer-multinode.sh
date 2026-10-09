@@ -167,8 +167,8 @@ srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
         node_name=${SLURMD_NODENAME:-$(hostname)}
         rclone copy "$actor_dir" "$REMOTE_RUN/raw/$node_name/actor" \
             --s3-no-check-bucket \
-            --include "/model_world_size_*_rank_*.pt" \
-            --include "/huggingface/**" --exclude "*" \
+            --filter "+ /model_world_size_*_rank_*.pt" \
+            --filter "+ /huggingface/**" --filter "- **" \
             --stats=30s --stats-one-line
     fi
 '

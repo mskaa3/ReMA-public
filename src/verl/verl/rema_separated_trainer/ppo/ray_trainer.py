@@ -237,6 +237,8 @@ def select_agent12_training_role(
 ) -> str:
     """Choose the role updated by one Agent 1/2 curriculum step."""
     if not worker_roles:
+        if train_decomposer and curriculum_state.phase != 'worker_bootstrap':
+            return decomposer_role
         raise ValueError("Agent 1/2 curriculum requires worker roles")
     switch_freq = max(int(switch_freq), 1)
     role_step = curriculum_state.phase_step if role_step is None else max(int(role_step), 0)
@@ -2119,10 +2121,15 @@ class RayReMASeparatedTrainer(object):
                         hierarchy_config.get('selector_role', 'selector'),
                     }
                 ]
-                if not worker_train_roles:
+                if not worker_train_roles and (
+                    not train_decomposer
+                    or train_roles != [decomposer_role]
+                    or int(curriculum.get('worker_bootstrap_steps', 0)) != 0
+                ):
                     raise ValueError(
-                        "agent12_curriculum requires at least one trainable "
-                        "worker stage"
+                        "agent12_curriculum without trainable workers requires "
+                        "train_agent_roles=[decomposer], train_decomposer=True, "
+                        "and worker_bootstrap_steps=0"
                     )
                 for key in (
                     'worker_bootstrap_steps',
