@@ -490,11 +490,11 @@ def test_worker_grpo_groups_do_not_cross_decomposition_boundaries() -> None:
     group_ids = {sample.group_id for sample in training_batch.worker_samples}
     assert len(group_ids) == 2
     assert any(
-        group_id.startswith(f"task:{task.task_id}:decomposition:decomp-1:worker:{worker_id}:instr:")
+        group_id.startswith(f"task:{task.task_id}:decomposition:decomp-1:node:1:worker:{worker_id}:policy:")
         for group_id in group_ids
     )
     assert any(
-        group_id.startswith(f"task:{task.task_id}:decomposition:decomp-2:worker:{worker_id}:instr:")
+        group_id.startswith(f"task:{task.task_id}:decomposition:decomp-2:node:1:worker:{worker_id}:policy:")
         for group_id in group_ids
     )
     assert {sample.metadata["decomposition_id"] for sample in training_batch.worker_samples} == {
@@ -504,7 +504,7 @@ def test_worker_grpo_groups_do_not_cross_decomposition_boundaries() -> None:
     assert all(sample.metadata["advantage_group_size"] == 1 for sample in training_batch.worker_samples)
     assert all(
         sample.metadata["advantage_group_kind"]
-        == "worker_id_and_normalized_instruction_within_task_and_decomposition"
+        == "node_id_and_executor_policy_within_task_and_decomposition"
         for sample in training_batch.worker_samples
     )
 

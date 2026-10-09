@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import json
 import math
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
@@ -16,6 +17,7 @@ from .backends import (
     WorkerExecutionRequest,
 )
 from .recording import RolloutRecorder
+from .progress import StageProgress
 from .rewarding import (
     INTERMEDIATE_FINAL_ANSWER_PENALTY,
     NON_FINAL_ANSWER_CONTAINMENT_PENALTY,
@@ -111,6 +113,7 @@ class HierarchicalReMAOrchestrator:
         self.train_worker_model = bool(train_worker_model)
         self.min_worker_grpo_group_size = max(int(min_worker_grpo_group_size), 1)
         self.gfam_reward_scorer = gfam_reward_scorer
+        self._reported_verification_failures = set()
 
     @staticmethod
     def _canonical_decomposition_completion(candidate: DecompositionCandidate) -> str:
@@ -228,7 +231,8 @@ class HierarchicalReMAOrchestrator:
             return aggregated_reward
 
         has_correct_selection = any(
-            selection.reward.final_answer_correctness > 0.0
+            selection.reward.final_answer_correctness is not None
+            and selection.reward.final_answer_correctness > 0.0
             for selection in selection_rollouts
         )
         if not has_correct_selection:
@@ -390,6 +394,22 @@ class HierarchicalReMAOrchestrator:
         final_answer: str,
         reward,
     ) -> tuple[object, Dict[str, object]]:
+        if reward.verification_status == "unverified":
+            # Do not substitute model-predicted success for failed verification.
+            reward.total_reward = None
+            if self.gfam_reward_scorer is not None:
+                reward.reward_model_source = "gfam_v1"
+            for execution in executions:
+                execution.reward_model_reward = None
+            failure_key = (task.task_id, str(task.ground_truth))
+            if failure_key not in self._reported_verification_failures:
+                self._reported_verification_failures.add(failure_key)
+                print(f"[answer-verifier] unverified task={task.task_id} plan={decomposition.decomposition_id} "
+                      f"rollout={selection.selection_id} error={reward.verification_error}; "
+                      "repeats are recorded in verification_failures.jsonl", flush=True)
+            return reward, {"source": "answer_verifier", "status": "unscored",
+                            "error": reward.verification_error, "selection_reward": None,
+                            "compiled_rewards": {}, "graph_summary": {"verification_status": "unverified"}}
         if self.gfam_reward_scorer is None:
             return reward, {}
 
@@ -517,7 +537,7 @@ class HierarchicalReMAOrchestrator:
             rollout_config=rollout_config,
             schedule=schedule,
         )
-        progress_suffix = f" epoch_tasks={progress_label}" if progress_label else ""
+        progress_suffix = f" {progress_label}" if progress_label else ""
         print(
             f"[hierarchical-rema][rollout] stage=decomposer "
             f"tasks={len(tasks)}{progress_suffix} decompositions_per_task={num_decompositions} "
@@ -732,7 +752,7 @@ class HierarchicalReMAOrchestrator:
         total_states = len(active_states)
         total_tasks = len({state.task_index for state in active_states})
         max_frontier_steps = max((len(state.topo_order) for state in active_states), default=0)
-        progress_suffix = f" epoch_tasks={progress_label}" if progress_label else ""
+        progress_suffix = f" {progress_label}" if progress_label else ""
         while True:
             worker_requests: List[WorkerExecutionRequest] = []
             request_states: List[_SelectionExecutionState] = []
@@ -793,33 +813,36 @@ class HierarchicalReMAOrchestrator:
             )
 
         selection_rollout_map: Dict[tuple[int, int, int], SelectionRollout] = {}
-        for state in active_states:
-            final_answer = state.outputs[state.decomposition.final_node_id]
-            reward = build_selection_reward(
-                final_answer=final_answer,
-                ground_truth=state.task.ground_truth,
-                executions=state.executions,
-                weights=self.reward_weights,
-                task_metadata=state.task.metadata,
-                final_node_id=state.decomposition.final_node_id,
-            )
-            reward, reward_model_outputs = self._apply_gfam_reward_model(
-                task=state.task,
-                decomposition=state.decomposition,
-                selection=state.selection,
-                executions=state.executions,
-                final_answer=final_answer,
-                reward=reward,
-            )
-            selection_rollout_map[
-                (state.task_index, state.decomposition_index, state.selection_index)
-            ] = SelectionRollout(
-                selection=state.selection,
-                executions=state.executions,
-                final_answer=final_answer,
-                reward=reward,
-                reward_model_outputs=reward_model_outputs,
-            )
+        with StageProgress("reward_scoring", len(active_states), context=progress_label) as progress:
+            for state in active_states:
+                final_answer = state.outputs[state.decomposition.final_node_id]
+                reward = build_selection_reward(
+                    final_answer=final_answer,
+                    ground_truth=state.task.ground_truth,
+                    executions=state.executions,
+                    weights=self.reward_weights,
+                    task_metadata=state.task.metadata,
+                    final_node_id=state.decomposition.final_node_id,
+                )
+                reward, reward_model_outputs = self._apply_gfam_reward_model(
+                    task=state.task,
+                    decomposition=state.decomposition,
+                    selection=state.selection,
+                    executions=state.executions,
+                    final_answer=final_answer,
+                    reward=reward,
+                )
+                selection_rollout_map[
+                    (state.task_index, state.decomposition_index, state.selection_index)
+                ] = SelectionRollout(
+                    selection=state.selection,
+                    executions=state.executions,
+                    final_answer=final_answer,
+                    reward=reward,
+                    reward_model_outputs=reward_model_outputs,
+                )
+                progress.advance(unscored=reward.total_reward is None,
+                                 unverified=reward.verification_status == "unverified")
         return selection_rollout_map
 
     def _execute_selection(
@@ -1099,7 +1122,7 @@ class HierarchicalReMAOrchestrator:
         if include_worker:
             worker_lookup = worker_pool.workers_by_id()
             worker_groups: Dict[
-                str,
+                tuple[str, str, str, str, str, str],
                 List[tuple[SelectionRollout, WorkerExecution, str, float, str, str]],
             ] = {}
             for decomposition_rollout in decompositions:
@@ -1138,8 +1161,16 @@ class HierarchicalReMAOrchestrator:
                             node.instruction if node is not None else execution.node_id
                         )
                         decomposition_id = decomposition_rollout.decomposition.decomposition_id
+                        adapter_path = worker_spec.lora_adapter_path if worker_spec is not None else None
+                        # Compare the same planned node across executions, not identical
+                        # instructions that can belong to different nodes in one plan.
                         worker_group_key = (
-                            f"{decomposition_id}::{execution.worker_id}::{normalized_instruction}"
+                            task.task_id,
+                            decomposition_id,
+                            execution.node_id,
+                            execution.worker_id,
+                            model_path or "",
+                            adapter_path or "",
                         )
                         worker_groups.setdefault(worker_group_key, []).append(
                             (
@@ -1166,15 +1197,18 @@ class HierarchicalReMAOrchestrator:
                 used_group_sizes.append(group_size)
                 grouped_rewards = [payload[3] for payload in grouped_payloads]
                 grouped_advantages = group_relative_advantages(grouped_rewards)
-                worker_id = grouped_payloads[0][1].worker_id
-                normalized_instruction = grouped_payloads[0][4]
-                decomposition_id = grouped_payloads[0][5]
-                instruction_hash = hashlib.sha1(
-                    normalized_instruction.encode("utf-8")
-                ).hexdigest()[:12]
+                group_task_id, decomposition_id, node_id, worker_id, model_path, adapter_path = worker_group_key
+                executor_policy = {
+                    "worker_id": worker_id,
+                    "base_model_path": model_path,
+                    "lora_adapter_path": adapter_path,
+                }
+                policy_hash = hashlib.sha256(
+                    json.dumps(executor_policy, sort_keys=True).encode("utf-8")
+                ).hexdigest()[:16]
                 group_id = (
-                    f"task:{task.task_id}:decomposition:{decomposition_id}:worker:{worker_id}:"
-                    f"instr:{instruction_hash}"
+                    f"task:{group_task_id}:decomposition:{decomposition_id}:node:{node_id}:"
+                    f"worker:{worker_id}:policy:{policy_hash}"
                 )
                 for advantage, payload in zip(grouped_advantages, grouped_payloads):
                     (
@@ -1203,8 +1237,9 @@ class HierarchicalReMAOrchestrator:
                                 "reward_model_reward": execution.reward_model_reward,
                                 "advantage_group_size": group_size,
                                 "advantage_group_kind": (
-                                    "worker_id_and_normalized_instruction_within_task_and_decomposition"
+                                    "node_id_and_executor_policy_within_task_and_decomposition"
                                 ),
+                                "advantage_group_executor_policy": dict(executor_policy),
                                 "normalized_node_instruction": normalized_instruction,
                                 "invalid_reason": execution.invalid_reason,
                                 "final_answer_leak": execution.final_answer_leak,

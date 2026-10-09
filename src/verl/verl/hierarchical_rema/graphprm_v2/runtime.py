@@ -1,6 +1,7 @@
 """Deployment adapter using EXACTLY the same feature code as HPC training."""
 from pathlib import Path
 from threading import RLock
+import os
 import re
 import torch
 
@@ -12,6 +13,7 @@ from .graphprm_model import instantiate_model_from_checkpoint
 from .evaluation import predictions_from_outputs
 from .rewards import compile_rewards
 from .graphprm_sequence import resolve_device
+from .live_logging import feature_progress
 
 
 def live_record(task, decomposition, executions, final_answer):
@@ -73,7 +75,9 @@ class GraphPRMV2RewardScorer:
         self.lock = RLock()
 
     def score_record(self, record, verified_final_correctness=None):
-        with self.lock, torch.inference_mode():
+        with self.lock, torch.inference_mode(), feature_progress(
+            visible=os.environ.get('GFAM_FEATURE_PROGRESS', '0').lower() in {'1', 'true', 'yes'}
+        ):
             row = canonical_record(record)
             try:
                 self.engine.prepare([row])

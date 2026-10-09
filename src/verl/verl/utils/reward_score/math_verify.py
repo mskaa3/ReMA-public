@@ -16,6 +16,14 @@ from functools import lru_cache
 import re
 
 
+class AnswerVerificationError(ValueError):
+    """A data-specific verification failure, not an incorrect answer."""
+
+    def __init__(self, message, code="reference_parse_failed"):
+        super().__init__(message)
+        self.code = code
+
+
 @lru_cache(maxsize=1)
 def _verifier():
     try:
@@ -76,6 +84,9 @@ def _normalize_notation(text: str) -> str:
         if text.startswith(opening) and text.endswith(closing):
             text = text[len(opening):-len(closing)].strip()
     text = _normalize_fraction_grouping(text)
+    # TeX permits a macro or single character as an unbraced fraction argument.
+    # Limit this repair to the unambiguous pi/single-digit cases in ReMA data.
+    text = re.sub(r"\\(frac|dfrac|tfrac)\s*\\pi\s*([0-9])", r"\\\1{\\pi}{\2}", text)
     # Parse standalone percentages as exact fractions. LaTeX parsers can reject
     # the percent suffix or silently strip it when wrapped in \text{...}.
     percentage = re.fullmatch(
@@ -86,6 +97,41 @@ def _normalize_notation(text: str) -> str:
     if percentage:
         return r"\frac{" + percentage.group(1) + "}{100}"
     return text
+
+
+@lru_cache(maxsize=16384)
+def _parse_expression(text, parse, latex_config):
+    kwargs = dict(extraction_config=[latex_config()], fallback_mode="no_fallback",
+                  extraction_mode="first_match")
+    builder = re.fullmatch(r"(?:\\\{|\{)\s*([a-zA-Z])\s*(?:\||\\mid)\s*(.*?)\s*(?:\\\}|\})", text)
+    if builder:
+        variable, predicate = builder.groups()
+        predicate = re.sub(r"\\(leq|geq|le|ge|lt|gt)(?=" + re.escape(variable) + r"\b)",
+                           r"\\\1 ", predicate)
+        parsed = parse("$" + predicate + "$", **kwargs)
+        if len(parsed) == 1:
+            expression = parsed[0]
+            symbols = getattr(expression, "free_symbols", set())
+            if {str(symbol) for symbol in symbols} == {variable} and hasattr(expression, "as_set"):
+                try:
+                    return (expression.as_set(),)
+                except (ValueError, TypeError, NotImplementedError):
+                    pass
+        # Do not let a failed set-builder parse fall back to a matching number.
+        return ()
+    return tuple(parse("$" + text + "$", **kwargs))
+
+
+def validate_reference(ground_truth):
+    """Audit the extracted reference, even when a prediction happens to match it."""
+    reference = _normalize_notation(ground_truth)
+    if not reference or reference.lower() in {"none", "null", "nan"}:
+        raise AnswerVerificationError("Ground-truth answer is missing", "missing_reference")
+    parse, _, latex_config = _verifier()
+    if not re.fullmatch(r"(?:\\text\{)?([A-E])\}?", reference):
+        if not _parse_expression(reference, parse, latex_config):
+            raise AnswerVerificationError(f"Cannot parse ground-truth mathematical answer: {ground_truth!r}")
+    return reference
 
 
 def compute_answer_score(model_output: str, ground_truth: str) -> float:
@@ -103,15 +149,22 @@ def compute_answer_score(model_output: str, ground_truth: str) -> float:
         return float(bool(pred_choice and pred_choice[1] == ref_choice[1]))
 
     parse, verify, latex_config = _verifier()
-    kwargs = dict(extraction_config=[latex_config()], fallback_mode="no_fallback",
-                  extraction_mode="first_match")
     # The caller supplies the extracted terminal answer. Wrapping the whole
     # expression avoids dropping pi, intervals, fractions or plain sqrt(...).
-    gold = parse("$" + reference + "$", **kwargs)
-    answer = parse("$" + prediction + "$", **kwargs)
+    gold = _parse_expression(reference, parse, latex_config)
+    answer = _parse_expression(prediction, parse, latex_config)
     if not gold:
-        raise ValueError(f"Cannot parse ground-truth mathematical answer: {ground_truth!r}")
-    return float(bool(answer) and verify(gold, answer))
+        raise AnswerVerificationError(f"Cannot parse ground-truth mathematical answer: {ground_truth!r}")
+    # A one-variable inequality can be another notation for the reference set.
+    from sympy import Set
+    if len(gold) == len(answer) == 1 and isinstance(gold[0], Set):
+        expression = answer[0]
+        if len(getattr(expression, "free_symbols", ())) == 1 and hasattr(expression, "as_set"):
+            try:
+                answer = (expression.as_set(),)
+            except (ValueError, TypeError, NotImplementedError):
+                pass
+    return float(bool(answer) and verify(list(gold), list(answer)))
 
 
 def compute_score(model_output: str, ground_truth: str) -> float:

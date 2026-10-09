@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 from .backends import MockHierarchicalBackend, RayVLLMHierarchicalBackend, TransformersHierarchicalBackend
+from .audit_answers import audit_tasks, record_verification_failures, skip_unverified_tasks, write_audit
 from .controller_data import controller_samples_from_task_rollouts, write_samples_to_jsonl
 from .demo import make_demo_tasks, make_worker_pool
 from .offline_training import (
@@ -68,7 +69,7 @@ def _clear_live_progress() -> None:
 
 def _print_console_line(message: str) -> None:
     _clear_live_progress()
-    print(message)
+    print(message, flush=True)
 
 
 def _progress_bar(fraction: float, width: int = 24) -> str:
@@ -1508,11 +1509,14 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         for decomposition in rollout.decompositions
         for selection in decomposition.selections
     ]
+    verified_correctness = [value for value in selection_correctness if value is not None]
     return {
         "best_decomposition_id": best_decomposition.decomposition.decomposition_id if best_decomposition else None,
         "best_decomposition_reward": best_decomposition.decomposition_reward if best_decomposition else float('nan'),
         "unscored_rollouts": sum(sel.reward.total_reward is None for dec in rollout.decompositions for sel in dec.selections),
         "unscored_plans": sum(dec.decomposition_reward is None for dec in rollout.decompositions),
+        "verified_rollouts": len(verified_correctness),
+        "unverified_rollouts": len(selection_correctness) - len(verified_correctness),
         "best_executor_rollout_reward": (
             max(executor_rollout_rewards) if executor_rollout_rewards else float('nan')
         ),
@@ -1532,7 +1536,12 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
             sum(selector_decision_rewards) / max(len(selector_decision_rewards), 1)
         ),
         "mean_worker_reward": _available_mean(worker_rewards),
-        "best_final_correctness": max(selection_correctness) if selection_correctness else 0.0,
+        # Exclude partially verified tasks too: best-of-N must use the same N.
+        "best_final_correctness": (
+            max(verified_correctness)
+            if verified_correctness and len(verified_correctness) == len(selection_correctness)
+            else float('nan')
+        ),
     }
 
 
@@ -1563,6 +1572,35 @@ def _merge_reward_metric_coverage(target, summaries):
     target['reward_metric_task_counts'] = counts
     target['unscored_rollouts'] = sum(item.get('unscored_rollouts', 0) for item in summaries)
     target['unscored_plans'] = sum(item.get('unscored_plans', 0) for item in summaries)
+    verified_tasks = 0
+    correct_sum = 0.0
+    for item in summaries:
+        value = item.get('mean_best_final_correctness')
+        if value is not None and math.isfinite(value):
+            count = item.get('num_verified_tasks', item['num_tasks'])
+            verified_tasks += count
+            correct_sum += value * count
+    target.update(
+        num_verified_tasks=verified_tasks,
+        num_unverified_tasks=target['num_tasks'] - verified_tasks,
+        verification_coverage=verified_tasks / target['num_tasks'] if target['num_tasks'] else 0.0,
+        num_correct=correct_sum,
+        mean_best_final_correctness=correct_sum / verified_tasks if verified_tasks else float('nan'),
+        verified_rollouts=sum(item.get('verified_rollouts', 0) for item in summaries),
+        unverified_rollouts=sum(item.get('unverified_rollouts', 0) for item in summaries),
+    )
+
+
+def _verification_coverage(metrics):
+    values = [item['best_final_correctness'] for item in metrics
+              if math.isfinite(item['best_final_correctness'])]
+    return {
+        'num_verified_tasks': len(values), 'num_unverified_tasks': len(metrics) - len(values),
+        'verification_coverage': len(values) / len(metrics) if metrics else 0.0,
+        'num_correct': sum(values), 'mean_best_final_correctness': _available_mean(values),
+        'verified_rollouts': sum(item['verified_rollouts'] for item in metrics),
+        'unverified_rollouts': sum(item['unverified_rollouts'] for item in metrics),
+    }
 
 
 def epoch_rollout_summary(
@@ -1571,6 +1609,7 @@ def epoch_rollout_summary(
     include_tasks: bool = True,
 ) -> Dict[str, Any]:
     task_summaries = []
+    verification_metrics = []
     best_decomposition_rewards = []
     best_selection_rewards = []
     mean_selection_rewards = []
@@ -1589,6 +1628,7 @@ def epoch_rollout_summary(
     worker_grpo_min_group_size = 0
     for rollout in rollouts:
         metrics = _best_rollout_metrics(rollout)
+        verification_metrics.append(metrics)
         best_decomposition_rewards.append(metrics["best_decomposition_reward"])
         best_selection_rewards.append(metrics["best_selection_reward"])
         mean_selection_rewards.append(metrics["mean_selection_reward"])
@@ -1636,12 +1676,15 @@ def epoch_rollout_summary(
                     "best_correctness": [],
                     "unscored_rollouts": 0,
                     "unscored_plans": 0,
+                    "verification_metrics": [],
                 },
             )
             bucket["num_tasks"] += 1
+            bucket["verification_metrics"].append(metrics)
             bucket["unscored_rollouts"] += metrics["unscored_rollouts"]
             bucket["unscored_plans"] += metrics["unscored_plans"]
-            bucket["num_correct"] += metrics["best_final_correctness"]
+            if math.isfinite(metrics["best_final_correctness"]):
+                bucket["num_correct"] += metrics["best_final_correctness"]
             bucket["best_decomposition_rewards"].append(metrics["best_decomposition_reward"])
             bucket["best_selection_rewards"].append(metrics["best_selection_reward"])
             bucket["mean_selection_rewards"].append(metrics["mean_selection_reward"])
@@ -1723,6 +1766,10 @@ def epoch_rollout_summary(
                 target.setdefault('reward_metric_task_counts', {})[key] = sum(math.isfinite(v) for v in bucket[bucket_key])
     summary['unscored_rollouts'] = sum(sel.reward.total_reward is None for r in rollouts for d in r.decompositions for sel in d.selections)
     summary['unscored_plans'] = sum(d.decomposition_reward is None for r in rollouts for d in r.decompositions)
+    summary.update(_verification_coverage(verification_metrics))
+    if include_subsets:
+        for name, bucket in subset_metrics.items():
+            summary['subsets'][name].update(_verification_coverage(bucket['verification_metrics']))
     return summary
 
 
@@ -2218,7 +2265,8 @@ def run_external_validation(
                 schedule=validation_schedule,
                 update_worker_memory=False,
                 progress_label=(
-                    f"{validation_tasks_completed + 1}-"
+                    f"epoch={epoch_number}/{getattr(args, 'num_epochs', epoch_number)} phase=validation "
+                    f"batch={batch_index}/{len(val_batches)} tasks={validation_tasks_completed + 1}-"
                     f"{validation_tasks_completed + len(task_batch)}/{len(val_tasks)}"
                 ),
             )
@@ -2229,6 +2277,7 @@ def run_external_validation(
                     include_tasks=False,
                 )
             )
+            record_verification_failures(output_dir / "verification_failures.jsonl", batch_rollouts)
             validation_tasks_completed += len(batch_rollouts)
             elapsed = time.time() - validation_start_time
             avg_seconds_per_task = elapsed / max(validation_tasks_completed, 1)
@@ -2263,7 +2312,9 @@ def run_external_validation(
         f"mean_best_selection_reward={summary['mean_best_selection_reward']:.4f} "
         f"mean_selector_decision_reward={summary.get('mean_selector_decision_reward', 0.0):.4f} "
         f"mean_best_decomposition_reward={summary['mean_best_decomposition_reward']:.4f} "
-        f"mean_best_final_correctness={summary['mean_best_final_correctness']:.4f}"
+        f"mean_best_final_correctness={summary['mean_best_final_correctness']:.4f} "
+        f"verified_tasks={summary['num_verified_tasks']}/{summary['num_tasks']} "
+        f"unverified_rollouts={summary['unverified_rollouts']}"
     )
     for subset_name in sorted(summary.get("subsets", {})):
         subset_summary = summary["subsets"][subset_name]
@@ -2289,10 +2340,14 @@ def run_external_validation(
             "val/mean_best_decomposition_reward": summary["mean_best_decomposition_reward"],
             "val/mean_best_final_correctness": summary["mean_best_final_correctness"],
             "val/num_tasks": summary["num_tasks"],
+            "val/verification_coverage": summary["verification_coverage"],
+            "val/unverified_rollouts": summary["unverified_rollouts"],
+            "val/num_verified_tasks": summary["num_verified_tasks"],
         }
         for subset_name, subset_summary in summary.get("subsets", {}).items():
             metrics[f"val/test_score/{subset_name}"] = subset_summary["mean_best_selection_reward"]
             metrics[f"val/acc/{subset_name}"] = subset_summary["mean_best_final_correctness"]
+            metrics[f"val/verification_coverage/{subset_name}"] = subset_summary["verification_coverage"]
         tracking.log(metrics, step=tracking_step)
     return summary
 
@@ -2364,6 +2419,21 @@ def main() -> None:
             task_id_key=args.val_task_id_key,
             max_tasks=args.max_val_tasks,
         )
+    audit_reports = [audit_tasks(tasks, source=resolved_task_source)]
+    tasks = skip_unverified_tasks(tasks, audit_reports[0], split="train")
+    if resolved_val_task_source is not None:
+        audit_reports.append(audit_tasks(val_tasks, source=resolved_val_task_source))
+        val_tasks = skip_unverified_tasks(val_tasks, audit_reports[-1], split="validation")
+    reference_filtering = {report["filtering"]["split"]: report["filtering"] for report in audit_reports}
+    write_audit(output_dir / "answer_reference_audit.json", audit_reports)
+    if not tasks:
+        with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
+            json.dump({"status": "skipped_no_usable_training_tasks", "num_loaded_tasks": 0,
+                       "num_loaded_val_tasks": len(val_tasks), "reference_filtering": reference_filtering,
+                       "epochs": []}, handle, indent=2, sort_keys=True)
+        _print_console_line("[hierarchical-rema][integrated] No usable training examples remain; "
+                            "skipping training before loading models. See answer_reference_audit.json.")
+        return
     worker_pool = make_worker_pool(base_model_path=args.worker_base_model_path)
     max_nodes_per_decomposition = (
         args.max_nodes_per_decomposition
@@ -2421,6 +2491,7 @@ def main() -> None:
         "resolved_val_task_source": resolved_val_task_source,
         "num_loaded_tasks": len(tasks),
         "num_loaded_val_tasks": len(val_tasks),
+        "reference_filtering": reference_filtering,
         "num_epochs": args.num_epochs,
         "best_model_root": str((output_dir / "best_models").resolve()),
         "epochs": [],
@@ -2453,10 +2524,14 @@ def main() -> None:
             seed=args.seed,
         )
         schedule = build_schedule(args.mode, current_phase)
+        phase_label = (
+            schedule.alternating_phase.value
+            if schedule.mode == TrainingMode.ALTERNATING else schedule.mode.value
+        )
 
         _print_console_line(
             f"[hierarchical-rema][integrated] epoch={epoch_number}/{args.num_epochs} "
-            f"phase={schedule.alternating_phase.value} tasks={len(epoch_tasks)}"
+            f"phase={phase_label} tasks={len(epoch_tasks)}"
         )
         rollout_config = _rollout_config_for_schedule(
             base_rollout_config,
@@ -2499,6 +2574,8 @@ def main() -> None:
                            'mean_worker_reward': []}
         running_unscored_rollouts = 0
         running_best_correctness = 0.0
+        running_verified_tasks = 0
+        running_unverified_rollouts = 0
         tasks_completed = 0
         rollout_tracking_step = tracking_step_offset
         rollout_progress_path = epoch_dir / "rollout_progress.json"
@@ -2603,17 +2680,25 @@ def main() -> None:
                         policy_config=policy_config,
                         rollout_config=rollout_config,
                         schedule=schedule,
-                        progress_label=f"{tasks_completed + 1}-{tasks_completed + len(task_batch)}/{len(epoch_tasks)}",
+                        progress_label=(
+                            f"epoch={epoch_number}/{args.num_epochs} phase={phase_label} "
+                            f"batch={batch_index}/{len(task_batches)} "
+                            f"tasks={tasks_completed + 1}-{tasks_completed + len(task_batch)}/{len(epoch_tasks)}"
+                        ),
                     )
                     segment_rollouts.extend(batch_rollouts)
                     rollouts.extend(batch_rollouts)
+                    record_verification_failures(epoch_dir / "verification_failures.jsonl", batch_rollouts)
 
                     for rollout in batch_rollouts:
                         metrics = _best_rollout_metrics(rollout)
                         for key in reward_progress:
                             reward_progress[key].append(metrics[key])
                         running_unscored_rollouts += metrics['unscored_rollouts']
-                        running_best_correctness += metrics['best_final_correctness']
+                        running_unverified_rollouts += metrics['unverified_rollouts']
+                        if math.isfinite(metrics['best_final_correctness']):
+                            running_best_correctness += metrics['best_final_correctness']
+                            running_verified_tasks += 1
 
                     tasks_completed += len(batch_rollouts)
                     should_log_progress = (
@@ -2644,12 +2729,18 @@ def main() -> None:
                             "avg_best_decomposition_reward": _available_mean(reward_progress['best_decomposition_reward']),
                             "avg_mean_worker_reward": _available_mean(reward_progress['mean_worker_reward']),
                             "unscored_rollouts": running_unscored_rollouts,
-                            "avg_best_final_correctness": running_best_correctness / tasks_completed,
+                            "unverified_rollouts": running_unverified_rollouts,
+                            "num_verified_tasks": running_verified_tasks,
+                            "verification_coverage": running_verified_tasks / tasks_completed,
+                            "avg_best_final_correctness": (
+                                running_best_correctness / running_verified_tasks
+                                if running_verified_tasks else float('nan')
+                            ),
                         }
                         progress_message = (
                             f"[hierarchical-rema][integrated] rollout_progress "
                             f"epoch={epoch_number}/{args.num_epochs} "
-                            f"phase={schedule.alternating_phase.value} "
+                            f"phase={phase_label} "
                             f"segment={segment_index} batch={batch_index}/{len(task_batches)} "
                             f"{_progress_bar(progress_metrics['progress_fraction'])} "
                             f"tasks={tasks_completed}/{len(epoch_tasks)} "
@@ -2658,7 +2749,8 @@ def main() -> None:
                             f"dec={progress_metrics['avg_best_decomposition_reward']:.4f} "
                             f"wrk={progress_metrics['avg_mean_worker_reward']:.4f} "
                             f"acc={progress_metrics['avg_best_final_correctness']:.4f} "
-                            f"unscored={running_unscored_rollouts}"
+                            f"unscored={running_unscored_rollouts} "
+                            f"verified_tasks={running_verified_tasks}/{tasks_completed}"
                         )
                         _emit_live_progress(
                             progress_message,
@@ -2680,6 +2772,8 @@ def main() -> None:
                                     ],
                                     "rollout_progress/avg_best_decomposition_reward": progress_metrics["avg_best_decomposition_reward"],
                                     "rollout_progress/avg_mean_worker_reward": progress_metrics["avg_mean_worker_reward"],
+                                    "rollout_progress/verification_coverage": progress_metrics["verification_coverage"],
+                                    "rollout_progress/unverified_rollouts": running_unverified_rollouts,
                                     "rollout_progress/avg_best_final_correctness": progress_metrics["avg_best_final_correctness"],
                                 },
                                 step=rollout_tracking_step,
@@ -2749,6 +2843,8 @@ def main() -> None:
                     )
                     _print_console_line(
                         f"[hierarchical-rema][integrated] training policy={policy_id} "
+                        f"epoch={epoch_number}/{args.num_epochs} phase={phase_label} "
+                        f"stage=policy_update "
                         f"segment={segment_index} train_samples={len(split['train'])} "
                         f"val_samples={len(split['val'])} model={model_path} "
                         f"lr={policy_hparams['learning_rate']:.6g} "
@@ -2899,7 +2995,8 @@ def main() -> None:
             f"mean_best_selection_reward={rollout_summary['mean_best_selection_reward']:.4f} "
             f"mean_best_decomposition_reward={rollout_summary['mean_best_decomposition_reward']:.4f} "
             f"mean_worker_reward={rollout_summary['mean_worker_reward']:.4f} "
-            f"mean_best_final_correctness={rollout_summary['mean_best_final_correctness']:.4f}"
+            f"mean_best_final_correctness={rollout_summary['mean_best_final_correctness']:.4f} "
+            f"verified_tasks={rollout_summary['num_verified_tasks']}/{rollout_summary['num_tasks']}"
         )
         if tracking is not None:
             tracking.log(
@@ -2909,6 +3006,9 @@ def main() -> None:
                     "rollout/mean_worker_reward": rollout_summary["mean_worker_reward"],
                     "rollout/mean_best_final_correctness": rollout_summary["mean_best_final_correctness"],
                     "rollout/num_tasks": rollout_summary["num_tasks"],
+                    "rollout/verification_coverage": rollout_summary["verification_coverage"],
+                    "rollout/unverified_rollouts": rollout_summary["unverified_rollouts"],
+                    "rollout/num_verified_tasks": rollout_summary["num_verified_tasks"],
                     "rollout/worker_grpo_min_group_size": rollout_summary["worker_grpo_min_group_size"],
                     "rollout/worker_grpo_num_groups_total": rollout_summary["worker_grpo_num_groups_total"],
                     "rollout/worker_grpo_num_groups_used": rollout_summary["worker_grpo_num_groups_used"],

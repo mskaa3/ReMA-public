@@ -384,10 +384,16 @@ def test_live_execution_and_learned_rewards_are_reference_invariant(checkpoint, 
         assert rollout.executions[1].dependency_outputs == {'A': '42'}
         assert all(e.success and not e.invalid_reason and not e.final_answer_leak for e in rollout.executions)
     assert [r.executions[0].reference_answer_match for r in rollouts] == [True, False, False]
-    assert [r.reward.final_answer_correctness for r in rollouts] == [1., 0., 0.]
+    assert [r.reward.final_answer_correctness for r in rollouts] == [1., 0., None]
     assert FakeExtractor.calls == 1
-    assert blueprints[0] == blueprints[1] == blueprints[2]
+    assert len(blueprints) == 2
+    assert blueprints[0] == blueprints[1]
     for other in rollouts[1:]:
         assert [e.worker_prompt for e in other.executions] == [e.worker_prompt for e in rollouts[0].executions]
+    for other in rollouts[1:2]:
         assert other.reward_model_outputs == rollouts[0].reward_model_outputs
         assert [e.reward_model_reward for e in other.executions] == [e.reward_model_reward for e in rollouts[0].executions]
+    assert rollouts[2].reward.total_reward is None
+    assert rollouts[2].reward.verification_status == 'unverified'
+    assert rollouts[2].reward_model_outputs['status'] == 'unscored'
+    assert all(e.reward_model_reward is None for e in rollouts[2].executions)

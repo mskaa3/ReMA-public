@@ -205,11 +205,7 @@ def is_non_final_answer_leak(
     task_metadata: Dict[str, Any] | None = None,
 ) -> bool:
     for candidate in _extract_non_final_leak_candidates(text):
-        if compute_final_answer_correctness(
-            candidate,
-            reference,
-            task_metadata=task_metadata,
-        ) > 0.0:
+        if _verified_match(candidate, reference, task_metadata):
             return True
     return False
 
@@ -222,13 +218,44 @@ def contains_answer_like_content(
     if _contains_normalized_reference(text, reference):
         return True
     for candidate in _extract_answer_like_candidates(text):
-        if compute_final_answer_correctness(
-            candidate,
-            reference,
-            task_metadata=task_metadata,
-        ) > 0.0:
+        if _verified_match(candidate, reference, task_metadata):
             return True
     return False
+
+
+def _math_verifier_module():
+    parent = __package__.rpartition(".")[0]
+    return importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
+
+
+def reference_verification_status(reference, task_metadata=None):
+    """Preflight only; reference text is never added to model inputs."""
+    backend = _math_verifier_module()
+    metadata = task_metadata if isinstance(task_metadata, dict) else {}
+    source = str(metadata.get("data_source") or "ReMA-math")
+    text = str(reference or "").strip()
+    candidates = _extract_answer_like_candidates(text)
+    extracted = candidates[0] if candidates else text
+    try:
+        if not extracted or extracted.lower() in {"none", "null", "nan"}:
+            raise backend.AnswerVerificationError("Ground-truth answer is missing", "missing_reference")
+        if source not in {
+            "ReMA-math", "lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval",
+            "orz_hard_13k", "orz_default_57k", "HuggingFaceH4/aime_2024",
+        }:
+            return {"status": "not_audited", "data_source": source}
+        backend.validate_reference(extracted)
+    except backend.AnswerVerificationError as exc:
+        return {"status": "unverified", "code": exc.code, "message": str(exc)}
+    return {"status": "parseable"}
+
+
+def _verified_match(prediction, reference, task_metadata=None):
+    try:
+        return compute_final_answer_correctness(prediction, reference, task_metadata) > 0.0
+    except _math_verifier_module().AnswerVerificationError:
+        # An unsupported comparison is not evidence of answer containment.
+        return False
 
 
 def _load_default_compute_score():
@@ -505,6 +532,8 @@ class WorkerPerformanceMemory:
         selection_reward: SelectionRewardBreakdown,
         reward_weights: RewardWeights,
     ) -> None:
+        if selection_reward.total_reward is None:
+            return
         stats = self._stats_for(execution.worker_id)
         uses_reward_model = (
             selection_reward.reward_model_source == "gfam_v1"
@@ -601,11 +630,21 @@ def build_selection_reward(
     task_metadata: Dict[str, Any] | None = None,
     final_node_id: str | None = None,
 ) -> SelectionRewardBreakdown:
-    final_correct = compute_final_answer_correctness(
-        final_answer,
-        ground_truth,
-        task_metadata=task_metadata,
-    )
+    verification = reference_verification_status(ground_truth, task_metadata)
+    final_correct = None
+    if verification["status"] != "unverified":
+        try:
+            final_correct = compute_final_answer_correctness(
+                final_answer, ground_truth, task_metadata=task_metadata,
+            )
+        except _math_verifier_module().AnswerVerificationError as exc:
+            verification = {"status": "unverified", "code": exc.code, "message": str(exc)}
+    if final_correct is None:
+        return SelectionRewardBreakdown(
+            final_answer_correctness=None, confidence_reward=0.0,
+            compatibility_reward=0.0, total_reward=None,
+            verification_status="unverified", verification_error=verification,
+        )
     # A matching intermediate value is not proof of a role violation. Keep the
     # reference-based observation separate from delivered text and validity.
     for execution in executions:
@@ -664,23 +703,13 @@ def build_selection_reward(
             if execution.node_id == final_node_id or execution.final_answer_leak or not execution.output_text.strip():
                 execution.answer_containment = False
                 continue
-            try:
-                matches_generated_final = compute_final_answer_correctness(
-                    execution.output_text,
-                    final_answer,
-                    task_metadata=task_metadata,
-                ) > 0.0
-            except ValueError:
-                # This comparison target is generated text, not ground truth;
-                # an unparsable final artifact is not evidence of containment.
-                matches_generated_final = False
+            matches_generated_final = _verified_match(
+                execution.output_text, final_answer, task_metadata,
+            )
             execution.answer_containment = (
-                matches_generated_final or compute_final_answer_correctness(
-                    execution.output_text,
-                    ground_truth,
-                    task_metadata=task_metadata,
+                matches_generated_final or _verified_match(
+                    execution.output_text, ground_truth, task_metadata,
                 )
-                > 0.0
             )
             if execution.answer_containment:
                 non_final_answer_containment_count += 1

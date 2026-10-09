@@ -409,7 +409,7 @@ class WorkerExecution:
 
 @dataclass
 class SelectionRewardBreakdown:
-    final_answer_correctness: float
+    final_answer_correctness: Optional[float]
     confidence_reward: float
     compatibility_reward: float
     total_reward: Optional[float]
@@ -427,6 +427,8 @@ class SelectionRewardBreakdown:
     final_dependency_usage_rate: float = 0.0
     final_raw_score_usage_multiplier: float = 1.0
     reward_model_source: str = "handcrafted"
+    verification_status: str = "verified"
+    verification_error: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         if self.reward_model_source == "gfam_v1":
@@ -434,6 +436,8 @@ class SelectionRewardBreakdown:
                 "total_reward": self.total_reward,
                 "reward_model_source": self.reward_model_source,
                 "final_answer_correctness": self.final_answer_correctness,
+                "verification_status": self.verification_status,
+                "verification_error": self.verification_error,
             }
         return asdict(self)
 
