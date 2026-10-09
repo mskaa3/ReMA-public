@@ -902,6 +902,20 @@ def _ensure_ray_initialized_for_offline_training() -> None:
     ray.init(**init_kwargs)
 
 
+def _offline_rank_node_ids(nodes, *, nnodes, gpus_per_node, driver_node_id=None):
+    if nnodes < 1 or gpus_per_node < 1:
+        raise ValueError("Learner node and GPU counts must be positive")
+    eligible = {node["NodeID"]: node for node in nodes
+                if node.get("Alive") and float(node.get("Resources", {}).get("GPU", 0)) >= gpus_per_node}
+    if driver_node_id and driver_node_id not in eligible:
+        raise RuntimeError("Driver node does not have the requested learner GPU capacity")
+    ordered = sorted(eligible, key=lambda node: (node != driver_node_id, node))
+    if len(ordered) < nnodes:
+        raise RuntimeError(f"Learner requested {nnodes} nodes with {gpus_per_node} GPUs each; "
+                           f"only {len(ordered)} eligible Ray nodes")
+    return [node for node in ordered[:nnodes] for _ in range(gpus_per_node)]
+
+
 def _run_distributed_offline_policy_training(
     train_samples,
     val_samples,
@@ -956,10 +970,7 @@ def _run_distributed_offline_policy_training(
         max_restarts=0,
         runtime_env=_offline_training_ray_runtime_env(),
     )(RayOfflineGRPOWorker)
-    try:
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-    except Exception:
-        NodeAffinitySchedulingStrategy = None
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     driver_node_id = None
     try:
@@ -968,17 +979,17 @@ def _run_distributed_offline_policy_training(
         driver_node_id = None
 
     workers = []
-    for rank in range(world_size):
-        if rank == 0 and driver_node_id and NodeAffinitySchedulingStrategy is not None:
-            worker = worker_cls.options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=driver_node_id,
-                    soft=False,
-                )
-            ).remote()
-        else:
-            worker = worker_cls.options(scheduling_strategy="SPREAD").remote()
-        workers.append(worker)
+    rank_nodes = _offline_rank_node_ids(ray.nodes(), nnodes=nnodes, gpus_per_node=gpus_per_node,
+                                        driver_node_id=driver_node_id)
+    print(f"[hierarchical-rema][grpo] learner_rank_nodes={rank_nodes}", flush=True)
+    try:
+        for node_id in rank_nodes:
+            workers.append(worker_cls.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False)).remote())
+    except Exception:
+        for worker in workers:
+            ray.kill(worker, no_restart=True)
+        raise
     master_addr = ray.get(workers[0].get_node_ip.remote())
     print(
         f"[hierarchical-rema][grpo] launching distributed offline learner "

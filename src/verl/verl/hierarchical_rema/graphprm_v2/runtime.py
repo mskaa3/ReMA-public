@@ -1,6 +1,7 @@
 """Deployment adapter using EXACTLY the same feature code as HPC training."""
 from pathlib import Path
 from threading import RLock
+import tempfile
 import os
 import re
 import torch
@@ -8,7 +9,8 @@ import torch
 from . import FEATURE_SCHEMA
 from . import graphprm_core as core
 from .contract import canonical_record
-from .features import FeatureEngine, DEFAULT_SPEC
+from .features import DEFAULT_SPEC
+from .live_features import LiveFeatureEngine
 from .graphprm_model import instantiate_model_from_checkpoint
 from .evaluation import predictions_from_outputs
 from .rewards import compile_rewards
@@ -67,51 +69,73 @@ class GraphPRMV2RewardScorer:
         self.device = torch.device(resolve_device(device))
         self.model = instantiate_model_from_checkpoint(self.checkpoint, self.device)
         self.model.requires_grad_(False)
-        self.engine = FeatureEngine(spec, cache_dir or Path.home() / '.cache' / 'graphprm_v2',
-                                    device=prm_device, bge_batch_size=16, prm_batch_size=1,
-                                    encoder_device=encoder_device or device)
-        self.engine.keep_models = True
+        self.rollout_batch_size = int(os.environ.get('GFAM_REWARD_BATCH_SIZE', '64'))
+        if self.rollout_batch_size < 1:
+            raise ValueError('GFAM_REWARD_BATCH_SIZE must be positive')
+        local_cache = (Path(os.environ.get('TMPDIR_LOCAL') or tempfile.gettempdir()) /
+                       f'graphprm_v2_{os.getuid()}_{os.environ.get("SLURM_JOB_ID", "local")}')
+        self.engine = LiveFeatureEngine(spec, cache_dir or local_cache, device=prm_device,
+            bge_batch_size=int(os.environ.get('GFAM_BGE_BATCH_SIZE', '32')),
+            prm_batch_size=int(os.environ.get('GFAM_PRM_BATCH_SIZE', '16')),
+            bge_cache_size=int(os.environ.get('GFAM_BGE_RAM_CACHE_SIZE', '8192')),
+            graph_cache_size=int(os.environ.get('GFAM_GRAPH_RAM_CACHE_SIZE', '128')),
+            encoder_device=encoder_device or device)
         self.bad_class_penalty = bad_class_penalty
         self.lock = RLock()
 
     def score_record(self, record, verified_final_correctness=None):
+        return self.score_records([record], [verified_final_correctness])[0]
+
+    def _overflow_result(self, row, exc):
+        message = str(exc)
+        prm_overflow = re.fullmatch(
+            r'PRM context overflow: (\d+) > (\d+); no truncation/zero substitution is permitted\. Audit this rollout before training\.',
+            message)
+        if not prm_overflow and message != 'BGE context overflow; no silent truncation in v2':
+            raise exc
+        encoder = 'prm' if prm_overflow else 'bge'
+        return {'source': 'gfam_v1', 'backend': 'graphprm_binary_v2',
+                'status': 'unscored', 'record': row, 'compiled_rewards': {},
+                'model_predictions': {}, 'prm_step_scores': [],
+                'error': {'code': 'context_overflow', 'encoder': encoder,
+                          'message': message,
+                          'total_tokens': int(prm_overflow[1]) if prm_overflow else None,
+                          'max_tokens': self.engine.spec[f'{encoder}_max_length']},
+                'graph_summary': {'feature_schema': FEATURE_SCHEMA,
+                                  'reward_status': 'unscored', 'reward_backend': 'graphprm_binary_v2'}}
+
+    def score_records(self, records, verified_final_correctness=None):
+        outcomes = [None] * len(records) if verified_final_correctness is None else verified_final_correctness
+        if len(outcomes) != len(records):
+            raise ValueError('One verified outcome is required per record')
+        results = []
         with self.lock, torch.inference_mode(), feature_progress(
             visible=os.environ.get('GFAM_FEATURE_PROGRESS', '0').lower() in {'1', 'true', 'yes'}
         ):
-            row = canonical_record(record)
-            try:
-                self.engine.prepare([row])
-            except ValueError as exc:
-                # Only the pinned feature builder's explicit context errors are recoverable.
-                # Alignment, nonfinite features, and incompatible checkpoints still fail loudly.
-                message = str(exc)
-                prm_overflow = re.fullmatch(
-                    r'PRM context overflow: (\d+) > (\d+); no truncation/zero substitution is permitted\. Audit this rollout before training\.',
-                    message)
-                if not prm_overflow and message != 'BGE context overflow; no silent truncation in v2':
-                    raise
-                encoder = 'prm' if prm_overflow else 'bge'
-                return {'source': 'gfam_v1', 'backend': 'graphprm_binary_v2',
-                        'status': 'unscored', 'record': row, 'compiled_rewards': {},
-                        'model_predictions': {}, 'prm_step_scores': [],
-                        'error': {'code': 'context_overflow', 'encoder': encoder,
-                                  'message': message,
-                                  'total_tokens': int(prm_overflow[1]) if prm_overflow else None,
-                                  'max_tokens': self.engine.spec[f'{encoder}_max_length']},
-                        'graph_summary': {'feature_schema': FEATURE_SCHEMA,
-                                          'reward_status': 'unscored', 'reward_backend': 'graphprm_binary_v2'}}
-            example = self.engine.example(row)
-            predictions = predictions_from_outputs(self.model(example, self.device))
-            compiled = compile_rewards(predictions, row, self.bad_class_penalty,
-                                       verified_final_correctness=verified_final_correctness)
-            summary = compiled['graph_summary']
-            summary.update(feature_schema=FEATURE_SCHEMA, reward_backend='graphprm_binary_v2',
-                           missing_prm_markers=0, prm_total_tokens=example.prm_alignment['total_tokens'],
-                           prm_max_length=self.engine.spec['prm_max_length'])
-            return {'source': 'gfam_v1', 'backend': 'graphprm_binary_v2', 'status': 'scored', 'record': row,
-                    'compiled_rewards': compiled['node_rewards'], 'graph_summary': summary,
-                    'predictions': predictions, 'model_predictions': predictions,
-                    'prm_step_scores': example.prm_scores}
+            for start in range(0, len(records), self.rollout_batch_size):
+                rows = [canonical_record(record) for record in records[start:start + self.rollout_batch_size]]
+                errors = self.engine.prepare_safe(rows)
+                for index, row in enumerate(rows):
+                    if index in errors:
+                        results.append(self._overflow_result(row, errors[index]))
+                        continue
+                    example = self.engine.example(row)
+                    predictions = predictions_from_outputs(self.model(example, self.device))
+                    compiled = compile_rewards(predictions, row, self.bad_class_penalty,
+                                               verified_final_correctness=outcomes[start + index])
+                    summary = compiled['graph_summary']
+                    summary.update(feature_schema=FEATURE_SCHEMA, reward_backend='graphprm_binary_v2',
+                                   missing_prm_markers=0, prm_total_tokens=example.prm_alignment['total_tokens'],
+                                   prm_max_length=self.engine.spec['prm_max_length'])
+                    results.append({'source': 'gfam_v1', 'backend': 'graphprm_binary_v2', 'status': 'scored',
+                        'record': row, 'compiled_rewards': compiled['node_rewards'], 'graph_summary': summary,
+                        'predictions': predictions, 'model_predictions': predictions, 'prm_step_scores': example.prm_scores})
+        return results
+
+    def score_rollouts(self, requests):
+        rows = [live_record(item['task'], item['decomposition'], item['executions'], item['final_answer'])
+                for item in requests]
+        return self.score_records(rows, [item.get('verified_final_correctness') for item in requests])
 
     def score_rollout(self, *, task, decomposition, selection, executions, final_answer,
                       verified_final_correctness=None):

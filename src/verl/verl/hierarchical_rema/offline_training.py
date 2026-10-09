@@ -596,13 +596,23 @@ def _sequence_log_probs(logits, labels):
     return gathered
 
 
-def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_size: int, device) -> Dict[int, torch.Tensor]:
+def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_size: int, device,
+                                distributed_context=None) -> Dict[int, torch.Tensor]:
     from torch.utils.data import DataLoader
 
+    context = distributed_context or DistributedTrainingContext()
+    sampler = None
+    if context.enabled:
+        from torch.utils.data import DistributedSampler
+        # Equal-length shards keep DDP forward collectives synchronized. Only
+        # padding rows are repeated, rather than the full dataset on every rank.
+        sampler = DistributedSampler(dataset, num_replicas=context.world_size,
+                                     rank=context.rank, shuffle=False, drop_last=False)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=sampler,
         collate_fn=_collate_rows,
     )
     cached: Dict[int, torch.Tensor] = {}
@@ -622,6 +632,21 @@ def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_s
             token_log_probs = _sequence_log_probs(outputs.logits[:, :-1, :], input_ids[:, 1:])
             for row_idx, sample_index in enumerate(batch["sample_index"]):
                 cached[sample_index] = token_log_probs[row_idx][loss_mask[row_idx].bool()].detach().cpu()
+    local_rows = len(cached)
+    if context.enabled:
+        import torch.distributed as dist
+        # Replicate only compact completion log-probs, so subsequent replay
+        # epochs can reshuffle sample ownership without another model forward.
+        shards = [None] * context.world_size
+        dist.all_gather_object(shards, cached)
+        cached = {}
+        for shard in shards:
+            for index, values in shard.items():
+                cached.setdefault(index, values)
+    if set(cached) != set(range(len(dataset))):
+        raise RuntimeError("Distributed old-log-probability cache is incomplete")
+    print(f"[hierarchical-rema][grpo] old_log_probs rank={context.rank}/{context.world_size} "
+          f"computed_unique_rows={local_rows} cached_rows={len(cached)}", flush=True)
     return cached
 
 
@@ -845,6 +870,7 @@ def run_offline_policy_training(
         dataset=train_dataset,
         batch_size=config.train_batch_size,
         device=device,
+        distributed_context=distributed_context,
     )
 
     output_dir = Path(config.output_dir).expanduser().resolve()

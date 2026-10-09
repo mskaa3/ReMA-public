@@ -384,6 +384,17 @@ class HierarchicalReMAOrchestrator:
         )
         return adjusted_reward
 
+    def _reward_model_request(self, *, task, decomposition, selection, executions, final_answer, reward):
+        request = dict(task=task, decomposition=decomposition, selection=selection,
+                       executions=executions, final_answer=final_answer)
+        if getattr(self.gfam_reward_scorer, "supports_verified_final_correctness", False):
+            if task.ground_truth is not None and str(task.ground_truth).strip():
+                verifier_score = float(reward.final_answer_correctness)
+                if not math.isfinite(verifier_score):
+                    raise ValueError("Final-answer verifier returned a nonfinite result")
+                request["verified_final_correctness"] = float(verifier_score >= 1.0)
+        return request
+
     def _apply_gfam_reward_model(
         self,
         *,
@@ -393,6 +404,7 @@ class HierarchicalReMAOrchestrator:
         executions: List[WorkerExecution],
         final_answer: str,
         reward,
+        scored=None,
     ) -> tuple[object, Dict[str, object]]:
         if reward.verification_status == "unverified":
             # Do not substitute model-predicted success for failed verification.
@@ -417,23 +429,10 @@ class HierarchicalReMAOrchestrator:
             isinstance(selection.raw_payload, dict)
             and selection.raw_payload.get("synthetic_executor_rollout")
         )
-        outcome_kwargs = {}
-        if getattr(self.gfam_reward_scorer, "supports_verified_final_correctness", False):
-            if task.ground_truth is not None and str(task.ground_truth).strip():
-                verifier_score = float(reward.final_answer_correctness)
-                if not math.isfinite(verifier_score):
-                    raise ValueError("Final-answer verifier returned a nonfinite result")
-                # Some general verifiers award partial/format credit. Only full
-                # correctness counts as binary success for the planner bonus.
-                outcome_kwargs["verified_final_correctness"] = float(verifier_score >= 1.0)
-        scored = self.gfam_reward_scorer.score_rollout(
-            task=task,
-            decomposition=decomposition,
-            selection=selection,
-            executions=executions,
-            final_answer=final_answer,
-            **outcome_kwargs,
-        )
+        if scored is None:
+            scored = self.gfam_reward_scorer.score_rollout(**self._reward_model_request(
+                task=task, decomposition=decomposition, selection=selection,
+                executions=executions, final_answer=final_answer, reward=reward))
         if scored.get("status") == "unscored":
             print(f"[graphprm] unscored task={task.task_id} plan={decomposition.decomposition_id} "
                   f"executor_rollout={selection.selection_id} error={scored['error']}", flush=True)
@@ -813,36 +812,41 @@ class HierarchicalReMAOrchestrator:
             )
 
         selection_rollout_map: Dict[tuple[int, int, int], SelectionRollout] = {}
+        score_batch = getattr(self.gfam_reward_scorer, "score_rollouts", None)
+        batch_size = max(1, int(getattr(self.gfam_reward_scorer, "rollout_batch_size", 1)))
         with StageProgress("reward_scoring", len(active_states), context=progress_label) as progress:
-            for state in active_states:
-                final_answer = state.outputs[state.decomposition.final_node_id]
-                reward = build_selection_reward(
-                    final_answer=final_answer,
-                    ground_truth=state.task.ground_truth,
-                    executions=state.executions,
-                    weights=self.reward_weights,
-                    task_metadata=state.task.metadata,
-                    final_node_id=state.decomposition.final_node_id,
-                )
-                reward, reward_model_outputs = self._apply_gfam_reward_model(
-                    task=state.task,
-                    decomposition=state.decomposition,
-                    selection=state.selection,
-                    executions=state.executions,
-                    final_answer=final_answer,
-                    reward=reward,
-                )
-                selection_rollout_map[
-                    (state.task_index, state.decomposition_index, state.selection_index)
-                ] = SelectionRollout(
-                    selection=state.selection,
-                    executions=state.executions,
-                    final_answer=final_answer,
-                    reward=reward,
-                    reward_model_outputs=reward_model_outputs,
-                )
-                progress.advance(unscored=reward.total_reward is None,
-                                 unverified=reward.verification_status == "unverified")
+            for start in range(0, len(active_states), batch_size):
+                pending, requests, request_indices = [], [], []
+                for state in active_states[start:start + batch_size]:
+                    final_answer = state.outputs[state.decomposition.final_node_id]
+                    reward = build_selection_reward(
+                        final_answer=final_answer, ground_truth=state.task.ground_truth,
+                        executions=state.executions, weights=self.reward_weights,
+                        task_metadata=state.task.metadata, final_node_id=state.decomposition.final_node_id)
+                    if score_batch is not None and reward.verification_status != "unverified":
+                        request_indices.append(len(pending))
+                        requests.append(self._reward_model_request(
+                            task=state.task, decomposition=state.decomposition, selection=state.selection,
+                            executions=state.executions, final_answer=final_answer, reward=reward))
+                    pending.append((state, final_answer, reward))
+                scored = {}
+                if requests:
+                    results = score_batch(requests)
+                    if len(results) != len(requests) or any(not isinstance(item, dict) for item in results):
+                        raise ValueError("Reward scorer returned misaligned batch results")
+                    scored = dict(zip(request_indices, results))
+                for index, (state, final_answer, reward) in enumerate(pending):
+                    reward, reward_model_outputs = self._apply_gfam_reward_model(
+                        task=state.task, decomposition=state.decomposition, selection=state.selection,
+                        executions=state.executions, final_answer=final_answer, reward=reward,
+                        scored=scored.get(index))
+                    selection_rollout_map[
+                        (state.task_index, state.decomposition_index, state.selection_index)
+                    ] = SelectionRollout(
+                        selection=state.selection, executions=state.executions,
+                        final_answer=final_answer, reward=reward, reward_model_outputs=reward_model_outputs)
+                    progress.advance(unscored=reward.total_reward is None,
+                                     unverified=reward.verification_status == "unverified")
         return selection_rollout_map
 
     def _execute_selection(

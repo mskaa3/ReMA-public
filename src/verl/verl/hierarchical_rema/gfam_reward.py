@@ -1817,6 +1817,15 @@ class GFAMRewardScorer:
     def supports_verified_final_correctness(self):
         return self.checkpoint.get("feature_schema") == "graphprm_declared_provided_v2"
 
+    @property
+    def rollout_batch_size(self):
+        return getattr(self.graphprm, "rollout_batch_size", 1)
+
+    def score_rollouts(self, requests):
+        if self.graphprm is not None and hasattr(self.graphprm, "score_rollouts"):
+            return self.graphprm.score_rollouts(requests)
+        return [self.score_rollout(**request) for request in requests]
+
     def score_rollout(
         self,
         *,
