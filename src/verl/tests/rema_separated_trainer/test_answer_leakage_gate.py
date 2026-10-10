@@ -297,7 +297,7 @@ def test_decomposer_checks_all_downstream_workers_like_validation(local, reason)
 
 @pytest.mark.parametrize("role", ["decomposer", "worker_stage_1"])
 @pytest.mark.parametrize("case", ["contrast", "equal", "only_one", "all_rejected"])
-def test_decomposer_baseline_conditions_on_complete_eligible_plans(role, case):
+def test_decomposer_gates_rewards_while_workers_keep_raw_baseline(role, case):
     trainer = _trainer(role)
     trainer.scoped_c3_grpo_config.update(
         continuations_per_action=4, require_eligible_success=True,
@@ -305,8 +305,8 @@ def test_decomposer_baseline_conditions_on_complete_eligible_plans(role, case):
     counts = [4, 3, 3 if case == "equal" else 2]
     raw = torch.tensor([float(m < count) for count in counts for m in range(4)])
     histories = [_history() for _ in range(12)]
-    # A single rejected suffix must exclude the whole first plan, not just
-    # that suffix, while preserving its perfect factual success rate.
+    # A single rejected suffix zeroes the whole plan's reward, while preserving
+    # its perfect factual success rate. Worker behavior must not change.
     histories[1][1]["content"] = r"LOCAL_RESULT: \boxed{26}"
     if case in ("only_one", "all_rejected"):
         histories[9][1]["content"] = "missing result"
@@ -327,24 +327,37 @@ def test_decomposer_baseline_conditions_on_complete_eligible_plans(role, case):
     trainer._attach_prefix_probe_signals(batch, raw, metrics)
     trainer._attach_scoped_c3_grpo_signals(batch, {"acc": raw}, metrics)
     torch.testing.assert_close(batch.batch["scoped_c3_raw_outcome_score"], raw)
-    torch.testing.assert_close(batch.batch["scoped_c3_outcome_score"][::4],
+    torch.testing.assert_close(batch.batch["scoped_c3_raw_action_mean_score"][::4],
                                torch.tensor(counts) / 4)
     estimate = trainer._estimate_scoped_c3_advantages(batch)
-    if role == "decomposer" and case == "contrast":
-        torch.testing.assert_close(estimate.advantage[::4], torch.tensor([0., .25, -.25]))
-        assert estimate.effective_mask[::4].tolist() == [False, True, True]
+    if role == "decomposer":
+        rewards = {
+            "contrast": [0., .75, .5], "equal": [0., .75, .75],
+            "only_one": [0., .75, 0.], "all_rejected": [0., 0., 0.],
+        }[case]
+        expected_advantages = {
+            "contrast": [-.625, .5, .125], "equal": [-.75, .375, .375],
+            "only_one": [-.75, .75, 0.], "all_rejected": [0., 0., 0.],
+        }[case]
+        torch.testing.assert_close(batch.batch["scoped_c3_outcome_score"],
+                                   torch.tensor(rewards).repeat_interleave(4))
+        torch.testing.assert_close(estimate.advantage[::4], torch.tensor(expected_advantages))
+        assert torch.equal(estimate.effective_mask[::4], torch.tensor(expected_advantages).ne(0))
+        prefix = f"reward/c3/roles/{role}"
+        assert metrics[f"{prefix}/gate_zero_reward_action_count"] == (2 if case == "all_rejected" else 1)
+        assert metrics[f"{prefix}/unknown_reward_excluded_action_count"] == int(case in ("only_one", "all_rejected"))
     else:
+        torch.testing.assert_close(batch.batch["scoped_c3_outcome_score"][::4], torch.tensor(counts) / 4)
         assert not estimate.effective_mask.any()
     assert not estimate.effective_mask[torch.arange(12) % 4 != 0].any()
-    if role == "decomposer":
-        excluded = {"contrast": 1, "equal": 1, "only_one": 2, "all_rejected": 3}[case]
-        assert metrics[f"reward/c3/roles/{role}/gate_excluded_baseline_action_count"] == excluded
-    # The actor pass recomputes advantages from the stored conditioned mask.
+    # The actor pass must retain the signed signal, including zero-reward plans.
     batch.batch["labels"] = torch.ones(12, 2, dtype=torch.long)
     batch.batch["step_ids"] = torch.zeros(12, 2, dtype=torch.long)
     batch.batch["token_level_rewards"] = torch.zeros(12, 2)
     trainer._compute_scoped_c3_grpo_advantage(batch, metrics)
     assert torch.equal(batch.batch["labels"].ne(-100).any(-1), estimate.effective_mask)
+    torch.testing.assert_close(batch.batch["token_level_rewards"].sum(-1),
+                               batch.batch["scoped_c3_outcome_score"] * estimate.effective_mask)
 
 
 @pytest.mark.parametrize("sources,num_examine,expected_indices", [
@@ -408,12 +421,146 @@ def test_decomposer_single_continuation_baseline_and_probe_opt_out(probes_enable
     trainer._attach_scoped_c3_grpo_signals(batch, {"acc": raw}, {})
     estimate = trainer._estimate_scoped_c3_advantages(batch)
     expected = estimate_scoped_c3_grpo(
-        raw, ["q"] * 3, torch.tensor([not probes_enabled, True, True]),
+        torch.tensor([0., 1., 0.]) if probes_enabled else raw,
+        ["q"] * 3, torch.ones(3, dtype=torch.bool),
         normalize=normalize, require_eligible_success=True,
     )
     torch.testing.assert_close(estimate.advantage, expected.advantage)
     assert torch.equal(estimate.effective_mask, expected.effective_mask)
     torch.testing.assert_close(batch.batch["scoped_c3_raw_outcome_score"], raw)
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_decomposer_eight_by_four_uses_known_zero_rewards_not_unknowns(normalize, tmp_path):
+    import json
+    from verl.rema_separated_trainer.ppo.credit_audit import CreditAudit
+
+    trainer = _trainer("decomposer")
+    trainer.scoped_c3_grpo_config.update(
+        continuations_per_action=4, require_eligible_success=True,
+        positive_only_nonterminal_workers=True, normalize_advantages=normalize,
+    )
+    trainer._credit_audit = CreditAudit(tmp_path)
+    histories = [_history() for _ in range(32)]
+    # Two passing actions, three known failures, two unknown actions, and a
+    # known failure with an unresolved sibling. All raw answers are correct.
+    histories[8][0]["planned_subtask_count"] = 1
+    histories[12][1]["content"] = r"LOCAL_RESULT: \boxed{26}"
+    histories[20][1]["content"] = "missing result"
+    del histories[24][2]["terminal_probe_input"]
+    histories[28][0]["planned_subtask_count"] = 1
+    del histories[29][2]["terminal_probe_input"]
+    for history in histories[16:20]:
+        history[2]["terminal_probe_input"] = "CURRENT TASK: known recoverable"
+
+    def probe(messages):
+        return [r"\boxed{26}" if "known recoverable" in msg else r"\boxed{UNKNOWN}"
+                for msg in messages], [3] * len(messages), ["stop"] * len(messages)
+
+    trainer._generate_prefix_probe_responses = probe
+    batch = _batch(histories)
+    batch.non_tensor_batch.update({
+        "c3_action_turn": _object_array([0] * 32),
+        "c3_action_index": _object_array([i // 4 for i in range(32)]),
+        "c3_suffix_index": _object_array([i % 4 for i in range(32)]),
+        "decomposer_action_token_ids": _object_array([[100 + i // 4] for i in range(32)]),
+        "decomposer_conversation_history": _object_array([
+            [{"role": "user", "content": "shared"},
+             {"role": "assistant", "content": str(i // 4)}] for i in range(32)
+        ]),
+    })
+    metrics = {}
+    raw = torch.ones(32)
+    trainer._attach_prefix_probe_signals(batch, raw, metrics)
+    trainer._attach_scoped_c3_grpo_signals(batch, {"acc": raw}, metrics)
+    known = torch.tensor([True] * 5 + [False, False, True])
+    rewards = torch.tensor([1., 1., 0., 0., 0., 0., 0., 0.])
+    expected = estimate_scoped_c3_grpo(
+        rewards, ["q"] * 8, known, normalize=normalize, require_eligible_success=True,
+    )
+    torch.testing.assert_close(batch.batch["scoped_c3_outcome_score"], rewards.repeat_interleave(4))
+    assert batch.batch["scoped_c3_reward_known"][::4].tolist() == known.tolist()
+    assert batch.batch["scoped_c3_gate_zeroed_reward"][::4].tolist() == [False, False, True, True, True, False, False, True]
+    assert batch.batch["scoped_c3_causal_valid"].sum() == 6
+    assert metrics["reward/c3/roles/decomposer/gate_zero_reward_action_count"] == 4
+    assert metrics["reward/c3/roles/decomposer/unknown_reward_excluded_action_count"] == 2
+    assert metrics["reward/c3/roles/decomposer/action_success_mean"] == 1
+    assert metrics["reward/c3/roles/decomposer/gated_action_reward_mean"] == pytest.approx(1/3)
+
+    # Recomputed actor masks and audited dispositions must include failed plans
+    # with negative advantage, but never their replicas or unresolved actions.
+    batch.batch["labels"] = torch.ones(32, 2, dtype=torch.long)
+    batch.batch["step_ids"] = torch.zeros(32, 2, dtype=torch.long)
+    batch.batch["token_level_rewards"] = torch.zeros(32, 2)
+    trainer._compute_scoped_c3_grpo_advantage(batch, metrics)
+    active = batch.batch["labels"].ne(-100).any(-1)
+    assert torch.equal(active[::4], known)
+    assert not active[torch.arange(32) % 4 != 0].any()
+    torch.testing.assert_close(batch.batch["advantages"][::4, 0], expected.advantage)
+    torch.testing.assert_close(batch.batch["token_level_rewards"].sum(-1),
+                               rewards.repeat_interleave(4) * active)
+    log_probs = torch.zeros(32, 2, requires_grad=True)
+    loss = -(log_probs * batch.batch["advantages"]).sum()
+    gradient = torch.autograd.grad(loss, log_probs)[0]
+    assert (gradient[[0, 4]] < 0).all()
+    assert (gradient[[8, 12, 16, 28]] > 0).all()
+    assert not gradient[~active].any()
+    audit_metrics = trainer._credit_audit.finish(batch, actor_updated=True, actor_update_step=1)
+    assert audit_metrics["train/credit/used_positive_actions"] == 2
+    assert audit_metrics["train/credit/used_negative_actions"] == 4
+    assert audit_metrics["train/credit/used_gate_rejected_negative_actions"] == 4
+    assert audit_metrics["train/credit/unknown_reward_actions"] == 2
+    events = [json.loads(line) for line in (tmp_path / "train_step_1.jsonl").read_text().splitlines()]
+    dispositions = [e for e in events if e["event"] == "disposition"]
+    assert dispositions[2]["action_mean_score"] == 1
+    assert dispositions[2]["action_reward"] == 0
+    assert dispositions[2]["status"] == "included_negative"
+    assert dispositions[5]["status"] == "unknown_collaboration_reward"
+    assert not dispositions[5]["negative_training_signal"]
+
+    trainer.config.trainer = SimpleNamespace(default_local_dir=str(tmp_path))
+    trainer._get_score_role = lambda: "worker_stage_2"
+    trainer._get_rollout_agent_roles = lambda: ["worker_stage_1", "worker_stage_2"]
+    batch.non_tensor_batch["response"] = _object_array([r"\boxed{26}"] * 32)
+    batch.non_tensor_batch["finish_reason"] = _object_array(["final_boxed_answer"] * 32)
+    batch.batch["worker_stage_2_turn_level_reward"] = raw[:, None]
+    trainer._save_train_generations(batch)
+    saved = json.loads((tmp_path / "replay_buffer/train_step_1.jsonl").read_text())
+    assert saved["c3_action_mean_score"] == [1.] * 32
+    assert saved["c3_action_reward"] == rewards.repeat_interleave(4).tolist()
+    assert saved["c3_reward_known"] == known.repeat_interleave(4).tolist()
+    assert saved["c3_gate_zeroed_reward"][::4] == [False, False, True, True, True, False, False, True]
+
+
+@pytest.mark.parametrize("count,terminal,local,other_local,known", [
+    (2, "malformed", "6", "8", False),
+    (2, r"\boxed{UNKNOWN}", "6", "UNKNOWN", False),
+    (1, "malformed", "UNKNOWN", "UNKNOWN", True),
+    (2, r"\boxed{26}", "UNKNOWN", "UNKNOWN", True),
+    (2, "malformed", "26", "UNKNOWN", True),
+])
+def test_known_rejections_are_distinct_from_incomplete_audits(count, terminal, local, other_local, known):
+    trainer = _trainer("decomposer", terminal_response=terminal)
+    history = _history(local, count=count)
+    history.insert(2, _record("worker_stage_3", "LOCAL_RESULT: \\boxed{" + other_local + "}", "S3"))
+    history.pop()
+    batch = _batch([history])
+    trainer._attach_prefix_probe_signals(batch, torch.ones(1), {})
+    assert not batch.batch["prefix_probe_gate_valid"].item()
+    assert not batch.batch["prefix_probe_collaboration_eligible"].item()
+    assert batch.batch["prefix_probe_known_rejection"].item() is known
+
+
+@pytest.mark.parametrize("response", [r"\boxed{26}", r"\boxed{UNKNOWN}"])
+def test_length_stopped_probe_with_box_is_still_unknown(response):
+    trainer = _trainer("decomposer")
+    trainer._generate_prefix_probe_responses = lambda messages: (
+        [response] * len(messages), [256] * len(messages), ["length"] * len(messages),
+    )
+    batch = _batch([_history()])
+    trainer._attach_prefix_probe_signals(batch, torch.ones(1), {})
+    assert not batch.batch["prefix_probe_gate_valid"].item()
+    assert not batch.batch["prefix_probe_known_rejection"].item()
 
 
 def test_c3_trainer_keeps_rejected_and_unparseable_actions_as_baseline():
@@ -533,6 +680,7 @@ def test_chunk_metrics_are_weighted_and_replay_contains_new_gates(tmp_path):
     assert saved["gated_outcome_score"] == [0., 1., 1.]
     assert saved["raw_outcome_score"] == [1., 1., 1.]
     assert saved["prefix_probe_gate_protocol"] == "terminal_instruction"
+    assert saved["prefix_probe_known_rejection"] == [True, False, False]
     assert saved["prefix_probe_terminal_score"] == [0., 0., 0.]
     assert saved["prefix_probe_terminal_response"] == [r"\boxed{UNKNOWN}"] * 3
     assert all("S2: Add 20" in value for value in saved["prefix_probe_terminal_input"])

@@ -1324,10 +1324,13 @@ class RayReMASeparatedTrainer(object):
                 }
                 for answer in answers
             ]
-            scores = [0.0 if missing else float('nan') for missing in unknown]
             valid_answers = [
-                missing or parse_boxed_math_answer(response) is not None
-                for missing, response in zip(unknown, responses)
+                stop != 'length' and (missing or parse_boxed_math_answer(response) is not None)
+                for missing, response, stop in zip(unknown, responses, stops)
+            ]
+            scores = [
+                0.0 if missing and valid else float('nan')
+                for missing, valid in zip(unknown, valid_answers)
             ]
             to_score = [i for i, valid in enumerate(valid_answers) if valid and not unknown[i]]
             if to_score:
@@ -1414,6 +1417,11 @@ class RayReMASeparatedTrainer(object):
             'prefix_probe_raw_outcome_score': raw,
             'prefix_probe_gated_outcome_score': torch.tensor(gate.outcome_scores, dtype=torch.float32),
             'prefix_probe_gate_valid': torch.tensor(gate.valid_mask, dtype=torch.bool),
+            # A known match suffices to reject even if another comparison timed out.
+            'prefix_probe_known_rejection': torch.tensor([
+                rejected or any(item['match'] is True for item in comparisons)
+                for rejected, comparisons in zip(gate.known_rejection_mask, comparison_records)
+            ], dtype=torch.bool),
             'prefix_probe_collaboration_eligible': torch.tensor(gate.collaboration_eligible_mask, dtype=torch.bool),
             'prefix_probe_plan_eligible': torch.tensor(gate.plan_eligible_mask, dtype=torch.bool),
             'prefix_probe_subtask_count': torch.tensor(counts, dtype=torch.long),
@@ -1598,6 +1606,7 @@ class RayReMASeparatedTrainer(object):
             raw_outcome_scores,
             dtype=torch.bool,
         )
+        known_rejection = torch.zeros_like(raw_outcome_scores, dtype=torch.bool)
         if self.prefix_probe_enabled:
             prefix_gate_valid = data_batch.batch[
                 'prefix_probe_gate_valid'
@@ -1605,6 +1614,7 @@ class RayReMASeparatedTrainer(object):
             collaboration_eligible = data_batch.batch[
                 'prefix_probe_collaboration_eligible'
             ].bool().cpu()
+            known_rejection = data_batch.batch['prefix_probe_known_rejection'].bool().cpu()
         action_present = self._c3_action_present_mask(data_batch, role)
         action_turns = data_batch.non_tensor_batch.get('c3_action_turn')
         if action_turns is None:
@@ -1641,9 +1651,10 @@ class RayReMASeparatedTrainer(object):
             metrics,
         )
         # Preserve all factual outcomes through continuation aggregation.
-        # Decomposer baseline eligibility is applied to complete action means below.
+        # Apply decomposer rewards only after aggregating the complete action.
         baseline_valid = action_present & exact_prefix
         update_valid = baseline_valid & prefix_gate_valid & collaboration_eligible
+        action_gate_eligible = prefix_gate_valid & collaboration_eligible
         positive_only = self._c3_positive_only_mask(data_batch, role, action_present)
         continuations = int(self.scoped_c3_grpo_config.get('continuations_per_action', 1))
         if continuations > 1:
@@ -1660,10 +1671,13 @@ class RayReMASeparatedTrainer(object):
                 update_valid,
                 continuations_per_action=continuations,
                 positive_only_mask=positive_only,
+                known_rejection_mask=known_rejection,
             )
             outcome_scores = grouped.outcome_scores
             baseline_valid = grouped.valid_mask
             update_valid = grouped.update_mask
+            action_gate_eligible = grouped.gate_eligible_mask
+            known_rejection = grouped.known_rejection_mask
             data_batch.batch['scoped_c3_action_representative'] = grouped.representative_mask
             prefix = f'reward/c3/roles/{role}'
             representatives = grouped.representative_mask
@@ -1692,16 +1706,34 @@ class RayReMASeparatedTrainer(object):
                 f"unique_action_rate={metrics[f'{prefix}/unique_action_rate']:.3f} "
                 f"gate_eligible_actions={int(update_valid.sum().item())}"
             )
+        raw_action_means = outcome_scores.clone()
+        reward_known = torch.ones_like(baseline_valid)
+        gate_zeroed = torch.zeros_like(baseline_valid)
         if self.prefix_probe_enabled and role == self._get_hierarchy_config().get(
             'decomposer_role', 'decomposer'
         ):
-            # Compare plans only against other eligible plans. Do this after
-            # aggregation: one rejected suffix vetoes the whole plan, without
-            # dropping that suffix's outcome from the factual action mean.
-            metrics[f'reward/c3/roles/{role}/gate_excluded_baseline_action_count'] = float(
-                (baseline_valid & ~update_valid).sum().item()
+            # Known failures are zero-reward alternatives, not masked actions.
+            # An unresolved audit alone must never manufacture negative credit.
+            reward_known = action_gate_eligible | known_rejection
+            gate_zeroed = known_rejection
+            outcome_scores = torch.where(action_gate_eligible, raw_action_means, 0.0)
+            prefix = f'reward/c3/roles/{role}'
+            metrics[f'{prefix}/gate_zero_reward_action_count'] = float(
+                (baseline_valid & gate_zeroed).sum().item()
             )
-            baseline_valid &= update_valid
+            metrics[f'{prefix}/unknown_reward_excluded_action_count'] = float(
+                (baseline_valid & ~reward_known).sum().item()
+            )
+            baseline_valid &= reward_known
+            update_valid = baseline_valid.clone()
+            metrics[f'{prefix}/gated_action_reward_mean'] = (
+                float(outcome_scores[baseline_valid].mean().item()) if baseline_valid.any() else 0.0
+            )
+            print(
+                f"[c3/decomposer_rewards] known_zero={int(metrics[f'{prefix}/gate_zero_reward_action_count'])} "
+                f"unknown_excluded={int(metrics[f'{prefix}/unknown_reward_excluded_action_count'])} "
+                f"reward_mean={metrics[f'{prefix}/gated_action_reward_mean']:.3f}", flush=True,
+            )
         pre_mixed_valid = baseline_valid.clone()
         mixed_mask = torch.ones_like(baseline_valid)
         if bool(
@@ -1716,7 +1748,10 @@ class RayReMASeparatedTrainer(object):
             update_valid &= mixed_mask
 
         data_batch.batch['scoped_c3_raw_outcome_score'] = raw_outcome_scores
+        data_batch.batch['scoped_c3_raw_action_mean_score'] = raw_action_means
         data_batch.batch['scoped_c3_outcome_score'] = outcome_scores
+        data_batch.batch['scoped_c3_reward_known'] = reward_known
+        data_batch.batch['scoped_c3_gate_zeroed_reward'] = gate_zeroed
         data_batch.batch['scoped_c3_causal_valid'] = baseline_valid
         data_batch.batch['scoped_c3_gate_update_mask'] = update_valid.clone()
         data_batch.batch['scoped_c3_positive_only_mask'] = positive_only
@@ -4278,6 +4313,9 @@ class RayReMASeparatedTrainer(object):
                         "c3_action_index": [],
                         "c3_suffix_index": [],
                         "c3_action_mean_score": [],
+                        "c3_action_reward": [],
+                        "c3_reward_known": [],
+                        "c3_gate_zeroed_reward": [],
                         "c3_action_representative": [],
                         "c3_action_update_eligible": [],
                     })
@@ -4297,6 +4335,7 @@ class RayReMASeparatedTrainer(object):
                         "raw_outcome_score": [],
                         "gated_outcome_score": [],
                         "prefix_probe_gate_valid": [],
+                        "prefix_probe_known_rejection": [],
                         "prefix_probe_collaboration_eligible": [],
                     })
                 results_dict[uid] = result
@@ -4321,8 +4360,13 @@ class RayReMASeparatedTrainer(object):
                 for key in ('c3_action_index', 'c3_suffix_index'):
                     results_dict[uid][key].append(int(data_item.non_tensor_batch[key]))
                 results_dict[uid]['c3_action_mean_score'].append(float(
+                    data_item.batch['scoped_c3_raw_action_mean_score'].item()
+                ))
+                results_dict[uid]['c3_action_reward'].append(float(
                     data_item.batch['scoped_c3_outcome_score'].item()
                 ))
+                for key in ('c3_reward_known', 'c3_gate_zeroed_reward'):
+                    results_dict[uid][key].append(bool(data_item.batch[f'scoped_{key}'].item()))
                 results_dict[uid]['c3_action_representative'].append(bool(
                     data_item.batch['scoped_c3_action_representative'].item()
                 ))
@@ -4365,6 +4409,9 @@ class RayReMASeparatedTrainer(object):
                 ))
                 results_dict[uid]['prefix_probe_gate_valid'].append(bool(
                     data_item.batch['prefix_probe_gate_valid'].item()
+                ))
+                results_dict[uid]['prefix_probe_known_rejection'].append(bool(
+                    data_item.batch['prefix_probe_known_rejection'].item()
                 ))
                 results_dict[uid][
                     'prefix_probe_collaboration_eligible'

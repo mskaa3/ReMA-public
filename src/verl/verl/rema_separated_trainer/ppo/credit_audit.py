@@ -55,7 +55,7 @@ class CreditAudit:
             indices.sort(key=lambda i: int(suffixes[i]) if suffixes is not None else 0)
             i = indices[0]
             def values(key, default):
-                tensor = batch.batch.get(key)
+                tensor = batch.batch.get(key, None)
                 return [tensor[j].item() if tensor is not None else default for j in indices]
 
             valid = values('prefix_probe_gate_valid', True)
@@ -69,7 +69,12 @@ class CreditAudit:
                 'suffix_gate_valid': [bool(v) for v in valid],
                 'suffix_gates': gates,
                 'all_suffix_gates_pass': all(gates),
-                'action_mean_score': float(batch.batch['scoped_c3_outcome_score'][i]),
+                'action_mean_score': float(batch.batch.get(
+                    'scoped_c3_raw_action_mean_score', batch.batch['scoped_c3_outcome_score'],
+                )[i]),
+                'action_reward': float(batch.batch['scoped_c3_outcome_score'][i]),
+                'reward_known': bool(values('scoped_c3_reward_known', True)[0]),
+                'gate_zeroed_reward': bool(values('scoped_c3_gate_zeroed_reward', False)[0]),
                 'advantage': float(estimate.advantage[i]),
                 'c3_effective': bool(estimate.effective_mask[i]),
                 'c3_positive_only': bool(batch.batch['scoped_c3_positive_only_mask'][i]),
@@ -113,6 +118,7 @@ class CreditAudit:
             'not_selected_for_optimizer_batch', 'no_trainable_tokens',
             'zero_trainable_batch', 'sparse_batch', 'critic_warmup',
             'actor_update_not_completed',
+            'unknown_collaboration_reward',
         )})
         events = []
         for audit_id, record in self.pending.items():
@@ -124,7 +130,9 @@ class CreditAudit:
                 reason = 'included_positive' if advantage > 0 else 'included_negative'
             elif unknown:
                 reason = 'actor_update_failed_or_partial'
-            elif not record['all_suffix_gates_pass']:
+            elif not record['reward_known']:
+                reason = 'unknown_collaboration_reward'
+            elif not record['all_suffix_gates_pass'] and not record['gate_zeroed_reward']:
                 reason = 'suffix_gate_rejected_or_invalid'
             elif record['advantage'] == 0:
                 reason = 'no_effective_c3_contrast'
@@ -156,6 +164,10 @@ class CreditAudit:
             counts['positive_advantage_actions'] += int(record['advantage'] > 0)
             counts['used_positive_actions'] += int(bool(event['positive_training_signal']))
             counts['used_negative_actions'] += int(bool(event['negative_training_signal']))
+            counts['used_gate_rejected_negative_actions'] += int(
+                bool(event['negative_training_signal']) and record['gate_zeroed_reward']
+            )
+            counts['unknown_reward_actions'] += int(not record['reward_known'])
             counts['excluded_actions'] += int(not included and not unknown)
             counts['unknown_update_actions'] += int(unknown)
             counts[f'status/{reason}'] += 1
@@ -167,7 +179,8 @@ class CreditAudit:
                 print(
                     f"[credit/example] id={event['audit_id']} "
                     f"outcomes={event['suffix_outcomes']} gates={event['suffix_gates']} "
-                    f"mean={event['action_mean_score']:.3f} advantage={event['advantage']:+.3f} "
+                    f"mean={event['action_mean_score']:.3f} reward={event['action_reward']:.3f} "
+                    f"reward_known={int(event['reward_known'])} advantage={event['advantage']:+.3f} "
                     f"trainable_tokens={event['final_trainable_tokens']} "
                     f"actor_updated={int(actor_updated)} status={event['status']}", flush=True,
                 )

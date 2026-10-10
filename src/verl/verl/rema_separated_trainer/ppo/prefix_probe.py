@@ -20,13 +20,14 @@ class PrefixProbeRequest:
 
 @dataclass(frozen=True)
 class PrefixProbeGate:
-    """Diagnostic gated outcomes and update eligibility, not C3 rewards."""
+    """Trajectory gates; the caller decides how they affect role-local credit."""
 
     outcome_scores: List[float]
     valid_mask: List[bool]
     collaboration_eligible_mask: List[bool]
     plan_eligible_mask: List[bool]
     rejection_reasons: List[str]
+    known_rejection_mask: List[bool]
 
 
 def has_complete_boxed_answer(response: str) -> bool:
@@ -155,7 +156,7 @@ def apply_prefix_probe_gate(
     comparison_scores: Sequence[float],
     comparison_required: Sequence[bool],
 ) -> PrefixProbeGate:
-    """Apply G(plan) and M(action), leaving raw C3 rewards to the caller.
+    """Apply G(plan) and M(action), leaving C3 action rewards to the caller.
 
     Validation supplies max(E_k) across all non-terminal workers, with NaN
     if any required comparison failed. Decomposer training uses the same
@@ -169,7 +170,7 @@ def apply_prefix_probe_gate(
         terminal_scores, subtask_counts, comparison_scores, comparison_required,
     )):
         raise ValueError("All leakage gate inputs must have equal lengths")
-    valid, eligible, plans, outcomes, reasons = [], [], [], [], []
+    valid, eligible, plans, outcomes, reasons, known_rejections = [], [], [], [], [], []
     for raw, lt, count, match, required in zip(
         raw_scores, terminal_scores, subtask_counts, comparison_scores, comparison_required,
     ):
@@ -189,12 +190,17 @@ def apply_prefix_probe_gate(
         else:
             reason = "eligible"
         allowed = reason == "eligible"
+        known_rejections.append(
+            int(count) < 2
+            or (plan_valid and float(lt) > 0.0)
+            or (required and compare_valid and float(match) > 0.0)
+        )
         valid.append(plan_valid and compare_valid)
         plans.append(plan_ok)
         eligible.append(allowed)
         outcomes.append(float(raw) if allowed else 0.0)
         reasons.append(reason)
-    return PrefixProbeGate(outcomes, valid, eligible, plans, reasons)
+    return PrefixProbeGate(outcomes, valid, eligible, plans, reasons, known_rejections)
 
 
 def select_stratified_probe_indices(labels: Sequence[str], max_samples: int) -> List[int]:

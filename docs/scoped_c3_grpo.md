@@ -26,7 +26,7 @@ rank and shared states within tensor-parallel groups. Greedy validation and prob
 are unchanged. This preserves seeded execution, not bitwise reproducibility across
 different hardware, batching, or checkpoint restarts.
 
-For K valid actions:
+For worker training with K valid actions:
 
     q_j = mean_m(Y_jm)
     C_j = q_j - sum_{l != j}(q_l) / (K - 1)
@@ -45,8 +45,9 @@ They are not four independent observations of terminal correctness.
 
 Only the suffix-zero representative is a baseline entry and an actor training
 row. The other three copies have no actor gradient, entropy, or KL contribution.
-Raw trajectory scores remain unchanged for accuracy and diagnostics. The mean
-is used only for role-local C3 credit. Validation remains ordinary generation,
+Raw trajectory scores remain unchanged for accuracy and diagnostics. For
+decomposer training, the factual mean is multiplied by the all-suffix gate before
+C3 credit is computed, as detailed below. Validation remains ordinary generation,
 not a vote or a best-of-32 evaluation.
 
 ## Per-action credit audit
@@ -73,6 +74,13 @@ Join records by `audit_id = <uid>:<role>:<action_index>`:
   groups. Action IDs survive role splitting, rank balancing, and padding;
   transport duplicates and suffix replicas are not counted again.
 
+`action_mean_score` preserves factual mean correctness. `action_reward` is the
+actual C3 reward (gated for decomposer training). `reward_known=false` denotes
+an unresolved collaboration reward, not a known zero; `gate_zeroed_reward=true`
+denotes a known rejected decomposer plan. Such a plan can have raw mean 1,
+reward 0, and `status=included_negative`. Unknown rewards are excluded and get
+`status=unknown_collaboration_reward`.
+
 An action has `positive_training_signal=true` only when it is in the final
 batch, has unmasked label/step tokens with positive advantage, and the actor
 update completes. This means participation in the positive-advantage policy
@@ -85,12 +93,15 @@ an update occurred or did not occur. Resumed sessions append rather than erase
 old records; new prompt UIDs distinguish the attempts.
 
 Console output adds `uid`, `action`, and `suffix` to `[leakage/example]`.
-`[credit/example]` prints up to two action dispositions per optimizer attempt
+`[credit/example]` prints raw mean, reward, reward-known status, advantage, and
+up to two action dispositions per optimizer attempt
 (preferring included actions); `[credit/summary]` prints action counts.
 All action details remain in JSONL, so console sampling is not the audit sample.
 W&B receives `train/credit/generated_actions`, `gate_passing_actions`,
 `positive_advantage_actions`, `used_positive_actions`, `used_negative_actions`,
 `excluded_actions`, `unknown_update_actions`, and `status/<reason>` counts.
+`used_gate_rejected_negative_actions` counts actual negative participation by
+known rejected plans; `unknown_reward_actions` counts unresolved action rewards.
 These are counts over the whole optimizer attempt, not fractions over replicated
 trajectory rows. Existing `positive_after_policy_count` metrics are computed
 before the collective-safety check and do not certify update completion.
@@ -158,7 +169,7 @@ LOCAL_RESULTs are withheld. Whole-plan L_D is logged but does not gate training.
 Non-terminal actions also require a parsed LOCAL_RESULT not equivalent to
 the terminal answer. Terminal actions are exempt only from this comparison.
 
-C3 uses raw correctness, not gated correctness. Apply the gate after computing
+For worker training, C3 uses raw correctness, not gated correctness. Apply the gate after computing
 advantages by masking the focal action's training tokens. Both positive and
 negative updates are skipped for rejected actions.
 
@@ -171,12 +182,15 @@ not inferred from a fixed final slot. Decomposer/selector actions remain signed.
 For worker training, all factual alternatives remain baseline donors; advantages
 are not re-centered after masking. Disabling both flags restores signed worker C3.
 
-With prefix probing enabled, decomposer training instead compares only plans
-passing the whole-chain collaboration gate. Eligibility is applied to complete
-action means after suffix aggregation, before mixed-group filtering and advantage
-normalization. Rejected plans retain their raw outcomes in diagnostics but do not
-enter the decomposer baseline. At least two eligible plans with different means
-are needed. See [Decomposer training](c3_prefix_probe.md#decomposer-training).
+With prefix probing enabled, decomposer training instead uses R_j=G_j*q_j,
+where G_j requires all suffixes to pass the whole-chain collaboration gate.
+Known rejected plans receive zero reward and remain in both the baseline and
+signed actor updates. Unresolved audits, unless another check establishes a
+known rejection, exclude the complete action. Mixed-group filtering and
+normalization use these rewards, not raw correctness. Equal raw means can now
+provide contrast if gates differ. Groups with equal rewards still cannot update.
+No SFT, extra generations, or new penalty weights are introduced. See
+[Decomposer training](c3_prefix_probe.md#decomposer-training).
 
 The gates require one round, branch_turn=0; initialization rejects multi-round
 configurations with these gates enabled. Generic C3 without the gates still

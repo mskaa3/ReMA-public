@@ -161,6 +161,7 @@ def test_trainer_masks_copies_after_mean_credit_and_preserves_raw_scores(termina
             "step_ids": torch.zeros(32, 2, dtype=torch.long),
             "token_level_rewards": torch.zeros(32, 2),
             "prefix_probe_gate_valid": torch.ones(32, dtype=torch.bool),
+            "prefix_probe_known_rejection": torch.zeros(32, dtype=torch.bool),
             "prefix_probe_collaboration_eligible": torch.ones(32, dtype=torch.bool),
         },
         non_tensors={

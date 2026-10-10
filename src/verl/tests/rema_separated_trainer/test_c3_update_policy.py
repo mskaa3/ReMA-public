@@ -109,6 +109,9 @@ def _trainer_and_batch(*, role="worker_stage_2", terminals=None, eligible=None):
             "step_ids": torch.zeros(size, 2, dtype=torch.long),
             "token_level_rewards": torch.zeros(size, 2),
             "prefix_probe_gate_valid": torch.ones(size, dtype=torch.bool),
+            "prefix_probe_known_rejection": torch.tensor(
+                [not value for value in eligible] if eligible is not None else [False] * size,
+            ),
             "prefix_probe_collaboration_eligible": torch.tensor(
                 eligible if eligible is not None else [True] * size,
             ),

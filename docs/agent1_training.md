@@ -52,13 +52,18 @@ The wrapper preserves four available worker stages, up to four planned tasks,
 deterministic routing, one round, and the last planned worker as the answer.
 C3 samples 8 decomposer outputs from each shared input, each followed by four
 independent worker continuations (32 trajectory slots). Credit uses mean final
-correctness with the existing LOO normalization and gates. Decomposer credit
+correctness multiplied by the all-continuation collaboration gate, then the
+existing LOO normalization. Decomposer credit
 remains signed; the positive-only rule applies to non-terminal workers, not D.
 
-No rewards or probe rules are changed. The terminal-instruction probe gates
-decomposer updates; whole-plan L_D remains diagnostic. Worker/final answer
-comparisons are still reported during validation, but training comparisons are
-role-local and do not gate D based on every worker. The probe solver remains
+Known gate-failing plans receive reward zero and remain in the C3 comparison
+and signed policy update. Unresolved audits are excluded unless another valid
+check already establishes rejection. Both the terminal-instruction probe and
+all non-terminal worker/final answer comparisons enter D's collaboration gate;
+whole-plan L_D remains diagnostic. All four continuations must pass for a plan
+to retain its factual success reward. Equal raw success rates can now provide
+learning signal when gate outcomes differ. All-zero reward groups still cannot
+update. No SFT or additional probe calls are introduced. The probe solver remains
 Agent 1, whose weights now change during training; probe rates therefore reflect
 both plan changes and changes in that solver, not a fixed external evaluator.
 

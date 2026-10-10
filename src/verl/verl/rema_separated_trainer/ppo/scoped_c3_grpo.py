@@ -26,6 +26,8 @@ class ScopedC3ActionMeans:
     update_mask: torch.Tensor
     within_action_variance: torch.Tensor
     gate_disagreement_mask: torch.Tensor
+    gate_eligible_mask: torch.Tensor
+    known_rejection_mask: torch.Tensor
 
 
 def aggregate_scoped_c3_actions(
@@ -39,14 +41,16 @@ def aggregate_scoped_c3_actions(
     *,
     continuations_per_action: int,
     positive_only_mask: torch.Tensor,
+    known_rejection_mask: torch.Tensor | None = None,
 ) -> ScopedC3ActionMeans:
     """Average complete repeated actions before LOO, retaining one actor row.
 
     All suffix outcomes enter the mean, even when a leakage gate rejects one.
     A rejected or unknown gate vetoes the shared action's update, not its
-    baseline contribution at this stage. The caller may then restrict the
-    baseline to eligible complete plans for decomposer training. Never choose
-    only successful/eligible suffixes.
+    baseline contribution at this stage. For decomposer rewards the caller
+    uses the aggregated gates: any known rejection makes the all-suffix gate
+    false, even if a different suffix's audit is unresolved. Never select only
+    successful/eligible suffixes when computing the factual mean.
     """
     size = outcome_scores.numel()
     if continuations_per_action < 1 or outcome_scores.ndim != 1:
@@ -56,12 +60,18 @@ def aggregate_scoped_c3_actions(
         valid_mask, update_mask, positive_only_mask,
     )):
         raise ValueError("C3 continuation arrays must have equal lengths")
+    if known_rejection_mask is None:
+        known_rejection_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+    if known_rejection_mask.shape != outcome_scores.shape:
+        raise ValueError("known_rejection_mask must match outcome_scores")
     means = outcome_scores.clone()
     representatives = torch.zeros_like(valid_mask, dtype=torch.bool)
     valid = torch.zeros_like(representatives)
     updates = torch.zeros_like(representatives)
     variance = torch.zeros_like(outcome_scores)
     disagreement = torch.zeros_like(representatives)
+    gate_eligible = torch.zeros_like(representatives)
+    known_rejections = torch.zeros_like(representatives)
     by_action = defaultdict(list)
     for index, (group, action) in enumerate(zip(group_ids, action_indices)):
         if int(action) < 0:
@@ -86,7 +96,12 @@ def aggregate_scoped_c3_actions(
             valid[representative] = valid_mask[indices].all() & torch.isfinite(scores).all()
             updates[representative] = valid[representative] & update_mask[indices].all()
             disagreement[representative] = update_mask[indices].any() & ~update_mask[indices].all()
-    return ScopedC3ActionMeans(means, representatives, valid, updates, variance, disagreement)
+            gate_eligible[indices] = update_mask[indices].all()
+            known_rejections[indices] = known_rejection_mask[indices].any()
+    return ScopedC3ActionMeans(
+        means, representatives, valid, updates, variance, disagreement,
+        gate_eligible, known_rejections,
+    )
 
 
 def estimate_scoped_c3_grpo(
