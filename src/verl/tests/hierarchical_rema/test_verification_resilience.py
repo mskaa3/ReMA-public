@@ -52,6 +52,64 @@ def test_wrong_prediction_with_valid_reference_is_still_incorrect():
     assert reward.total_reward is not None
 
 
+@pytest.mark.parametrize('prediction,reference,expected', [
+    (r'-2\le\sin(x)\le1', r'(-\infty,\infty)', 1.),
+    (r'-2\le\sin(x)\le1', r'[-1,1]', 0.),
+    (r'(-\infty,\infty)', r'\{x\mid -2\le\sin(x)\le1\}', 1.),
+    (r'0\le x^2<1', '(-1,1)', 1.),
+    (r'0\le x^2<1', '[-1,1]', 0.),
+    (r'0<x^2<1', '(-1,1)', 0.),
+])
+def test_compound_inequality_conversion_avoids_latex2sympy_metadata_bug(prediction, reference, expected):
+    reward = rewarding.build_selection_reward(prediction, reference, [], api.RewardWeights())
+    assert reward.verification_status == 'verified'
+    assert reward.final_answer_correctness == expected
+
+
+def test_nested_parser_booleans_are_rebuilt_without_changing_logic():
+    from latex2sympy2_extended.logic import And as ParserAnd
+    from sympy import And, Or, Symbol, Interval
+    x = Symbol('x', real=True)
+    expression = Or(ParserAnd(x > -2, x < -1), ParserAnd(x > 1, x < 2))
+    backend = rewarding._math_verifier_module()
+    rebuilt = backend._native_boolean(expression)
+    assert all(type(arg) is And for arg in rebuilt.args)
+    assert backend._real_solution_set(expression) == Interval.open(-2, -1) | Interval.open(1, 2)
+
+
+@pytest.mark.parametrize('error', [AttributeError, NotImplementedError, RecursionError])
+def test_failed_symbolic_conversion_is_unknown_not_incorrect(monkeypatch, error):
+    backend = rewarding._math_verifier_module()
+    def broken(expression):
+        raise error('unsupported symbolic expression')
+    monkeypatch.setattr(backend, '_native_boolean', broken)
+    reward = rewarding.build_selection_reward(r'-2\le x<1', '[-2,1)', [], api.RewardWeights())
+    assert reward.verification_status == 'unverified'
+    assert reward.verification_error['code'] == 'set_conversion_failed'
+    assert reward.final_answer_correctness is None
+    assert reward.total_reward is None
+
+
+@pytest.mark.parametrize('role', ['reference', 'prediction', 'comparison'])
+def test_external_symbolic_failures_have_auditable_error_codes(monkeypatch, role):
+    backend = rewarding._math_verifier_module()
+    parse, verify, config = backend._verifier()
+    def guarded_parse(text, **kwargs):
+        target = '$4$' if role == 'reference' else '$2+2$'
+        if role != 'comparison' and text == target:
+            raise AttributeError('third-party parser failure')
+        return parse(text, **kwargs)
+    def guarded_verify(*args, **kwargs):
+        if role == 'comparison':
+            raise AttributeError('third-party comparison failure')
+        return verify(*args, **kwargs)
+    monkeypatch.setattr(backend, '_verifier', lambda: (guarded_parse, guarded_verify, config))
+    reward = rewarding.build_selection_reward('2+2', '4', [], api.RewardWeights())
+    assert reward.verification_status == 'unverified'
+    assert reward.verification_error['code'] == ('comparison_failed' if role == 'comparison' else f'{role}_parse_failed')
+    assert reward.total_reward is None
+
+
 def test_missing_dependency_is_not_a_recoverable_data_failure(monkeypatch):
     def unavailable():
         raise RuntimeError("install math-verify")

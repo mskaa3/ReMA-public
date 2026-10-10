@@ -13,7 +13,7 @@ from .features import DEFAULT_SPEC
 from .live_features import LiveFeatureEngine
 from .graphprm_model import instantiate_model_from_checkpoint
 from .evaluation import predictions_from_outputs
-from .rewards import compile_rewards
+from .rewards import compile_rewards, validate_failure_positive_scale, DEFAULT_VERIFIED_FAILURE_POSITIVE_SCALE
 from .graphprm_sequence import resolve_device
 from .live_logging import feature_progress
 
@@ -53,7 +53,11 @@ class GraphPRMV2RewardScorer:
 
     def __init__(self, checkpoint_path, device='cpu', encoder_backend=None, encoder_model=None,
                  prm_device='cpu', prm_torch_dtype='auto', prm_max_length=0,
-                 cache_dir=None, encoder_device=None, bad_class_penalty=1., **kwargs):
+                 cache_dir=None, encoder_device=None, bad_class_penalty=1.,
+                 verified_failure_positive_scale=None, **kwargs):
+        self.verified_failure_positive_scale = validate_failure_positive_scale(
+            os.environ.get('GFAM_VERIFIED_FAILURE_POSITIVE_SCALE', DEFAULT_VERIFIED_FAILURE_POSITIVE_SCALE)
+            if verified_failure_positive_scale is None else verified_failure_positive_scale)
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
         self.checkpoint = torch.load(self.checkpoint_path, map_location='cpu', weights_only=False)
         validate_checkpoint(self.checkpoint)
@@ -122,7 +126,8 @@ class GraphPRMV2RewardScorer:
                     example = self.engine.example(row)
                     predictions = predictions_from_outputs(self.model(example, self.device))
                     compiled = compile_rewards(predictions, row, self.bad_class_penalty,
-                                               verified_final_correctness=outcomes[start + index])
+                                               verified_final_correctness=outcomes[start + index],
+                                               verified_failure_positive_scale=self.verified_failure_positive_scale)
                     summary = compiled['graph_summary']
                     summary.update(feature_schema=FEATURE_SCHEMA, reward_backend='graphprm_binary_v2',
                                    missing_prm_markers=0, prm_total_tokens=example.prm_alignment['total_tokens'],

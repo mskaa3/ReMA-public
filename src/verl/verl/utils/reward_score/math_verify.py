@@ -24,6 +24,45 @@ class AnswerVerificationError(ValueError):
         self.code = code
 
 
+# Restrict recovery to data-dependent symbolic failures. Missing dependencies,
+# resource failures and unrelated runtime bugs must still surface.
+_SYMBOLIC_ERRORS = (AttributeError, ValueError, TypeError, NotImplementedError, RecursionError)
+
+
+def _native_boolean(expression):
+    from sympy import And, Or, Not
+    for operation in (And, Or, Not):
+        if isinstance(expression, operation):
+            return operation(*(_native_boolean(arg) for arg in expression.args))
+    return expression
+
+
+def _real_solution_set(expression):
+    from sympy import S
+    try:
+        # latex2sympy's And writes _unsorted_args even when substitutions reduce
+        # it to a single relation. Native booleans preserve meaning without that
+        # metadata bug. Inequality solution sets are over the real numbers.
+        return _native_boolean(expression).as_set().intersect(S.Reals)
+    except _SYMBOLIC_ERRORS as exc:
+        raise AnswerVerificationError(
+            f"Cannot convert mathematical answer to a real solution set: {type(exc).__name__}: {exc}",
+            "set_conversion_failed",
+        ) from exc
+
+
+def _parse_for_verification(text, parse, latex_config, role):
+    try:
+        return _parse_expression(text, parse, latex_config)
+    except AnswerVerificationError:
+        raise
+    except _SYMBOLIC_ERRORS as exc:
+        raise AnswerVerificationError(
+            f"Cannot parse {role} mathematical answer: {type(exc).__name__}: {exc}",
+            f"{role}_parse_failed",
+        ) from exc
+
+
 @lru_cache(maxsize=1)
 def _verifier():
     try:
@@ -113,10 +152,7 @@ def _parse_expression(text, parse, latex_config):
             expression = parsed[0]
             symbols = getattr(expression, "free_symbols", set())
             if {str(symbol) for symbol in symbols} == {variable} and hasattr(expression, "as_set"):
-                try:
-                    return (expression.as_set(),)
-                except (ValueError, TypeError, NotImplementedError):
-                    pass
+                return (_real_solution_set(expression),)
         # Do not let a failed set-builder parse fall back to a matching number.
         return ()
     return tuple(parse("$" + text + "$", **kwargs))
@@ -129,7 +165,7 @@ def validate_reference(ground_truth):
         raise AnswerVerificationError("Ground-truth answer is missing", "missing_reference")
     parse, _, latex_config = _verifier()
     if not re.fullmatch(r"(?:\\text\{)?([A-E])\}?", reference):
-        if not _parse_expression(reference, parse, latex_config):
+        if not _parse_for_verification(reference, parse, latex_config, "reference"):
             raise AnswerVerificationError(f"Cannot parse ground-truth mathematical answer: {ground_truth!r}")
     return reference
 
@@ -151,20 +187,23 @@ def compute_answer_score(model_output: str, ground_truth: str) -> float:
     parse, verify, latex_config = _verifier()
     # The caller supplies the extracted terminal answer. Wrapping the whole
     # expression avoids dropping pi, intervals, fractions or plain sqrt(...).
-    gold = _parse_expression(reference, parse, latex_config)
-    answer = _parse_expression(prediction, parse, latex_config)
+    gold = _parse_for_verification(reference, parse, latex_config, "reference")
     if not gold:
         raise AnswerVerificationError(f"Cannot parse ground-truth mathematical answer: {ground_truth!r}")
+    answer = _parse_for_verification(prediction, parse, latex_config, "prediction")
     # A one-variable inequality can be another notation for the reference set.
     from sympy import Set
     if len(gold) == len(answer) == 1 and isinstance(gold[0], Set):
         expression = answer[0]
         if len(getattr(expression, "free_symbols", ())) == 1 and hasattr(expression, "as_set"):
-            try:
-                answer = (expression.as_set(),)
-            except (ValueError, TypeError, NotImplementedError):
-                pass
-    return float(bool(answer) and verify(list(gold), list(answer)))
+            answer = (_real_solution_set(expression),)
+    try:
+        return float(bool(answer) and verify(list(gold), list(answer)))
+    except _SYMBOLIC_ERRORS as exc:
+        raise AnswerVerificationError(
+            f"Cannot compare mathematical answers: {type(exc).__name__}: {exc}",
+            "comparison_failed",
+        ) from exc
 
 
 def compute_score(model_output: str, ground_truth: str) -> float:

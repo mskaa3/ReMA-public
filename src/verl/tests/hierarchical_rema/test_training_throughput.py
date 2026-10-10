@@ -118,6 +118,7 @@ def scorer(engine, spec, batch_size=64):
     value = runtime.GraphPRMV2RewardScorer.__new__(runtime.GraphPRMV2RewardScorer)
     value.engine, value.device, value.lock = engine, torch.device('cpu'), RLock()
     value.model, value.bad_class_penalty = network(spec), 1.
+    value.verified_failure_positive_scale = .25
     value.rollout_batch_size = batch_size
     return value
 

@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 import pytest
 
 try:
@@ -67,11 +68,12 @@ def rollout(tmp_path, failures=()):
     return result, trainer, scorer
 
 
-def test_verified_outcome_only_changes_planner_feedback():
+def test_verified_outcome_changes_planner_feedback_and_positive_final_credit():
     pred = predictions()
-    bad = compile_rewards(pred, {}, verified_final_correctness=0)
-    good = compile_rewards(pred, {}, verified_final_correctness=1)
-    assert bad['node_rewards']['final'] == good['node_rewards']['final']
+    record = {'trajectory': {'final_answer': '4'}}
+    bad = compile_rewards(pred, record, verified_final_correctness=0)
+    good = compile_rewards(pred, record, verified_final_correctness=1)
+    assert bad['node_rewards']['final']['reward'] == pytest.approx(.25 * good['node_rewards']['final']['reward'])
     assert good['node_rewards']['decomposer']['execution_bonus'] == pytest.approx(.15*.9*.8)
     assert bad['node_rewards']['decomposer']['execution_bonus'] == 0
     assert good['graph_summary']['predicted_success'] == .01
@@ -81,6 +83,110 @@ def test_verified_outcome_only_changes_planner_feedback():
         assert compile_rewards(pred, {}, verified_final_correctness=1)['node_rewards']['decomposer']['execution_bonus'] == 0
     with pytest.raises(ValueError, match='binary'):
         compile_rewards(predictions(), {}, verified_final_correctness=float('nan'))
+
+
+@pytest.mark.parametrize('scale', [0., .1, .25, 1.])
+@pytest.mark.parametrize('probability', [.1, .5, .8, 1.])
+def test_execution_gate_preserves_negative_credit_and_predictions(scale, probability):
+    pred = predictions()
+    pred['final'] = {name: {'probabilities': {'0': 1-probability, '1': probability}}
+                     for name in ('task_fulfillment', 'execution_discipline', 'causal_utility')}
+    pred['workers'] = {node: copy.deepcopy(pred['final']) for node in ('A', 'B')}
+    before = copy.deepcopy(pred)
+    record = {'trajectory': {'final_answer': '4', 'final_node_id': 'B'},
+              'workers': [{'node_id': node, 'output_text': '4'} for node in ('A', 'B')]}
+    results = [compile_rewards(pred, record, verified_final_correctness=outcome,
+                               verified_failure_positive_scale=scale) for outcome in (0, 1, None)]
+    for result, outcome in zip(results, (0, 1, None)):
+        factor = scale if outcome == 0 else 1.
+        assert result['graph_summary']['execution_positive_credit_scale'] == factor
+        local = result['node_rewards']
+        for payload in [local['final'], *local['workers'].values()]:
+            baseline = .9 * (2*probability-1) if probability > .5 else 2*probability-1
+            assert payload['reward_before_outcome_gate'] == pytest.approx(baseline)
+            assert payload['reward'] == pytest.approx(min(baseline, 0) + factor*max(baseline, 0))
+            assert payload['verified_failure_gate_applied'] == (outcome == 0)
+    assert pred == before
+    assert compile_rewards(pred, record, verified_final_correctness=0,
+                           verified_failure_positive_scale=scale) == results[0]
+
+
+@pytest.mark.parametrize('probability', [.1, .8])
+def test_protocol_penalties_are_applied_after_the_gate_without_discount(probability):
+    pred = predictions()
+    pred['final'] = {name: {'probabilities': {'0': 1-probability, '1': probability}}
+                     for name in ('task_fulfillment', 'execution_discipline', 'causal_utility')}
+    pred['workers'] = {'B': copy.deepcopy(pred['final'])}
+    record = {'trajectory': {'final_answer': '', 'final_node_id': 'B'},
+              'workers': [{'node_id': 'B', 'output_text': '', 'raw_output_text': '4'}]}
+    for outcome in (0, 1):
+        result = compile_rewards(pred, record, verified_final_correctness=outcome)['node_rewards']
+        expected = min(2*probability-1, 0) - .10
+        assert result['final']['reward'] == pytest.approx(expected)
+        assert result['workers']['B']['reward'] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize('scale', [-.1, 1.1, float('nan'), float('inf')])
+def test_gate_configuration_fails_before_loading_models(monkeypatch, scale):
+    with pytest.raises(ValueError, match='verified_failure_positive_scale'):
+        compile_rewards(predictions(), {}, verified_failure_positive_scale=scale)
+    monkeypatch.setenv('GFAM_VERIFIED_FAILURE_POSITIVE_SCALE', str(scale))
+    with pytest.raises(ValueError, match='verified_failure_positive_scale'):
+        runtime.GraphPRMV2RewardScorer('never-load.pkl')
+
+
+@pytest.mark.parametrize('env,override,expected', [('0.1', None, .1), ('0.1', .5, .5), (None, None, .25)])
+def test_runtime_reads_gate_setting_once_at_startup(monkeypatch, env, override, expected):
+    if env is None:
+        monkeypatch.delenv('GFAM_VERIFIED_FAILURE_POSITIVE_SCALE', raising=False)
+    else:
+        monkeypatch.setenv('GFAM_VERIFIED_FAILURE_POSITIVE_SCALE', env)
+    monkeypatch.setattr(runtime.torch, 'load', lambda *a, **kw: {'feature_spec': runtime.DEFAULT_SPEC})
+    monkeypatch.setattr(runtime, 'validate_checkpoint', lambda cp: None)
+    monkeypatch.setattr(runtime, 'instantiate_model_from_checkpoint', lambda *a: SimpleNamespace(requires_grad_=lambda x: None))
+    monkeypatch.setattr(runtime, 'LiveFeatureEngine', lambda *a, **kw: None)
+    scorer = runtime.GraphPRMV2RewardScorer('mock.pkl', verified_failure_positive_scale=override)
+    assert scorer.verified_failure_positive_scale == expected
+    monkeypatch.setenv('GFAM_VERIFIED_FAILURE_POSITIVE_SCALE', '0.99')
+    assert scorer.verified_failure_positive_scale == expected
+
+
+def test_gate_reaches_worker_training_samples_including_final_worker(tmp_path, monkeypatch):
+    backend = importlib.import_module(api.__name__ + '.backends').MockHierarchicalBackend
+    original = backend.execute_worker
+    final_calls = []
+    def mixed_final_answers(self, task, decomposition, node, *args, **kwargs):
+        execution = original(self, task, decomposition, node, *args, **kwargs)
+        if node.node_id == decomposition.final_node_id:
+            final_calls.append(node.node_id)
+            execution.output_text = execution.raw_output_text = '4' if len(final_calls) % 2 else '5'
+        return execution
+    monkeypatch.setattr(backend, 'execute_worker', mixed_final_answers)
+    result, trainer, scorer = rollout(tmp_path)
+    expected_rewards = {}
+    outcomes = set()
+    final_workers_checked = 0
+    for dec in result.decompositions:
+        for sel in dec.selections:
+            outcome = sel.reward.final_answer_correctness
+            outcomes.add(outcome)
+            scale = .25 if outcome == 0 else 1.
+            compiled = sel.reward_model_outputs['compiled_rewards']
+            assert sel.reward.total_reward == compiled['final']['reward']
+            assert sel.reward.total_reward == pytest.approx(.54 * scale)
+            for ex in sel.executions:
+                payload = compiled['workers'][ex.node_id]
+                assert ex.reward_model_reward == pytest.approx(.54 * scale)
+                assert trainer.orchestrator._worker_training_reward(sel, ex) == payload['reward']
+                key = (dec.decomposition.decomposition_id, sel.selection.selection_id, ex.node_id)
+                expected_rewards[key] = payload['reward']
+                final_workers_checked += ex.node_id == dec.decomposition.final_node_id
+    assert outcomes == {0., 1.}
+    assert final_workers_checked == 8
+    assert result.training_batch.worker_samples
+    for sample in result.training_batch.worker_samples:
+        key = tuple(sample.metadata[name] for name in ('decomposition_id', 'selection_id', 'node_id'))
+        assert sample.reward == expected_rewards[key]
 
 
 def test_four_repeats_are_averaged(tmp_path):
