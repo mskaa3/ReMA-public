@@ -489,8 +489,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(vllm_enable_sleep_mode=False)
     parser.add_argument("--disable-rollout-logging", action="store_true")
-    parser.add_argument("--rollout-log-mode", choices=["best", "all"], default="best")
-    parser.add_argument("--rollout-log-detail", choices=["compact", "full"], default="compact")
+    parser.add_argument("--rollout-log-mode", choices=["best", "all"], default="all")
+    parser.add_argument("--rollout-log-detail", choices=["compact", "full"], default="full")
     parser.add_argument("--best-k", type=int, default=10)
     parser.add_argument(
         "--rollout-task-batch-size",
@@ -1526,6 +1526,9 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         "best_decomposition_reward": best_decomposition.decomposition_reward if best_decomposition else float('nan'),
         "unscored_rollouts": sum(sel.reward.total_reward is None for dec in rollout.decompositions for sel in dec.selections),
         "unscored_plans": sum(dec.decomposition_reward is None for dec in rollout.decompositions),
+        "safety_excluded_rollouts": sum(sel.training_excluded for dec in rollout.decompositions for sel in dec.selections),
+        "safety_excluded_plans": sum(any(sel.training_excluded for sel in dec.selections) for dec in rollout.decompositions),
+        "safety_excluded_worker_executions": sum(len(sel.executions) for dec in rollout.decompositions for sel in dec.selections if sel.training_excluded),
         "verified_rollouts": len(verified_correctness),
         "unverified_rollouts": len(selection_correctness) - len(verified_correctness),
         "best_executor_rollout_reward": (
@@ -1583,6 +1586,8 @@ def _merge_reward_metric_coverage(target, summaries):
     target['reward_metric_task_counts'] = counts
     target['unscored_rollouts'] = sum(item.get('unscored_rollouts', 0) for item in summaries)
     target['unscored_plans'] = sum(item.get('unscored_plans', 0) for item in summaries)
+    for key in ('safety_excluded_rollouts', 'safety_excluded_plans', 'safety_excluded_worker_executions'):
+        target[key] = sum(item.get(key, 0) for item in summaries)
     verified_tasks = 0
     correct_sum = 0.0
     for item in summaries:
@@ -1611,6 +1616,8 @@ def _verification_coverage(metrics):
         'num_correct': sum(values), 'mean_best_final_correctness': _available_mean(values),
         'verified_rollouts': sum(item['verified_rollouts'] for item in metrics),
         'unverified_rollouts': sum(item['unverified_rollouts'] for item in metrics),
+        **{key: sum(item.get(key, 0) for item in metrics)
+           for key in ('safety_excluded_rollouts', 'safety_excluded_plans', 'safety_excluded_worker_executions')},
     }
 
 

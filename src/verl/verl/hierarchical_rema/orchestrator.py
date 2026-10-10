@@ -50,6 +50,7 @@ from .schema import (
     WorkerPoolConfig,
 )
 from .structured import format_decomposition_plan, format_selection_plan
+from .training_safety import SaturatedFailureFilter
 
 if TYPE_CHECKING:
     from .gfam_reward import GFAMRewardScorer
@@ -113,6 +114,7 @@ class HierarchicalReMAOrchestrator:
         self.train_worker_model = bool(train_worker_model)
         self.min_worker_grpo_group_size = max(int(min_worker_grpo_group_size), 1)
         self.gfam_reward_scorer = gfam_reward_scorer
+        self.saturated_failure_filter = SaturatedFailureFilter.from_environment()
         self._reported_verification_failures = set()
 
     @staticmethod
@@ -198,6 +200,8 @@ class HierarchicalReMAOrchestrator:
     def _worker_training_reward(selection: SelectionRollout, execution: WorkerExecution) -> float:
         if selection.reward.total_reward is None:
             raise ValueError("Unscored rollout cannot produce a training reward")
+        if selection.training_excluded:
+            raise ValueError("Excluded rollout cannot produce a training reward")
         if execution.reward_model_reward is not None:
             return float(execution.reward_model_reward)
         reward = float(selection.reward.total_reward)
@@ -469,9 +473,17 @@ class HierarchicalReMAOrchestrator:
             worker_payload = worker_payloads.get(execution.node_id)
             if worker_payload is not None and "reward" in worker_payload:
                 execution.reward_model_reward = float(worker_payload["reward"])
+        training_safety = self.saturated_failure_filter.evaluate(
+            task=task, decomposition=decomposition, executions=executions,
+            reward=reward, compiled_rewards=compiled_rewards)
+        if training_safety["excluded"]:
+            print(f"[training-safety] excluded task={task.task_id} plan={decomposition.decomposition_id} "
+                  f"executor_rollout={selection.selection_id} reason={training_safety['reason']} "
+                  f"threshold={training_safety['threshold']}; scores retained for audit", flush=True)
         return reward, {
             "source": "gfam_v1",
             "status": "scored",
+            "training_safety": training_safety,
             "backend": scored.get("backend", "gfam_v1"),
             "model_predictions": scored.get("model_predictions", {}),
             "prm_step_scores": scored.get("prm_step_scores", []),
@@ -642,8 +654,12 @@ class HierarchicalReMAOrchestrator:
                     )
                 )
 
-            scored_decompositions = [item for item in decomposition_rollouts
-                                     if item.decomposition_reward is not None]
+            # Keep complete means for analysis, but never learn from a mean made by
+            # dropping suspicious repeats (that would select the surviving outcomes).
+            for item in decomposition_rollouts:
+                if not item.training_eligible:
+                    item.decomposer_advantage = None
+            scored_decompositions = [item for item in decomposition_rollouts if item.training_eligible]
             decomposition_training_rewards = [
                 self._format_adjusted_reward(
                     decomposition_rollout.decomposition_reward,
@@ -909,7 +925,7 @@ class HierarchicalReMAOrchestrator:
     ) -> None:
         for decomposition_rollout in decompositions:
             for selection_rollout in decomposition_rollout.selections:
-                if selection_rollout.reward.total_reward is None:
+                if not selection_rollout.training_eligible:
                     continue
                 for execution in selection_rollout.executions:
                     self.worker_memory.record_execution(
@@ -943,6 +959,8 @@ class HierarchicalReMAOrchestrator:
             "num_worker_samples_skipped_final_answer_leak": 0,
             "num_worker_samples_skipped_unscored": 0,
             "num_decomposer_samples_skipped_unscored": 0,
+            "num_worker_samples_skipped_safety": 0,
+            "num_decomposer_samples_skipped_safety": 0,
             "mean_group_size_used": 0.0,
         }
 
@@ -962,6 +980,9 @@ class HierarchicalReMAOrchestrator:
             for decomposition_rollout in decompositions:
                 if decomposition_rollout.decomposition_reward is None:
                     worker_grpo_stats["num_decomposer_samples_skipped_unscored"] += 1
+                    continue
+                if not decomposition_rollout.training_eligible:
+                    worker_grpo_stats["num_decomposer_samples_skipped_safety"] += 1
                     continue
                 adjusted_reward, reward_after_fallback_mask, format_penalty = (
                     self._controller_training_reward_components(
@@ -1141,6 +1162,9 @@ class HierarchicalReMAOrchestrator:
                 for selection_rollout in decomposition_rollout.selections:
                     if selection_rollout.reward.total_reward is None:
                         worker_grpo_stats["num_worker_samples_skipped_unscored"] += len(selection_rollout.executions)
+                        continue
+                    if selection_rollout.training_excluded:
+                        worker_grpo_stats["num_worker_samples_skipped_safety"] += len(selection_rollout.executions)
                         continue
                     for execution in selection_rollout.executions:
                         if (

@@ -451,6 +451,14 @@ class SelectionRollout:
     reward_model_outputs: Dict[str, Any] = field(default_factory=dict)
     selector_advantage: float = 0.0
 
+    @property
+    def training_excluded(self) -> bool:
+        return bool(self.reward_model_outputs.get("training_safety", {}).get("excluded", False))
+
+    @property
+    def training_eligible(self) -> bool:
+        return self.reward.total_reward is not None and not self.training_excluded
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "selection": self.selection.to_dict(),
@@ -459,6 +467,7 @@ class SelectionRollout:
             "reward": self.reward.to_dict(),
             "reward_model_outputs": self.reward_model_outputs,
             "selector_advantage": self.selector_advantage,
+            "training_eligible": self.training_eligible,
         }
 
 
@@ -470,6 +479,10 @@ class DecompositionRollout:
     decomposition_reward: Optional[float]
     decomposer_advantage: Optional[float] = 0.0
 
+    @property
+    def training_eligible(self) -> bool:
+        return self.decomposition_reward is not None and all(sel.training_eligible for sel in self.selections)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "decomposition": self.decomposition.to_dict(),
@@ -477,6 +490,10 @@ class DecompositionRollout:
             "base_decomposition_reward": self.base_decomposition_reward,
             "decomposition_reward": self.decomposition_reward,
             "decomposer_advantage": self.decomposer_advantage,
+            "training_eligible": self.training_eligible,
+            "training_excluded_executor_rollout_ids": [
+                sel.selection.selection_id for sel in self.selections if sel.training_excluded
+            ],
         }
 
 

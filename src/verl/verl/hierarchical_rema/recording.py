@@ -35,6 +35,13 @@ class RolloutRecorder:
                         "decomposition": decomposition.decomposition.to_dict(),
                         "executor_rollout": self._strip_worker_prompts(selection.to_dict()),
                     })
+                if selection.training_excluded:
+                    self._append_jsonl(self.output_dir / "training_exclusions.jsonl", {
+                        "timestamp": timestamp, "task_id": rollout.task.task_id,
+                        "task_prompt": rollout.task.prompt, "ground_truth": rollout.task.ground_truth,
+                        "decomposition": decomposition.decomposition.to_dict(),
+                        "executor_rollout": self._strip_worker_prompts(selection.to_dict()),
+                    })
         task_payload = self._task_payload(rollout=rollout, timestamp=timestamp)
         if self.config.save_all_rollouts:
             self._append_jsonl(self.output_dir / "all_rollouts.jsonl", task_payload)
@@ -182,12 +189,15 @@ class RolloutRecorder:
         }
 
     def _task_payload(self, rollout: TaskRollout, timestamp: str) -> Dict:
-        if not self.config.compact_mode:
+        # "All" must preserve the entire plan/repeat tree, even if best-only views
+        # are compact. Otherwise all_rollouts.jsonl silently contains just a winner.
+        if self.config.save_all_rollouts or not self.config.compact_mode:
             rollout_payload = self._strip_worker_prompts(rollout.to_dict())
             if self._uses_gfam_rewards(rollout):
                 rollout_payload = self._strip_gfam_handcrafted_reward_fields(rollout_payload)
             return {
                 "timestamp": timestamp,
+                "log_schema": "all_plan_executor_rollouts_v2",
                 "task_id": rollout.task.task_id,
                 "rollout": rollout_payload,
             }
@@ -311,6 +321,8 @@ class RolloutRecorder:
                 },
                 "decomposition_id": decomposition_rollout.decomposition.decomposition_id,
                 "selection_id": selection_rollout.selection.selection_id,
+                "decomposition": decomposition_rollout.decomposition.to_dict(),
+                "training_eligible": selection_rollout.training_eligible,
                 "score": selection_rollout.reward.total_reward,
                 "reward_model_outputs": self._strip_worker_prompts(selection_rollout.reward_model_outputs),
                 "rollout": selection_payload,
@@ -328,6 +340,8 @@ class RolloutRecorder:
             "final_node_id": decomposition_rollout.decomposition.final_node_id,
             "decomposition_summary": decomposition_rollout.decomposition.summary,
             "decomposition_raw_text": decomposition_rollout.decomposition.raw_text,
+            "decomposition": decomposition_rollout.decomposition.to_dict(),
+            "training_eligible": selection_rollout.training_eligible,
             "selection_id": selection_rollout.selection.selection_id,
             "score": selection_rollout.reward.total_reward,
             "selection_raw_text": selection_rollout.selection.raw_text,
