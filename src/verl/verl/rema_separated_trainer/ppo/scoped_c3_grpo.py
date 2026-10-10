@@ -44,7 +44,9 @@ def aggregate_scoped_c3_actions(
 
     All suffix outcomes enter the mean, even when a leakage gate rejects one.
     A rejected or unknown gate vetoes the shared action's update, not its
-    baseline contribution. Never choose only successful/eligible suffixes.
+    baseline contribution at this stage. The caller may then restrict the
+    baseline to eligible complete plans for decomposer training. Never choose
+    only successful/eligible suffixes.
     """
     size = outcome_scores.numel()
     if continuations_per_action < 1 or outcome_scores.ndim != 1:

@@ -101,7 +101,7 @@ its generated record to the disposition, and compute the fraction of audited
 Logging supplies the participation label, not a mathematical correctness judge.
 Correct final answers and passed gates are not intermediate-correctness labels.
 
-Action presence and exact-prefix agreement determine baseline validity.
+For worker training, action presence and exact-prefix agreement determine baseline validity.
 Leakage measurements determine actor-update eligibility separately. Even an
 unparseable or equivalent worker result can remain a baseline donor if its
 focal action and raw trajectory outcome are available.
@@ -111,7 +111,7 @@ and a consistent terminal/non-terminal status. Incomplete records cannot be
 averaged over a convenient surviving subset. The actor gate conservatively
 requires every continuation's existing gate to pass; one rejection or unknown
 vetoes the shared action's update. Its complete raw outcome mean still remains
-a baseline donor. This all-suffix rule can reduce update coverage; it is a
+a baseline donor for worker training. This all-suffix rule can reduce update coverage; it is a
 deliberate conservative gate, not a consequence of Monte Carlo estimation.
 
 ## Configuration and cost
@@ -168,8 +168,15 @@ success is gated out. With positive_only_nonterminal_workers, negative
 non-terminal actions are masked after normalization, while terminal actions
 retain signed advantages. The actual terminal role is read per trajectory,
 not inferred from a fixed final slot. Decomposer/selector actions remain signed.
-All factual alternatives remain baseline donors; advantages are not re-centered
-after masking. Disabling both flags restores the previous signed C3 policy.
+For worker training, all factual alternatives remain baseline donors; advantages
+are not re-centered after masking. Disabling both flags restores signed worker C3.
+
+With prefix probing enabled, decomposer training instead compares only plans
+passing the whole-chain collaboration gate. Eligibility is applied to complete
+action means after suffix aggregation, before mixed-group filtering and advantage
+normalization. Rejected plans retain their raw outcomes in diagnostics but do not
+enter the decomposer baseline. At least two eligible plans with different means
+are needed. See [Decomposer training](c3_prefix_probe.md#decomposer-training).
 
 The gates require one round, branch_turn=0; initialization rejects multi-round
 configurations with these gates enabled. Generic C3 without the gates still

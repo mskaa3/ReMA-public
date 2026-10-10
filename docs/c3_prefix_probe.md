@@ -22,7 +22,7 @@ retains the previous estimator. See [Scoped C3-GRPO](scoped_c3_grpo.md) for
 sampling, costs, and limitations. Raw accuracy still uses individual Y_jm.
 
 Only groups with differing action means, at least two factual alternatives, and at least one
-eligible successful focal action are used for optimization. Masked actions remain
+eligible successful focal action are used for optimization. For worker training, masked actions remain
 baseline donors. Their outcomes are not replaced by zero before computing
 C3, normalizing advantages, or checking outcome contrast.
 
@@ -96,7 +96,33 @@ With repeated suffixes, all continuation-level gates must pass for the shared
 focal action to be update-eligible. Never select a favorable suffix or omit a
 rejected suffix's raw outcome from the action mean. This is conservative and can
 reduce coverage. Gate rejection does not remove a complete action mean from the
-baseline. Continuation rows other than the first are masked actor copies.
+baseline for worker training. Continuation rows other than the first are masked actor copies.
+
+## Decomposer training
+
+Decomposer training applies the same whole-chain comparisons as validation:
+every executed non-terminal worker must have a valid result different from the
+terminal answer. A match or unknown comparison rejects the plan. The existing
+multi-subtask and terminal-instruction gates still apply; whole-plan L_D remains
+diagnostic. This closes the "solve everything, then repeat" plan loophole.
+
+For a sampled plan j with M continuations, retain the complete factual mean q_j
+but require every continuation's gate to pass. Let E be the set of these eligible
+plans. Decomposer advantages use only eligible alternatives:
+
+    C_j = q_j - mean_{l in E, l != j}(q_l), j in E
+
+Rejected plans are excluded from both updates and the baseline, not assigned
+zero reward. Eligibility is applied after continuation aggregation and before
+group filtering and normalization. Fewer than two eligible plans, or equal
+eligible action means, produces no update. Decomposer advantages remain signed.
+Worker and terminal-worker training retain their previous baseline policy.
+
+This is eligibility-conditioned optimization, not an unbiased estimate against
+all sampled plans or proof of causal collaboration. Raw accuracy and complete
+action means remain unchanged. The metric
+`reward/c3/roles/decomposer/gate_excluded_baseline_action_count` counts complete
+causally valid plans removed from the baseline before mixed-group filtering.
 
 For decomposer/selector updates, the same plan gate applies. The decomposer
 is frozen during Agent-2-only training.

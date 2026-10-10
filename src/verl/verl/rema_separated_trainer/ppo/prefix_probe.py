@@ -158,7 +158,8 @@ def apply_prefix_probe_gate(
     """Apply G(plan) and M(action), leaving raw C3 rewards to the caller.
 
     Validation supplies max(E_k) across all non-terminal workers, with NaN
-    if any required comparison failed. Training supplies the focal E_k only.
+    if any required comparison failed. Decomposer training uses the same
+    whole-chain comparisons; worker training supplies the focal E_k only.
     Terminal actions need no comparison but still require a valid negative
     terminal-instruction probe. Whole-plan L_D never enters this gate.
     """

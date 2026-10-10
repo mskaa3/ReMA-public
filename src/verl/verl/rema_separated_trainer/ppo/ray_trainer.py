@@ -1378,7 +1378,7 @@ class RayReMASeparatedTrainer(object):
                 if record.get('executed', True) is not False
             }
             terminal_output = executed.get(str(terminal_role), {}).get('content', '')
-            if validation:
+            if validation or focal_role == decomposer_role:
                 roles = [
                     role for role in stage_roles
                     if role != str(terminal_role) and role in executed
@@ -1640,8 +1640,8 @@ class RayReMASeparatedTrainer(object):
             action_present,
             metrics,
         )
-        # A failed gate removes gradients, never factual outcomes from the
-        # leave-one-out baseline (including failed mathematical comparisons).
+        # Preserve all factual outcomes through continuation aggregation.
+        # Decomposer baseline eligibility is applied to complete action means below.
         baseline_valid = action_present & exact_prefix
         update_valid = baseline_valid & prefix_gate_valid & collaboration_eligible
         positive_only = self._c3_positive_only_mask(data_batch, role, action_present)
@@ -1692,6 +1692,16 @@ class RayReMASeparatedTrainer(object):
                 f"unique_action_rate={metrics[f'{prefix}/unique_action_rate']:.3f} "
                 f"gate_eligible_actions={int(update_valid.sum().item())}"
             )
+        if self.prefix_probe_enabled and role == self._get_hierarchy_config().get(
+            'decomposer_role', 'decomposer'
+        ):
+            # Compare plans only against other eligible plans. Do this after
+            # aggregation: one rejected suffix vetoes the whole plan, without
+            # dropping that suffix's outcome from the factual action mean.
+            metrics[f'reward/c3/roles/{role}/gate_excluded_baseline_action_count'] = float(
+                (baseline_valid & ~update_valid).sum().item()
+            )
+            baseline_valid &= update_valid
         pre_mixed_valid = baseline_valid.clone()
         mixed_mask = torch.ones_like(baseline_valid)
         if bool(

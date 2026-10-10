@@ -269,6 +269,84 @@ def test_validation_checks_all_nonterminal_results_and_logs_example(capsys):
     assert "worker_before" not in output
 
 
+@pytest.mark.parametrize("local,reason", [
+    (r"LOCAL_RESULT: \boxed{26}", "equivalent_answer"),
+    ("missing result", "comparison_invalid"),
+    (r"LOCAL_RESULT: \boxed{8}", "eligible"),
+])
+def test_decomposer_checks_all_downstream_workers_like_validation(local, reason):
+    history = _history()
+    history.insert(2, _record("worker_stage_3", local, "S3"))
+    history.pop()  # Remove the unused record for that stage.
+    train_batch, val_batch = _batch([history]), _batch([history])
+    trainer = _trainer("decomposer", plan_response=r"\boxed{26}")
+    trainer._attach_prefix_probe_signals(train_batch, torch.ones(1), {})
+    trainer._attach_prefix_probe_signals(val_batch, torch.ones(1), {}, validation=True)
+    assert train_batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == [reason]
+    assert train_batch.non_tensor_batch["prefix_probe_worker_comparisons"].tolist() == (
+        val_batch.non_tensor_batch["prefix_probe_worker_comparisons"].tolist()
+    )
+    assert len(train_batch.non_tensor_batch["prefix_probe_worker_comparisons"][0]) == 2
+    torch.testing.assert_close(train_batch.batch["prefix_probe_collaboration_eligible"],
+                               val_batch.batch["prefix_probe_collaboration_eligible"])
+    # Worker updates still check only their own result, not another worker's.
+    trainer._current_train_agent = "worker_stage_1"
+    trainer._attach_prefix_probe_signals(train_batch, torch.ones(1), {})
+    assert train_batch.batch["prefix_probe_collaboration_eligible"].tolist() == [True]
+
+
+@pytest.mark.parametrize("role", ["decomposer", "worker_stage_1"])
+@pytest.mark.parametrize("case", ["contrast", "equal", "only_one", "all_rejected"])
+def test_decomposer_baseline_conditions_on_complete_eligible_plans(role, case):
+    trainer = _trainer(role)
+    trainer.scoped_c3_grpo_config.update(
+        continuations_per_action=4, require_eligible_success=True,
+    )
+    counts = [4, 3, 3 if case == "equal" else 2]
+    raw = torch.tensor([float(m < count) for count in counts for m in range(4)])
+    histories = [_history() for _ in range(12)]
+    # A single rejected suffix must exclude the whole first plan, not just
+    # that suffix, while preserving its perfect factual success rate.
+    histories[1][1]["content"] = r"LOCAL_RESULT: \boxed{26}"
+    if case in ("only_one", "all_rejected"):
+        histories[9][1]["content"] = "missing result"
+    if case == "all_rejected":
+        histories[5][0]["planned_subtask_count"] = 1
+    batch = _batch(histories)
+    batch.non_tensor_batch.update({
+        "c3_action_turn": _object_array([0] * 12),
+        "c3_action_index": _object_array([i // 4 for i in range(12)]),
+        "c3_suffix_index": _object_array(list(range(4)) * 3),
+        f"{role}_action_token_ids": _object_array([[100 + i // 4] for i in range(12)]),
+        f"{role}_conversation_history": _object_array([
+            [{"role": "user", "content": "shared"},
+             {"role": "assistant", "content": str(i // 4)}] for i in range(12)
+        ]),
+    })
+    metrics = {}
+    trainer._attach_prefix_probe_signals(batch, raw, metrics)
+    trainer._attach_scoped_c3_grpo_signals(batch, {"acc": raw}, metrics)
+    torch.testing.assert_close(batch.batch["scoped_c3_raw_outcome_score"], raw)
+    torch.testing.assert_close(batch.batch["scoped_c3_outcome_score"][::4],
+                               torch.tensor(counts) / 4)
+    estimate = trainer._estimate_scoped_c3_advantages(batch)
+    if role == "decomposer" and case == "contrast":
+        torch.testing.assert_close(estimate.advantage[::4], torch.tensor([0., .25, -.25]))
+        assert estimate.effective_mask[::4].tolist() == [False, True, True]
+    else:
+        assert not estimate.effective_mask.any()
+    assert not estimate.effective_mask[torch.arange(12) % 4 != 0].any()
+    if role == "decomposer":
+        excluded = {"contrast": 1, "equal": 1, "only_one": 2, "all_rejected": 3}[case]
+        assert metrics[f"reward/c3/roles/{role}/gate_excluded_baseline_action_count"] == excluded
+    # The actor pass recomputes advantages from the stored conditioned mask.
+    batch.batch["labels"] = torch.ones(12, 2, dtype=torch.long)
+    batch.batch["step_ids"] = torch.zeros(12, 2, dtype=torch.long)
+    batch.batch["token_level_rewards"] = torch.zeros(12, 2)
+    trainer._compute_scoped_c3_grpo_advantage(batch, metrics)
+    assert torch.equal(batch.batch["labels"].ne(-100).any(-1), estimate.effective_mask)
+
+
 @pytest.mark.parametrize("sources,num_examine,expected_indices", [
     (["math"], 1, [0]),
     (["math", "math", "gsm8k", "gsm8k"], 1, [0, 2]),
@@ -307,6 +385,35 @@ def test_training_logs_selected_examples_without_changing_batch(
     assert batch.batch["prefix_probe_gated_outcome_score"].tolist() == raw.tolist()
     assert metrics["reward/leakage/all/raw_accuracy"] == pytest.approx(raw.mean().item())
     assert all(column.dtype == object for column in batch.non_tensor_batch.values())
+
+
+@pytest.mark.parametrize("probes_enabled", [True, False])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_decomposer_single_continuation_baseline_and_probe_opt_out(probes_enabled, normalize):
+    trainer = _trainer("decomposer")
+    trainer.prefix_probe_enabled = probes_enabled
+    trainer.scoped_c3_grpo_config.update(normalize_advantages=normalize,
+                                       require_eligible_success=True)
+    batch = _batch([_history("26"), _history(), _history()])
+    raw = torch.tensor([1., 1., 0.])
+    batch.non_tensor_batch.update({
+        "c3_action_turn": _object_array([0] * 3),
+        "decomposer_action_token_ids": _object_array([[100 + i] for i in range(3)]),
+        "decomposer_conversation_history": _object_array([
+            [{"role": "user", "content": "shared"},
+             {"role": "assistant", "content": str(i)}] for i in range(3)
+        ]),
+    })
+    trainer._attach_prefix_probe_signals(batch, raw, {})
+    trainer._attach_scoped_c3_grpo_signals(batch, {"acc": raw}, {})
+    estimate = trainer._estimate_scoped_c3_advantages(batch)
+    expected = estimate_scoped_c3_grpo(
+        raw, ["q"] * 3, torch.tensor([not probes_enabled, True, True]),
+        normalize=normalize, require_eligible_success=True,
+    )
+    torch.testing.assert_close(estimate.advantage, expected.advantage)
+    assert torch.equal(estimate.effective_mask, expected.effective_mask)
+    torch.testing.assert_close(batch.batch["scoped_c3_raw_outcome_score"], raw)
 
 
 def test_c3_trainer_keeps_rejected_and_unparseable_actions_as_baseline():
