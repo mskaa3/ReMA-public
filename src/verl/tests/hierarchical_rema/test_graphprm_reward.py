@@ -383,7 +383,8 @@ def test_live_execution_and_learned_rewards_are_reference_invariant(checkpoint, 
         assert rollout.final_answer == '42'
         assert rollout.executions[1].dependency_outputs == {'A': '42'}
         assert all(e.success and not e.invalid_reason and not e.final_answer_leak for e in rollout.executions)
-    assert [r.executions[0].reference_answer_match for r in rollouts] == [True, False, False]
+    # A missing reference was not checked, rather than verified as a non-match.
+    assert [r.executions[0].reference_answer_match for r in rollouts] == [True, False, None]
     assert [r.reward.final_answer_correctness for r in rollouts] == [1., 0., None]
     assert FakeExtractor.calls == 1
     assert len(blueprints) == 2

@@ -251,11 +251,8 @@ def reference_verification_status(reference, task_metadata=None):
 
 
 def _verified_match(prediction, reference, task_metadata=None):
-    try:
-        return compute_final_answer_correctness(prediction, reference, task_metadata) > 0.0
-    except _math_verifier_module().AnswerVerificationError:
-        # An unsupported comparison is not evidence of answer containment.
-        return False
+    # Unknown is not a definite non-match. The rollout boundary records failures.
+    return compute_final_answer_correctness(prediction, reference, task_metadata) > 0.0
 
 
 def _load_default_compute_score():
@@ -622,6 +619,22 @@ def compatibility_score(
     return skill_match_score(required_skills, worker)
 
 
+def _unverified_selection_reward(error, final_correctness=None):
+    return SelectionRewardBreakdown(
+        final_answer_correctness=final_correctness, confidence_reward=0.0,
+        compatibility_reward=0.0, total_reward=None,
+        verification_status="unverified", verification_error=error,
+    )
+
+
+def _record_failed_execution_check(execution, check, exc, final_correctness):
+    setattr(execution, check, None)
+    error = {"status": "unverified", "code": exc.code, "message": str(exc),
+             "stage": check, "node_id": execution.node_id}
+    execution.verification_checks[check] = error
+    return _unverified_selection_reward(error, final_correctness)
+
+
 def build_selection_reward(
     final_answer: str,
     ground_truth: str,
@@ -640,23 +653,21 @@ def build_selection_reward(
         except _math_verifier_module().AnswerVerificationError as exc:
             verification = {"status": "unverified", "code": exc.code, "message": str(exc)}
     if final_correct is None:
-        return SelectionRewardBreakdown(
-            final_answer_correctness=None, confidence_reward=0.0,
-            compatibility_reward=0.0, total_reward=None,
-            verification_status="unverified", verification_error=verification,
-        )
+        return _unverified_selection_reward(verification)
     # A matching intermediate value is not proof of a role violation. Keep the
     # reference-based observation separate from delivered text and validity.
     for execution in executions:
-        execution.reference_answer_match = bool(
-            final_node_id is not None
-            and execution.node_id != final_node_id
-            and str(ground_truth or "").strip()
-            and execution.output_text.strip()
-            and is_non_final_answer_leak(
-                execution.output_text, ground_truth, task_metadata=task_metadata,
-            )
-        )
+        eligible = bool(final_node_id is not None and execution.node_id != final_node_id
+                        and str(ground_truth or "").strip() and execution.output_text.strip())
+        try:
+            execution.reference_answer_match = bool(eligible and is_non_final_answer_leak(
+                execution.output_text, ground_truth, task_metadata=task_metadata))
+        except _math_verifier_module().AnswerVerificationError as exc:
+            return _record_failed_execution_check(execution, "reference_answer_match", exc, final_correct)
+        execution.verification_checks["reference_answer_match"] = {
+            "status": "verified" if eligible else "not_applicable",
+            "match": execution.reference_answer_match,
+        }
     hierarchy_stats = _compute_hierarchy_reward_stats(
         executions=executions,
         final_node_id=final_node_id,
@@ -702,15 +713,22 @@ def build_selection_reward(
         for execution in executions:
             if execution.node_id == final_node_id or execution.final_answer_leak or not execution.output_text.strip():
                 execution.answer_containment = False
+                execution.verification_checks["answer_containment"] = {"status": "not_applicable"}
                 continue
-            matches_generated_final = _verified_match(
-                execution.output_text, final_answer, task_metadata,
-            )
-            execution.answer_containment = (
-                matches_generated_final or _verified_match(
-                    execution.output_text, ground_truth, task_metadata,
+            try:
+                matches_generated_final = _verified_match(
+                    execution.output_text, final_answer, task_metadata,
                 )
-            )
+                execution.answer_containment = (
+                    matches_generated_final or _verified_match(
+                        execution.output_text, ground_truth, task_metadata,
+                    )
+                )
+            except _math_verifier_module().AnswerVerificationError as exc:
+                return _record_failed_execution_check(execution, "answer_containment", exc, final_correct)
+            execution.verification_checks["answer_containment"] = {
+                "status": "verified", "match": execution.answer_containment,
+            }
             if execution.answer_containment:
                 non_final_answer_containment_count += 1
     non_final_answer_containment_penalty = (

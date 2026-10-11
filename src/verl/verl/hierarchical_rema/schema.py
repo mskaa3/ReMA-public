@@ -389,14 +389,15 @@ class WorkerExecution:
     dependency_outputs: Dict[str, str] = field(default_factory=dict)
     success: bool = True
     final_answer_leak: bool = False
-    answer_containment: bool = False
+    answer_containment: Optional[bool] = False
     unique_result: bool = False
     downstream_used: bool = False
     dependency_used: bool = False
     reward_model_reward: Optional[float] = None
     invalid_reason: str = ""
     # Post-rollout oracle diagnostic, not a protocol error or a model feature.
-    reference_answer_match: bool = False
+    reference_answer_match: Optional[bool] = None
+    verification_checks: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)

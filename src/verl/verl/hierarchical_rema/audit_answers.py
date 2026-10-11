@@ -92,6 +92,12 @@ def record_verification_failures(path, rollouts):
                         "plan_id": plan.decomposition.decomposition_id,
                         "rollout_id": selection.selection.selection_id,
                         "final_answer": selection.final_answer,
+                        "final_answer_correctness": selection.reward.final_answer_correctness,
+                        "execution_checks": [
+                            {"node_id": execution.node_id, "output_text": execution.output_text,
+                             "verification_checks": execution.verification_checks}
+                            for execution in selection.executions
+                        ],
                         "error": selection.reward.verification_error,
                     })
     if failures:

@@ -141,7 +141,7 @@ def _normalize_notation(text: str) -> str:
 @lru_cache(maxsize=16384)
 def _parse_expression(text, parse, latex_config):
     kwargs = dict(extraction_config=[latex_config()], fallback_mode="no_fallback",
-                  extraction_mode="first_match")
+                  extraction_mode="first_match", parsing_timeout=0)
     builder = re.fullmatch(r"(?:\\\{|\{)\s*([a-zA-Z])\s*(?:\||\\mid)\s*(.*?)\s*(?:\\\}|\})", text)
     if builder:
         variable, predicate = builder.groups()
@@ -158,7 +158,7 @@ def _parse_expression(text, parse, latex_config):
     return tuple(parse("$" + text + "$", **kwargs))
 
 
-def validate_reference(ground_truth):
+def _validate_reference(ground_truth):
     """Audit the extracted reference, even when a prediction happens to match it."""
     reference = _normalize_notation(ground_truth)
     if not reference or reference.lower() in {"none", "null", "nan"}:
@@ -170,7 +170,7 @@ def validate_reference(ground_truth):
     return reference
 
 
-def compute_answer_score(model_output: str, ground_truth: str) -> float:
+def _compute_answer_score(model_output: str, ground_truth: str) -> float:
     """Compare complete answer expressions, not a matching number within one."""
     prediction = _normalize_notation(model_output)
     reference = _normalize_notation(ground_truth)
@@ -198,12 +198,40 @@ def compute_answer_score(model_output: str, ground_truth: str) -> float:
         if len(getattr(expression, "free_symbols", ())) == 1 and hasattr(expression, "as_set"):
             answer = (_real_solution_set(expression),)
     try:
-        return float(bool(answer) and verify(list(gold), list(answer)))
+        # The parent enforces a hard deadline. Disable math-verify's SIGALRM
+        # timeout, which can be swallowed or converted into a false verdict.
+        return float(bool(answer) and verify(list(gold), list(answer), timeout_seconds=0))
     except _SYMBOLIC_ERRORS as exc:
         raise AnswerVerificationError(
             f"Cannot compare mathematical answers: {type(exc).__name__}: {exc}",
             "comparison_failed",
         ) from exc
+
+
+def _dispatch_verification(operation, arguments):
+    if operation == "validate_reference":
+        return _validate_reference(*arguments)
+    if operation == "compare":
+        return _compute_answer_score(*arguments)
+    raise ValueError(f"Unknown mathematical verification operation: {operation}")
+
+
+def _isolated_call(operation, *arguments):
+    from .isolated_verifier import verify_in_process
+    response = verify_in_process(operation, *arguments)
+    if response["status"] == "unverified":
+        raise AnswerVerificationError(response["message"], response["code"])
+    return response["value"]
+
+
+def validate_reference(ground_truth):
+    """Audit references in a bounded process, including exact-match answers."""
+    return _isolated_call("validate_reference", str(ground_truth or ""))
+
+
+def compute_answer_score(model_output: str, ground_truth: str) -> float:
+    """Retain mathematical equivalence without allowing SymPy to block training."""
+    return _isolated_call("compare", str(model_output or ""), str(ground_truth or ""))
 
 
 def compute_score(model_output: str, ground_truth: str) -> float:

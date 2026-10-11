@@ -1273,6 +1273,7 @@ class HierarchicalReMAOrchestrator:
                                 "final_answer_leak": execution.final_answer_leak,
                                 "answer_containment": execution.answer_containment,
                                 "reference_answer_match": execution.reference_answer_match,
+                                "verification_checks": execution.verification_checks,
                                 "reward_before_local_penalties": selection_rollout.reward.total_reward,
                                 "final_answer_correctness": selection_rollout.reward.final_answer_correctness,
                                 "worker_format_penalty": WORKER_INVALID_RESULT_PENALTY if execution.invalid_reason else 0.0,

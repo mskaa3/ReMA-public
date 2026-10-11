@@ -19,6 +19,13 @@ audit = importlib.import_module(api.__name__ + ".audit_answers")
 progress_module = importlib.import_module(api.__name__ + ".progress")
 
 
+def inline_fault_injection(monkeypatch, backend):
+    # Test third-party exception classification in isolation. Production uses
+    # a subprocess; the separate process tests cover timeout/IPC behavior.
+    monkeypatch.setattr(backend, "_isolated_call",
+                        lambda operation, *args: backend._dispatch_verification(operation, args))
+
+
 @pytest.mark.parametrize("prediction,reference,expected", [
     ("[-2,1)", r"{x|-2\lex<1}", 1.0),
     ("(-2,1)", r"{x|-2\lex<1}", 0.0),
@@ -80,6 +87,7 @@ def test_nested_parser_booleans_are_rebuilt_without_changing_logic():
 @pytest.mark.parametrize('error', [AttributeError, NotImplementedError, RecursionError])
 def test_failed_symbolic_conversion_is_unknown_not_incorrect(monkeypatch, error):
     backend = rewarding._math_verifier_module()
+    inline_fault_injection(monkeypatch, backend)
     def broken(expression):
         raise error('unsupported symbolic expression')
     monkeypatch.setattr(backend, '_native_boolean', broken)
@@ -93,6 +101,7 @@ def test_failed_symbolic_conversion_is_unknown_not_incorrect(monkeypatch, error)
 @pytest.mark.parametrize('role', ['reference', 'prediction', 'comparison'])
 def test_external_symbolic_failures_have_auditable_error_codes(monkeypatch, role):
     backend = rewarding._math_verifier_module()
+    inline_fault_injection(monkeypatch, backend)
     parse, verify, config = backend._verifier()
     def guarded_parse(text, **kwargs):
         target = '$4$' if role == 'reference' else '$2+2$'
@@ -111,6 +120,7 @@ def test_external_symbolic_failures_have_auditable_error_codes(monkeypatch, role
 
 
 def test_missing_dependency_is_not_a_recoverable_data_failure(monkeypatch):
+    inline_fault_injection(monkeypatch, rewarding._math_verifier_module())
     def unavailable():
         raise RuntimeError("install math-verify")
     monkeypatch.setattr(rewarding._math_verifier_module(), "_verifier", unavailable)
