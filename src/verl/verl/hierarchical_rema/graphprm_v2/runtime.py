@@ -10,6 +10,7 @@ from . import FEATURE_SCHEMA
 from . import graphprm_core as core
 from .contract import canonical_record
 from .features import DEFAULT_SPEC
+from .versioned_features import validate_feature_spec
 from .live_features import LiveFeatureEngine
 from .graphprm_model import instantiate_model_from_checkpoint
 from .evaluation import predictions_from_outputs
@@ -36,8 +37,7 @@ def live_record(task, decomposition, executions, final_answer):
 def validate_checkpoint(cp):
     if cp.get('feature_schema') != FEATURE_SCHEMA or cp.get('feature_spec', {}).get('feature_schema') != FEATURE_SCHEMA:
         raise ValueError('Wrong checkpoint feature schema; v1 and v2 are not interchangeable')
-    if cp['feature_spec'].get('feature_code_sha256') != DEFAULT_SPEC['feature_code_sha256']:
-        raise ValueError('Feature source code differs from training; install the matching shared package')
+    validate_feature_spec(cp['feature_spec'])
     for name, expected in [('node_types', core.NODE_TYPES), ('edge_types', core.EDGE_TYPES),
                            ('metadata_names', core.METADATA_NAMES)]:
         if tuple(cp.get(name, [])) != expected:

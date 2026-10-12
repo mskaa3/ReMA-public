@@ -19,6 +19,7 @@ except ModuleNotFoundError:
 pkg = api.__name__
 live = importlib.import_module(pkg + '.graphprm_v2.live_features')
 features = importlib.import_module(pkg + '.graphprm_v2.features')
+versioned = importlib.import_module(pkg + '.graphprm_v2.versioned_features')
 gm = importlib.import_module(pkg + '.graphprm_v2.graphprm_model')
 core = importlib.import_module(pkg + '.graphprm_v2.graphprm_core')
 runtime = importlib.import_module(pkg + '.graphprm_v2.runtime')
@@ -141,9 +142,13 @@ def test_marker_only_transfer_matches_reference(padding, dtype):
         assert torch.equal(before['hidden_states'], after['hidden_states'])
 
 
-def test_live_features_equal_offline_and_batch_rewards_equal_single(spec, tmp_path):
+@pytest.mark.parametrize('serialization', ['legacy_v1', 'compact_v1'])
+def test_live_features_equal_offline_and_batch_rewards_equal_single(spec, tmp_path, serialization):
+    if serialization == 'compact_v1':
+        spec = dict(versioned.DEFAULT_SPEC, bge_dim=4, prm_hidden_dim=8)
     rows = [row(i, 'extra ' * i) for i in (8, 0, 5, 2)]
-    original = features.FeatureEngine(spec, tmp_path/'reference', device='cpu', prm_batch_size=1)
+    builder = features.FeatureEngine if serialization == 'legacy_v1' else versioned.VersionedFeatureEngine
+    original = builder(spec, tmp_path/'reference', device='cpu', prm_batch_size=1)
     original.prepare(rows)
     engine = live.LiveFeatureEngine(spec, tmp_path/'live', device='cpu', prm_batch_size=16)
     batch_scorer = scorer(engine, spec)
@@ -160,7 +165,7 @@ def test_live_features_equal_offline_and_batch_rewards_equal_single(spec, tmp_pa
         single = batch_scorer.score_record(source, [1, 0, 1, 0][index])
         assert batch[index] == single
     assert engine.last_stats['cached_graphs'] == 1
-    assert features.DEFAULT_SPEC['feature_code_sha256'] == spec['feature_code_sha256']
+    versioned.validate_feature_spec(spec)
     # The live adapter accepts existing offline caches without encoder work.
     reused = live.LiveFeatureEngine(spec, tmp_path/'reference', device='cpu')
     assert reused.prepare_safe(rows) == {}
@@ -168,7 +173,10 @@ def test_live_features_equal_offline_and_batch_rewards_equal_single(spec, tmp_pa
     assert reused.encoder is None and reused.prm_model is None
 
 
-def test_one_overflow_does_not_shift_other_results(spec, tmp_path):
+@pytest.mark.parametrize('serialization', ['legacy_v1', 'compact_v1'])
+def test_one_overflow_does_not_shift_other_results(spec, tmp_path, serialization):
+    if serialization == 'compact_v1':
+        spec = dict(versioned.DEFAULT_SPEC, bge_dim=4, prm_hidden_dim=8)
     engine = live.LiveFeatureEngine(spec, tmp_path, device='cpu')
     reward = scorer(engine, spec)
     rows = [row(1), row(2, 'word ' * 5000), row(3), row(4, 'BGE_OVERFLOW'), row(5)]

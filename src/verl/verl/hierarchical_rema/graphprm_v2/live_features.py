@@ -10,7 +10,8 @@ from types import SimpleNamespace
 
 import torch
 
-from .features import FeatureEngine, atomic_torch, load_cache
+from .features import atomic_torch, load_cache
+from .versioned_features import VersionedFeatureEngine as FeatureEngine
 from .data import digest, feature_key
 from .graphprm_core import prepare_graph_blueprint
 from .graphprm_model import build_fused_feature_tensor
