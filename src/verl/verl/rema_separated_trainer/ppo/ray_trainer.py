@@ -59,14 +59,17 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
     estimate_scoped_c3_grpo,
 )
 from verl.rema_separated_trainer.ppo.credit_audit import CreditAudit
+from verl.rema_separated_trainer.ppo.math_verification import (
+    bounded_verification_map,
+    boxed_answer_is_parseable,
+    worker_answer_matches_terminal,
+)
 from verl.rema_separated_trainer.ppo.prefix_probe import (
     apply_prefix_probe_gate,
     answer_round_records,
-    compare_worker_final_answers,
     count_planned_subtasks,
     collect_prefix_probe_requests,
     extract_complete_boxed_answer,
-    parse_boxed_math_answer,
     select_console_probe_indices,
     select_stratified_probe_indices,
 )
@@ -1254,6 +1257,24 @@ class RayReMASeparatedTrainer(object):
             flush=True,
         )
 
+    def _run_prefix_math_checks(self, operation, inputs, metrics, *, validation=False):
+        function = {
+            'parse': boxed_answer_is_parseable,
+            'compare': worker_answer_matches_terminal,
+        }[operation]
+        results, stats = bounded_verification_map(function, inputs)
+        scope = 'val' if validation else 'train'
+        prefix = f'{scope}/math_verify/{operation}'
+        for name, value in stats.items():
+            metrics[f'{prefix}/{name}'] = metrics.get(f'{prefix}/{name}', 0.0) + value
+        if stats['timeout_count'] or stats['worker_crash_count']:
+            print(
+                f'[math_verify/{scope}] operation={operation} checks={stats["checks"]} '
+                f'timeouts={stats["timeout_count"]} worker_crashes={stats["worker_crash_count"]} '
+                'timed-out/crashed checks marked unknown; continuing', flush=True,
+            )
+        return results
+
     def _attach_prefix_probe_signals(
         self,
         data_batch,
@@ -1330,10 +1351,14 @@ class RayReMASeparatedTrainer(object):
                 }
                 for answer in answers
             ]
-            valid_answers = [
-                stop != 'length' and (missing or parse_boxed_math_answer(response) is not None)
-                for missing, response, stop in zip(unknown, responses, stops)
-            ]
+            valid_answers = [missing and stop != 'length' for missing, stop in zip(unknown, stops)]
+            to_parse = [i for i, answer in enumerate(answers)
+                        if answer is not None and not unknown[i] and stops[i] != 'length']
+            parsed = self._run_prefix_math_checks(
+                'parse', [responses[i] for i in to_parse], metrics, validation=validation,
+            )
+            for index, valid in zip(to_parse, parsed):
+                valid_answers[index] = valid is True
             scores = [
                 0.0 if missing and valid else float('nan')
                 for missing, valid in zip(unknown, valid_answers)
@@ -1379,6 +1404,7 @@ class RayReMASeparatedTrainer(object):
         comparison_required = []
         comparison_records = np.empty(size, dtype=object)
         comparison_cache = {}
+        comparison_keys = []
         for index, (history, terminal_role) in enumerate(zip(histories, terminal_roles)):
             records = answer_round_records(history, str(terminal_role), decomposer_role)
             counts.append(count_planned_subtasks(records, decomposer_role))
@@ -1399,13 +1425,24 @@ class RayReMASeparatedTrainer(object):
                 )
             comparison_required.append(bool(roles))
             comparisons = []
+            keys = []
             for role in roles:
                 output = executed.get(role, {}).get('content', '')
                 key = (output, terminal_output)
-                if key not in comparison_cache:
-                    comparison_cache[key] = compare_worker_final_answers(output, terminal_output)
-                comparisons.append({'role': role, 'match': comparison_cache[key]})
+                comparison_cache.setdefault(key, None)
+                keys.append(key)
+                comparisons.append({'role': role, 'match': None})
             comparison_records[index] = comparisons
+            comparison_keys.append(keys)
+
+        unique_comparisons = list(comparison_cache)
+        matches = self._run_prefix_math_checks(
+            'compare', unique_comparisons, metrics, validation=validation,
+        )
+        comparison_cache.update(zip(unique_comparisons, matches))
+        for index, (comparisons, keys) in enumerate(zip(comparison_records, comparison_keys)):
+            for item, key in zip(comparisons, keys):
+                item['match'] = comparison_cache[key]
             if comparisons and all(item['match'] is not None for item in comparisons):
                 comparison_scores[index] = float(any(item['match'] for item in comparisons))
 

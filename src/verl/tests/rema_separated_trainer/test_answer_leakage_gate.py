@@ -79,6 +79,26 @@ def test_comparison_timeout_is_unknown(monkeypatch):
     assert compare_worker_final_answers("LOCAL_RESULT: \\boxed{6}", "\\boxed{26}") is None
 
 
+def test_real_math_checks_work_across_spawn_boundary():
+    from verl.rema_separated_trainer.ppo.math_verification import (
+        bounded_verification_map,
+        boxed_answer_is_parseable,
+        worker_answer_matches_terminal,
+    )
+
+    parsed, _ = bounded_verification_map(
+        boxed_answer_is_parseable, [r"\boxed{\frac{1}{2}}", "missing box"],
+    )
+    assert parsed == [True, False]
+    compared, stats = bounded_verification_map(worker_answer_matches_terminal, [
+        (r"LOCAL_RESULT: \boxed{\frac{1}{2}}", r"\boxed{0.5}"),
+        (r"LOCAL_RESULT: \boxed{6}", r"\boxed{26}"),
+        (r"LOCAL_RESULT: \boxed{UNKNOWN}", r"\boxed{26}"),
+    ])
+    assert compared == [True, False, None]
+    assert stats['timeout_count'] == 0
+
+
 @pytest.mark.parametrize("ld,count,match,required,reason", [
     (0, 2, 0, True, "eligible"),
     (0, 2, 1, True, "equivalent_answer"),
@@ -223,6 +243,19 @@ def _trainer(focal_role="worker_stage_1", terminal_response=r"\boxed{UNKNOWN}",
         ], [3] * len(messages), ["stop"] * len(messages)
 
     trainer._generate_prefix_probe_responses = probe
+    # Keep gate unit tests in-process; test_math_verification covers the real
+    # subprocess boundary, including hangs and crashed verifier workers.
+    from verl.rema_separated_trainer.ppo.math_verification import (
+        boxed_answer_is_parseable,
+        worker_answer_matches_terminal,
+    )
+
+    def math_checks(operation, inputs, metrics, **kwargs):
+        function = {'parse': boxed_answer_is_parseable,
+                    'compare': worker_answer_matches_terminal}[operation]
+        return [function(item) for item in inputs]
+
+    trainer._run_prefix_math_checks = math_checks
     return trainer
 
 
@@ -638,14 +671,59 @@ def test_c3_trainer_keeps_rejected_and_unparseable_actions_as_baseline():
     assert metrics[f"reward/c3/roles/{role}/negative_removed_count"] == 1
 
 
-def test_invalid_math_terminal_probe_does_not_become_clean_measurement(monkeypatch):
-    from verl.rema_separated_trainer.ppo import ray_trainer
-
+def test_invalid_math_terminal_probe_does_not_become_clean_measurement():
     trainer = _trainer(terminal_response=r"\boxed{unparseable}")
-    monkeypatch.setattr(ray_trainer, "parse_boxed_math_answer", lambda text: None)
+    healthy_checks = trainer._run_prefix_math_checks
+    trainer._run_prefix_math_checks = lambda operation, inputs, metrics, **kwargs: (
+        [None] * len(inputs) if operation == 'parse'
+        else healthy_checks(operation, inputs, metrics, **kwargs)
+    )
     batch = _batch([_history()])
     trainer._attach_prefix_probe_signals(batch, torch.ones(1), {})
     assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == ["terminal_probe_invalid"]
+    assert not batch.batch["prefix_probe_known_rejection"].item()
+
+
+def test_comparison_timeout_preserves_order_and_does_not_pass_gate():
+    trainer = _trainer()
+    calls = []
+
+    def checks(operation, inputs, metrics, **kwargs):
+        assert operation == 'compare'  # Explicit UNKNOWN probes need no parsing.
+        calls.append(inputs)
+        return [None, False]
+
+    trainer._run_prefix_math_checks = lambda operation, inputs, metrics, **kwargs: (
+        checks(operation, inputs, metrics, **kwargs) if inputs else []
+    )
+    batch = _batch([_history("6"), _history("8"), _history("6")])
+    trainer._attach_prefix_probe_signals(batch, torch.ones(3), {})
+    assert len(calls) == 1 and len(calls[0]) == 2
+    assert batch.non_tensor_batch["prefix_probe_rejection_reason"].tolist() == [
+        "comparison_invalid", "eligible", "comparison_invalid",
+    ]
+    assert batch.batch["prefix_probe_collaboration_eligible"].tolist() == [False, True, False]
+    assert batch.batch["prefix_probe_known_rejection"].tolist() == [False, False, False]
+    assert batch.non_tensor_batch["prefix_probe_worker_comparisons"][0][0]['match'] is None
+
+
+def test_verifier_timeout_metrics_are_accumulated_and_reported(monkeypatch, capsys):
+    from verl.rema_separated_trainer.ppo import ray_trainer
+
+    def checks(function, inputs):
+        return [None, False], {'checks': 2, 'timeout_count': 1,
+                               'worker_crash_count': 0, 'unknown_count': 1}
+
+    monkeypatch.setattr(ray_trainer, 'bounded_verification_map', checks)
+    trainer = _trainer()
+    metrics = {}
+    run = ray_trainer.RayReMASeparatedTrainer._run_prefix_math_checks
+    for _ in range(2):
+        assert run(trainer, 'compare', ['a', 'b'], metrics, validation=True) == [None, False]
+    assert metrics['val/math_verify/compare/checks'] == 4
+    assert metrics['val/math_verify/compare/timeout_count'] == 2
+    assert metrics['val/math_verify/compare/unknown_count'] == 2
+    assert 'timed-out/crashed checks marked unknown; continuing' in capsys.readouterr().out
 
 
 def test_terminal_scorer_timeout_is_not_a_clean_measurement():

@@ -5,6 +5,7 @@
 #SBATCH --time=48:00:00             # maksymalny czas wykonania zadania
 #SBATCH --mem=200gb                 # ilość pamięci RAM
 #SBATCH -p lem-gpu-short            # partycja
+#SBATCH --exclude=r16-[2,11,14]
 #SBATCH --gpus-per-node=hopper:4    # (ilość kart graficznych na węźle)
 #SBATCH --verbose                   # wyświetlanie informacji o zadaniu
 
