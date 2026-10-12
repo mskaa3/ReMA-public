@@ -1,0 +1,535 @@
+{
+  "baseline": [
+    {
+      "question": "In $\\triangle PQR$, we have $PQ = QR = 34$ and $PR = 32$. Find the length of median $\\overline{QM}$.",
+      "gate": {
+        "raw_score": 0.0,
+        "gated_score": 0.0,
+        "subtasks": 1.0,
+        "Ld": 0.0,
+        "plan_eligible": 0.0,
+        "update_eligible": 0.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nTo find the length of the median \\(QM\\) in an isosceles triangle \\(PQR\\) with \\(PQ = QR = 34\\) and \\(PR = 32\\), we can use Apollonius's theorem. This theorem states that in any triangle, the sum of the squares of any two sides is equal to twice the square of the median to the third side plus twice the square of half the third side. Here, \\(QM\\) is the median to the side \\(PR\\). We need to calculate \\(QM\\) using the formula derived from Apollonius's theorem.\n\nPLAN:\n- S1: Apply Apollonius's theorem to find the length of the median \\(QM\\). The theorem states \\(2PQ^2 + 2QR^2 = 2QM^2 + PR^2\\). Substitute \\(PQ = QR = 34\\) and \\(PR = 32\\) into the equation and solve for \\(QM\\). Return the length of \\(QM\\).",
+          "num_gen_tokens": 218,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 1
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. We are given the lengths \\(PQ = 34\\), \\(QR = 34\\), and \\(PR = 32\\).\n2. According to Apollonius's theorem, \\(2PQ^2 + 2QR^2 = 2QM^2 + PR^2\\).\n3. Substitute the given values into the equation:\n   \\[\n   2(34)^2 + 2(34)^2 = 2QM^2 + 32^2\n   \\]\n4. Simplify the equation:\n   \\[\n   2 \\cdot 1156 + 2 \\cdot 1156 = 2QM^2 + 1024\n   \\]\n   \\[\n   2312 + 2312 = 2QM^2 + 1024\n   \\]\n   \\[\n   4624 = 2QM^2 + 1024\n   \\]\n5. Isolate \\(QM^2\\):\n   \\[\n   4624 - 1024 = 2QM^2\n   \\]\n   \\[\n   3600 = 2QM^2\n   \\]\n6. Solve for \\(QM^2\\):\n   \\[\n   QM^2 = \\frac{3600}{2}\n   \\]\n   \\[\n   QM^2 = 1800\n   \\]\n7. Take the square root of both sides to find \\(QM\\):\n   \\[\n   QM = \\sqrt{1800}\n   \\]\n   \\[\n   QM = 30\\sqrt{2}\n   \\]\n\nLOCAL_RESULT: \\boxed{30\\sqrt{2}}",
+          "num_gen_tokens": 388,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S1: Apply Apollonius's theorem to find the length of the median \\(QM\\). The theorem states \\(2PQ^2 + 2QR^2 = 2QM^2 + PR^2\\). Substitute \\(PQ = QR = 34\\) and \\(PR = 32\\) into the equation and solve for \\(QM\\). Return the length of \\(QM\\).\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=0.0 gated_score=0.0 terminal_role=worker_stage_1 subtasks=1 Ld=0.0 Lt=n/a E=[exempt] plan_eligible=0 update_eligible=0 reason=single_subtask question='In $\\\\triangle PQR$, we have $PQ = QR = 34$ and $PR = 32$. Find the length of median $\\\\overline{QM}$.'"
+    },
+    {
+      "question": "Janet had 22 green pens and 10 yellow pens. Then she bought 6 bags of blue pens and 2 bags of red pens. There were 9 pens in each bag of blue and 6 pens in each bag of red. How many pens does Janet have now?",
+      "gate": {
+        "raw_score": 1.0,
+        "gated_score": 1.0,
+        "subtasks": 2.0,
+        "Ld": 1.0,
+        "Lt": 0.0,
+        "plan_eligible": 1.0,
+        "update_eligible": 1.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nFirst, calculate the number of blue and red pens Janet bought. Then, add these to her initial count of green and yellow pens. Two subtasks are needed: one to compute the newly acquired pens and another to sum all the pens together.\n\nPLAN:\n- S1: Calculate the total number of blue pens by multiplying 6 bags by 9 pens per bag, and the total number of red pens by multiplying 2 bags by 6 pens per bag. Return these quantities as the S1 LOCAL_RESULT.\n- S2: Using the blue and red pen counts from S1, add them to the initial counts of green (22) and yellow (10) pens. Sum these to get the total number of pens. Return the total as an integer.",
+          "num_gen_tokens": 160,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 2
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker\n- S2 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. Calculate the total number of blue pens:\n   - Janet bought 6 bags of blue pens.\n   - Each bag contains 9 pens.\n   - Total blue pens = 6 bags * 9 pens/bag = 54 pens.\n\n2. Calculate the total number of red pens:\n   - Janet bought 2 bags of red pens.\n   - Each bag contains 6 pens.\n   - Total red pens = 2 bags * 6 pens/bag = 12 pens.\n\nLOCAL_RESULT: \\boxed{54, 12}",
+          "num_gen_tokens": 120,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ]
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "REASONING:\n1. The initial counts of green and yellow pens are given as 22 and 10, respectively.\n2. The counts of blue and red pens from S1 are given as 54 and 12, respectively.\n3. To find the total number of pens, we need to sum the counts of all four colors: green, yellow, blue, and red.\n4. The total number of pens is calculated as follows:\n   \\[ \\text{Total pens} = \\text{Green pens} + \\text{Yellow pens} + \\text{Blue pens} + \\text{Red pens} \\]\n   \\[ \\text{Total pens} = 22 + 10 + 54 + 12 \\]\n\nLOCAL_RESULT: \\boxed{98}",
+          "num_gen_tokens": 170,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S2"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S2: Using the blue and red pen counts from S1, add them to the initial counts of green (22) and yellow (10) pens. Sum these to get the total number of pens. Return the total as an integer.\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=1.0 gated_score=1.0 terminal_role=worker_stage_2 subtasks=2 Ld=1.0 Lt=0.0 E=[worker_stage_1:0] plan_eligible=1 update_eligible=1 reason=eligible question='Janet had 22 green pens and 10 yellow pens. Then she bought 6 bags of blue pens and 2 bags of red pens. There were 9 pens in each bag of blue and 6 pens in each bag of red. How many pens does Janet have now?'"
+    },
+    {
+      "question": "A real estate agent has spent $5 on each newspaper ad and spent $75 on each television ad. He bought 50 newspaper ads and 15 television ads. How much did the real estate agent spend on buying all the ads?",
+      "gate": {
+        "raw_score": 1.0,
+        "gated_score": 1.0,
+        "subtasks": 3.0,
+        "Ld": 1.0,
+        "Lt": 0.0,
+        "plan_eligible": 1.0,
+        "update_eligible": 1.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nFirst, calculate the total cost for the newspaper ads and then the total cost for the television ads. Since the total cost is the sum of these two amounts, two subtasks are needed: one for each type of ad. The final subtask will sum the intermediate results to get the total expenditure.\n\nPLAN:\n- S1: Calculate the total cost for the newspaper ads by multiplying the number of newspaper ads (50) by the cost per ad ($5). Return this cost as the S1 LOCAL_RESULT.\n- S2: Calculate the total cost for the television ads by multiplying the number of television ads (15) by the cost per ad ($75). Return this cost as the S2 LOCAL_RESULT.\n- S3: Using the S1 and S2 LOCAL_RESULTS, compute the total amount spent by adding the cost of the newspaper ads and the cost of the television ads. Return the total cost as an integer.",
+          "num_gen_tokens": 193,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 3
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker\n- S2 -> general_math_worker\n- S3 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. The cost per newspaper ad is $5.\n2. The number of newspaper ads is 50.\n3. To find the total cost for the newspaper ads, we multiply the cost per ad by the number of ads:\n   \\[ 5 \\times 50 = 250 \\]\n\nLOCAL_RESULT: \\boxed{250}",
+          "num_gen_tokens": 79,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ]
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "REASONING:\n1. The cost for one television ad is $75.\n2. The number of television ads is 15.\n3. To find the total cost for the television ads, we multiply the cost per ad by the number of ads: $75 \u00d7 15 = $1,125.\n\nLOCAL_RESULT: \\boxed{1125}",
+          "num_gen_tokens": 80,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S2"
+          ]
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "REASONING:\nTo compute the total amount spent, we need to add the cost of the newspaper ads and the cost of the television ads. The cost of the newspaper ads is given by S1 LOCAL_RESULT, which is 250. The cost of the television ads is given by S2 LOCAL_RESULT, which is 1125.\n\nLOCAL_RESULT: \\boxed{1375}",
+          "num_gen_tokens": 84,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S3"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S3: Using the S1 and S2 LOCAL_RESULTS, compute the total amount spent by adding the cost of the newspaper ads and the cost of the television ads. Return the total cost as an integer.\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=1.0 gated_score=1.0 terminal_role=worker_stage_3 subtasks=3 Ld=1.0 Lt=0.0 E=[worker_stage_1:0,worker_stage_2:0] plan_eligible=1 update_eligible=1 reason=eligible question='A real estate agent has spent $5 on each newspaper ad and spent $75 on each television ad. He bought 50 newspaper ads and 15 television ads. How much did the real estate agent spend on buying all the ads?'"
+    },
+    {
+      "question": "Grayson recycles cans and bottles for money each week. An aluminum can is worth two cents and a plastic bottle is worth three cents. She drinks three aluminum cans of soda and five plastic bottles of water a week. How many cents does Grayson earn from recycling in a four-week month?",
+      "gate": {
+        "raw_score": 1.0,
+        "gated_score": 1.0,
+        "subtasks": 2.0,
+        "Ld": 1.0,
+        "Lt": 0.0,
+        "plan_eligible": 1.0,
+        "update_eligible": 1.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nFirst, calculate the weekly earnings from recycling cans and bottles. Then, multiply the weekly earnings by four to find the total earnings for a four-week month. Two subtasks are needed: one to find the weekly earnings and another to scale that to a four-week period.\n\nPLAN:\n- S1: Calculate the weekly earnings from recycling cans and bottles. Grayson earns 2 cents per can and 3 cents per bottle. She recycles 3 cans and 5 bottles weekly. Therefore, her weekly earnings are \\(3 \\times 2 + 5 \\times 3\\) cents. Let \\(W\\) be the weekly earnings. Compute \\(W\\) and return it.\n- S2: Using \\(W\\) from the S1 LOCAL_RESULT, calculate the total earnings for a four-week month by multiplying \\(W\\) by 4. Return the total earnings as an integer in cents.",
+          "num_gen_tokens": 184,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 2
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker\n- S2 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. Grayson earns 2 cents per can and 3 cents per bottle.\n2. She recycles 3 cans and 5 bottles weekly.\n3. Weekly earnings from cans: \\(3 \\times 2 = 6\\) cents.\n4. Weekly earnings from bottles: \\(5 \\times 3 = 15\\) cents.\n5. Total weekly earnings: \\(6 + 15 = 21\\) cents.\n\nLOCAL_RESULT: \\boxed{21}",
+          "num_gen_tokens": 103,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ]
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "REASONING:\nThe previous LOCAL_RESULT provided \\(W\\) as 21. To calculate the total earnings for a four-week month, we need to multiply \\(W\\) by 4.\n\n\\[\n\\text{Total earnings} = W \\times 4 = 21 \\times 4\n\\]\n\n\\[\n\\text{Total earnings} = 84\n\\]\n\nLOCAL_RESULT: \\boxed{84}",
+          "num_gen_tokens": 89,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S2"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S2: Using \\(W\\) from the S1 LOCAL_RESULT, calculate the total earnings for a four-week month by multiplying \\(W\\) by 4. Return the total earnings as an integer in cents.\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=1.0 gated_score=1.0 terminal_role=worker_stage_2 subtasks=2 Ld=1.0 Lt=0.0 E=[worker_stage_1:0] plan_eligible=1 update_eligible=1 reason=eligible question='Grayson recycles cans and bottles for money each week. An aluminum can is worth two cents and a plastic bottle is worth three cents. She drinks three aluminum cans of soda and five plastic bottles of water a week. How many cents does Grayson earn from recycling in a four-week month?'"
+    }
+  ],
+  "eligibility": [
+    {
+      "question": "In $\\triangle PQR$, we have $PQ = QR = 34$ and $PR = 32$. Find the length of median $\\overline{QM}$.",
+      "gate": {
+        "raw_score": 0.0,
+        "gated_score": 0.0,
+        "subtasks": 2.0,
+        "Ld": 1.0,
+        "plan_eligible": 0.0,
+        "update_eligible": 0.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nTo find the length of the median \\( \\overline{QM} \\) in \\( \\triangle PQR \\), we can use Apollonius's theorem, which states that for any triangle, the sum of the squares of any two sides is equal to twice the square of the median to the third side plus twice the square of half the third side. Here, \\( M \\) is the midpoint of \\( PR \\), so \\( PM = MR = \\frac{PR}{2} = 16 \\). We need to find \\( QM \\). We can set up the equation using Apollonius's theorem and solve for \\( QM \\). This requires two stages: first, calculating the necessary intermediate quantities, and then using those to find \\( QM \\).\n\nPLAN:\n- S1: Given \\( PQ = 34 \\), \\( QR = 34 \\), and \\( PR = 32 \\), compute \\( PM = \\frac{PR}{2} \\). Then, using Apollonius's theorem, express \\( QM^2 \\) in terms of \\( PQ \\), \\( QR \\), and \\( PM \\). Return \\( PM \\) and the expression for \\( QM^2 \\) as the S1 LOCAL_RESULT.\n- S2: Using \\( PM \\) and the expression for \\( QM^2 \\) from the S1 LOCAL_RESULT, compute \\( QM \\). Return \\( QM \\) as the length of the median.",
+          "num_gen_tokens": 313,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 2
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker\n- S2 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. Given \\( PQ = 34 \\), \\( QR = 34 \\), and \\( PR = 32 \\), we first find \\( PM \\), the median from \\( P \\) to \\( QR \\).\n2. Since \\( PM \\) is the median, it splits \\( QR \\) into two equal segments, each of length \\( \\frac{QR}{2} = \\frac{34}{2} = 17 \\).\n3. Now, we use Apollonius's theorem, which states that in any triangle, the sum of the squares of any two sides is equal to twice the square of the median to the third side plus twice the square of half the third side.\n4. Applying Apollonius's theorem to \\( \\triangle PQR \\):\n   \\[\n   PQ^2 + PR^2 = 2 \\cdot PM^2 + 2 \\cdot \\left(\\frac{QR}{2}\\right)^2\n   \\]\n5. Substituting the known values:\n   \\[\n   34^2 + 32^2 = 2 \\cdot PM^2 + 2 \\cdot 17^2\n   \\]\n6. Simplifying:\n   \\[\n   1156 + 1024 = 2 \\cdot PM^2 + 2 \\cdot 289\n   \\]\n   \\[\n   2180 = 2 \\cdot PM^2 + 578\n   \\]\n7. Solving for \\( PM^2 \\):\n   \\[\n   2 \\cdot PM^2 = 2180 - 578\n   \\]\n   \\[\n   2 \\cdot PM^2 = 1602\n   \\]\n   \\[\n   PM^2 = \\frac{1602}{2}\n   \\]\n   \\[\n   PM^2 = 801\n   \\]\n\nLOCAL_RESULT: \\boxed{PM = 17, QM^2 = 801}",
+          "num_gen_tokens": 439,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ]
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "REASONING:\nGiven \\( PM = 17 \\) and \\( QM^2 = 801 \\), we need to find \\( QM \\).\n\nFrom the given information, we have:\n\\[ QM^2 = 801 \\]\n\nTo find \\( QM \\), we take the square root of both sides:\n\\[ QM = \\sqrt{801} \\]\n\nSo, \\( QM \\) is the length of the median.\n\nLOCAL_RESULT: \\boxed{\\sqrt{801}}",
+          "num_gen_tokens": 111,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S2"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S2: Using \\( PM \\) and the expression for \\( QM^2 \\) from the S1 LOCAL_RESULT, compute \\( QM \\). Return \\( QM \\) as the length of the median.\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=0.0 gated_score=0.0 terminal_role=worker_stage_2 subtasks=2 Ld=1.0 Lt=n/a E=[worker_stage_1:0] plan_eligible=0 update_eligible=0 reason=terminal_probe_invalid question='In $\\\\triangle PQR$, we have $PQ = QR = 34$ and $PR = 32$. Find the length of median $\\\\overline{QM}$.'"
+    },
+    {
+      "question": "Janet had 22 green pens and 10 yellow pens. Then she bought 6 bags of blue pens and 2 bags of red pens. There were 9 pens in each bag of blue and 6 pens in each bag of red. How many pens does Janet have now?",
+      "gate": {
+        "raw_score": 1.0,
+        "gated_score": 1.0,
+        "subtasks": 2.0,
+        "Ld": 1.0,
+        "Lt": 0.0,
+        "plan_eligible": 1.0,
+        "update_eligible": 1.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nWe need to calculate the number of blue and red pens Janet bought and then add these to her initial count of green and yellow pens. We can break this into two subtasks: one to calculate the number of blue and red pens, and another to sum all the pens together.\n\nPLAN:\n- S1: Compute the number of blue pens B from 6 bags of 9 pens each and the number of red pens R from 2 bags of 6 pens each. Return B and R as the S1 LOCAL_RESULT.\n- S2: Using B and R from the S1 LOCAL_RESULT, calculate 22 (initial green pens) + 10 (initial yellow pens) + B + R. Return the total number of pens as an integer.",
+          "num_gen_tokens": 159,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 2
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker\n- S2 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. Janet bought 6 bags of blue pens, with 9 pens in each bag.\n   - Number of blue pens B = 6 bags * 9 pens/bag = 54 pens.\n\n2. Janet bought 2 bags of red pens, with 6 pens in each bag.\n   - Number of red pens R = 2 bags * 6 pens/bag = 12 pens.\n\nLOCAL_RESULT: \\boxed{54, 12}",
+          "num_gen_tokens": 102,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ]
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "REASONING:\nThe S1 LOCAL_RESULT provided the values B = 54 and R = 12. We need to calculate the total number of pens, which is the sum of initial green pens (22), initial yellow pens (10), and the values of B and R.\n\n22 (initial green pens) + 10 (initial yellow pens) + B (value of B) + R (value of R) = 22 + 10 + 54 + 12\n\nLOCAL_RESULT: \\boxed{98}",
+          "num_gen_tokens": 118,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S2"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S2: Using B and R from the S1 LOCAL_RESULT, calculate 22 (initial green pens) + 10 (initial yellow pens) + B + R. Return the total number of pens as an integer.\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=1.0 gated_score=1.0 terminal_role=worker_stage_2 subtasks=2 Ld=1.0 Lt=0.0 E=[worker_stage_1:0] plan_eligible=1 update_eligible=1 reason=eligible question='Janet had 22 green pens and 10 yellow pens. Then she bought 6 bags of blue pens and 2 bags of red pens. There were 9 pens in each bag of blue and 6 pens in each bag of red. How many pens does Janet have now?'"
+    },
+    {
+      "question": "A real estate agent has spent $5 on each newspaper ad and spent $75 on each television ad. He bought 50 newspaper ads and 15 television ads. How much did the real estate agent spend on buying all the ads?",
+      "gate": {
+        "raw_score": 1.0,
+        "gated_score": 1.0,
+        "subtasks": 3.0,
+        "Ld": 1.0,
+        "Lt": 0.0,
+        "plan_eligible": 1.0,
+        "update_eligible": 1.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nWe need to calculate the total cost for both newspaper and television ads separately and then sum them up. The cost for newspaper ads can be calculated by multiplying the number of newspaper ads by the cost per ad. Similarly, the cost for television ads can be calculated by multiplying the number of television ads by the cost per ad. After finding these two intermediate results, we can sum them to get the total cost. This problem can be divided into two subtasks: one for calculating the cost of newspaper ads and another for calculating the cost of television ads. The final subtask will sum these two costs to get the total amount spent.\n\nPLAN:\n- S1: Using the number of newspaper ads (50) and the cost per newspaper ad ($5), calculate the total cost for newspaper ads. Return the cost as C_newspaper.\n- S2: Using the number of television ads (15) and the cost per television ad ($75), calculate the total cost for television ads. Return the cost as C_tv.\n- S3: Using C_newspaper from the S1 LOCAL_RESULT and C_tv from the S2 LOCAL_RESULT, calculate C_newspaper + C_tv. Return the total cost as the final answer.",
+          "num_gen_tokens": 254,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 3
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker\n- S2 -> general_math_worker\n- S3 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. The number of newspaper ads is given as 50.\n2. The cost per newspaper ad is given as $5.\n3. To find the total cost for newspaper ads, we multiply the number of newspaper ads by the cost per newspaper ad:\n   \\[ C_{\\text{newspaper}} = 50 \\times 5 \\]\n\nLOCAL_RESULT: \\boxed{250}",
+          "num_gen_tokens": 89,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ]
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "REASONING:\n1. The number of television ads is given as 15.\n2. The cost per television ad is $75.\n3. To find the total cost for television ads, we multiply the number of television ads by the cost per television ad:\n   \\[ C_{\\text{tv}} = 15 \\times 75 \\]\n\nLOCAL_RESULT: \\boxed{1125}",
+          "num_gen_tokens": 88,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S2"
+          ]
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "REASONING:\nTo calculate the total cost of C_newspaper and C_tv, we need to add the values from the previous LOCAL_RESULTS.\n\nFrom S1 LOCAL_RESULT: C_newspaper = 250\nFrom S2 LOCAL_RESULT: C_tv = 1125\n\nNow, we add these two values together:\nC_newspaper + C_tv = 250 + 1125\n\nLOCAL_RESULT: \\boxed{1375}",
+          "num_gen_tokens": 101,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S3"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S3: Using C_newspaper from the S1 LOCAL_RESULT and C_tv from the S2 LOCAL_RESULT, calculate C_newspaper + C_tv. Return the total cost as the final answer.\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=1.0 gated_score=1.0 terminal_role=worker_stage_3 subtasks=3 Ld=1.0 Lt=0.0 E=[worker_stage_1:0,worker_stage_2:0] plan_eligible=1 update_eligible=1 reason=eligible question='A real estate agent has spent $5 on each newspaper ad and spent $75 on each television ad. He bought 50 newspaper ads and 15 television ads. How much did the real estate agent spend on buying all the ads?'"
+    },
+    {
+      "question": "Grayson recycles cans and bottles for money each week. An aluminum can is worth two cents and a plastic bottle is worth three cents. She drinks three aluminum cans of soda and five plastic bottles of water a week. How many cents does Grayson earn from recycling in a four-week month?",
+      "gate": {
+        "raw_score": 1.0,
+        "gated_score": 1.0,
+        "subtasks": 2.0,
+        "Ld": 1.0,
+        "Lt": 0.0,
+        "plan_eligible": 1.0,
+        "update_eligible": 1.0
+      },
+      "history": [
+        {
+          "role": "decomposer",
+          "content": "REASONING:\nFirst, we need to calculate the weekly earnings from recycling the cans and bottles. Then, we can multiply the weekly earnings by four to find the total earnings for a four-week month. We can break this into two stages: the first to find the weekly earnings, and the second to find the four-week total. This approach ensures we only compute the weekly earnings once and use that result to find the total for the month.\n\nPLAN:\n- S1: Using the given values, calculate the weekly earnings from recycling the cans and bottles. Specifically, compute the earnings from the cans as 3 cans * 2 cents/can and the earnings from the bottles as 5 bottles * 3 cents/bottle. Return the total weekly earnings as W.\n- S2: Using W from the S1 LOCAL_RESULT, calculate the total earnings for a four-week month as 4 * W. Return the total earnings as an integer.",
+          "num_gen_tokens": 191,
+          "stop_reason": "stop",
+          "executed": true,
+          "planned_subtask_count": 2
+        },
+        {
+          "role": "selector",
+          "content": "ASSIGNMENTS:\n- S1 -> general_math_worker\n- S2 -> general_math_worker",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false,
+          "deterministic_routing": true
+        },
+        {
+          "role": "worker_stage_1",
+          "content": "REASONING:\n1. Grayson earns 3 cents for each aluminum can.\n2. She drinks 3 aluminum cans of soda a week, so her weekly earnings from cans = 3 cans * 2 cents/can = 6 cents.\n3. Grayson earns 5 cents for each plastic bottle.\n4. She drinks 5 plastic bottles of water a week, so her weekly earnings from bottles = 5 bottles * 3 cents/bottle = 15 cents.\n5. To find the total weekly earnings, we add the earnings from cans and bottles: 6 cents + 15 cents = 21 cents.\n\nLOCAL_RESULT: \\boxed{21}",
+          "num_gen_tokens": 141,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S1"
+          ]
+        },
+        {
+          "role": "worker_stage_2",
+          "content": "REASONING:\nThe previous LOCAL_RESULT provided W as 21. To calculate the total earnings for a four-week month, we need to multiply W by 4.\n\nLOCAL_RESULT: \\boxed{84}",
+          "num_gen_tokens": 45,
+          "stop_reason": "stop",
+          "executed": true,
+          "assigned_subtasks": [
+            "S2"
+          ],
+          "terminal_probe_input": "The assigned subtask is your task context and should contain the needed facts. Use previous LOCAL_RESULTs when they help.\n\nCURRENT TASK:\n- S2: Using W from the S1 LOCAL_RESULT, calculate the total earnings for a four-week month as 4 * W. Return the total earnings as an integer.\n\nWork on the assigned subtask above. Reason step by step with concrete calculations, transformations, or checks. Keep the reasoning scoped to this subtask and check conditions that directly affect its result. Finish with one concise LOCAL_RESULT for this subtask. Output exactly:\nREASONING:\n<step-by-step reasoning for this subtask>\n\nLOCAL_RESULT: \\boxed{<useful result of this subtask>}\n\n"
+        },
+        {
+          "role": "worker_stage_3",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        },
+        {
+          "role": "worker_stage_4",
+          "content": "",
+          "num_gen_tokens": 0,
+          "stop_reason": "stop",
+          "executed": false
+        }
+      ],
+      "gate_line": "[leakage/example] scope=val uid=n/a focal_role=n/a action=n/a suffix=n/a raw_score=1.0 gated_score=1.0 terminal_role=worker_stage_2 subtasks=2 Ld=1.0 Lt=0.0 E=[worker_stage_1:0] plan_eligible=1 update_eligible=1 reason=eligible question='Grayson recycles cans and bottles for money each week. An aluminum can is worth two cents and a plastic bottle is worth three cents. She drinks three aluminum cans of soda and five plastic bottles of water a week. How many cents does Grayson earn from recycling in a four-week month?'"
+    }
+  ]
+}

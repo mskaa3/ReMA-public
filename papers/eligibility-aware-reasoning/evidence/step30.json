@@ -1,0 +1,142 @@
+{
+  "notes": [
+    "Baseline: retained ANSI-cleaned copy of run 6061597; original full log is unavailable.",
+    "Treatment: user-provided October 11 excerpt, identified as run 6068468.",
+    "Both final audit summaries refer to the configured 128-trajectory audit, not full-suite accuracy.",
+    "The treatment step-30 metric line is truncated; missing benchmark results are not inferred.",
+    "Runs differ in eligibility handling AND group handling; not an isolated intervention.",
+    "Audit selection prioritizes console examples and fills the remaining budget by subset strata."
+  ],
+  "runs": {
+    "baseline": {
+      "source": "/private/tmp/6061597-clean.txt",
+      "sha256": "9de1742c0e55b8dea688d6e5a2874462061dcccc526655d88af1d345d25e002b",
+      "step": 30,
+      "final_audit": {
+        "step": 30.0,
+        "actor_update_step": 30.0,
+        "raw_acc": 0.422,
+        "gated_acc": 0.156,
+        "plan_eligible": 0.383,
+        "update_eligible": 0.242,
+        "Ld": 0.543,
+        "Ld_valid": 0.82,
+        "Lt": 0.293,
+        "Lt_valid": 0.719,
+        "worker_match": 0.25,
+        "comparison_valid": 0.907,
+        "single_subtask": 0.484,
+        "removed_correct": 0.266
+      },
+      "validation_metrics": {
+        "val/acc/MATH500": 0.502,
+        "val/acc/gsm8k": 0.691,
+        "val/acc/aime24": 0.033,
+        "val/acc/amc23": 0.25,
+        "val/acc/gaokao2023en": 0.421,
+        "val/acc/minerva_math": 0.235,
+        "val/acc/olympiadbench": 0.193,
+        "val/acc/aime25": 0.033,
+        "val/leakage/raw_accuracy": 0.422,
+        "val/leakage/gated_accuracy": 0.156,
+        "val/leakage/removed_correct_rate": 0.266,
+        "val/leakage/plan_eligible_rate": 0.383,
+        "val/leakage/gate_valid_rate": 0.68,
+        "val/leakage/update_eligible_rate": 0.242,
+        "val/leakage/subtask_count_mean": 1.586,
+        "val/leakage/rejected/single_subtask_rate": 0.484,
+        "val/leakage/rejected/terminal_probe_invalid_rate": 0.055,
+        "val/leakage/rejected/terminal_recoverable_rate": 0.078,
+        "val/leakage/rejected/comparison_invalid_rate": 0.039,
+        "val/leakage/rejected/equivalent_answer_rate": 0.102,
+        "val/leakage/trajectory_count": 128.0,
+        "val/leakage/decomposer/rate": 0.543,
+        "val/leakage/decomposer/count": 105.0,
+        "val/leakage/decomposer_valid/rate": 0.82,
+        "val/leakage/decomposer_valid/count": 128.0,
+        "val/leakage/decomposer_nonempty/rate": 1.0,
+        "val/leakage/decomposer_nonempty/count": 128.0,
+        "val/leakage/decomposer_length_stopped/rate": 0.18,
+        "val/leakage/decomposer_length_stopped/count": 128.0,
+        "val/leakage/terminal/rate": 0.293,
+        "val/leakage/terminal/count": 92.0,
+        "val/leakage/terminal_valid/rate": 0.719,
+        "val/leakage/terminal_valid/count": 128.0,
+        "val/leakage/terminal_nonempty/rate": 1.0,
+        "val/leakage/terminal_nonempty/count": 128.0,
+        "val/leakage/terminal_length_stopped/rate": 0.281,
+        "val/leakage/terminal_length_stopped/count": 128.0,
+        "val/leakage/worker_match_valid/rate": 0.907,
+        "val/leakage/worker_match_valid/count": 75.0,
+        "val/leakage/worker_match/rate": 0.25,
+        "val/leakage/worker_match/count": 68.0,
+        "val/leakage/roles/worker_stage_1/worker_match_valid/rate": 0.894,
+        "val/leakage/roles/worker_stage_1/worker_match_valid/count": 66.0,
+        "val/leakage/roles/worker_stage_1/worker_match/rate": 0.288,
+        "val/leakage/roles/worker_stage_1/worker_match/count": 59.0,
+        "val/leakage/roles/worker_stage_2/worker_match_valid/rate": 1.0,
+        "val/leakage/roles/worker_stage_2/worker_match_valid/count": 7.0,
+        "val/leakage/roles/worker_stage_2/worker_match/rate": 0.0,
+        "val/leakage/roles/worker_stage_2/worker_match/count": 7.0,
+        "val/leakage/roles/worker_stage_3/worker_match_valid/rate": 1.0,
+        "val/leakage/roles/worker_stage_3/worker_match_valid/count": 2.0,
+        "val/leakage/roles/worker_stage_3/worker_match/rate": 0.0,
+        "val/leakage/roles/worker_stage_3/worker_match/count": 2.0,
+        "val/num_turns/mean": 1.0,
+        "val/num_turns/max": 1.0,
+        "val/num_turns/min": 1.0,
+        "val/completion_tokens/mean": 584.988,
+        "val/completion_tokens/max": 3242.0,
+        "val/completion_tokens/min": 128.0
+      },
+      "complete_benchmark_metrics_available": true,
+      "actor_update_step": 30.0
+    },
+    "eligibility": {
+      "source": "/Users/arkadiuszjanz/.codex/attachments/bf985db2-c3c9-4aa9-8d87-5f3155b397f9/Pasted text.txt",
+      "sha256": "be92135f9500a4bac2885c245ba8fc55a991bb2ab4bc2905107db3a864f63bbb",
+      "step": 30,
+      "final_audit": {
+        "step": 30.0,
+        "actor_update_step": 30.0,
+        "raw_acc": 0.312,
+        "gated_acc": 0.219,
+        "plan_eligible": 0.633,
+        "update_eligible": 0.508,
+        "Ld": 0.58,
+        "Ld_valid": 0.688,
+        "Lt": 0.057,
+        "Lt_valid": 0.68,
+        "worker_match": 0.076,
+        "comparison_valid": 0.856,
+        "single_subtask": 0.023,
+        "removed_correct": 0.094
+      },
+      "validation_metrics": {},
+      "complete_benchmark_metrics_available": false,
+      "actor_update_step": 30.0
+    }
+  },
+  "matched_printed_examples": {
+    "count": 51,
+    "baseline": {
+      "raw_correct": 25.0,
+      "gate_accepted_correct": 13.0,
+      "subtask_counts": {
+        "1": 27,
+        "2": 20,
+        "3": 4
+      }
+    },
+    "eligibility": {
+      "raw_correct": 23.0,
+      "gate_accepted_correct": 18.0,
+      "subtask_counts": {
+        "1": 1,
+        "2": 45,
+        "3": 4,
+        "4": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,133 @@
+% Vector artwork shared by the paper and the standalone figure.
+\definecolor{eacInk}{HTML}{233442}
+\definecolor{eacMuted}{HTML}{596570}
+\definecolor{eacLine}{HTML}{A7AFB6}
+\definecolor{eacPaper}{HTML}{F3F5F7}
+\definecolor{eacDisclosure}{HTML}{9B4F3D}
+\definecolor{eacBypass}{HTML}{8E641E}
+\definecolor{eacCoop}{HTML}{236D68}
+
+\noindent\begin{tikzpicture}[
+    x=1cm,y=1cm,
+    font=\sffamily\fontsize{9}{11}\selectfont,
+    text=eacInk,
+    box/.style={draw=eacLine,line width=0.5pt,rounded corners=2pt,
+        fill=white,text width=4.05cm,inner sep=6pt,align=left},
+    plan/.style={box,minimum height=1.95cm},
+    worker/.style={box,minimum height=1.47cm},
+    terminal/.style={box,minimum height=1.47cm,line width=0.8pt},
+    flow/.style={-{Stealth[length=5pt,width=4pt]},line width=1pt},
+    ignored/.style={-{Stealth[length=5pt,width=4pt]},draw=eacLine,
+        line width=0.75pt,dash pattern=on 2pt off 2pt},
+    value/.style={fill=white,inner sep=1.8pt,
+        font=\sffamily\fontsize{9}{10}\selectfont},
+    result/.style={rounded corners=2pt,fill=eacPaper,
+        text width=4.05cm,align=center,inner sep=6pt,minimum height=0.86cm,
+        font=\sffamily\bfseries\fontsize{9}{11}\selectfont}
+]
+\path[use as bounding box] (-0.02,0.12) rectangle (16.07,-11.83);
+
+\node[anchor=north west,rounded corners=3pt,fill=eacPaper,
+    text width=15.58cm,inner sep=7pt,align=left] at (0,0)
+    {\textbf{Question $Q$}\quad Janet has 22 green and 10 yellow pens.
+    She buys 6 bags of 9 blue pens and 2 bags of 6 red pens. How many pens does she have now?};
+\node[anchor=north,align=center,text width=15.75cm,text=eacMuted,
+    font=\sffamily\fontsize{8}{10}\selectfont] at (8.025,-1.04)
+    {$D$ sees $Q$. W1 and W2 see $Q$ + assigned task + prior results.\\
+    W3 sees its task + prior results; no separately supplied $Q$.};
+
+% Panel colour is redundant with the labels and line styles.
+\foreach \x/\accent in {0/eacDisclosure,5.45/eacBypass,10.90/eacCoop} {
+    \fill[\accent!4,rounded corners=4pt] (\x,-1.78) rectangle +(5.15,-9.39);
+    \draw[\accent,line width=1.5pt] (\x+0.18,-1.78) -- (\x+4.97,-1.78);
+}
+
+\node[anchor=north west,text=eacDisclosure,
+    font=\sffamily\bfseries\fontsize{10}{12}\selectfont] at (0.18,-1.96)
+    {(a) Planner disclosure};
+\node[anchor=north west,text=eacBypass,
+    font=\sffamily\bfseries\fontsize{10}{12}\selectfont] at (5.63,-1.96)
+    {(b) Worker bypass};
+\node[anchor=north west,text=eacCoop,
+    font=\sffamily\bfseries\fontsize{10}{12}\selectfont] at (11.08,-1.96)
+    {(c) Division of reasoning};
+
+\node[plan,draw=eacDisclosure!50] (ad) at (2.47,-3.48)
+    {\textbf{D / PLAN}\\[3pt]
+     S1: Return $54$.\\
+     S2: Return $12$.\\
+     S3: Return $98$.};
+\node[plan,draw=eacBypass!50] (bd) at (7.92,-3.48)
+    {\textbf{D / PLAN}\\[3pt]
+     S1: Blue pens: $6\cdot9$.\\
+     S2: Red pens: $2\cdot6$.\\
+     S3: Add $22+10+z_1+z_2$.};
+\node[plan,draw=eacCoop!50] (cd) at (13.37,-3.48)
+    {\textbf{D / PLAN}\\[3pt]
+     S1: Blue pens: $6\cdot9$.\\
+     S2: Red pens: $2\cdot6$.\\
+     S3: Add $22+10+z_1+z_2$.};
+
+\node[worker] (aone) at (2.47,-5.47)
+    {\textbf{W1 / S1}\\[3pt]
+     Copies supplied value.\\
+     Local result: $z_1=\boxed{54}$};
+\node[worker,draw=eacBypass,line width=0.8pt] (bone) at (7.92,-5.47)
+    {\textbf{W1 / BYPASSES S1}\\[3pt]
+     $22+10+6\cdot9+2\cdot6=98$.\\
+     Local result: $z_1=\boxed{98}$};
+\node[worker,draw=eacCoop!60] (cone) at (13.37,-5.47)
+    {\textbf{W1 / S1: BLUE PENS}\\[3pt]
+     Computes $6\cdot9=54$.\\
+     Local result: $z_1=\boxed{54}$};
+
+\node[worker] (atwo) at (2.47,-7.31)
+    {\textbf{W2 / S2}\\[3pt]
+     Copies supplied value.\\
+     Local result: $z_2=\boxed{12}$};
+\node[worker] (btwo) at (7.92,-7.31)
+    {\textbf{W2 / S2: RED PENS}\\[3pt]
+     Computes $2\cdot6=12$.\\
+     Local result: $z_2=\boxed{12}$};
+\node[worker,draw=eacCoop!60] (ctwo) at (13.37,-7.31)
+    {\textbf{W2 / S2: RED PENS}\\[3pt]
+     Computes $2\cdot6=12$.\\
+     Local result: $z_2=\boxed{12}$};
+
+\node[terminal,draw=eacDisclosure] (afinal) at (2.47,-9.20)
+    {\textbf{W3 / TERMINAL}\\[3pt]
+     Returns S3's value.\\
+     Local result: $\boxed{98}$};
+\node[terminal,draw=eacBypass] (bfinal) at (7.92,-9.20)
+    {\textbf{W3 / TERMINAL}\\[3pt]
+     Copies W1's result.\\
+     Local result: $\boxed{98}$};
+\node[terminal,draw=eacCoop] (cfinal) at (13.37,-9.20)
+    {\textbf{W3 / TERMINAL}\\[3pt]
+     Computes $22+10+z_1+z_2$.\\
+     Local result: $\boxed{98}$};
+
+% Highlight actual use, not the complete instruction/context routing graph.
+\draw[flow,draw=eacDisclosure] (ad.east) -- (4.97,-3.48)
+    -- (4.97,-9.20) -- (afinal.east);
+\node[value,text=eacDisclosure] at (4.97,-6.38) {$98$};
+\draw[ignored] (atwo.south) -- node[value,text=eacMuted] {not needed} (afinal.north);
+
+\draw[flow,draw=eacBypass] (bone.east) -- (10.42,-5.47)
+    -- (10.42,-9.20) -- (bfinal.east);
+\node[value,text=eacBypass] at (10.42,-6.38) {$98$};
+\draw[ignored] (btwo.south) -- node[value,text=eacMuted] {ignored} (bfinal.north);
+
+\draw[flow,draw=eacCoop] (cone.east) -- (15.87,-5.47)
+    -- (15.87,-9.20) -- (cfinal.east);
+\node[value,text=eacCoop] at (15.87,-6.38) {$54$};
+\draw[flow,draw=eacCoop] (ctwo.south) -- node[value,text=eacCoop] {$12$} (cfinal.north);
+
+\foreach \x in {2.47,7.92,13.37} {
+    \node[result] at (\x,-10.62) {Correct answer: $98$\\Raw reward: $Y=1$};
+}
+
+\node[anchor=north,align=center,text width=15.8cm,text=eacMuted,
+    font=\sffamily\fontsize{8}{10}\selectfont] at (8.025,-11.40)
+    {Illustrative executions. $z_k$: W$k$'s local result. Solid arrows: used; dashed arrows: unused.};
+\end{tikzpicture}

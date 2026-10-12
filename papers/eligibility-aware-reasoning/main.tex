@@ -1,0 +1,259 @@
+\documentclass[11pt]{article}
+\usepackage[review]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,tabularx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\hypersetup{pdftitle={Learning a Division of Reasoning: Information Boundaries in Multi-Agent Mathematical Problem Solving},pdfauthor={Anonymous Authors}}
+\newcommand{\ind}{\mathbb{I}}
+\newcommand{\pending}{\textcolor{blue!65!black}{\textsc{pending}}}
+
+\title{Learning a Division of Reasoning:\\Information Boundaries in Multi-Agent Mathematical Problem Solving}
+\author{Anonymous Authors}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A correct mathematical answer can conceal a failed division of reasoning: a planner may disclose the solution, or one worker may bypass the others. Such executions can earn outcome reward without exercising the intended worker computations. We formulate the information-boundary problem: providing guidance that enables, rather than replaces, downstream reasoning. We introduce \textbf{Eligibility-Aware C3 (EAC3)}, which combines counterfactual continuation credit with answer-recovery probes and intermediate-answer checks, distinguishing eligible success, known failure, and unresolved audits. In experiments with small-model workers, gate-accepted accuracy on a 128-trajectory validation audit rises from 15.6\% to 21.9\%, while raw accuracy falls from 42.2\% to 31.2\%. Single-subtask plans fall from 48.4\% to 2.3\%. These results reveal an accuracy--eligibility trade-off: higher outcome accuracy need not correspond to more eligible reasoning. Independent cooperation and transfer tests remain necessary to determine whether preserving a division of work improves worker capabilities beyond protocol compliance.
+\end{abstract}
+
+\section{Introduction}
+\emph{Successful answers need not imply successful cooperation.} A planner may disclose a solution, one worker may solve the entire problem, or several workers may compute complementary intermediate results. All three can produce the same correct answer. When training aims to develop reusable worker skills, however, they need not be equally useful experiences. The research problem is therefore how to \emph{learn a useful division of reasoning}, not simply how to assign different role prompts.
+
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{\input{figures/problem-overview.tex}}
+\caption{\textbf{Illustrative patterns of planner and worker computation.} (a) The decomposer supplies the answers, making worker computation unnecessary. (b) $W_1$ solves the whole question instead of its blue-pen subtask; the terminal worker copies it and ignores $W_2$'s result. (c) Workers compute distinct quantities and combine them. Arrows highlight selected result use, not all routed inputs; each worker receives only its own plan item. These are illustrative executions, not measured results or automatic eligibility labels.}
+\label{fig:problem}
+\end{figure*}
+
+Figure~\ref{fig:problem} makes the distinction concrete. Identical final answers and raw rewards can arise from answer disclosure, independent whole-problem solving, or complementary worker computations. The training objective must therefore distinguish the outcome from the division of work we hope to develop.
+
+Better credit assignment alone does not settle this problem. A disclosed answer may genuinely cause downstream success; rewarding that contribution is not an estimation error. It is an objective mismatch if the intended outcome includes worker computation. We distinguish \emph{attribution}, which action improved the outcome, from \emph{eligibility}, whether that outcome meets the conditions under which we want to reinforce the action.
+
+The boundary is difficult to specify. Restricting question access risks insufficient context; restoring it permits independent re-solving. A planner may also need partial reasoning to identify useful subtasks. We ask: \emph{how can guidance enable downstream computation without replacing it?} The motivation is capability acquisition, not cooperation at any cost: a single solver can remain preferable when only immediate accuracy matters.
+
+\textbf{Our contributions are threefold.} \emph{(1) Problem:} we formulate this information boundary, separating task correctness, desired cooperation, and measurable eligibility. \emph{(2) Method:} EAC3 conditions counterfactual credit on operational eligibility without a separate large-model semantic judge. \emph{(3) Results:} our experiments show higher gate-accepted accuracy and fewer single-subtask plans, alongside lower raw accuracy. This trade-off motivates controlled ablations, independent cooperation audits, and worker-transfer tests to connect eligibility with useful specialisation.
+
+\section{Related Work}
+MAST documents system-design, inter-agent, and verification failures \citep{cemri2025mast}. ReMA learns meta-thinking/reasoning collaboration \citep{wan2025rema}; HintMR guides a small language model (SLM) with localised hints \citep{hossain2026hintmr}. We do not claim that guidance or role separation is new. We study how outcome reward can reinforce bypass of the intended computations, including in successful executions.
+
+C3 supports shared-prefix alternatives, repeated continuations, and leave-one-out credit for a specified reward \citep{chen2026c3}. EAC3 adapts the target and update rules to measured eligibility, with group-relative normalisation \citep{shao2024deepseekmath}, rather than proposing a new unbiased estimator. SNEAK evaluates information sharing through differently informed receivers \citep{avsian2026sneak}; our probes instead test answer recovery in cooperative mathematics, not secrecy.
+
+\section{Problem Formulation}
+\subsection{Roles and information access}
+For a question $Q$ with reference answer $y^*$, a decomposer $D_\theta$ produces reasoning and an ordered plan $P=(S_1,\ldots,S_K)$. A deterministic router assigns one task per worker stage. All workers share parameters $\phi$. Worker $k<K$ observes $Q$, its assigned task, and preceding extracted local results $z_{<k}$. The last planned worker observes its task and preceding results, but no separately supplied $Q$. Information copied into its task remains visible. There is no separate finaliser.
+
+Each worker generates reasoning followed by a boxed \texttt{LOCAL\_RESULT}. A shared extractor defines both the communicated value $z_k$ and the value used by the eligibility comparison. The terminal answer is $\hat y=z_K$, with outcome
+\begin{equation}
+Y=\ind[\operatorname{Verify}(\hat y,y^*)=1].
+\end{equation}
+Only $D_\theta$ is updated in the experiment reported here; the worker model is frozen. Alternating worker/decomposer training is a planned extension, not an evaluated result.
+
+\subsection{The information-boundary problem}
+For a complete execution trace $\tau$, distinguish task success from success through the intended division of work:
+\begin{equation}
+J_{\rm task}=\mathbb E[Y],\qquad
+J_{\rm collab}=\mathbb E[Y\,\mathcal C(\tau)].
+\end{equation}
+Here $\mathcal C(\tau)\in\{0,1\}$ denotes the desired, unobserved property that workers perform their assigned computations and use dependencies when needed. It is a research target, not an available label or the implemented reward. Correctness alone does not identify it.
+
+For example, instructing a worker to compute $6\cdot9$ leaves computation to that worker; instructing it to return 54 can replace that computation. Both may lead to the same correct terminal answer. We use \emph{strategic leakage} for guidance that substitutes for the intended downstream reasoning, and \emph{role bypass} for independent whole-problem solving. These are protocol-relative shortcuts, not necessarily mistakes or evidence of deceptive intent. A single worker can be appropriate for an easy problem; excluding such cases is a deliberate multi-step learning objective.
+
+This boundary concerns computational work, not information-theoretic secrecy: the question already determines its answer. Neither final correctness nor eligibility identifies $\mathcal C$. Whether preserving worker computation improves later capability acquisition is a separate, testable hypothesis, not a consequence of the definition.
+
+\section{EAC3: Eligibility-Aware C3}
+\subsection{Operational eligibility}
+A probe solver receives the terminal worker's static instruction $I_K$, without preceding worker results or a separately appended question. Define
+\begin{equation}
+L_T=\ind[\operatorname{Verify}(\operatorname{Probe}(I_K),y^*)=1].
+\end{equation}
+A positive $L_T$ indicates that the tested solver can recover the answer without the routed worker results. It does not distinguish literal disclosure from fresh reasoning. For each non-terminal result, we also compute
+\begin{equation}
+E_k=\ind[\operatorname{MathEq}(z_k,\hat y)=1],\quad k<K.
+\end{equation}
+This compares against the generated terminal answer, not the reference. When all required checks are valid, a trajectory passes if
+\begin{equation}
+\gamma=\ind[K\geq2](1-L_T)\prod_{k<K}(1-E_k).
+\label{eq:gate}
+\end{equation}
+A known rejection takes precedence over other unresolved checks. Otherwise, a parsing failure, truncated probe, or surfaced verifier error yields an \emph{unknown} audit, not evidence of leakage. Unknowns cannot receive positive credit.
+
+The complete decomposer output is separately probed as $L_D$ for diagnostics only. A complete plan may legitimately contain enough information to reconstruct the solution; consequently $L_D$ is not used in Eq.~\ref{eq:gate}. Neither negative recovery nor unequal answers proves correct execution of the assigned subtask.
+
+\subsection{Shared-prefix credit and optimisation}
+For each identical decomposer input $x$, sample $N=8$ plans $P_j\sim D_{\theta_{\rm old}}(\cdot\mid x)$. For each plan, generate $M=4$ independent worker continuations. The complete factual success estimate is
+\begin{equation}
+q_j=\frac{1}{M}\sum_{m=1}^{M}Y_{jm}.
+\end{equation}
+No unsuccessful continuation is discarded from this average. The decomposer reward is
+\begin{equation}
+R_j=\begin{cases}
+q_j & \text{if all $M$ continuations pass},\\
+0 & \text{if any has a known rejection},\\
+\bot & \text{otherwise (unresolved audit)}.
+\end{cases}
+\label{eq:reward}
+\end{equation}
+When every audit is valid, Eq.~\ref{eq:reward} is $R_j=q_j\prod_m\gamma_{jm}$, not $M^{-1}\sum_mY_{jm}\gamma_{jm}$. Thus, it rewards success only when the sampled continuation set is entirely eligible. Increasing $M$ changes this conservative target, not only estimation variance.
+
+Let $\mathcal K_x$ contain the structurally valid, distinct sampled action slots with known rewards for input $x$. Repeated continuation copies are represented only once. For $|\mathcal K_x|\geq2$, compute
+\begin{align}
+C_j&=R_j-\frac{\sum_{\ell\in\mathcal K_x\setminus\{j\}}R_\ell}{|\mathcal K_x|-1},\\
+A_j&=\frac{C_j}{\operatorname{sd}(\{C_\ell\}_{\ell\in\mathcal K_x})+\epsilon}.
+\end{align}
+Groups without reward contrast are skipped. Signed advantages enter a PPO-style clipped policy objective on decomposer tokens; worker tokens and replicated actions are masked. Known rejected plans remain zero-reward alternatives in both the baseline and policy update. Thus, zero reward can produce a negative advantage. Unknown rewards are excluded from both.
+
+\paragraph{What changes relative to C3?}
+EAC3 changes the learning target, not the need for accurate attribution. Even if every $q_j=1$, differing eligibility supplies a contrast absent from raw-outcome credit. Known failures remain zero-reward trainable alternatives rather than being filtered out; unresolved audits do not become fabricated failures. Thus, EAC3 can favour eligible plans over equally successful bypasses. Its target remains a proxy, and outcome-dependent exclusion and group normalisation do not inherit C3's unbiasedness guarantee for the original target.
+
+\section{Experimental Setting}
+Our experiments use a Qwen2.5-7B-Instruct decomposer and a shared Qwen2.5-1.5B-Instruct worker model previously trained in a worker-only phase. There are at most four routed tasks and one execution round. Cached teacher attempts from Phi-4-mini-reasoning provide optional decomposer context during training; correct and incorrect attempts are retained. Teacher visibility decreases linearly from one to zero over 200 completed decomposer updates. Validation is question-only from the start.
+
+The recovery solver reuses the decomposer's current weights with a different prompt and a 256-token limit, so its measurement properties can change during training. Training budgets, batch construction, and evaluation provenance are recorded in Appendix~\ref{app:evidence}.
+
+We compare two training configurations: a raw-outcome decomposer (\textbf{A}) and EAC3 with corrected group handling (\textbf{B}). The comparison evaluates the combined training configurations rather than isolating the effect of reward conditioning. Raw benchmark accuracies and the 128-trajectory leakage audit are distinct measurements. The audit prioritises printed examples and fills its remaining budget by validation-subset strata; it is not a uniform random sample.
+
+\section{Results and Analysis}
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Audit metric (\%) & A & B\\
+\midrule
+Raw accuracy & 42.2 & 31.2\\
+Gate-accepted accuracy & 15.6 & 21.9\\
+Fully eligible trajectories & 24.2 & 50.8\\
+Single-subtask plans & 48.4 & 2.3\\
+Terminal recovery $L_T$\textsuperscript{v} & 29.3 & 5.7\\
+Worker/terminal match\textsuperscript{v} & 25.0 & 7.6\\
+Whole-plan recovery $L_D$\textsuperscript{v} & 54.3 & 58.0\\
+\midrule
+Valid terminal probes & 71.9 & 68.0\\
+Valid whole-plan probes & 82.0 & 68.8\\
+Valid worker comparisons & 90.7 & 85.6\\
+\bottomrule
+\end{tabular}
+\caption{Validation-audit results, 128 trajectories per condition. A: raw-outcome training; B: EAC3 with corrected group handling. Values reproduce rounded console summaries. Superscript v denotes rates conditional on valid measurements. Worker rates count comparisons, not trajectories.}
+\label{tab:results}
+\end{table}
+
+Table~\ref{tab:results} shows an accuracy--eligibility trade-off: gate-accepted correctness increases by 6.3 percentage points, while raw accuracy decreases by 11.0 points. The audit is consistent with 20 versus 28 accepted correct answers and 54 versus 40 raw correct answers. Non-singleton planning increases, but whole-plan recovery does not decrease and audit coverage is imperfect. These are changes in measured eligibility, not proof of improved cooperation or universal leakage reduction.
+
+Among 51 questions with printed trajectories in both conditions, raw correct answers change from 25 to 23, gate-accepted correct answers from 13 to 18, and single-task plans from 27 to one. This common-question analysis uses a selected subset, not an independent representative evaluation.
+
+\paragraph{Cooperation already occurs in both runs.}
+Both runs solve an advertising-cost example through $50\cdot5=250$, $15\cdot75=1125$, and summation to $1375$. Both also route $(54,12)$ in a pen-count example before adding 22 and 10 to obtain 98. These chains contain meaningful computation; their causal necessity still requires intervention tests.
+
+\paragraph{Explicit dependencies can propagate errors.}
+For a triangle with sides $34,34,32$, B reports $PM=17$ and $QM^2=801$, then propagates this error to return $\sqrt{801}$ instead of 30. Conversely, a correct recycling solution misstates unit prices while using the right arithmetic. Dependence is not reliability, and final correctness is not local correctness.
+
+\section{From Eligibility to Useful Cooperation}
+The following tests are \emph{not yet performed}. They separate protocol compliance from benefits that would justify preserving a division of reasoning.
+
+\paragraph{RQ1: Does eligibility conditioning change learned planning?}
+\textbf{Hypothesis:} retaining known failures as zero-reward alternatives improves eligible success beyond filtering. Table~\ref{tab:planned} controls group handling; its minimum-two-task baseline isolates task-count effects. Freeze worker checkpoints and match question splits and compute across repeated runs.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Controlled condition & ACC & G-ACC & Dep.\\
+\midrule
+Raw-outcome C3 & \pending & \pending & \pending\\
+Minimum two tasks & \pending & \pending & \pending\\
+Eligibility masking & \pending & \pending & \pending\\
+EAC3 & \pending & \pending & \pending\\
+\bottomrule
+\end{tabular}
+\caption{Unperformed controlled comparisons. ACC: raw accuracy; G-ACC: gate-accepted accuracy; Dep.: held-out result-dependence intervention. All entries are intentionally pending, not zero.}
+\label{tab:planned}
+\end{table}
+
+\paragraph{RQ2: Do gains reflect cooperation or probe adaptation?}
+\textbf{Hypothesis:} gains persist under a frozen evaluation probe and independent trace audits. Compare interventions on relevant results with irrelevant-message controls, alongside local correctness. Greater fragility alone is not better cooperation. Report audit coverage and probe errors, not only gate pass rates.
+
+\paragraph{RQ3: Does specialised planning improve worker learning?}
+\textbf{Hypothesis:} workers trained under EAC3 planners gain more transferable skills than workers trained under raw-outcome planners. Freeze each planner, start identical workers, and match training budgets. Test unfamiliar subtasks, replacement planners, and end-to-end accuracy against resource-matched single-agent and ReMA-style baselines. Capability gains and accuracy recovery remain hypotheses.
+
+\paragraph{Why this matters beyond our gates.}
+The broader question is when assistance improves immediate task completion but bypasses computation a learner is meant to acquire. EAC3 is one operational test of this tension. Future evaluations should separate correctness, eligibility, independent cooperation evidence, and actual policy updates. Gate-accepted success does not itself imply positive advantage or an update. A reusable trace protocol is proposed in Appendix~\ref{app:future}.
+
+\section{Conclusion}
+Correct answers can conceal bypass of intended worker computations. EAC3 separates attribution from operational eligibility, exposing a measurable accuracy--eligibility trade-off. Its broader value depends on whether preserving a division of work develops transferable capabilities. This is the next empirical test, not an inference from gate pass rates.
+
+\section*{Limitations}
+Our experiments use one run per condition, a small non-random audit, and simultaneous reward and group-handling changes. The results do not establish statistical significance or isolate the contribution of reward conditioning. Negative recovery can reflect probe weakness; equal answers can be legitimate, while unequal answers can conceal irrelevant or incorrect computation. Partial solution disclosure remains possible. The evolving probe confounds generation and measurement, and conservative gating can reduce coverage and bias the retained sample. The evaluated training phase updates the decomposer, not workers, and cannot establish improved worker skills. Full benchmark results for B are unavailable in the retained evaluation record.
+
+\section*{Ethics Statement}
+The study concerns mathematical reasoning with existing model checkpoints and datasets. No human-subject experiment or new annotation study has yet been conducted. Planned manual audits require a documented annotation protocol. Eligibility is an operational research criterion, not a safety certification or evidence of model intent. Compute accounting and dataset/model licensing should be documented before submission.
+
+\bibliography{references}
+
+\appendix
+\section{Evidence and Reproducibility}
+\label{app:evidence}
+\paragraph{Training budget and evaluation records.}
+We report evaluation after 30 completed decomposer updates per condition, using runs 6061597 (A) and 6068468 (B). A's evidence is an ANSI-cleaned log; B's October 11 excerpt contains the audit but truncates the per-benchmark metrics. The retained complete B log does not include this evaluation, so missing values remain pending.
+
+Each batch expands three questions over 16 teacher-attempt slots and 32 continuations, not 1,536 independent questions. Prefix identity is checked within each C3 group.
+
+The evidence bundle records source hashes, summaries, 51 matched questions, and case histories. Extraction does not rerun verification. A explicitly logs 128 audit trajectories; B's size follows the configured cap and needs confirmation from its complete record. Audit identities are not fully matched.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Validation subset & A & B\\
+\midrule
+MATH500 & 50.2 & \pending\\
+GSM8K & 69.1 & \pending\\
+AIME 2024 & 3.3 & \pending\\
+AMC 2023 & 25.0 & \pending\\
+Gaokao 2023 (English) & 42.1 & \pending\\
+Minerva Math & 23.5 & \pending\\
+OlympiadBench & 19.3 & \pending\\
+AIME 2025 & 3.3 & \pending\\
+\bottomrule
+\end{tabular}
+\caption{Per-subset raw accuracy (\%), distinct from Table~\ref{tab:results}'s validation audit. Entries for B await the complete evaluation record.}
+\end{table}
+
+MATH500 is an implementation-specific evaluation subset of MATH \citep{hendrycks2021math}, not its full test set. GSM8K follows \citet{cobbe2021gsm8k}; exact split identifiers and evaluated counts remain to be archived.
+
+\paragraph{Implementation.}
+At revision \texttt{4615d0d}, \texttt{prefix\_probe.py} defines eligibility. Action credit is computed in \texttt{scoped\_c3\_grpo.py}; update masks are applied in \texttt{ray\_trainer.py}. A's historical configuration must be reconstructed before assuming identical grouping or masking.
+
+\paragraph{Extraction and audit details.}
+Explicit local-result sections take precedence; ambiguous results are not guessed. Completed boxed \texttt{UNKNOWN} is valid negative recovery; truncated probes remain unknown. Valid-only recovery rates and invalid rates have different denominators.
+
+\paragraph{Scope of EAC3.}
+The reported decomposer experiment uses eligibility-conditioned rewards before the leave-one-out comparison. The worker-training implementation instead retains factual action means in the baseline and applies eligibility to update masks, with optional positive-only updates for non-terminal workers. Terminal status is determined per trajectory, not by a fixed model identity: one shared worker model executes multiple stages. These are distinct training rules; the decomposer results do not evaluate the worker rule. Exact-prefix checks, complete continuation groups, and one actor row per sampled action preserve the counterfactual sampling unit. They are implementation requirements, not standalone estimator innovations. The $8\times4$ budget is likewise a configuration choice.
+
+\section{Planned Evaluation and Reusable Traces}
+\label{app:future}
+These specifications are a research agenda, not additional completed results or a released benchmark. They support evaluation of alternative eligibility checks as well as EAC3.
+
+\paragraph{Controlled training comparison.}
+Run raw-outcome C3, a minimum-two-task constraint, eligibility-only update masking, and EAC3 with identical corrected grouping, initial model checkpoints, question splits, and decoding settings. Report at least three seeds where feasible, uncertainty, completed updates, retained groups, and total compute including teacher generation, probes, and all continuations. Match compute as well as reporting update counts; eligibility filtering can change the cost of an update.
+
+\paragraph{Independent cooperation audit.}
+Use a question-matched evaluation sample selected independently of gate outcomes. Freeze the evaluation probe across conditions, and manually label a subset for local correctness, direct answer disclosure, and use of relevant dependencies. Record annotation agreement and distinguish invalid checks from negative recovery. Compare removal and replacement of relevant results against irrelevant-message controls, reporting factual accuracy and local-result quality alongside intervention effects. These interventions can introduce distribution shift and should not be interpreted as an exact decomposition of credit.
+
+\paragraph{Worker learning and transfer.}
+Train identical worker initialisations under frozen baseline and EAC3 planners with matched budgets. Evaluate on held-out questions and unfamiliar subtasks under common evaluation planners, including replacement planners, so a familiar partner cannot alone explain a gain. Report worker-only, paired-system, and resource-matched single-agent results. Only then test whether alternating planner/worker training recovers accuracy while retaining independently assessed cooperation.
+
+\paragraph{Reusable trace protocol.}
+Archive role inputs and outputs, parsed local results, question and action-group identifiers, continuation membership, factual correctness, each probe outcome and validity status, eligibility decisions, action rewards, advantages, token-update masks, and whether an update occurred. Independent annotations should remain separate from the training gates. A release should include versioned prompts, model and verifier identities, extraction rules, sampling metadata, and compute counts. This would let future methods compare not just which traces pass an audit, but which behaviours receive actual training credit.
+
+\end{document}
