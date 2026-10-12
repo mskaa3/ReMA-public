@@ -6,7 +6,6 @@
 #SBATCH --time=72:00:00
 #SBATCH --mem=200gb
 #SBATCH -p lem-gpu-short
-#SBATCH --exclude=r16-[2,11,14]
 #SBATCH --gres=gpu:hopper:4,storage:local:200G
 #SBATCH --verbose
 
