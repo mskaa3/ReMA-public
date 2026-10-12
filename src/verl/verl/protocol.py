@@ -195,9 +195,16 @@ class DataProto:
             return 0
 
     def __getitem__(self, item):
-        tensor_data = self.batch[item]
-        non_tensor_data = {key: val[item] for key, val in self.non_tensor_batch.items()}
-        return_type = DataProto if isinstance(item, slice) else DataProtoItem
+        """Return an item for a scalar row index, or a batch for row selections."""
+        if isinstance(item, (np.ndarray, torch.Tensor)) and item.ndim == 0:
+            item = item.item()
+        # Use native indices on both sides so singleton tensors and boolean
+        # arrays select the same rows without dropping metadata's batch axis.
+        tensor_index = torch.as_tensor(item) if isinstance(item, np.ndarray) else item
+        numpy_index = item.detach().cpu().numpy() if isinstance(item, torch.Tensor) else item
+        tensor_data = self.batch[tensor_index] if self.batch is not None else None
+        non_tensor_data = {key: val[numpy_index] for key, val in self.non_tensor_batch.items()}
+        return_type = DataProtoItem if isinstance(item, (int, np.integer)) else DataProto
         return return_type(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
 
     def __getstate__(self):

@@ -1491,7 +1491,7 @@ class RayReMASeparatedTrainer(object):
                 int(getattr(probe_reward_fn, 'num_examine', 1)),
             )
             for index in indices:
-                # Only slicing preserves DataProto; list indexing returns DataProtoItem.
+                # Keep a batch dimension when logging an individual example.
                 self._print_validation_leakage_examples(data_batch[index:index + 1], scope='train')
 
     def _update_prefix_probe_batch_metrics(self, data_batch, metrics):
