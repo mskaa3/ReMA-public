@@ -1,0 +1,64 @@
+% Execution architecture; training-time reward computation is shown separately in text.
+\definecolor{archInk}{HTML}{26343B}
+\definecolor{archMuted}{HTML}{64717A}
+\definecolor{archLine}{HTML}{ABB4B9}
+\definecolor{archAccent}{HTML}{236D68}
+\definecolor{archFill}{HTML}{F6F8F9}
+
+\noindent\begin{tikzpicture}[
+    x=1cm,y=1cm,
+    font=\sffamily\fontsize{9}{11}\selectfont,
+    text=archInk,
+    block/.style={draw=archLine,line width=0.65pt,rounded corners=2pt,
+        fill=white,align=center,inner sep=6pt},
+    worker/.style={block,text width=2.4cm,minimum height=1.25cm},
+    flow/.style={-{Stealth[length=5pt,width=4pt]},draw=archInk,line width=0.8pt},
+    route/.style={-{Stealth[length=5pt,width=4pt]},draw=archMuted,line width=0.65pt},
+    label/.style={fill=white,inner sep=2pt,
+        font=\sffamily\fontsize{9}{10}\selectfont}
+]
+\path[use as bounding box] (-0.25,0.82) rectangle (16.05,-5.08);
+
+\node[block,text width=1.45cm,minimum height=1cm] (q) at (0.72,0)
+    {Question\\[2pt]$Q$};
+\node[block,draw=archAccent,line width=0.9pt,text width=2.4cm,
+    minimum height=1cm] (d) at (3.70,0)
+    {\textbf{Decomposer}\\[2pt]
+     {\color{archMuted}\fontsize{8}{10}\selectfont $D_\theta$\quad Trainable}};
+\node[block,text width=3.2cm,minimum height=1cm] (router) at (10.00,0)
+    {\textbf{Deterministic routing}\\[2pt]
+     {\color{archMuted}\fontsize{8}{10}\selectfont One task per stage}};
+\draw[flow] (q.east) -- (d.west);
+\draw[flow] (d.east) -- node[label,above=3pt] {$P=(S_1,\ldots,S_K)$} (router.west);
+
+% Worker stages are separate invocations of one model, not separate parameter sets.
+\filldraw[fill=archFill,draw=archLine!65,line width=0.5pt,rounded corners=3pt]
+    (2.02,-2.35) rectangle (13.96,-4.62);
+\node[worker] (wone) at (3.70,-3.16)
+    {\textbf{Worker $W_1$}\\[5pt]$Q,\ S_1$};
+\node[worker] (wtwo) at (8.00,-3.16)
+    {\textbf{Worker $W_2$}\\[5pt]$Q,\ S_2,\ z_1$};
+\node[worker,draw=archAccent,line width=0.9pt] (wk) at (12.30,-3.16)
+    {\textbf{Terminal $W_K$}\\[5pt]$S_K,\ z_{<K}$};
+
+% The plan is split before routing; workers do not receive the full plan.
+\draw[draw=archMuted,line width=0.65pt] (router.south) -- (10.00,-1.38);
+\draw[draw=archMuted,line width=0.65pt] (3.70,-1.38) -- (12.30,-1.38);
+\foreach \x/\target/\task in {3.70/wone/1,8.00/wtwo/2,12.30/wk/K} {
+    \draw[route] (\x,-1.38) -- node[label] {$S_{\task}$} (\target.north);
+}
+
+\draw[flow] (wone.east) -- node[label,fill=archFill,above=4pt] {$z_1$} (wtwo.west);
+\draw[flow] (wtwo.east) -- node[label,fill=archFill,above=4pt] {$z_{<K}$}
+    node[label,fill=archFill] {$\cdots$} (wk.west);
+\draw[flow] (wk.east) -- (14.66,-3.16);
+\node[anchor=west,align=left,inner sep=3pt] at (14.70,-3.16)
+    {Answer\\[3pt]$\hat y=z_K$};
+
+\node[anchor=center,text=archMuted,
+    font=\sffamily\fontsize{8}{10}\selectfont] at (8.00,-4.21)
+    {Shared worker parameters $\phi$\quad\textbar\quad Frozen};
+\node[anchor=north,align=center,text width=15.5cm,text=archMuted,
+    font=\sffamily\fontsize{8}{10}\selectfont] at (8.00,-4.80)
+    {Inputs are shown inside each stage. $z_{<k}$ denotes all preceding local results.};
+\end{tikzpicture}

@@ -58,6 +58,22 @@ The standalone deliverable is:
 The source ZIP must retain the figures/ subdirectory for Overleaf compilation.
 Page-count reduction is deferred while the problem presentation is developed.
 
+ARCHITECTURE FIGURE
+Figure 2 shows the execution path: question, decomposer, deterministic routing,
+sequential worker stages, and the terminal answer. Input labels distinguish
+non-terminal question access from the terminal stage's task-and-results context.
+All worker stages share one model; trainable/frozen labels refer to the reported
+decomposer-training phase. Optional training-only teacher context and EAC3 reward
+computation are omitted to keep the architecture separate from the learning rule.
+
+Editable vector artwork:
+  figures/architecture.tex
+Build its standalone export with:
+  latexmk -pdf -interaction=nonstopmode -halt-on-error architecture-standalone.tex
+The standalone deliverable is:
+  output/pdf/eac3-architecture.pdf
+Include architecture-standalone.tex and figures/architecture.tex in the source ZIP.
+
 RESULTS
 The main results are the step-30 128-trajectory leakage audits and the 51
 identity-matched printed examples. They are NOT full-suite validation accuracy.

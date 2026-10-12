@@ -51,6 +51,15 @@ C3 supports shared-prefix alternatives, repeated continuations, and leave-one-ou
 \subsection{Roles and information access}
 For a question $Q$ with reference answer $y^*$, a decomposer $D_\theta$ produces reasoning and an ordered plan $P=(S_1,\ldots,S_K)$. A deterministic router assigns one task per worker stage. All workers share parameters $\phi$. Worker $k<K$ observes $Q$, its assigned task, and preceding extracted local results $z_{<k}$. The last planned worker observes its task and preceding results, but no separately supplied $Q$. Information copied into its task remains visible. There is no separate finaliser.
 
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{\input{figures/architecture.tex}}
+\caption{\textbf{Execution architecture.} The decomposer produces an ordered plan; deterministic routing assigns one subtask to each sequential worker stage. Stages share one worker model and pass extracted local results, not full reasoning transcripts. Each stage receives its own task, not the full plan. Non-terminal stages also receive $Q$; the last stage receives no separately supplied question and returns the system answer. The ellipsis represents optional intervening stages, with all preceding local results available downstream. Trainable/frozen labels describe the reported decomposer-training phase. Training-only teacher context and EAC3 reward computation are omitted.}
+\label{fig:architecture}
+\end{figure*}
+
+Figure~\ref{fig:architecture} summarises the execution path and stage-specific inputs.
+
 Each worker generates reasoning followed by a boxed \texttt{LOCAL\_RESULT}. A shared extractor defines both the communicated value $z_k$ and the value used by the eligibility comparison. The terminal answer is $\hat y=z_K$, with outcome
 \begin{equation}
 Y=\ind[\operatorname{Verify}(\hat y,y^*)=1].
