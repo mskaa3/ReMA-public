@@ -1392,6 +1392,13 @@ class MultiAgentRollout:
                 prompts.meta_info.get("teacher_attempt_probability", 0.0)
             )
         )
+        from verl.rema_separated_trainer.ppo.experiment_io import validation_plans
+        fixed_plans = validation_plans(
+            prompts.non_tensor_batch,
+            enabled=bool(prompts.meta_info.get("replay_plans", False)),
+            validation=is_validation,
+            max_turns=max_num_turns,
+        )
         sampled_teacher_attempts = prompts.non_tensor_batch.get(
             teacher_attempt_key,
             np.asarray([""] * batch_size, dtype=object),
@@ -1673,20 +1680,25 @@ class MultiAgentRollout:
                     idx,
                     content,
                 )
-            decomposer_records = self._generate_from_hierarchical_chat_map(
-                decomposer_role,
-                unfinished_indices,
-                decomposer_chats_by_idx,
-                tokenizers,
-                prompts.meta_info,
-                response_length,
-                max_new_tokens=decomposer_max_new_tokens,
-                group_ids=generation_group_ids(decomposer_role),
-                coupled_group_ids=coupled_groups_for(
+            if fixed_plans is not None:
+                decomposer_records = {
+                    idx: (fixed_plans[idx], 0, "stop", []) for idx in unfinished_indices
+                }
+            else:
+                decomposer_records = self._generate_from_hierarchical_chat_map(
                     decomposer_role,
                     unfinished_indices,
-                ),
-            )
+                    decomposer_chats_by_idx,
+                    tokenizers,
+                    prompts.meta_info,
+                    response_length,
+                    max_new_tokens=decomposer_max_new_tokens,
+                    group_ids=generation_group_ids(decomposer_role),
+                    coupled_group_ids=coupled_groups_for(
+                        decomposer_role,
+                        unfinished_indices,
+                    ),
+                )
             mark_branch_open(decomposer_role, unfinished_indices)
             current_plan = {}
             for idx in unfinished_indices:
@@ -1700,6 +1712,8 @@ class MultiAgentRollout:
                     num_tokens,
                     stop_reason,
                     token_ids,
+                    executed=fixed_plans is None,
+                    provided_plan=fixed_plans is not None,
                 )
                 record_c3_branch_action(
                     idx,

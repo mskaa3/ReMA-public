@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Build opt-in EAC3 research runs; never submit jobs automatically."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src/verl/verl/rema_separated_trainer/ppo'))
+from experiment_io import question_id, plan_id  # noqa: E402
+
+PHASES = ('planners', 'workers', 'transfer', 'cross')
+WORKER_ROLES = '[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4]'
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def sha_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def validate_study(cfg):
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', cfg['study']):
+        raise ValueError('study must be a filesystem-safe, unique study name')
+    if set(cfg['planners']) != {'baseline', 'eac3'}:
+        raise ValueError('Exactly baseline and eac3 planner exports are required')
+    if cfg['planners']['baseline'] == cfg['planners']['eac3']:
+        raise ValueError('Baseline and EAC3 must identify different planner artifacts')
+    for key in ('worker_updates', 'rollout_step_limit', 'test_freq', 'save_freq',
+                'train_question_batch_size', 'rollout_n', 'continuations_per_action',
+                'nodes', 'gpus_per_node'):
+        if type(cfg[key]) is not int or cfg[key] <= 0:
+            raise ValueError(f'{key} must be a positive integer')
+    if cfg['rollout_step_limit'] < cfg['worker_updates']:
+        raise ValueError('Rollout cap cannot be smaller than the optimizer-update target')
+    n, m = cfg['rollout_n'], cfg['continuations_per_action']
+    if n % m or n // m < 2:
+        raise ValueError('C3 needs at least two actions and complete continuation groups')
+    gpu = cfg['gpus_per_node']
+    if gpu % 2 or (cfg['train_question_batch_size'] * n) % (cfg['nodes'] * gpu // 2):
+        raise ValueError('Two equal GPU pools and a divisible trajectory batch are required')
+    if not cfg['seeds'] or len(set(cfg['seeds'])) != len(cfg['seeds']):
+        raise ValueError('Specify distinct training seeds')
+    if any(type(seed) is not int or seed < 0 for seed in cfg['seeds'] + [cfg['eval_seed']]):
+        raise ValueError('Seeds must be non-negative integers')
+
+
+def run_name(cfg, phase, arm, seed):
+    return f"{cfg['study']}--{phase}-{arm}-s{seed}"
+
+
+def worker_export(cfg, arm, seed):
+    return f"{cfg['remote_root'].rstrip('/')}/{run_name(cfg, 'workers', arm, seed)}/workers/huggingface"
+
+
+def make_runs(cfg, phase):
+    validate_study(cfg)
+    jobs = []
+
+    def add(arm, seed, planner, worker, mode):
+        jobs.append({
+            'schema_version': 1, 'run_name': run_name(cfg, phase, arm, seed),
+            'phase': phase, 'arm': arm, 'seed': seed, 'mode': mode,
+            'planner': planner, 'worker': worker,
+            'evaluation_remote': cfg['common_plan_remote'] if mode == 'replay_eval' else cfg['eval_remote'],
+            'study_config': cfg,
+        })
+
+    if phase == 'planners':
+        for arm, planner in cfg['planners'].items():
+            add(arm, cfg['eval_seed'], planner, cfg['initial_worker'], 'planner_eval')
+    elif phase == 'workers':
+        for seed in cfg['seeds']:
+            for arm, planner in cfg['planners'].items():
+                add(arm, seed, planner, cfg['initial_worker'], 'worker_train')
+    elif phase == 'transfer':
+        # D is loaded for compatibility but never generates in fixed-plan evaluation.
+        planner = cfg['planners']['baseline']
+        add('initial', cfg['eval_seed'], planner, cfg['initial_worker'], 'replay_eval')
+        for seed in cfg['seeds']:
+            for arm in cfg['planners']:
+                add(arm, seed, planner, worker_export(cfg, arm, seed), 'replay_eval')
+    elif phase == 'cross':
+        for seed in cfg['seeds']:
+            for worker_arm in cfg['planners']:
+                for planner_arm, planner in cfg['planners'].items():
+                    add(f'{worker_arm}-under-{planner_arm}', seed, planner,
+                        worker_export(cfg, worker_arm, seed), 'planner_eval')
+    else:
+        raise ValueError(f'Unknown phase: {phase}')
+    return jobs
+
+
+def model_env(prefix, artifact):
+    if ':' in artifact:
+        return {prefix + '_MODEL_REMOTE': artifact}
+    return {prefix + '_MODEL_REMOTE': '', prefix + '_MODEL_PATH': artifact}
+
+
+def run_environment(run):
+    cfg = run['study_config']
+    validate_study(cfg)
+    expected = {item['run_name']: item for item in make_runs(cfg, run['phase'])}
+    if run['run_name'] not in expected or any(
+        run.get(key) != value for key, value in expected[run['run_name']].items()
+    ):
+        raise ValueError('Run differs from its declared experimental design; regenerate it')
+    for artifact in (run['planner'], run['worker'], cfg['train_remote'], run['evaluation_remote'], cfg['remote_root']):
+        if not artifact or 'SET_ME' in artifact or not re.fullmatch(r'[A-Za-z0-9_./:@+\-]+', artifact):
+            raise ValueError(f'Replace the unresolved/invalid artifact before launch: {artifact!r}')
+    if int(os.environ.get('SLURM_NNODES', cfg['nodes'])) != cfg['nodes']:
+        raise ValueError('Slurm node allocation differs from the experiment manifest')
+    train = run['mode'] == 'worker_train'
+    overrides = {
+        'algorithm.hierarchy.agent12_curriculum.enable': False,
+        'algorithm.hierarchy.start_agent': 'worker_stage_1',
+        'algorithm.hierarchy.scoped_c3_grpo.enable': True,
+        'algorithm.hierarchy.scoped_c3_grpo.positive_only_nonterminal_workers': True,
+        'algorithm.hierarchy.accept_revise.enable': False,
+        'actor_rollout_ref.rollout.max_num_turns': 1,
+        'algorithm.hierarchy.worker_context_mode': 'full_question',
+        'algorithm.hierarchy.pass_question_to_workers': True,
+        'actor_rollout_ref.rollout.seed': run['seed'],
+        'data.seed': run['seed'],
+        'actor_rollout_ref.rollout.val_kwargs.n': 1,
+        'actor_rollout_ref.rollout.val_kwargs.do_sample': False,
+        'data.replay_plans': run['mode'] == 'replay_eval',
+        'trainer.val_only': not train,
+        'trainer.val_before_train': True,
+        'trainer.resume_mode': 'disable',
+        'trainer.max_actor_updates': cfg['worker_updates'] if train else None,
+        'trainer.validation_output_dir': '${trainer.default_local_dir}/evaluations',
+    }
+    env = {
+        'GPUS_PER_NODE': cfg['gpus_per_node'], 'POOL_GPUS_PER_NODE': cfg['gpus_per_node'] // 2,
+        'AGENT12_RUN_NAME': run['run_name'], 'AGENT12_S3_REMOTE': cfg['remote_root'],
+        'AGENT12_WANDB_RUN_ID': run['run_name'] + '-' + os.environ.get('SLURM_JOB_ID', 'local'),
+        'TRAIN_DECOMPOSER': 'false', 'TRAIN_AGENT_ROLES': WORKER_ROLES,
+        'TERMINAL_WORKER_AS_ANSWER': 'true', 'NUM_WORKER_STAGES': 4,
+        'MAX_PLANNED_SUBTASKS': 4, 'WORKER_CHECKPOINT_ROLE': 'worker_stage_4',
+        'DECOMPOSER_USE_REMOVE_PADDING': 'true', 'WORKER_USE_REMOVE_PADDING': 'true',
+        'PREFIX_PROBE_ENABLE': 'false',
+        'AGENT2_PILOT': 'false', 'GENERATE_TEACHER_DATA': 0, 'ONLINE_TEACHER_GENERATION': 'false',
+        'TEACHER_TRAIN_REMOTE': cfg['train_remote'], 'TEACHER_TRAIN_SHARDS_REMOTE': '',
+        'TEACHER_ASSISTED_VALIDATION': 'false', 'TEACHER_ROLLOUT_N': 1, 'TEACHER_SAMPLES_PER_CALL': 1,
+        'BASE_QUESTION_BATCH_SIZE': cfg['train_question_batch_size'],
+        'OPTIMIZER_PROMPT_BATCH_SIZE': cfg['train_question_batch_size'],
+        'ROLLOUT_N': cfg['rollout_n'], 'C3_CONTINUATIONS_PER_ACTION': cfg['continuations_per_action'],
+        'TOTAL_STEPS': cfg['rollout_step_limit'], 'TEST_FREQ': cfg['test_freq'], 'SAVE_FREQ': cfg['save_freq'],
+        'EXPERIMENT_MODE': run['mode'], 'EXPERIMENT_VAL_REMOTE': run['evaluation_remote'],
+    }
+    env.update(model_env('DECOMPOSER', run['planner']))
+    env.update(model_env('WORKER', run['worker']))
+    # Shell quoting protects Hydra interpolations and strings from bash expansion.
+    env['AGENT12_EXPERIMENT_OVERRIDES'] = ' '.join(shlex.quote(
+        key + '=' + (json.dumps(value) if not isinstance(value, str) else value)
+    ) for key, value in overrides.items())
+    return env
+
+
+def write_runs(cfg, phase, directory):
+    runs = make_runs(cfg, phase)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    git_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    code_files = [ROOT / 'agent12-curriculum-trainer-multinode.sh', ROOT / 'config/rema-rl.yaml',
+                  ROOT / 'eac3-experiment-multinode.sh', Path(__file__)]
+    code_files += sorted((ROOT / 'src/verl/verl/rema_separated_trainer/ppo').glob('*.py'))
+    code_files += sorted((ROOT / 'prompt').rglob('*.py'))
+    code_files += [ROOT / name for name in (
+        'src/verl/verl/rema_separated_trainer/main_ppo.py',
+        'src/verl/verl/workers/reward_manager/rema.py',
+        'src/verl/verl/workers/fsdp_rema_workers.py',
+        'src/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py',
+        'src/verl/verl/utils/dataset/rema_dataset.py',
+    )]
+    fingerprint = {str(path.relative_to(ROOT)): sha_file(path) for path in code_files}
+    commands = []
+    for run in runs:
+        run.update(git_sha=git_sha, code_sha256=fingerprint)
+        path = directory / (run['run_name'] + '.json')
+        path.write_text(json.dumps(run, indent=2) + '\n')
+        command = ['sbatch', f"--nodes={cfg['nodes']}",
+                   f"--gres=gpu:hopper:{cfg['gpus_per_node']},storage:local:200G",
+                   'eac3-experiment-multinode.sh', str(path)]
+        commands.append(shlex.join(command))
+    (directory / 'commands.txt').write_text('\n'.join(commands) + '\n')
+    print('\n'.join(commands))
+    print(f'Wrote {len(runs)} run manifests. Nothing has been submitted.', file=sys.stderr)
+
+
+def data_frames(train_path, eval_path, *, replay=False, deduplicate_train=False):
+    import pandas as pd
+    train, evaluation = pd.read_parquet(train_path), pd.read_parquet(eval_path)
+    if deduplicate_train:
+        for _, group in train.groupby(train.question.map(question_id)):
+            if len({str(value['ground_truth']) for value in group.reward_model}) != 1:
+                raise ValueError('Duplicate training questions have conflicting labels')
+        train = train.loc[~train.question.map(question_id).duplicated()].copy()
+    for label, frame in [('train', train), ('eval', evaluation)]:
+        required = {'question', 'reward_model', 'data_source'}
+        if frame.empty or not required.issubset(frame.columns):
+            raise ValueError(f'{label}: non-empty data with {sorted(required)} required')
+        if not all(isinstance(q, str) and q.strip() for q in frame.question):
+            raise ValueError(f'{label}: questions must be non-empty strings')
+        if not all(isinstance(r, dict) and 'ground_truth' in r for r in frame.reward_model):
+            raise ValueError(f'{label}: missing ground truth for the existing verifier')
+        if (label == 'train' or not replay) and frame.question.map(question_id).duplicated().any():
+            raise ValueError(f'{label}: duplicate questions; deduplicate explicitly before this experiment')
+    if set(train.question.map(question_id)) & set(evaluation.question.map(question_id)):
+        raise ValueError('Training and held-out evaluation questions overlap')
+    if replay:
+        required = {'fixed_decomposer_output', 'eval_item_id', 'answer_free_reviewed'}
+        if not required.issubset(evaluation.columns):
+            raise ValueError(f'Replay bank requires {sorted(required)}')
+        if evaluation.eval_item_id.duplicated().any():
+            raise ValueError('Replay bank has duplicate evaluation items')
+        if not all(isinstance(p, str) and p.strip() for p in evaluation.fixed_decomposer_output):
+            raise ValueError('Replay bank contains missing plans')
+        if not evaluation.answer_free_reviewed.eq(True).all():
+            raise ValueError('Transfer test requires independently reviewed answer-free plans')
+    return train, evaluation
+
+
+def prepare_data(train_path, eval_path, directory, deduplicate_train=False):
+    train, evaluation = data_frames(train_path, eval_path, deduplicate_train=deduplicate_train)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    for name, frame in [('train', train), ('eval', evaluation)]:
+        # No candidate answers/teacher traces in the experimental planner input.
+        columns = [key for key in ('question', 'reward_model', 'data_source', 'subset', 'extra_info') if key in frame]
+        frame[columns].to_parquet(directory / f'{name}.parquet', index=False)
+    manifest = {
+        'train_questions': len(train), 'eval_questions': len(evaluation),
+        'sha256': {name: sha_file(directory / f'{name}.parquet') for name in ('train', 'eval')},
+        'split_rule': 'explicit input splits; normalized question overlap rejected; no outcome filtering',
+        'deduplicate_train': deduplicate_train,
+    }
+    (directory / 'data.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(json.dumps(manifest, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    plan = sub.add_parser('plan')
+    plan.add_argument('--config', default='config/eac3-experiments.json')
+    plan.add_argument('--phase', choices=PHASES, required=True)
+    plan.add_argument('--output-dir', required=True)
+    env = sub.add_parser('environment')
+    env.add_argument('--run', required=True)
+    prepare = sub.add_parser('prepare-data')
+    check = sub.add_parser('validate-data')
+    for command in (prepare, check):
+        command.add_argument('--train', required=True)
+        command.add_argument('--eval', required=True)
+    prepare.add_argument('--output-dir', required=True)
+    prepare.add_argument('--deduplicate-train', action='store_true')
+    check.add_argument('--mode', choices=['worker_train', 'planner_eval', 'replay_eval'], required=True)
+    check.add_argument('--output-manifest')
+    args = parser.parse_args()
+    if args.command == 'plan':
+        write_runs(read_json(args.config), args.phase, args.output_dir)
+    elif args.command == 'environment':
+        run = read_json(args.run)
+        for name, digest in run.get('code_sha256', {}).items():
+            if sha_file(ROOT / name) != digest:
+                raise ValueError(f'Code changed after manifest creation: {name}; regenerate manifests')
+        # Drop inherited node-local paths; each independent experiment starts fresh.
+        print('unset JOB_TMP RAY_NODE_TMP CHECKPOINT_ROOT TEACHER_TRAIN_FILE TEACHER_CANDIDATES_FILE')
+        for name, value in run_environment(run).items():
+            print(f'export {name}={shlex.quote(str(value))}')
+    elif args.command == 'prepare-data':
+        prepare_data(args.train, args.eval, args.output_dir, args.deduplicate_train)
+    else:
+        train, evaluation = data_frames(args.train, args.eval, replay=args.mode == 'replay_eval')
+        print(f'Validated disjoint train={len(train)}, eval={len(evaluation)}; mode={args.mode}')
+        if args.output_manifest:
+            path = Path(args.output_manifest)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                'train_rows': len(train), 'eval_rows': len(evaluation),
+                'train_sha256': sha_file(args.train), 'eval_sha256': sha_file(args.eval),
+            }, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()

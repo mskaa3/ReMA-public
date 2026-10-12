@@ -1030,6 +1030,11 @@ class RayReMASeparatedTrainer(object):
                 "Prefix-probe validation_max_samples must be non-negative"
             )
 
+    def _prefix_probe_gates_training(self):
+        return self.prefix_probe_enabled and bool(
+            self.scoped_c3_grpo_config.get('prefix_probe', {}).get('apply_to_training', True)
+        )
+
     @staticmethod
     def _prefix_probe_context_key(message, data_source, ground_truth, extra_info):
         try:
@@ -1234,6 +1239,7 @@ class RayReMASeparatedTrainer(object):
             f'[leakage/{scope}] step={self.global_steps} '
             f'actor_update_step={getattr(self, "actor_update_steps", 0)} '
             f'role={self._current_train_agent} gate=terminal_instruction '
+            f'training_gate_enabled={int(self._prefix_probe_gates_training())} '
             f'raw_acc={value("raw_accuracy")} gated_acc={value("gated_accuracy")} '
             f'plan_eligible={value("plan_eligible_rate")} '
             f'update_eligible={value("update_eligible_rate")} '
@@ -1607,7 +1613,9 @@ class RayReMASeparatedTrainer(object):
             dtype=torch.bool,
         )
         known_rejection = torch.zeros_like(raw_outcome_scores, dtype=torch.bool)
-        if self.prefix_probe_enabled:
+        apply_probe_gate = self._prefix_probe_gates_training()
+        metrics['reward/c3/eligibility_applied_to_training'] = float(apply_probe_gate)
+        if apply_probe_gate:
             prefix_gate_valid = data_batch.batch[
                 'prefix_probe_gate_valid'
             ].bool().cpu()
@@ -1709,7 +1717,7 @@ class RayReMASeparatedTrainer(object):
         raw_action_means = outcome_scores.clone()
         reward_known = torch.ones_like(baseline_valid)
         gate_zeroed = torch.zeros_like(baseline_valid)
-        if self.prefix_probe_enabled and role == self._get_hierarchy_config().get(
+        if apply_probe_gate and role == self._get_hierarchy_config().get(
             'decomposer_role', 'decomposer'
         ):
             # Known failures are zero-reward alternatives, not masked actions.
@@ -1752,6 +1760,9 @@ class RayReMASeparatedTrainer(object):
         data_batch.batch['scoped_c3_outcome_score'] = outcome_scores
         data_batch.batch['scoped_c3_reward_known'] = reward_known
         data_batch.batch['scoped_c3_gate_zeroed_reward'] = gate_zeroed
+        data_batch.batch['scoped_c3_eligibility_applied'] = torch.full_like(
+            baseline_valid, apply_probe_gate, dtype=torch.bool,
+        )
         data_batch.batch['scoped_c3_causal_valid'] = baseline_valid
         data_batch.batch['scoped_c3_gate_update_mask'] = update_valid.clone()
         data_batch.batch['scoped_c3_positive_only_mask'] = positive_only
@@ -2043,6 +2054,9 @@ class RayReMASeparatedTrainer(object):
 
     def _validate_config(self):
         config = self.config
+        update_target = config.trainer.get('max_actor_updates')
+        if update_target is not None and (not isinstance(update_target, int) or update_target <= 0):
+            raise ValueError('trainer.max_actor_updates must be a positive integer or null')
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         effective_train_prompt_batch_size = int(config.data.train_batch_size)
@@ -2485,6 +2499,16 @@ class RayReMASeparatedTrainer(object):
     def _validate_context(self, *, teacher_assisted=False):
         validation_context = 'val_teacher_assisted' if teacher_assisted else 'val'
         print(f'[validation/context] {validation_context}', flush=True)
+        recorder = None
+        output_dir = self.config.trainer.get('validation_output_dir')
+        if output_dir:
+            from verl.rema_separated_trainer.ppo.experiment_io import ValidationRecorder
+            recorder = ValidationRecorder(
+                output_dir, validation_context, self.global_steps,
+                getattr(self, 'actor_update_steps', 0),
+                len(self.val_dataset) * self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                OmegaConf.to_container(self.config, resolve=True),
+            )
         reward_tensor_lst = []
         acc_tensor_lst = []
         round_state_score_lst = []
@@ -2556,7 +2580,7 @@ class RayReMASeparatedTrainer(object):
             sample_inputs.extend(input_texts)
 
             # Store original ground truth if available
-            ground_truths = [x['ground_truth'] for x in test_data['reward_model'].tolist()]
+            ground_truths = [x['ground_truth'] for x in test_batch.non_tensor_batch['reward_model'].tolist()]
 
             sample_groundtruths.extend(ground_truths)
 
@@ -2568,6 +2592,10 @@ class RayReMASeparatedTrainer(object):
                 )
             else:
                 prompt_columns = ['question']
+                if self.config.data.get('replay_plans', False):
+                    if teacher_assisted:
+                        raise ValueError("Fixed-plan evaluation cannot use teacher-assisted validation")
+                    prompt_columns.append('fixed_decomposer_output')
                 if teacher_assisted:
                     if teacher_key not in test_batch.non_tensor_batch or not all(
                         isinstance(value, str) and value.strip()
@@ -2589,6 +2617,7 @@ class RayReMASeparatedTrainer(object):
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
                 'teacher_attempt_key': teacher_key,
+                'replay_plans': bool(self.config.data.get('replay_plans', False)),
             })
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 
@@ -2654,6 +2683,12 @@ class RayReMASeparatedTrainer(object):
             acc_tensor_lst.append(reward_tensor['acc'])
 
             histories = test_output_gen_batch.non_tensor_batch['history'].tolist()
+            if recorder is not None:
+                recorder.add_batch(
+                    test_batch.non_tensor_batch, histories, output_texts,
+                    reward_tensor['acc'].detach().cpu().tolist(),
+                    dynamic_score_roles if dynamic_score_roles is not None else [score_role] * len(test_batch),
+                )
             if self.prefix_probe_enabled:
                 probe_batch_offset = len(probe_histories)
                 terminal_role_values = dynamic_score_roles
@@ -2985,6 +3020,9 @@ class RayReMASeparatedTrainer(object):
             metric_dict['val/completion_tokens/mean'] = completion_tokens_tensor.float().mean().item()
             metric_dict['val/completion_tokens/max'] = completion_tokens_tensor.max().item()
             metric_dict['val/completion_tokens/min'] = completion_tokens_tensor.min().item()
+
+        if recorder is not None:
+            print(f'[validation/records] {recorder.finish(metric_dict)}', flush=True)
 
         # Save generation results to a JSON file
         if self.config.trainer.get('save_val_generations', False):
@@ -3573,6 +3611,8 @@ class RayReMASeparatedTrainer(object):
         if self._credit_audit is not None:
             print(f'[credit/audit] directory={self._credit_audit.directory}', flush=True)
 
+        experiment_effort = {'trajectory_slots': 0, 'generation_seconds': 0.0}
+
         for epoch in range(self.config.trainer.total_epochs):
             self._update_current_train_agent(epoch)
             for batch_dict in self.train_dataloader:
@@ -3670,6 +3710,8 @@ class RayReMASeparatedTrainer(object):
                     # generate a batch
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.multi_turn_generate_sequences(gen_batch)
+                    experiment_effort['trajectory_slots'] += len(gen_batch)
+                    experiment_effort['generation_seconds'] += timing_raw['gen']
                         
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         raise NotImplementedError('REMAX is not implemented yet')
@@ -4223,6 +4265,11 @@ class RayReMASeparatedTrainer(object):
                             ),
                         ))
 
+                    update_target = self.config.trainer.get('max_actor_updates')
+                    if update_target is not None and self.actor_update_steps >= int(update_target):
+                        is_training_last_step = True
+                        is_session_last_step = True
+
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         (is_training_last_step or self._update_frequency_due(self.config.trainer.test_freq, actor_updated)):
@@ -4262,6 +4309,15 @@ class RayReMASeparatedTrainer(object):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                if self.config.trainer.get('validation_output_dir'):
+                    from verl.rema_separated_trainer.ppo.experiment_io import json_default
+                    progress_file = Path(self.config.trainer.validation_output_dir) / 'training_metrics.jsonl'
+                    progress_file.parent.mkdir(parents=True, exist_ok=True)
+                    with progress_file.open('a') as stream:
+                        stream.write(json.dumps({
+                            'step': self.global_steps, 'metrics': metrics,
+                            'cumulative_rollout_effort': experiment_effort,
+                        }, default=json_default) + '\n')
 
                 batch = None
                 num_prompt_in_batch = 0

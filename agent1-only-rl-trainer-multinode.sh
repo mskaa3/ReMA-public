@@ -45,6 +45,22 @@ export NUM_WORKER_STAGES=4
 export MAX_PLANNED_SUBTASKS=4
 export WORKER_CHECKPOINT_ROLE=worker_stage_4
 export PREFIX_PROBE_ENABLE=true
+export AGENT1_ELIGIBILITY_MODE=${AGENT1_ELIGIBILITY_MODE:-eac3}
+case "$AGENT1_ELIGIBILITY_MODE" in
+    eac3)
+        export PREFIX_PROBE_APPLY_TO_TRAINING=true
+        export C3_REQUIRE_ELIGIBLE_SUCCESS=true
+        ;;
+    baseline)
+        export PREFIX_PROBE_APPLY_TO_TRAINING=false
+        export C3_REQUIRE_ELIGIBLE_SUCCESS=false
+        ;;
+    *)
+        echo "ERROR: AGENT1_ELIGIBILITY_MODE must be eac3 or baseline." >&2
+        exit 1
+        ;;
+esac
+echo "Agent 1 objective: ${AGENT1_ELIGIBILITY_MODE}; leakage diagnostics enabled; training gate: ${PREFIX_PROBE_APPLY_TO_TRAINING}"
 export C3_CONTINUATIONS_PER_ACTION=${C3_CONTINUATIONS_PER_ACTION:-4}
 export ROLLOUT_N=${ROLLOUT_N:-32}
 export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}

@@ -24,6 +24,7 @@ export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-microsoft/Phi-4-mini-reasoning}
 export DECOMPOSER_MODEL_PATH=${DECOMPOSER_MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}
 export WORKER_MODEL_PATH=${WORKER_MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}
 export WORKER_MODEL_REMOTE=${WORKER_MODEL_REMOTE:-}
+export DECOMPOSER_MODEL_REMOTE=${DECOMPOSER_MODEL_REMOTE:-}
 export DECOMPOSER_USE_REMOVE_PADDING=${DECOMPOSER_USE_REMOVE_PADDING:-true}
 export WORKER_USE_REMOVE_PADDING=${WORKER_USE_REMOVE_PADDING:-true}
 export TEACHER_ROLLOUT_N=${TEACHER_ROLLOUT_N:-16}
@@ -42,6 +43,8 @@ export NUM_WORKER_STAGES=${NUM_WORKER_STAGES:-5}
 export MAX_PLANNED_SUBTASKS=${MAX_PLANNED_SUBTASKS:-4}
 export WORKER_CHECKPOINT_ROLE=${WORKER_CHECKPOINT_ROLE:-worker_stage_${NUM_WORKER_STAGES}}
 export PREFIX_PROBE_ENABLE=${PREFIX_PROBE_ENABLE:-false}
+export PREFIX_PROBE_APPLY_TO_TRAINING=${PREFIX_PROBE_APPLY_TO_TRAINING:-true}
+export C3_REQUIRE_ELIGIBLE_SUCCESS=${C3_REQUIRE_ELIGIBLE_SUCCESS:-true}
 export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}
 export PREFIX_PROBE_VALIDATION_MAX_SAMPLES=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES:-128}
 export AGENT2_PILOT=${AGENT2_PILOT:-false}
@@ -184,6 +187,24 @@ if [[ -n "$WORKER_MODEL_REMOTE" ]]; then
     srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
         apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         python3 /root/ReMA-public/scripts/validate_hf_model_dir.py "$WORKER_MODEL_PATH"
+fi
+
+if [[ -n "$DECOMPOSER_MODEL_REMOTE" ]]; then
+    export DECOMPOSER_MODEL_PATH=${JOB_TMP}/decomposer_model
+    echo "Staging frozen/checkpointed decomposer from ${DECOMPOSER_MODEL_REMOTE} on all nodes"
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+        set -euo pipefail
+        test ! -e "$DECOMPOSER_MODEL_PATH"
+        test ! -e "$DECOMPOSER_MODEL_PATH.partial"
+        mkdir -p "$DECOMPOSER_MODEL_PATH.partial"
+        rclone copy "$DECOMPOSER_MODEL_REMOTE" "$DECOMPOSER_MODEL_PATH.partial" \
+            --s3-no-check-bucket --stats=30s --stats-one-line
+        test -s "$DECOMPOSER_MODEL_PATH.partial/config.json"
+        mv "$DECOMPOSER_MODEL_PATH.partial" "$DECOMPOSER_MODEL_PATH"
+    '
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 /root/ReMA-public/scripts/validate_hf_model_dir.py "$DECOMPOSER_MODEL_PATH"
 fi
 
 RAY_JOB_PIDS=()
@@ -364,6 +385,8 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.max_planned_subtasks=${MAX_PLANNED_SUBTASKS} \
   algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.enable=${PREFIX_PROBE_ENABLE} \
+  algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training=${PREFIX_PROBE_APPLY_TO_TRAINING} \
+  algorithm.hierarchy.scoped_c3_grpo.require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS} \
   algorithm.hierarchy.scoped_c3_grpo.continuations_per_action=${C3_CONTINUATIONS_PER_ACTION} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES} \
@@ -381,6 +404,9 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   trainer.wandb_run_id=${AGENT12_WANDB_RUN_ID} \
   trainer.wandb_resume=allow \
   trainer.default_local_dir=${CHECKPOINT_ROOT}"
+
+    # Generated only by the opt-in experiment wrapper; defaults above stay intact.
+    train_command+=" ${AGENT12_EXPERIMENT_OVERRIDES:-}"
 
     PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
         apptainer exec --nv --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
@@ -660,9 +686,33 @@ if [[ "$AGENT2_PILOT" == "true" || "$AGENT2_PILOT" == "1" ]]; then
         rclone copy "$JOB_TMP/agent2_pilot" "$REMOTE_RUN/pilot_data" --s3-no-check-bucket
 fi
 
+if [[ -n "${EAC3_RUN_FILE:-}" ]]; then
+    export AGENT12_VAL_FILE=${JOB_TMP}/experiment-val.parquet
+    download_remote_file_on_head "$EXPERIMENT_VAL_REMOTE" "$AGENT12_VAL_FILE" "experiment evaluation data"
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 /root/ReMA-public/scripts/eac3_experiments.py validate-data \
+            --train "$TEACHER_TRAIN_FILE" --eval "$AGENT12_VAL_FILE" --mode "$EXPERIMENT_MODE" \
+            --output-manifest "$CHECKPOINT_ROOT/evaluations/input-data.json"
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" bash -lc '
+        mkdir -p "$CHECKPOINT_ROOT/evaluations"
+        cp "$EAC3_RUN_FILE" "$CHECKPOINT_ROOT/evaluations/run.json"
+    '
+fi
+
 start_ray
 run_agent12_training "$TEACHER_TRAIN_FILE" "$TOTAL_STEPS" True True
 stop_ray
+fi
+
+if [[ -n "${EAC3_RUN_FILE:-}" ]]; then
+    srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+        rclone copy "$CHECKPOINT_ROOT/evaluations" "$REMOTE_RUN/evaluations" \
+            --s3-no-check-bucket --stats=30s --stats-one-line
+    if [[ "$EXPERIMENT_MODE" != "worker_train" ]]; then
+        echo "Evaluation complete: $REMOTE_RUN/evaluations (no optimizer updates or model export)"
+        exit 0
+    fi
 fi
 
 LATEST_STEP=$(srun --overlap --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
@@ -742,6 +792,8 @@ num_worker_stages=${NUM_WORKER_STAGES}
 max_planned_subtasks=${MAX_PLANNED_SUBTASKS}
 worker_checkpoint_role=${WORKER_CHECKPOINT_ROLE}
 prefix_probe_enable=${PREFIX_PROBE_ENABLE}
+prefix_probe_apply_to_training=${PREFIX_PROBE_APPLY_TO_TRAINING}
+c3_require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS}
 prefix_probe_max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS}
 prefix_probe_validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES}
 prefix_probe_gate=terminal_instruction
@@ -750,6 +802,7 @@ teacher_assisted_validation=${TEACHER_ASSISTED_VALIDATION}
 decomposer_base=${DECOMPOSER_MODEL_PATH}
 worker_base=${WORKER_MODEL_PATH}
 worker_model_remote=${WORKER_MODEL_REMOTE}
+decomposer_model_remote=${DECOMPOSER_MODEL_REMOTE}
 teacher_train_shards_remote=${TEACHER_TRAIN_SHARDS_REMOTE}
 decomposer_use_remove_padding=${DECOMPOSER_USE_REMOVE_PADDING}
 worker_use_remove_padding=${WORKER_USE_REMOVE_PADDING}

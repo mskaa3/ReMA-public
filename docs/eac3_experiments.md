@@ -1,0 +1,297 @@
+# EAC3 experiments: behaviour, worker learning, and transfer
+
+This suite reuses the current trainer and mathematical datasets. It does not
+change the existing Agent-1-only or Agent-2-only defaults, submit jobs, retrain
+the planners, or require an external LLM judge.
+
+## Questions and comparisons
+
+| Phase | What changes? | What stays fixed? | What it answers |
+| --- | --- | --- | --- |
+| `planners` | Baseline vs EAC3 planner checkpoint | Initial workers, held-out questions, prompts, greedy decoding | Does the learned planner change task execution, answer disclosure, and system accuracy? |
+| `workers` | Frozen planner used to train workers | Worker initialization, training questions, C3 objective, update target; paired seeds | Do these two planners provide different worker learning environments? |
+| `transfer` | Initial workers vs workers trained under either planner | Exact, reviewed, answer-free held-out plans; all worker prompts and routing | Did worker execution improve, beyond dependence on their own training planner? |
+| `cross` (optional) | Each learned worker model under both frozen planners | Same held-out questions, decoding, and protocol | How much improvement survives a change of planning partner? |
+
+Primary sequence: `planners`, `workers`, `transfer`. The cross-partner matrix is
+a follow-up, not required for the first pilot. With the default three worker
+training seeds these are 2 evaluation jobs, 6 training jobs, and 7 replay jobs.
+`cross` adds 12 evaluation jobs. Every job currently uses the existing two-pool
+6-node allocation; evaluation-only does not yet use an inference-only runtime.
+Run a single small pilot before allocating the complete matrix.
+
+## Important design choices
+
+- Both worker-learning arms use the same outcome-based C3 objective, including
+  the existing positive-only non-terminal worker rule. Leakage probes are OFF
+  in these experimental runs. Otherwise changing D would also change the probe
+  judge, confounding planner quality with reward changes. This is an explicit
+  controlled experiment, not a change to production gated training.
+- Decomposers are frozen. Only shared worker weights update. No teacher attempts
+  are generated, expanded, or shown: D receives the question only. Removing the
+  teacher avoids comparing different scaffold reliance rather than planners.
+- Non-terminal workers retain the full question. The terminal worker receives
+  its task and earlier local results, without a separately appended question.
+- Training retains 8 sampled focal actions x 4 downstream continuations. The
+  default batch has 48 distinct questions, not 3 questions x 16 teacher traces.
+- Default target: 100 completed optimizer updates, validation every 10 updates,
+  and saves every 50. `rollout_step_limit=1200` is a separate safety ceiling.
+  Skipped batches do not count as updates. If the ceiling/time limit is reached
+  early, report the actual update count; do not call that a 100-update result.
+- Paired seeds control data ordering and rollout engine initialization, not
+  bitwise identity of sampling streams across different planners. A single
+  pair of planner checkpoints is not three independently trained planner pairs.
+- Equal update targets are not equal compute or equal effective training tokens.
+  Keep the full training metrics, actor-update counts by role, C3 update-mask
+  statistics, generation time, and cumulative trajectory slots. Compute-matched
+  claims need an additional analysis/control, not just equal update counts.
+- Existing baseline/EAC3 planner artifacts may differ in more than eligibility
+  handling. Their comparison measures the effect of these artifacts. A clean
+  claim about the EAC3 algorithm requires matched planner-training ablations.
+- The common bank is selected by independent review, not gate scores or worker
+  correctness. Report its coverage and selection criteria separately from full
+  benchmark accuracy. Human labels are not infallible: independently double-label
+  a subset and report agreement/unknown rates.
+
+## 1. Freeze data and model identities
+
+### Training the baseline decomposer
+
+Use `agent1-baseline-rl-trainer-multinode.sh` to produce the no-eligibility
+checkpoint. It delegates to the same Agent-1-only launcher, trains only the
+decomposer, and freezes the SAME Agent-2 HF checkpoint as the EAC3 run:
+
+```bash
+export WORKER_MODEL_REMOTE="s3v2:.../snapshots/global_step_50/workers/huggingface"
+sbatch agent1-baseline-rl-trainer-multinode.sh
+```
+
+Use the exact worker export, decomposer initialization, cached teacher data,
+curriculum, and resource overrides from the EAC3 run. Do not initialize the
+baseline from the trained EAC3 decomposer or resume its optimizer/checkpoint.
+Unset `EAC3_RUN_FILE` and `AGENT12_EXPERIMENT_OVERRIDES` left by other experiments.
+
+The two objective settings are:
+
+| Setting | Agent-1 EAC3 launcher | Agent-1 baseline launcher |
+| --- | --- | --- |
+| `prefix_probe.enable` | true | true |
+| `prefix_probe.apply_to_training` | true | false |
+| `require_eligible_success` | true | false |
+| C3 action/continuation aggregation | 8 x 4, corrected grouping | identical |
+| Reward per plan | eligibility-conditioned action reward | mean raw correctness over all four suffixes |
+
+Baseline probes remain diagnostic, including unknown and rejected probe
+outcomes: they neither zero rewards nor exclude actions from training. Ordinary
+C3 checks (exact prefix, complete action groups, nonzero outcome contrast) still
+apply. In baseline logs, `gated_acc` means the diagnostic score the gate WOULD
+assign, not the optimization reward. Look for `training_gate_enabled=0` and
+`reward/c3/eligibility_applied_to_training=0`; credit-audit records also store
+`eligibility_applied_to_training` alongside the actual action reward/advantage.
+Both arms pay the probe cost. Self-probing scores alone are not independent
+evidence of better specialization; retain the reviewed evaluation below.
+
+Defaults remain 32 rollouts, evaluation every 10 completed updates, checkpoint
+saves every 50 updates, and the same teacher-attempt fading curriculum. Record
+actual completed updates: `global_step_*` names are rollout steps, not necessarily
+the completed-update count. The baseline may update more often than EAC3.
+
+The default run identity is `agent1-baseline-<JOB_ID>` (override with
+`BASELINE_RUN_NAME`). Local snapshots remain at
+`/mnt/lscratch/slurm/<JOB_ID>/agent12/checkpoints/agent12/global_step_<STEP>/decomposer/actor`.
+The normal end-of-job HF export goes to
+`<AGENT12_S3_REMOTE>/agent1-baseline-<JOB_ID>/decomposer/huggingface`.
+Periodic saves are local, not periodic S3 uploads; use the same all-node snapshot
+export as EAC3 if taking a checkpoint while training is still running.
+
+This produces a cleaner eligibility ablation than reproducing an old grouping
+bug. To compare with a run already in flight, record its exact code revision and
+overrides; unrelated differences from that historical run remain possible.
+
+### Selecting frozen exports
+
+Edit `config/eac3-experiments.json`. Set the two `planners` to immutable merged
+Hugging Face exports, not raw FSDP shards or mutable `latest` directories. The
+initial worker defaults to the base Qwen; alternatively use the SAME explicit
+Agent-2 HF export for both arms. Select checkpoints before looking at these test
+results. Record the selection criterion and keep a separate development split
+if choosing between checkpoints/hyperparameters.
+
+Prepare the existing data (pandas and pyarrow required):
+
+```bash
+python3 scripts/eac3_experiments.py prepare-data \
+  --train data/MATH/train_lv3to5_8k.parquet \
+  --eval data/overall_math/test.parquet \
+  --deduplicate-train \
+  --output-dir /tmp/eac3-data
+```
+
+The repository training file has two repeated normalized questions with matching
+labels. This explicit option removes duplicates; conflicting labels and overlap
+with evaluation questions are rejected. Teacher attempts and cached solutions
+are removed. All questions are otherwise retained, irrespective of correctness.
+Upload both parquet files and `data.json` to a new S3 data prefix using `rclone
+copy ... --s3-no-check-bucket`. Put the exact file remotes in `train_remote` and
+`eval_remote`. These checks detect normalized exact overlap, not semantic near
+duplicates or contamination in model pretraining.
+
+The common plan remote can remain `SET_ME...` until phase 3. Templates can be
+generated with placeholders, but launch refuses unresolved required artifacts.
+
+## 2. Inspect planners and train workers
+
+On the cluster, from the repository root, after all code changes are in place:
+
+```bash
+python3 scripts/eac3_experiments.py plan --phase planners \
+  --output-dir experiments/runs/planners
+```
+
+This prints `sbatch` commands and writes their run manifests plus `commands.txt`.
+Choose a command to submit; nothing submits automatically. Manifests MUST be in
+a directory accessible on the compute nodes, such as the shared repository home,
+not the login node's `/tmp`. The job reads its manifest on its first compute node;
+manifests are also copied into the results.
+Submit from the repository root, with the usual `env.sh` credentials available.
+
+```bash
+python3 scripts/eac3_experiments.py plan --phase workers \
+  --output-dir experiments/runs/workers
+```
+
+Workers in both arms start from the same HF weights with fresh optimizer state.
+All settings/code hashes are captured. Launch rejects edits to hashed code after
+manifest creation, so generate manifests AFTER your final changes/pull. The
+planner and worker artifacts are staged and validated on every node.
+
+For a pilot use a COPY of the configuration with a new `study` name, one seed,
+`worker_updates=10`, and a separate development evaluation subset. Do not silently
+change the study's fixed test set or later pool pilot and full-run results.
+
+## 3. Build an independent common plan bank
+
+Download the complete `val-step...-update0.jsonl` files and their sibling
+`.metadata.json` files from the two `planners` evaluations. Export plan-only
+review forms:
+
+```bash
+python3 scripts/analyze_eac3_experiments.py plan-review \
+  --source baseline baseline-val.jsonl --source eac3 eac3-val.jsonl \
+  --output /tmp/plan-review.csv
+```
+
+Reviewers see the question, ground truth, and plan, but not the model condition,
+worker output, raw score, or gate result. Label all candidates, including rejected
+ones, with `yes`, `no`, or `unknown` and a reviewer ID:
+
+- `supplies_computed_answers`: Does the plan give a computed subtask/final answer
+  instead of leaving that computation to a worker? Original givens and an
+  instruction naming a method do not by themselves count as supplied answers.
+- `executable`: Are the task instructions and dependencies sufficiently specified
+  for the intended workers, especially the question-hidden terminal worker?
+
+Only `no` + `yes` plans enter the bank. Unknowns stay excluded and counted. The
+script does not pretend it can certify this using string rules. Freeze the bank
+before looking at trained-worker performance. If no usable bank remains, that is
+a result about the planners, not a reason to silently accept leaked plans.
+
+```bash
+python3 scripts/analyze_eac3_experiments.py plan-bank \
+  --source baseline baseline-val.jsonl --source eac3 eac3-val.jsonl \
+  --labels /tmp/plan-review.csv --output /tmp/common-plans.parquet
+```
+
+Upload `common-plans.parquet` and its `.json` manifest; set `common_plan_remote`.
+Duplicate identical plans are merged; different plans for the same question are
+retained. Comparisons average within question before averaging across questions.
+This avoids overweighting questions with more accepted plans.
+
+## 4. Test transfer and partner robustness
+
+After worker runs have exported their models:
+
+```bash
+python3 scripts/eac3_experiments.py plan --phase transfer \
+  --output-dir experiments/runs/transfer
+# Optional follow-up:
+python3 scripts/eac3_experiments.py plan --phase cross \
+  --output-dir experiments/runs/cross
+```
+
+The expected worker export remotes are derived from the study/run names. Replay
+does NOT call the decomposer: it passes saved text through the existing parser
+and routing logic. Missing plans fail instead of falling back to fresh generation.
+Replay is forbidden during training or multi-round conversations.
+
+Compare each paired seed's full replay outputs:
+
+```bash
+python3 scripts/analyze_eac3_experiments.py compare \
+  --left baseline-workers-replay.jsonl --right eac3-workers-replay.jsonl \
+  --common-plans
+```
+
+Also compare each with the initial-worker replay. Report per-seed gains and their
+variation; do not pool three seed runs as independent questions. The provided
+paired bootstrap interval clusters repeated plans by question and describes ONE
+run pair, not uncertainty across training seeds. The script requires identical
+question/plan items and verified full-file checksums. It reports raw accuracy,
+per-dataset accuracy, and completion lengths, never labels these as causal
+cooperation or gate-certified accuracy.
+
+## 5. Independently audit behaviour
+
+```bash
+python3 scripts/analyze_eac3_experiments.py audit-export \
+  --left baseline-val.jsonl --right eac3-val.jsonl \
+  --questions 100 --seed 42 --output-dir /tmp/blinded-audit
+```
+
+Review `examples.jsonl`, fill `labels.csv`, and withhold `PRIVATE-key.json` from
+reviewers. Sampling is paired by question, without filtering by correctness or
+eligibility. Annotate supplied answers, assigned-task execution, relevant use of
+previous results, and local-result correctness. Use `unknown` or `not_applicable`
+instead of guessing. Dependency use is behaviourally assessed, not proof of a
+causal effect: that would require an explicit intervention experiment.
+
+```bash
+python3 scripts/analyze_eac3_experiments.py audit-summary \
+  --labels /tmp/blinded-audit/labels.csv \
+  --key /tmp/blinded-audit/PRIVATE-key.json
+```
+
+The summary retains unknown and not-applicable counts rather than counting them
+as failures/successes. Content may reveal the condition despite blinded IDs;
+report this limitation. Comparing planner artifacts alone does not isolate the
+causal effect of leakage from every other difference in their plans.
+
+## Artifacts and limits
+
+Locally: `$JOB_TMP/checkpoints/agent12/evaluations/`.
+S3: `<remote_root>/<study>--<phase>-<arm>-s<seed>/evaluations/`.
+Training jobs additionally export `workers/huggingface` and
+`decomposer/huggingface` using the existing end-of-run merger.
+
+Every evaluation writes all examples, responses, histories, raw verifier scores,
+terminal roles, question IDs, exact plan hashes, completion lengths, and the
+resolved configuration. Incomplete evaluations retain `.partial` files and are
+rejected by analysis. The original `val/acc/*` W&B metrics remain; no fake leakage
+or gated accuracy is reported when probes are disabled. Console examples remain
+as before. `training_metrics.jsonl` records all completed outer-loop metric events
+and accumulated rollout slots/time, including intervening generation batches.
+Generation time excludes probe/validation/optimizer time and is not GPU FLOPs.
+`input-data.json` contains checksums of the actual staged train/evaluation files.
+Verify these agree across arms; remotes themselves are not content-addressed.
+
+Use a NEW study name for a rerun; the generated experiment wrapper refuses a
+local manifest directory overwrite, but S3 object paths are not immutable.
+Evidence and models are uploaded after a successful run, not periodically or
+after crashes. No model training/evaluation on Slurm has been executed locally.
+The scripts need a smoke test on your actual container/GPU allocation.
+
+CPU contract tests:
+
+```bash
+python3 src/verl/tests/rema_separated_trainer/test_experiment_suite.py -v
+```

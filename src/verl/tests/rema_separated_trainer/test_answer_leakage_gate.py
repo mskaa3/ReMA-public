@@ -400,13 +400,14 @@ def test_training_logs_selected_examples_without_changing_batch(
     assert all(column.dtype == object for column in batch.non_tensor_batch.values())
 
 
-@pytest.mark.parametrize("probes_enabled", [True, False])
+@pytest.mark.parametrize("probes_enabled,apply_to_training", [(True, True), (True, False), (False, True)])
 @pytest.mark.parametrize("normalize", [True, False])
-def test_decomposer_single_continuation_baseline_and_probe_opt_out(probes_enabled, normalize):
+def test_decomposer_single_continuation_baseline_and_probe_opt_out(probes_enabled, apply_to_training, normalize):
     trainer = _trainer("decomposer")
     trainer.prefix_probe_enabled = probes_enabled
     trainer.scoped_c3_grpo_config.update(normalize_advantages=normalize,
                                        require_eligible_success=True)
+    trainer.scoped_c3_grpo_config['prefix_probe'] = {'apply_to_training': apply_to_training}
     batch = _batch([_history("26"), _history(), _history()])
     raw = torch.tensor([1., 1., 0.])
     batch.non_tensor_batch.update({
@@ -421,13 +422,60 @@ def test_decomposer_single_continuation_baseline_and_probe_opt_out(probes_enable
     trainer._attach_scoped_c3_grpo_signals(batch, {"acc": raw}, {})
     estimate = trainer._estimate_scoped_c3_advantages(batch)
     expected = estimate_scoped_c3_grpo(
-        torch.tensor([0., 1., 0.]) if probes_enabled else raw,
+        torch.tensor([0., 1., 0.]) if probes_enabled and apply_to_training else raw,
         ["q"] * 3, torch.ones(3, dtype=torch.bool),
         normalize=normalize, require_eligible_success=True,
     )
     torch.testing.assert_close(estimate.advantage, expected.advantage)
     assert torch.equal(estimate.effective_mask, expected.effective_mask)
     torch.testing.assert_close(batch.batch["scoped_c3_raw_outcome_score"], raw)
+    if probes_enabled:
+        # Diagnostic failure remains visible even when it no longer changes rewards.
+        assert batch.batch['prefix_probe_gated_outcome_score'][0] == 0
+
+
+@pytest.mark.parametrize('normalize', [False, True])
+def test_baseline_ignores_rejected_and_unknown_probes_but_keeps_c3_grouping(normalize):
+    trainer = _trainer('decomposer')
+    trainer.scoped_c3_grpo_config.update(
+        continuations_per_action=4, require_eligible_success=False,
+        normalize_advantages=normalize, prefix_probe={'apply_to_training': False},
+    )
+    histories = [_history() for _ in range(32)]
+    histories[1][1]['content'] = r'LOCAL_RESULT: \boxed{26}'
+    histories[5][1]['content'] = 'missing result'
+    histories[9][0]['planned_subtask_count'] = 1
+    counts = [4, 3, 2, 1, 0, 4, 3, 1]
+    raw = torch.tensor([float(m < count) for count in counts for m in range(4)])
+    batch = _batch(histories)
+    batch.non_tensor_batch.update({
+        'c3_action_turn': _object_array([0] * 32),
+        'c3_action_index': _object_array([i // 4 for i in range(32)]),
+        'c3_suffix_index': _object_array([i % 4 for i in range(32)]),
+        'decomposer_action_token_ids': _object_array([[100 + i // 4] for i in range(32)]),
+        'decomposer_conversation_history': _object_array([
+            [{'role': 'user', 'content': 'shared'},
+             {'role': 'assistant', 'content': str(i // 4)}] for i in range(32)
+        ]),
+    })
+    metrics = {}
+    trainer._attach_prefix_probe_signals(batch, raw, metrics)
+    trainer._attach_scoped_c3_grpo_signals(batch, {'acc': raw}, metrics)
+    assert not batch.batch['prefix_probe_collaboration_eligible'][[1, 5, 9]].any()
+    assert not batch.batch['prefix_probe_gate_valid'][5]
+    means = torch.tensor(counts, dtype=torch.float32) / 4
+    expected = estimate_scoped_c3_grpo(
+        means, ['q'] * 8, torch.ones(8, dtype=torch.bool), normalize=normalize,
+    )
+    estimate = trainer._estimate_scoped_c3_advantages(batch)
+    torch.testing.assert_close(batch.batch['scoped_c3_outcome_score'], means.repeat_interleave(4))
+    torch.testing.assert_close(estimate.advantage[::4], expected.advantage)
+    assert torch.equal(estimate.effective_mask[::4], expected.effective_mask)
+    assert not estimate.effective_mask[torch.arange(32) % 4 != 0].any()
+    assert batch.batch['scoped_c3_reward_known'].all()
+    assert not batch.batch['scoped_c3_gate_zeroed_reward'].any()
+    assert not batch.batch['scoped_c3_eligibility_applied'].any()
+    assert metrics['reward/c3/eligibility_applied_to_training'] == 0
 
 
 @pytest.mark.parametrize("normalize", [False, True])

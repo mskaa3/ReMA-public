@@ -69,6 +69,7 @@ class CreditAudit:
                 'suffix_gate_valid': [bool(v) for v in valid],
                 'suffix_gates': gates,
                 'all_suffix_gates_pass': all(gates),
+                'eligibility_applied_to_training': bool(values('scoped_c3_eligibility_applied', True)[0]),
                 'action_mean_score': float(batch.batch.get(
                     'scoped_c3_raw_action_mean_score', batch.batch['scoped_c3_outcome_score'],
                 )[i]),
@@ -132,7 +133,8 @@ class CreditAudit:
                 reason = 'actor_update_failed_or_partial'
             elif not record['reward_known']:
                 reason = 'unknown_collaboration_reward'
-            elif not record['all_suffix_gates_pass'] and not record['gate_zeroed_reward']:
+            elif (record['eligibility_applied_to_training']
+                  and not record['all_suffix_gates_pass'] and not record['gate_zeroed_reward']):
                 reason = 'suffix_gate_rejected_or_invalid'
             elif record['advantage'] == 0:
                 reason = 'no_effective_c3_contrast'
@@ -179,6 +181,7 @@ class CreditAudit:
                 print(
                     f"[credit/example] id={event['audit_id']} "
                     f"outcomes={event['suffix_outcomes']} gates={event['suffix_gates']} "
+                    f"training_gate_enabled={int(event['eligibility_applied_to_training'])} "
                     f"mean={event['action_mean_score']:.3f} reward={event['action_reward']:.3f} "
                     f"reward_known={int(event['reward_known'])} advantage={event['advantage']:+.3f} "
                     f"trainable_tokens={event['final_trainable_tokens']} "
