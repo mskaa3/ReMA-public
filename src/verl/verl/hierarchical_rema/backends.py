@@ -2120,7 +2120,8 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
 
     def __init__(self, config: VLLMBackendConfig | None = None) -> None:
         self.config = config or VLLMBackendConfig()
-        self._manager = RayVLLMGenerationManager(self.config)
+        from .ray_generation import generation_manager
+        self._manager = generation_manager(self.config)
 
     def _generate_text(
         self,
@@ -2174,4 +2175,8 @@ class RayVLLMHierarchicalBackend(TransformersHierarchicalBackend):
         ]
 
     def close(self) -> None:
-        self._manager.close()
+        if self._manager.persistent:
+            self._manager.suspend_for_learning()
+            self._manager.finish_learning()
+        else:
+            self._manager.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import atexit
 import sys
 import time
 from collections import OrderedDict
@@ -11,12 +12,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .schema import VLLMBackendConfig
+from .throughput import enabled
+from .persistent_policy import checkpoint_stamp, engine_signature, tokenizer_signature
 
 
 @dataclass(frozen=True)
 class RayGenerationKey:
     model_path: str
     bundle_response_length: int
+    weight_version: str = ""
 
 
 @dataclass
@@ -157,6 +161,12 @@ class RayVLLMGenerationManager:
         self.config = config
         self._bundle_cache: OrderedDict[RayGenerationKey, _RayBundle] = OrderedDict()
         self._bundle_sequence = 0
+        self.persistent = enabled("REMA_PERSISTENT_ROLLOUT", "0")
+        self.learning_lease = False
+        self._sleeping_slots = None
+        self._pinned_versions = {}
+        if self.persistent and config.tensor_model_parallel_size != 1:
+            raise ValueError("REMA_PERSISTENT_ROLLOUT currently requires TP=1")
 
     def _configured_bundle_response_length(self) -> int:
         response_lengths = [
@@ -359,6 +369,10 @@ class RayVLLMGenerationManager:
             from utils.fs import copy_to_local
             from workers.fsdp_workers import ActorRolloutRefWorker
 
+        if self.persistent:
+            from .persistent_rollout_worker import PersistentRolloutWorker
+            ActorRolloutRefWorker = PersistentRolloutWorker
+
         local_model_path = copy_to_local(key.model_path)
         print(
             f"[hierarchical-rema][ray-generation] event=bundle_model_path "
@@ -389,6 +403,9 @@ class RayVLLMGenerationManager:
                 config=self.config,
             )
         )
+        if self.persistent:
+            worker_config.model.rema_weight_version = key.weight_version
+            worker_config.rollout.enable_sleep_mode = True
         cpus_per_node = self.config.cpus_per_node
         max_collocate_count = 5
         if cpus_per_node is not None and self.config.n_gpus_per_node > 0:
@@ -417,7 +434,11 @@ class RayVLLMGenerationManager:
             f"[hierarchical-rema][ray-generation] event=bundle_init_start "
             f"model={Path(key.model_path).name} response_length={key.bundle_response_length}"
         )
-        worker_group.init_model()
+        try:
+            worker_group.init_model()
+        except Exception:
+            self._close_bundle(_RayBundle(key, local_model_path, tokenizer, worker_group, resource_pool))
+            raise
         init_elapsed = time.monotonic() - init_started_at
         total_elapsed = time.monotonic() - build_started_at
         print(
@@ -452,6 +473,28 @@ class RayVLLMGenerationManager:
         for bundle in self._bundle_cache.values():
             self._close_bundle(bundle)
         self._bundle_cache.clear()
+        self.learning_lease = False
+        self._sleeping_slots = None
+        self._pinned_versions.clear()
+
+    def suspend_for_learning(self):
+        if not self.persistent or not self._bundle_cache:
+            return None
+        if not self.learning_lease:
+            bundle = next(iter(self._bundle_cache.values()))
+            slots = bundle.worker_group.suspend_for_learning()
+            if len(slots) != bundle.worker_group.world_size or any(not s.get("sleeping") for s in slots):
+                raise RuntimeError("Rollout workers did not acknowledge GPU handoff")
+            self._sleeping_slots = slots
+            self.learning_lease = True
+            self._pinned_versions.clear()
+            print(f"[hierarchical-rema][persistent] event=sleep gpus={len(slots)}", flush=True)
+        return self._sleeping_slots
+
+    def finish_learning(self):
+        # Wake/load lazily on the next generation, after learner actors exit.
+        self.learning_lease = False
+        self._sleeping_slots = None
 
     def _get_bundle(
         self,
@@ -459,14 +502,45 @@ class RayVLLMGenerationManager:
         model_path: str,
         response_length: int,
     ) -> _RayBundle:
+        if self.learning_lease:
+            raise RuntimeError("Generation is forbidden while rollout GPUs are leased to the learner")
         key = RayGenerationKey(
             model_path=model_path,
             bundle_response_length=self._required_bundle_response_length(response_length),
+            weight_version=checkpoint_stamp(model_path) if self.persistent else "",
         )
-        cached = self._bundle_cache.pop(key, None)
+        if self.persistent:
+            expected = self._pinned_versions.setdefault(model_path, key.weight_version)
+            if expected != key.weight_version:
+                raise RuntimeError("Policy checkpoint changed inside an active rollout segment")
+        cached = self._bundle_cache.get(key)
         if cached is not None:
-            self._bundle_cache[key] = cached
+            if self.persistent:
+                versions = cached.worker_group.refresh_rollout(model_path, key.weight_version)
+                if len(versions) != cached.worker_group.world_size or any(version != key.weight_version for version in versions):
+                    raise RuntimeError("Persistent worker acknowledged a stale policy")
+            self._bundle_cache.move_to_end(key)
             return cached
+
+        if self.persistent and self._bundle_cache:
+            bundle = next(iter(self._bundle_cache.values()))
+            if key.bundle_response_length != bundle.key.bundle_response_length:
+                raise ValueError("Persistent engine context limit cannot change during a run")
+            from verl.utils import hf_tokenizer
+            tokenizer = hf_tokenizer(model_path, trust_remote_code=self.config.trust_remote_code)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            if tokenizer_signature(tokenizer) != tokenizer_signature(bundle.tokenizer):
+                raise ValueError("Persistent policy switch requires an identical tokenizer and chat template")
+            versions = bundle.worker_group.refresh_rollout(model_path, key.weight_version)
+            if len(versions) != bundle.worker_group.world_size or any(version != key.weight_version for version in versions):
+                raise RuntimeError("Persistent workers returned inconsistent weight versions")
+            self._bundle_cache.clear()
+            bundle.key = key
+            self._bundle_cache[key] = bundle
+            print(f"[hierarchical-rema][persistent] event=weight_refresh model={model_path} "
+                  f"version={key.weight_version}", flush=True)
+            return bundle
 
         print(
             f"[hierarchical-rema][ray-generation] event=bundle_cache_miss "
@@ -481,6 +555,14 @@ class RayVLLMGenerationManager:
             )
             self._close_bundle(stale_bundle)
         bundle = self._build_bundle(key)
+        if self.persistent:
+            try:
+                versions = bundle.worker_group.refresh_rollout(model_path, key.weight_version)
+                if len(versions) != bundle.worker_group.world_size or any(version != key.weight_version for version in versions):
+                    raise RuntimeError("Persistent workers failed their initial policy-version check")
+            except Exception:
+                self._close_bundle(bundle)
+                raise
         self._bundle_cache[key] = bundle
         while len(self._bundle_cache) > self._max_cached_bundles():
             _, stale_bundle = self._bundle_cache.popitem(last=False)
@@ -541,6 +623,8 @@ class RayVLLMGenerationManager:
                 do_sample=resolved_do_sample,
                 sampling_overrides=resolved_sampling_overrides,
             )
+            if self.persistent:
+                prompt_proto.meta_info["rema_weight_version"] = bundle.key.weight_version
             padded_prompt_proto, pad_size = pad_dataproto_to_divisor(
                 prompt_proto,
                 bundle.worker_group.world_size,
@@ -636,3 +720,35 @@ class RayVLLMGenerationManager:
             sampling_overrides=sampling_overrides,
             log_label=log_label,
         )[0]
+
+
+_persistent_manager = None
+
+
+def generation_manager(config):
+    global _persistent_manager
+    if not enabled("REMA_PERSISTENT_ROLLOUT", "0"):
+        return RayVLLMGenerationManager(config)
+    if _persistent_manager is None:
+        _persistent_manager = RayVLLMGenerationManager(config)
+        atexit.register(_persistent_manager.close)
+    elif engine_signature(config) != engine_signature(_persistent_manager.config):
+        raise ValueError("Persistent rollout engine settings changed; restart with consistent train/validation limits")
+    _persistent_manager.config = config
+    return _persistent_manager
+
+
+def borrow_rollout_gpus():
+    return _persistent_manager.suspend_for_learning() if _persistent_manager is not None else None
+
+
+def release_rollout_gpus():
+    if _persistent_manager is not None:
+        _persistent_manager.finish_learning()
+
+
+def close_persistent_rollouts():
+    global _persistent_manager
+    if _persistent_manager is not None:
+        _persistent_manager.close()
+        _persistent_manager = None

@@ -7,7 +7,7 @@ import os
 import random
 import shutil
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Sequence
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     import torch
 
 from .controller_data import ControllerReplaySample, load_samples_from_jsonl
+from .throughput import LengthBucketBatchSampler, enabled
 
 
 @dataclass
@@ -50,6 +51,7 @@ class OfflineTrainingConfig:
     save_intermediate_checkpoints: bool = False
     prune_unselected_checkpoints: bool = False
     selected_checkpoint_mirror_dir: str = ""
+    length_bucketing: bool = field(default_factory=lambda: enabled("REMA_LENGTH_BUCKETING"))
 
 
 @dataclass
@@ -74,13 +76,30 @@ def _ensure_repo_root_on_path() -> None:
 
 
 class RayOfflineGRPOWorker:
-    def __init__(self) -> None:
+    def __init__(self, borrowed_cuda_devices: str | None = None) -> None:
+        # Only used with the driver's explicit lease on sleeping rollout GPUs.
+        # Must precede importing/initializing CUDA in this fresh learner process.
+        if borrowed_cuda_devices is not None:
+            if not borrowed_cuda_devices or "," in borrowed_cuda_devices:
+                raise ValueError("A borrowed learner rank must have exactly one GPU")
+            os.environ["CUDA_VISIBLE_DEVICES"] = borrowed_cuda_devices
         _ensure_repo_root_on_path()
 
     def get_node_ip(self) -> str:
         import ray
 
         return ray.util.get_node_ip_address()
+
+    def release_gpu(self):
+        import gc
+        torch = _lazy_torch()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        return True
 
     def run(
         self,
@@ -597,7 +616,7 @@ def _sequence_log_probs(logits, labels):
 
 
 def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_size: int, device,
-                                distributed_context=None) -> Dict[int, torch.Tensor]:
+                                distributed_context=None, length_bucketing=False) -> Dict[int, torch.Tensor]:
     from torch.utils.data import DataLoader
 
     context = distributed_context or DistributedTrainingContext()
@@ -608,13 +627,13 @@ def _compute_old_log_prob_cache(model, dataset: ControllerReplayDataset, batch_s
         # padding rows are repeated, rather than the full dataset on every rank.
         sampler = DistributedSampler(dataset, num_replicas=context.world_size,
                                      rank=context.rank, shuffle=False, drop_last=False)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=sampler,
-        collate_fn=_collate_rows,
-    )
+    if length_bucketing:
+        sampler = LengthBucketBatchSampler([len(row["input_ids"]) for row in dataset.rows], batch_size,
+            rank=context.rank, world_size=context.world_size, shuffle=False)
+        dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=_collate_rows)
+    else:
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                                sampler=sampler, collate_fn=_collate_rows)
     cached: Dict[int, torch.Tensor] = {}
     model.eval()
     with _lazy_torch().no_grad():
@@ -866,21 +885,26 @@ def run_offline_policy_training(
                 shuffle=False,
                 drop_last=False,
             )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.train_batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        collate_fn=_collate_rows,
-        generator=generator if train_sampler is None else None,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.train_batch_size,
-        shuffle=False,
-        sampler=val_sampler,
-        collate_fn=_collate_rows,
-    ) if len(val_dataset) else None
+    if config.length_bucketing:
+        train_sampler = LengthBucketBatchSampler(
+            [len(row["input_ids"]) for row in train_dataset.rows], config.train_batch_size,
+            rank=distributed_context.rank, world_size=distributed_context.world_size,
+            seed=config.seed)
+        train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=_collate_rows)
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=config.train_batch_size, shuffle=train_sampler is None,
+            sampler=train_sampler, collate_fn=_collate_rows,
+            generator=generator if train_sampler is None else None)
+    if len(val_dataset) and config.length_bucketing:
+        val_sampler = LengthBucketBatchSampler(
+            [len(row["input_ids"]) for row in val_dataset.rows], config.train_batch_size,
+            rank=distributed_context.rank, world_size=distributed_context.world_size,
+            seed=config.seed, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, collate_fn=_collate_rows)
+    else:
+        val_loader = DataLoader(val_dataset, batch_size=config.train_batch_size, shuffle=False,
+                               sampler=val_sampler, collate_fn=_collate_rows) if len(val_dataset) else None
 
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
@@ -904,6 +928,7 @@ def run_offline_policy_training(
         batch_size=config.train_batch_size,
         device=device,
         distributed_context=distributed_context,
+        length_bucketing=config.length_bucketing,
     )
 
     output_dir = Path(config.output_dir).expanduser().resolve()
@@ -921,6 +946,7 @@ def run_offline_policy_training(
             json.dump(asdict(config), handle, indent=2, sort_keys=True)
 
     training_data_stats = {
+        "length_bucketing": config.length_bucketing,
         "num_train_samples": len(train_samples),
         "num_val_samples": len(val_samples),
         "objective": "grpo",
@@ -1390,7 +1416,9 @@ def evaluate_controller_model(
             attention_mask = batch["attention_mask"].to(device)
             position_ids = batch["position_ids"].to(device)
             loss_mask = batch["loss_mask"][:, :-1].to(device).float()
-            if not bool((loss_mask.sum(dim=1) > 0).any().item()):
+            # DDP forwards may synchronize buffers. An empty-loss rank must
+            # still join the same forwards as ranks with valid validation rows.
+            if not distributed_context.enabled and not bool((loss_mask.sum(dim=1) > 0).any().item()):
                 continue
             outputs = model(
                 input_ids=input_ids,

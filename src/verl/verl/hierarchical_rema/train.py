@@ -130,7 +130,8 @@ def _validation_primary_metric(summary: Dict[str, Any] | None) -> float | None:
     value = summary.get("mean_best_final_correctness")
     if value is None:
         return None
-    return float(value)
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 def _copy_checkpoint_dir(src: Path, dst: Path) -> None:
@@ -240,6 +241,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--disable-external-validation", action="store_true")
+    parser.add_argument("--validation-mode", choices=["auto", "routine", "diagnostic"], default="auto",
+                        help="Auto skips Graph+PRM for single-candidate routine validation.")
+    parser.add_argument("--val-diagnostics-every", type=int, default=4,
+                        help="In auto mode, run diagnostics every N validation events; 0 means final only.")
+    parser.add_argument("--val-diagnostic-examples", type=int, default=30,
+                        help="Maximum detailed rollout examples per diagnostic validation; 0 disables exports.")
     parser.add_argument(
         "--track-workers-history",
         action=argparse.BooleanOptionalAction,
@@ -927,6 +934,7 @@ def _run_distributed_offline_policy_training(
     gpus_per_node: int,
     master_port: int,
     shared_input_root: str = "",
+    borrowed_slots=None,
 ) -> Dict[str, Any]:
     _ensure_ray_initialized_for_offline_training()
     import ray
@@ -965,8 +973,8 @@ def _run_distributed_offline_policy_training(
         )
 
     worker_cls = ray.remote(
-        num_gpus=1,
-        num_cpus=1,
+        num_gpus=0 if borrowed_slots is not None else 1,
+        num_cpus=0 if borrowed_slots is not None else 1,
         max_restarts=0,
         runtime_env=_offline_training_ray_runtime_env(),
     )(RayOfflineGRPOWorker)
@@ -981,11 +989,20 @@ def _run_distributed_offline_policy_training(
     workers = []
     rank_nodes = _offline_rank_node_ids(ray.nodes(), nnodes=nnodes, gpus_per_node=gpus_per_node,
                                         driver_node_id=driver_node_id)
+    if borrowed_slots is not None:
+        from .persistent_policy import choose_borrowed_slots
+        borrowed_slots = choose_borrowed_slots(borrowed_slots, rank_nodes)
     print(f"[hierarchical-rema][grpo] learner_rank_nodes={rank_nodes}", flush=True)
     try:
-        for node_id in rank_nodes:
-            workers.append(worker_cls.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=node_id, soft=False)).remote())
+        for rank, node_id in enumerate(rank_nodes):
+            options = worker_cls.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False))
+            if borrowed_slots is None:
+                workers.append(options.remote())
+            else:
+                # GPU/CPU capacity remains reserved by the sleeping rollout pool.
+                # No unreserved device is selected and no competing lease is made.
+                workers.append(options.remote(borrowed_cuda_devices=borrowed_slots[rank]["cuda_visible_devices"]))
     except Exception:
         for worker in workers:
             ray.kill(worker, no_restart=True)
@@ -1014,6 +1031,10 @@ def _run_distributed_offline_policy_training(
                 for rank, worker in enumerate(workers)
             ]
         )
+        if borrowed_slots is not None:
+            acknowledgements = ray.get([worker.release_gpu.remote() for worker in workers])
+            if not all(acknowledgements):
+                raise RuntimeError("Learner did not acknowledge GPU memory release")
     finally:
         for worker in workers:
             try:
@@ -1981,6 +2002,7 @@ def _build_rollout_trainer(
     controller_batch_size: int | None = None,
     worker_batch_size: int | None = None,
     backend: Any | None = None,
+    score_reward_model: bool = True,
 ) -> HierarchicalGRPOTrainer:
     effective_controller_batch_size = (
         controller_batch_size if controller_batch_size is not None else args.controller_batch_size
@@ -1994,7 +2016,7 @@ def _build_rollout_trainer(
         else WorkerRewardMode.CURRENT
     )
     gfam_reward_scorer = None
-    if getattr(args, "gfam_reward_model_pkl", ""):
+    if score_reward_model and getattr(args, "gfam_reward_model_pkl", ""):
         from .gfam_reward import load_cached_reward_scorer
 
         gfam_reward_scorer = load_cached_reward_scorer(
@@ -2158,6 +2180,17 @@ def run_external_validation(
     tracking_step: int,
     base_rollout_config: RolloutConfig,
 ) -> Dict[str, Any]:
+    from .validation import validation_mode, ValidationAudit, hide_uncomputed_rewards, diagnostic_examples
+    mode = validation_mode(args, epoch_number)
+    score_rewards = mode == "diagnostic"
+    reward_model_enabled = score_rewards and bool(getattr(args, "gfam_reward_model_pkl", ""))
+    examples_limit = int(getattr(args, "val_diagnostic_examples", 30))
+    if examples_limit < 0:
+        raise ValueError("val_diagnostic_examples must be nonnegative")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audit = ValidationAudit()
+    examples = []
+    validation_start_time = time.monotonic()
     controller_max_new_tokens = (
         args.val_controller_max_new_tokens
         if args.val_controller_max_new_tokens > 0
@@ -2241,7 +2274,7 @@ def run_external_validation(
         schedule=validation_schedule,
     )
     print(
-        f"[hierarchical-rema][validation] epoch={epoch_number} tasks={len(val_tasks)} "
+        f"[hierarchical-rema][validation] epoch={epoch_number} mode={mode} tasks={len(val_tasks)} "
         f"controller_total={workload['controller_generations_total']} "
         f"worker_total_upper_bound={workload['worker_generations_total_upper_bound']} "
         f"task_batch_size={rollout_task_batch_size} "
@@ -2262,12 +2295,12 @@ def run_external_validation(
         controller_batch_size=controller_batch_size,
         worker_batch_size=worker_batch_size,
         rollout_logging_config=None,
+        score_reward_model=score_rewards,
     )
 
     try:
         batch_summaries: List[Dict[str, Any]] = []
         val_batches = chunk_tasks(val_tasks, rollout_task_batch_size)
-        validation_start_time = time.time()
         validation_tasks_completed = 0
         for batch_index, task_batch in enumerate(val_batches, start=1):
             print(
@@ -2296,8 +2329,15 @@ def run_external_validation(
                 )
             )
             record_verification_failures(output_dir / "verification_failures.jsonl", batch_rollouts)
+            for rollout in batch_rollouts:
+                audit.add(rollout, _task_subset_name(rollout.task))
+            if score_rewards and len(examples) < examples_limit:
+                for example in diagnostic_examples(batch_rollouts):
+                    examples.append(example)
+                    if len(examples) >= examples_limit:
+                        break
             validation_tasks_completed += len(batch_rollouts)
-            elapsed = time.time() - validation_start_time
+            elapsed = time.monotonic() - validation_start_time
             avg_seconds_per_task = elapsed / max(validation_tasks_completed, 1)
             remaining_tasks = len(val_tasks) - validation_tasks_completed
             eta_seconds = avg_seconds_per_task * remaining_tasks
@@ -2317,6 +2357,18 @@ def run_external_validation(
         include_subsets=True,
         include_tasks=False,
     )
+    elapsed = time.monotonic() - validation_start_time
+    summary.update(validation_mode=mode, reward_diagnostics_enabled=reward_model_enabled,
+                   elapsed_seconds=elapsed, seconds_per_task=elapsed / max(len(val_tasks), 1),
+                   diagnostics=audit.summary(), diagnostic_examples_saved=len(examples))
+    for name, subset_audit in audit.subsets.items():
+        summary["subsets"][name]["diagnostics"] = subset_audit.summary()
+    if not reward_model_enabled:
+        hide_uncomputed_rewards(summary)
+    if score_rewards:
+        with (output_dir / "validation_diagnostics.jsonl").open("w", encoding="utf-8") as handle:
+            for example in examples:
+                handle.write(json.dumps(_json_safe(example), ensure_ascii=False) + "\n")
     with (output_dir / "validation_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(_json_safe(summary), handle, indent=2, sort_keys=True)
     _write_validation_accuracy_table(
@@ -2326,10 +2378,7 @@ def run_external_validation(
     )
 
     print(
-        f"[hierarchical-rema][validation] epoch={epoch_number} "
-        f"mean_best_selection_reward={summary['mean_best_selection_reward']:.4f} "
-        f"mean_selector_decision_reward={summary.get('mean_selector_decision_reward', 0.0):.4f} "
-        f"mean_best_decomposition_reward={summary['mean_best_decomposition_reward']:.4f} "
+        f"[hierarchical-rema][validation] epoch={epoch_number} mode={mode} "
         f"mean_best_final_correctness={summary['mean_best_final_correctness']:.4f} "
         f"verified_tasks={summary['num_verified_tasks']}/{summary['num_tasks']} "
         f"unverified_rollouts={summary['unverified_rollouts']}"
@@ -2340,32 +2389,36 @@ def run_external_validation(
             f"[hierarchical-rema][validation][subset] epoch={epoch_number} "
             f"name={subset_name} "
             f"acc={subset_summary['mean_best_final_correctness']:.4f} "
-            f"test_score={subset_summary['mean_best_selection_reward']:.4f} "
             f"tasks={int(subset_summary.get('num_tasks', 0))} "
             f"correct={int(subset_summary.get('num_correct', 0))}"
         )
     if tracking is not None:
         metrics = {
-            "val/mean_best_selection_reward": summary["mean_best_selection_reward"],
-            "val/mean_best_selector_decision_reward": summary.get(
-                "mean_best_selector_decision_reward",
-                0.0,
-            ),
-            "val/mean_selector_decision_reward": summary.get(
-                "mean_selector_decision_reward",
-                0.0,
-            ),
-            "val/mean_best_decomposition_reward": summary["mean_best_decomposition_reward"],
             "val/mean_best_final_correctness": summary["mean_best_final_correctness"],
             "val/num_tasks": summary["num_tasks"],
             "val/verification_coverage": summary["verification_coverage"],
             "val/unverified_rollouts": summary["unverified_rollouts"],
             "val/num_verified_tasks": summary["num_verified_tasks"],
+            "val/reward_diagnostics_enabled": int(reward_model_enabled),
+            "val/elapsed_seconds": elapsed,
+            "val/seconds_per_task": summary["seconds_per_task"],
         }
+        if reward_model_enabled:
+            for key in ("mean_best_selection_reward", "mean_best_selector_decision_reward",
+                        "mean_selector_decision_reward", "mean_best_decomposition_reward",
+                        "mean_worker_reward", "mean_executor_rollout_reward"):
+                metrics[f"val/{key}"] = summary[key]
+        for key, value in summary["diagnostics"].items():
+            if value is not None:
+                metrics[f"val/diagnostics/{key}"] = value
         for subset_name, subset_summary in summary.get("subsets", {}).items():
-            metrics[f"val/test_score/{subset_name}"] = subset_summary["mean_best_selection_reward"]
+            if reward_model_enabled:
+                metrics[f"val/test_score/{subset_name}"] = subset_summary["mean_best_selection_reward"]
             metrics[f"val/acc/{subset_name}"] = subset_summary["mean_best_final_correctness"]
             metrics[f"val/verification_coverage/{subset_name}"] = subset_summary["verification_coverage"]
+            for key, value in subset_summary["diagnostics"].items():
+                if value is not None:
+                    metrics[f"val/diagnostics/{subset_name}/{key}"] = value
         tracking.log(metrics, step=tracking_step)
     return summary
 
@@ -2414,6 +2467,14 @@ def _sync_worker_pool_model_path(worker_pool, current_paths: Dict[str, str]) -> 
 
 def main() -> None:
     args = parse_args()
+    if args.val_task_source and not args.disable_external_validation:
+        from .validation import validation_mode
+        validation_mode(args, 1)  # Fail before training on incompatible validation settings.
+        if args.val_diagnostic_examples < 0:
+            raise ValueError("val_diagnostic_examples must be nonnegative")
+    from .throughput import enabled
+    if enabled("REMA_PERSISTENT_ROLLOUT", "0") and (args.backend != "vllm" or not args.offline_grpo_distributed):
+        raise ValueError("Persistent policy engines require vLLM and distributed offline GRPO")
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved_task_source = _resolve_task_source_path(args.task_source)
@@ -2907,18 +2968,24 @@ def main() -> None:
                     )
                     previous_model_path = current_paths.get(policy_id)
                     if args.offline_grpo_distributed:
-                        summary = _run_distributed_offline_policy_training(
-                            train_samples=split["train"],
-                            val_samples=split["val"],
-                            config=training_config,
-                            tracking=tracking,
-                            tracking_prefix=f"{policy_id}/",
-                            log_step_offset=tracking_step_offset,
-                            nnodes=args.offline_grpo_nnodes,
-                            gpus_per_node=args.offline_grpo_gpus_per_node,
-                            master_port=args.offline_grpo_master_port,
-                            shared_input_root=args.distributed_offline_input_root,
-                        )
+                        from .ray_generation import borrow_rollout_gpus, release_rollout_gpus
+                        borrowed_slots = borrow_rollout_gpus()
+                        try:
+                            summary = _run_distributed_offline_policy_training(
+                                train_samples=split["train"],
+                                val_samples=split["val"],
+                                config=training_config,
+                                tracking=tracking,
+                                tracking_prefix=f"{policy_id}/",
+                                log_step_offset=tracking_step_offset,
+                                nnodes=args.offline_grpo_nnodes,
+                                gpus_per_node=args.offline_grpo_gpus_per_node,
+                                master_port=args.offline_grpo_master_port,
+                                shared_input_root=args.distributed_offline_input_root,
+                                borrowed_slots=borrowed_slots,
+                            )
+                        finally:
+                            release_rollout_gpus()
                     else:
                         previous_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
                         offline_alloc_conf = _offline_training_alloc_conf()
@@ -3146,6 +3213,8 @@ def main() -> None:
         json.dump(_json_safe(job_summary), handle, indent=2, sort_keys=True)
     print(f"[hierarchical-rema][integrated] wrote job summary to {output_dir / 'training_summary.json'}")
     _finish_tracking(tracking)
+    from .ray_generation import close_persistent_rollouts
+    close_persistent_rollouts()
 
 
 if __name__ == "__main__":

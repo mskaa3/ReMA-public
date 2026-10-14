@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
 import re
+import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from .backends import (
@@ -18,6 +20,7 @@ from .backends import (
 )
 from .recording import RolloutRecorder
 from .progress import StageProgress
+from .throughput import RewardPipeline, enabled, positive_env
 from .rewarding import (
     INTERMEDIATE_FINAL_ANSWER_PENALTY,
     NON_FINAL_ANSWER_CONTAINMENT_PENALTY,
@@ -757,6 +760,21 @@ class HierarchicalReMAOrchestrator:
         worker_pool: WorkerPoolConfig,
         progress_label: str | None = None,
     ) -> Dict[tuple[int, int, int], SelectionRollout]:
+        batch_size = max(1, int(getattr(self.gfam_reward_scorer, "rollout_batch_size", 1)))
+        with StageProgress("reward_scoring", len(selection_states), context=progress_label) as progress:
+            with RewardPipeline(
+                lambda states: self._score_selection_states(states, progress),
+                batch_size=batch_size,
+                max_pending=positive_env("GFAM_REWARD_QUEUE_BATCHES", 2),
+                overlap=self.gfam_reward_scorer is not None and enabled("GFAM_OVERLAP_REWARDS"),
+            ) as pipeline:
+                self._generate_selection_states(selection_states, worker_pool, pipeline, progress_label)
+                results = pipeline.finish()
+                if len(results) != len(selection_states):
+                    raise ValueError("A completed trajectory is missing its reward result")
+                return results
+
+    def _generate_selection_states(self, selection_states, worker_pool, pipeline, progress_label):
         worker_map = worker_pool.workers_by_id()
         node_maps = {
             (state.task_index, state.decomposition_index): state.decomposition.nodes_by_id()
@@ -803,11 +821,28 @@ class HierarchicalReMAOrchestrator:
                 f"{progress_suffix.lstrip()} frontier={frontier_step}/{max_frontier_steps} "
                 f"requests={len(worker_requests)}"
             )
-            worker_executions = self.backend.execute_workers_batch(worker_requests)
-            for state, execution in zip(request_states, worker_executions):
-                state.executions.append(execution)
-                state.outputs[execution.node_id] = execution.output_text
-                state.next_node_index += 1
+            # Submit complete trajectories after each generation chunk, including
+            # the final frontier, while the next chunk still occupies policy GPUs.
+            chunk_size = max(1, int(getattr(getattr(self.backend, "config", None),
+                                           "worker_batch_size", len(worker_requests))))
+            for start in range(0, len(worker_requests), chunk_size):
+                requests = worker_requests[start:start + chunk_size]
+                states = request_states[start:start + chunk_size]
+                worker_executions = self.backend.execute_workers_batch(requests)
+                if len(worker_executions) != len(states):
+                    raise ValueError("Worker backend returned misaligned execution results")
+                for state, request, execution in zip(states, requests, worker_executions):
+                    if execution.node_id != request.node.node_id:
+                        raise ValueError("Worker backend returned the wrong node identity")
+                    state.executions.append(execution)
+                    state.outputs[execution.node_id] = execution.output_text
+                    state.next_node_index += 1
+                    if state.next_node_index == len(state.topo_order):
+                        key = (state.task_index, state.decomposition_index, state.selection_index)
+                        pipeline.add(key, state)
+                # Partial batches are allowed: do not leave a GPU idle waiting
+                # for a longer trajectory to complete another frontier.
+                pipeline.flush()
 
             completed_states = sum(
                 1 for state in active_states if state.next_node_index >= len(state.topo_order)
@@ -827,24 +862,35 @@ class HierarchicalReMAOrchestrator:
                 f"requests={len(worker_requests)}"
             )
 
+    def _score_selection_states(self, active_states, progress):
         selection_rollout_map: Dict[tuple[int, int, int], SelectionRollout] = {}
         score_batch = getattr(self.gfam_reward_scorer, "score_rollouts", None)
         batch_size = max(1, int(getattr(self.gfam_reward_scorer, "rollout_batch_size", 1)))
-        with StageProgress("reward_scoring", len(active_states), context=progress_label) as progress:
+        workers = positive_env("REMA_VERIFIER_WORKERS", 1)
+        if workers > 16:
+            raise ValueError("REMA_VERIFIER_WORKERS must be at most 16")
+
+        def verify(state):
+            final_answer = state.outputs[state.decomposition.final_node_id]
+            reward = build_selection_reward(
+                final_answer=final_answer, ground_truth=state.task.ground_truth,
+                executions=state.executions, weights=self.reward_weights,
+                task_metadata=state.task.metadata, final_node_id=state.decomposition.final_node_id)
+            return state, final_answer, reward
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rema-verify") as verifier:
             for start in range(0, len(active_states), batch_size):
-                pending, requests, request_indices = [], [], []
-                for state in active_states[start:start + batch_size]:
-                    final_answer = state.outputs[state.decomposition.final_node_id]
-                    reward = build_selection_reward(
-                        final_answer=final_answer, ground_truth=state.task.ground_truth,
-                        executions=state.executions, weights=self.reward_weights,
-                        task_metadata=state.task.metadata, final_node_id=state.decomposition.final_node_id)
+                verification_started = time.monotonic()
+                pending = list(verifier.map(verify, active_states[start:start + batch_size]))
+                print(f"[hierarchical-rema][verification-batch] rows={len(pending)} workers={workers} "
+                      f"elapsed_s={time.monotonic() - verification_started:.3f}", flush=True)
+                requests, request_indices = [], []
+                for index, (state, final_answer, reward) in enumerate(pending):
                     if score_batch is not None and reward.verification_status != "unverified":
-                        request_indices.append(len(pending))
+                        request_indices.append(index)
                         requests.append(self._reward_model_request(
                             task=state.task, decomposition=state.decomposition, selection=state.selection,
                             executions=state.executions, final_answer=final_answer, reward=reward))
-                    pending.append((state, final_answer, reward))
                 scored = {}
                 if requests:
                     results = score_batch(requests)

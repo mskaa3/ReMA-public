@@ -14,6 +14,7 @@ if __name__ == "__main__":
 import atexit
 from collections import OrderedDict
 import contextlib
+import hashlib
 import importlib.util
 import json
 import math
@@ -171,12 +172,33 @@ def _serve():
 
 _client = None
 _client_pid = None
+_client_lock = threading.Lock()
+
+
+class VerifierPool:
+    """Independent killable processes; identical requests share a cache/lock."""
+    def __init__(self, workers=1, process_factory=VerifierProcess):
+        if not 1 <= workers <= 16:
+            raise ValueError("REMA_VERIFIER_WORKERS must be between 1 and 16")
+        self.clients = [process_factory() for _ in range(workers)]
+
+    def call(self, operation, *arguments):
+        key = json.dumps([operation, arguments], ensure_ascii=True).encode()
+        index = int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % len(self.clients)
+        return self.clients[index].call(operation, *arguments)
+
+    def close(self):
+        for client in self.clients:
+            client.close()
 
 
 def verify_in_process(operation, *arguments):
     global _client, _client_pid
     if _client is None or _client_pid != os.getpid():
-        _client, _client_pid = VerifierProcess(), os.getpid()
+        with _client_lock:
+            if _client is None or _client_pid != os.getpid():
+                _client = VerifierPool(int(os.environ.get("REMA_VERIFIER_WORKERS", "1")))
+                _client_pid = os.getpid()
     return _client.call(operation, *arguments)
 
 
