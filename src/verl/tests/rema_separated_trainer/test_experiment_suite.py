@@ -83,6 +83,154 @@ class ExperimentTests(unittest.TestCase):
             x.pop(key); y.pop(key)
         self.assertEqual(x, y)
 
+    def test_worker_gate_modes_are_explicit_and_training_only(self):
+        for mode in ('off', 'diagnostic', 'gated'):
+            cfg = repository_config()
+            cfg['worker_gate_mode'] = mode
+            for phase in suite.PHASES:
+                with self.subTest(mode=mode, phase=phase):
+                    run = suite.make_runs(cfg, phase)[0]
+                    env = suite.run_environment(run)
+                    self.assertEqual(env['PREFIX_PROBE_ENABLE'], str(mode != 'off').lower())
+                    self.assertEqual(env['PREFIX_PROBE_APPLY_TO_TRAINING'],
+                                     str(mode == 'gated' and phase == 'workers').lower())
+                    self.assertEqual(env['C3_REQUIRE_ELIGIBLE_SUCCESS'], 'true')
+                    self.assertEqual(env['PREFIX_PROBE_MAX_NEW_TOKENS'], 256)
+                    self.assertEqual(env['PREFIX_PROBE_VALIDATION_MAX_SAMPLES'], 128)
+                    self.assertEqual(env['TRAIN_DECOMPOSER'], 'false')
+                    self.assertIn('prefix_probe.solver_role=decomposer', env['AGENT12_EXPERIMENT_OVERRIDES'])
+        for value in ('enabled', True, None):
+            cfg['worker_gate_mode'] = value
+            with self.assertRaisesRegex(ValueError, 'worker_gate_mode'):
+                suite.make_runs(cfg, 'workers')
+
+    def test_single_planner_runs_do_not_create_baseline_jobs(self):
+        cfg = repository_config()
+        cfg['planners'].pop('baseline')
+        cfg['seeds'] = [11]
+        for phase, count in [('planners', 1), ('workers', 1), ('transfer', 2), ('cross', 1)]:
+            runs = suite.make_runs(cfg, phase)
+            self.assertEqual(len(runs), count)
+            for run in runs:
+                self.assertEqual(run['planner'], cfg['planners']['eac3'])
+                self.assertNotIn('baseline', run['run_name'])
+                suite.run_environment(run)
+        for planners in ({}, {'unknown': 'model'}, {'baseline': 'model', 'eac3': 'model'}):
+            cfg['planners'] = planners
+            with self.assertRaises(ValueError):
+                suite.validate_study(cfg)
+
+    def test_eac3_worker_gate_pair_changes_only_training_gate_and_identity(self):
+        configs = [suite.read_json(ROOT / f'config/eac3-worker-gates-qwen7-step110-{arm}.json')
+                   for arm in ('ungated', 'gated')]
+        self.assertEqual([cfg['worker_gate_mode'] for cfg in configs], ['diagnostic', 'gated'])
+        self.assertEqual({k: v for k, v in configs[0].items() if k not in ('study', 'worker_gate_mode')},
+                         {k: v for k, v in configs[1].items() if k not in ('study', 'worker_gate_mode')})
+        envs, exports = [], []
+        with tempfile.TemporaryDirectory() as tmp:
+            for cfg in configs:
+                self.assertEqual(set(cfg['planners']), {'eac3'})
+                self.assertEqual(cfg['test_update_steps'], [1, 2, 5])
+                self.assertEqual(cfg['test_freq'], 10)
+                self.assertEqual(cfg['worker_updates'], 100)
+                directory = Path(tmp) / cfg['study']
+                suite.write_runs(cfg, 'workers', directory)
+                self.assertEqual(len(list(directory.glob('*.json'))), 1)
+                self.assertEqual(len((directory / 'commands.txt').read_text().splitlines()), 1)
+                run = suite.read_json(next(directory.glob('*.json')))
+                env = suite.run_environment(run)
+                self.assertEqual(env['PREFIX_PROBE_ENABLE'], 'true')
+                self.assertEqual(env['TRAIN_DECOMPOSER'], 'false')
+                self.assertIn('trainer.test_update_steps=[1, 2, 5]', env['AGENT12_EXPERIMENT_OVERRIDES'])
+                self.assertIn('trainer.resume_mode=disable', env['AGENT12_EXPERIMENT_OVERRIDES'])
+                self.assertIn('trainer.val_before_train=true', env['AGENT12_EXPERIMENT_OVERRIDES'])
+                envs.append(env)
+                exports.append(suite.worker_export(cfg, run['arm'], run['seed']))
+        self.assertEqual({k for k in envs[0] if envs[0][k] != envs[1][k]}, {
+            'AGENT12_RUN_NAME', 'AGENT12_WANDB_RUN_ID', 'PREFIX_PROBE_APPLY_TO_TRAINING',
+        })
+        self.assertEqual([env['PREFIX_PROBE_APPLY_TO_TRAINING'] for env in envs], ['false', 'true'])
+        self.assertNotEqual(*exports)
+        self.assertTrue(all(export != configs[0]['initial_worker'] for export in exports))
+
+    def test_early_evaluation_uses_completed_updates_without_repeating_skips(self):
+        path = ROOT / 'src/verl/verl/rema_separated_trainer/ppo/ray_trainer.py'
+        trainer = next(node for node in ast.parse(path.read_text()).body
+                       if isinstance(node, ast.ClassDef) and node.name == 'RayReMASeparatedTrainer')
+        method = next(node for node in trainer.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_update_frequency_due')
+        namespace = {}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
+        due = namespace['_update_frequency_due']
+        state = SimpleNamespace(actor_update_steps=0)
+        seen = []
+        for step in range(21):
+            state.actor_update_steps = step
+            self.assertFalse(due(state, 10, False, [1, 2, 5]))
+            if due(state, 10, True, [1, 2, 5]):
+                seen.append(step)
+        self.assertEqual(seen, [1, 2, 5, 10, 20])
+        state.actor_update_steps = 1
+        self.assertFalse(due(state, 50, True))  # Checkpoint cadence stays unchanged.
+        state.actor_update_steps = 50
+        self.assertTrue(due(state, 50, True))
+        self.assertFalse(due(state, 0, True))
+        fit = next(node for node in trainer.body if isinstance(node, ast.FunctionDef) and node.name == 'fit')
+        self.assertIn("self.config.trainer.get('test_update_steps', [])", ast.unparse(fit))
+        cfg = config()
+        for bad in (None, '1,2', [0], [-1], [True], [1, 1], [1.5], [{}]):
+            cfg['test_update_steps'] = bad
+            with self.assertRaisesRegex(ValueError, 'test_update_steps'):
+                suite.validate_study(cfg)
+
+    def test_gated_pilot_preserves_controls_and_has_separate_outputs(self):
+        off = suite.read_json(ROOT / 'config/eac3-worker-learning-qwen7-step110.json')
+        gated = suite.read_json(ROOT / 'config/eac3-worker-learning-qwen7-step110-gated.json')
+        self.assertEqual(gated['worker_gate_mode'], 'gated')
+        self.assertNotEqual(off['study'], gated['study'])
+        self.assertEqual({k: v for k, v in off.items() if k not in ('study', 'worker_gate_mode')},
+                         {k: v for k, v in gated.items() if k not in ('study', 'worker_gate_mode')})
+        for a, b in zip(suite.make_runs(off, 'workers'), suite.make_runs(gated, 'workers')):
+            x, y = suite.run_environment(a), suite.run_environment(b)
+            self.assertEqual({k for k in x if x[k] != y[k]}, {
+                'AGENT12_RUN_NAME', 'AGENT12_WANDB_RUN_ID',
+                'PREFIX_PROBE_ENABLE', 'PREFIX_PROBE_APPLY_TO_TRAINING',
+            })
+            self.assertNotEqual(suite.worker_export(off, a['arm'], a['seed']),
+                                suite.worker_export(gated, b['arm'], b['seed']))
+
+    def test_gate_mode_reaches_training_command_despite_inherited_flags(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        defaults = launcher[:launcher.index('\nif (( GPUS_PER_NODE')].replace('source ./env.sh', ':')
+        function = launcher[launcher.index('run_agent12_training() {'):launcher.index('\nif [[ "$ONLINE_TEACHER_GENERATION"')]
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp) / 'command'
+            for mode in ('off', 'diagnostic', 'gated'):
+                with self.subTest(mode=mode):
+                    cfg = repository_config()
+                    cfg['worker_gate_mode'] = mode
+                    cfg['test_update_steps'] = [1, 2, 5]
+                    run = suite.make_runs(cfg, 'workers')[0]
+                    env = {**os.environ, 'PREFIX_PROBE_ENABLE': 'inherited',
+                           'PREFIX_PROBE_APPLY_TO_TRAINING': 'inherited',
+                           'C3_REQUIRE_ELIGIBLE_SUCCESS': 'false',
+                           **{k: str(v) for k, v in suite.run_environment(run).items()},
+                           'SLURM_JOB_ID': '123', 'SLURM_NNODES': '6', 'CAPTURE': str(capture)}
+                    shell = defaults + '\nsrun() { printf "%s\\n" "${!#}" > "$CAPTURE"; }\n'
+                    shell += 'HEAD_NODE=head; IP_HEAD=head:6379; COMMON_MOUNTS=(--nv)\n' + function
+                    shell += '\nrun_agent12_training /tmp/train.parquet "$TOTAL_STEPS" True True\n'
+                    result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    command = shlex.split(capture.read_text().rsplit(';', 1)[-1])
+                    overrides = dict(arg.split('=', 1) for arg in command if '=' in arg and not arg.startswith('--'))
+                    prefix = 'algorithm.hierarchy.scoped_c3_grpo.'
+                    self.assertEqual(overrides[prefix + 'prefix_probe.enable'], str(mode != 'off').lower())
+                    self.assertEqual(overrides[prefix + 'prefix_probe.apply_to_training'], str(mode == 'gated').lower())
+                    self.assertEqual(overrides[prefix + 'require_eligible_success'], 'true')
+                    self.assertEqual(overrides['trainer.val_only'], 'false')
+                    self.assertEqual(json.loads(overrides['trainer.test_update_steps']), [1, 2, 5])
+                    self.assertEqual(overrides['algorithm.hierarchy.train_agent_roles'], suite.WORKER_ROLES)
+
     def test_repository_data_needs_no_train_or_eval_remote(self):
         cfg = repository_config()
         for phase in suite.PHASES:

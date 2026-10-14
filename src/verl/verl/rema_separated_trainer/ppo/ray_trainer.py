@@ -3267,10 +3267,13 @@ class RayReMASeparatedTrainer(object):
         self.actor_updates_by_role = progress['actor_updates_by_role']
         self.actor_update_count_origin_step = int(progress['actor_update_count_origin_step'])
 
-    def _update_frequency_due(self, frequency, actor_updated):
+    def _update_frequency_due(self, frequency, actor_updated, extra_steps=()):
         return (
-            actor_updated and int(frequency) > 0
-            and self.actor_update_steps % int(frequency) == 0
+            actor_updated and self.actor_update_steps > 0
+            and (
+                (int(frequency) > 0 and self.actor_update_steps % int(frequency) == 0)
+                or self.actor_update_steps in extra_steps
+            )
         )
 
     def _save_checkpoint(self):
@@ -4309,7 +4312,10 @@ class RayReMASeparatedTrainer(object):
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        (is_training_last_step or self._update_frequency_due(self.config.trainer.test_freq, actor_updated)):
+                        (is_training_last_step or self._update_frequency_due(
+                            self.config.trainer.test_freq, actor_updated,
+                            self.config.trainer.get('test_update_steps', []),
+                        )):
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
                             if is_training_last_step:

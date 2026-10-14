@@ -396,6 +396,8 @@ trainer:
   resume_mode: auto # or auto or resume_path if
   resume_from_path: null
   test_freq: 50
+  # Additional evaluations after these completed actor updates, not rollout attempts.
+  test_update_steps: []
   critic_warmup: 0
   default_hdfs_dir: null
   remove_previous_ckpt_in_save: True

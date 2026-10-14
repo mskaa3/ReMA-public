@@ -1,0 +1,25 @@
+{
+  "study": "eac3-worker-gates-qwen7-step110-ungated-v1",
+  "remote_root": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/eac3-experiments",
+  "planners": {
+    "eac3": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/agent1-eac3-qwen7-20261013-144231/snapshots/global_step_110/decomposer/huggingface"
+  },
+  "initial_worker": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/agent2-only-6055460/snapshots/global_step_50/workers/huggingface",
+  "data_source": "repository",
+  "train_file": "data/MATH/train_lv3to5_8k.parquet",
+  "eval_file": "data/overall_math/test.parquet",
+  "common_plan_remote": "SET_ME_REVIEWED_COMMON_PLAN_BANK_PARQUET_REMOTE",
+  "worker_gate_mode": "diagnostic",
+  "seeds": [11],
+  "eval_seed": 42,
+  "worker_updates": 100,
+  "rollout_step_limit": 1200,
+  "test_freq": 10,
+  "test_update_steps": [1, 2, 5],
+  "save_freq": 50,
+  "train_question_batch_size": 48,
+  "rollout_n": 32,
+  "continuations_per_action": 4,
+  "nodes": 4,
+  "gpus_per_node": 4
+}

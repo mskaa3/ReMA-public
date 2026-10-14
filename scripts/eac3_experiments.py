@@ -46,9 +46,10 @@ def repository_data_files(cfg):
 def validate_study(cfg):
     if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', cfg['study']):
         raise ValueError('study must be a filesystem-safe, unique study name')
-    if set(cfg['planners']) != {'baseline', 'eac3'}:
-        raise ValueError('Exactly baseline and eac3 planner exports are required')
-    if cfg['planners']['baseline'] == cfg['planners']['eac3']:
+    planners = cfg['planners']
+    if not planners or not set(planners).issubset({'baseline', 'eac3'}):
+        raise ValueError('Specify baseline and/or eac3 planner exports')
+    if len(planners) == 2 and planners['baseline'] == planners['eac3']:
         raise ValueError('Baseline and EAC3 must identify different planner artifacts')
     for key in ('worker_updates', 'rollout_step_limit', 'test_freq', 'save_freq',
                 'train_question_batch_size', 'rollout_n', 'continuations_per_action',
@@ -71,6 +72,13 @@ def validate_study(cfg):
         raise ValueError('data_source must be remote or repository')
     if cfg.get('data_source') == 'repository':
         repository_data_files(cfg)
+    if cfg.get('worker_gate_mode', 'off') not in ('off', 'diagnostic', 'gated'):
+        raise ValueError('worker_gate_mode must be off, diagnostic, or gated')
+    test_steps = cfg.get('test_update_steps', [])
+    if (not isinstance(test_steps, list)
+            or any(type(step) is not int or step <= 0 for step in test_steps)
+            or len(set(test_steps)) != len(test_steps)):
+        raise ValueError('test_update_steps must be a list of distinct positive update numbers')
 
 
 def run_name(cfg, phase, arm, seed):
@@ -105,7 +113,7 @@ def make_runs(cfg, phase):
                 add(arm, seed, planner, cfg['initial_worker'], 'worker_train')
     elif phase == 'transfer':
         # D is loaded for compatibility but never generates in fixed-plan evaluation.
-        planner = cfg['planners']['baseline']
+        planner = next(iter(cfg['planners'].values()))
         add('initial', cfg['eval_seed'], planner, cfg['initial_worker'], 'replay_eval')
         for seed in cfg['seeds']:
             for arm in cfg['planners']:
@@ -144,11 +152,13 @@ def run_environment(run):
     if int(os.environ.get('SLURM_NNODES', cfg['nodes'])) != cfg['nodes']:
         raise ValueError('Slurm node allocation differs from the experiment manifest')
     train = run['mode'] == 'worker_train'
+    gate_mode = cfg.get('worker_gate_mode', 'off')
     overrides = {
         'algorithm.hierarchy.agent12_curriculum.enable': False,
         'algorithm.hierarchy.start_agent': 'worker_stage_1',
         'algorithm.hierarchy.scoped_c3_grpo.enable': True,
         'algorithm.hierarchy.scoped_c3_grpo.positive_only_nonterminal_workers': True,
+        'algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_role': 'decomposer',
         'algorithm.hierarchy.accept_revise.enable': False,
         'actor_rollout_ref.rollout.max_num_turns': 1,
         'algorithm.hierarchy.worker_context_mode': 'full_question',
@@ -162,6 +172,7 @@ def run_environment(run):
         'trainer.val_before_train': True,
         'trainer.resume_mode': 'disable',
         'trainer.max_actor_updates': cfg['worker_updates'] if train else None,
+        'trainer.test_update_steps': cfg.get('test_update_steps', []),
         'trainer.validation_output_dir': '${trainer.default_local_dir}/evaluations',
     }
     env = {
@@ -172,7 +183,12 @@ def run_environment(run):
         'TERMINAL_WORKER_AS_ANSWER': 'true', 'NUM_WORKER_STAGES': 4,
         'MAX_PLANNED_SUBTASKS': 4, 'WORKER_CHECKPOINT_ROLE': 'worker_stage_4',
         'DECOMPOSER_USE_REMOVE_PADDING': 'true', 'WORKER_USE_REMOVE_PADDING': 'true',
-        'PREFIX_PROBE_ENABLE': 'false',
+        'PREFIX_PROBE_ENABLE': str(gate_mode != 'off').lower(),
+        'PREFIX_PROBE_APPLY_TO_TRAINING': str(train and gate_mode == 'gated').lower(),
+        # Preserve the existing successful-group requirement in every arm.
+        'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
+        'PREFIX_PROBE_MAX_NEW_TOKENS': 256,
+        'PREFIX_PROBE_VALIDATION_MAX_SAMPLES': 128,
         'AGENT2_PILOT': 'false', 'GENERATE_TEACHER_DATA': 0, 'ONLINE_TEACHER_GENERATION': 'false',
         'TEACHER_TRAIN_REMOTE': '' if repository_data else train_source, 'TEACHER_TRAIN_SHARDS_REMOTE': '',
         'TEACHER_ASSISTED_VALIDATION': 'false', 'TEACHER_ROLLOUT_N': 1, 'TEACHER_SAMPLES_PER_CALL': 1,
