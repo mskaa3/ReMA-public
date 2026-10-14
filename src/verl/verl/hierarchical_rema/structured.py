@@ -529,7 +529,6 @@ def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
         "<decomposition_plan>",
         f"TARGET_QUANTITY: {candidate.target_quantity}",
         f"FINAL_ANSWER_FORMAT_HINT: {candidate.final_answer_format_hint}",
-        f"FINAL_NODE_ID: {candidate.final_node_id}",
     ]
     if candidate.summary.strip():
         lines.insert(1, f"SUMMARY: {candidate.summary}")
@@ -544,7 +543,7 @@ def format_decomposition_plan(candidate: DecompositionCandidate) -> str:
                 f"OUTPUT_KEY: {node.output_key}",
             ]
         )
-    lines.append("</decomposition_plan>")
+    lines.extend([f"FINAL_NODE_ID: {candidate.final_node_id}", "</decomposition_plan>"])
     return "\n".join(lines)
 
 
@@ -628,8 +627,6 @@ def _parse_decomposition_plan(text: str) -> Dict[str, Any]:
         payload.setdefault("summary", "")
         payload.setdefault("target_quantity", "best final answer requested by TASK")
         payload.setdefault("final_answer_format_hint", "match the answer format requested by TASK")
-        if not payload.get("final_node_id"):
-            payload["final_node_id"] = payload["nodes"][-1]["node_id"]
         return payload
     raise StructuredOutputError("Could not parse a decomposition plan from controller output")
 
@@ -727,8 +724,6 @@ def salvage_decomposition_payload(
         merged_payload.setdefault("summary", "")
         merged_payload.setdefault("target_quantity", "best final answer requested by TASK")
         merged_payload.setdefault("final_answer_format_hint", "match the answer format requested by TASK")
-        if not merged_payload.get("final_node_id"):
-            merged_payload["final_node_id"] = merged_payload["nodes"][-1].get("node_id")
         return merged_payload
     return None
 
@@ -1076,7 +1071,9 @@ def validate_decomposition_payload(
         normalized_dependencies: List[str] = []
         seen_dependencies = set()
         for dependency in dependencies:
-            if not dependency or dependency == node_id or dependency in seen_dependencies:
+            if dependency == node_id:
+                raise StructuredOutputError(f"Node {node_id} cannot depend on itself")
+            if not dependency or dependency in seen_dependencies:
                 continue
             seen_dependencies.add(dependency)
             normalized_dependencies.append(dependency)
@@ -1102,19 +1099,6 @@ def validate_decomposition_payload(
             )
         )
 
-    if not final_node_id:
-        final_node_id = nodes[-1].node_id
-
-    raw_candidate = DecompositionCandidate(
-        decomposition_id=decomposition_id,
-        summary=summary,
-        target_quantity=target_quantity,
-        final_answer_format_hint=final_answer_format_hint,
-        nodes=nodes,
-        final_node_id=final_node_id,
-    )
-    raw_order = raw_candidate.topological_order()
-
     downstream_dependencies = {
         dependency
         for node in nodes
@@ -1125,18 +1109,36 @@ def validate_decomposition_payload(
     if not sink_node_ids:
         raise StructuredOutputError("Decomposition must contain at least one terminal sink node")
 
-    resolved_final_node_id = raw_candidate.final_node_id
+    resolved_final_node_id = final_node_id
+    final_node_repair = None
     if resolved_final_node_id not in node_ids or resolved_final_node_id in downstream_dependencies:
-        preferred_sink_ids = [
-            node.node_id
-            for node in nodes
-            if node.node_id in sink_node_ids and _is_generic_final_answer_instruction(node.instruction)
-        ]
-        if preferred_sink_ids:
-            resolved_final_node_id = preferred_sink_ids[-1]
-        else:
-            declared_sink_ids = [node.node_id for node in nodes if node.node_id in sink_node_ids]
-            resolved_final_node_id = declared_sink_ids[-1]
+        # A terminal pointer may be repaired, but neither instructions nor missing
+        # graph structure can be invented. Multiple sinks have no safe choice.
+        if len(sink_node_ids) != 1:
+            raise StructuredOutputError(
+                f"Cannot resolve FINAL_NODE_ID {final_node_id!r}: ambiguous terminal nodes "
+                + ", ".join(sink_node_ids)
+            )
+        resolved_final_node_id = sink_node_ids[0]
+        final_node_repair = {
+            "strategy": "unique_terminal_sink",
+            "declared_final_node_id": final_node_id,
+            "resolved_final_node_id": resolved_final_node_id,
+            "reason": ("missing" if not final_node_id else
+                       "unknown_node" if final_node_id not in node_ids else "nonterminal_node"),
+            "node_id_space": "before_canonicalization",
+        }
+
+    raw_candidate = DecompositionCandidate(
+        decomposition_id=decomposition_id,
+        summary=summary,
+        target_quantity=target_quantity,
+        final_answer_format_hint=final_answer_format_hint,
+        nodes=nodes,
+        final_node_id=resolved_final_node_id,
+    )
+    # Still reject unknown dependencies and cycles after resolving the pointer.
+    raw_order = raw_candidate.topological_order()
 
     original_node_map = raw_candidate.nodes_by_id()
     resolved_final_node = original_node_map[resolved_final_node_id]
@@ -1188,6 +1190,11 @@ def validate_decomposition_payload(
         nodes=canonical_nodes,
         final_node_id=remapped_node_ids[resolved_final_node_id],
     )
+    if final_node_repair is not None:
+        candidate.raw_payload["validation"] = {
+            "final_node_repair": final_node_repair,
+            "local_salvage_used": True,
+        }
     candidate.topological_order()
 
     if candidate.final_node_id != candidate.nodes[-1].node_id:

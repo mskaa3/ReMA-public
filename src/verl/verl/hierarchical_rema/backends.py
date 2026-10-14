@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .prompts import (
@@ -63,6 +64,20 @@ class DecompositionRequest:
     rollout_config: RolloutConfig
     decomposition_index: int
     worker_performance: Dict[str, WorkerPerformanceSnapshot]
+
+
+@dataclass
+class _DecompositionRepairState:
+    result_index: int
+    request: DecompositionRequest
+    prompt_text: str
+    fallback_id: str
+    initial_raw_text: str
+    initial_error: str
+    last_raw_text: str
+    last_error: str
+    errors: List[str] = field(default_factory=list)
+    history: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -1157,6 +1172,11 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         prompt_text: str,
         validation: Dict[str, object],
     ) -> DecompositionCandidate:
+        validation = dict(validation)
+        structural_validation = candidate.raw_payload.get("validation", {})
+        if structural_validation.get("final_node_repair"):
+            validation["final_node_repair"] = structural_validation["final_node_repair"]
+            validation["local_salvage_used"] = True
         candidate.raw_payload = {
             "decomposition": {
                 "decomposition_id": candidate.decomposition_id,
@@ -1175,6 +1195,40 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
         }
         candidate.raw_text = format_decomposition_plan(candidate)
         return candidate
+
+    @staticmethod
+    def _decomposition_repair_prompt(prompt_text: str, error: str) -> str:
+        return (
+            f"{prompt_text}\n\nYour previous answer did not match the required decomposition format. "
+            f"Error: {error}\nReturn ONLY the optional <decomposer_scratchpad> block followed by the corrected <decomposition_plan> block. "
+            "Do not add commentary, bullets, or repeated task text. "
+            "Every node must include NODE_ID and INSTRUCTION, and should include DEPENDENCIES. "
+            "Use allowed numeric node IDs and keep the dependency structure as a valid DAG. "
+            "Use coarse REQUIRED_SKILLS families, with `none` only on pure routing nodes when unavoidable. "
+            "REQUIRED_SKILLS_NOTE is optional and should stay short when present. "
+            "After all node blocks, write exactly one FINAL_NODE_ID line immediately before </decomposition_plan>. "
+            "It must identify the terminal final-answer node among the NODE_ID values you actually emitted, "
+            "not the hard node cap. Do not put FINAL_NODE_ID in the header."
+        )
+
+    @staticmethod
+    def _parse_decomposition_candidate(
+        raw_text: str,
+        rollout_config: RolloutConfig,
+        fallback_id: str,
+    ) -> Tuple[DecompositionCandidate, bool]:
+        payload = None
+        try:
+            payload = extract_decomposition_payload(raw_text)
+            return validate_decomposition_payload(payload, rollout_config, fallback_id), False
+        except (ValueError, TypeError, KeyError):
+            candidate = _try_salvage_decomposition_candidate(
+                raw_text=raw_text, payload=payload,
+                rollout_config=rollout_config, fallback_id=fallback_id,
+            )
+            if candidate is not None:
+                return candidate, True
+            raise
 
     @staticmethod
     def _set_selection_artifacts(
@@ -1551,16 +1605,7 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                         },
                     )
                 errors.append(str(exc))
-                repair_prompt = (
-                    f"{prompt_text}\n\nYour previous answer did not match the required decomposition format. "
-                    f"Error: {exc}\nReturn ONLY the optional <decomposer_scratchpad> block followed by the corrected <decomposition_plan> block. "
-                    "Do not add commentary, bullets, or repeated task text. "
-                    "Every node must include NODE_ID and INSTRUCTION, and should include DEPENDENCIES. "
-                    "Use allowed numeric node IDs and keep the dependency structure as a valid DAG. "
-                    "Use coarse REQUIRED_SKILLS families, with `none` only on pure routing nodes when unavoidable. "
-                    "REQUIRED_SKILLS_NOTE is optional and should stay short when present. "
-                    "Make FINAL_NODE_ID point to the terminal final-answer node."
-                )
+                repair_prompt = self._decomposition_repair_prompt(prompt_text, str(exc))
 
         if repair_progress is not None:
             print(
@@ -1852,75 +1897,145 @@ class TransformersHierarchicalBackend(HierarchicalBackend):
                 sampling_overrides=self._controller_sampling_overrides("decomposer"),
                 log_label="decomposer",
             )
-            repair_count = 0
+            if len(generated) != len(grouped_requests):
+                raise RuntimeError("Decomposition generation returned an unexpected number of results")
+            pending: List[_DecompositionRepairState] = []
             for (result_index, request, prompt_text), (raw_text, entropy) in zip(grouped_requests, generated):
                 fallback_id = f"{request.task.task_id}-decomp-{request.decomposition_index}"
-                payload: Dict[str, Any] | None = None
                 try:
-                    payload = extract_decomposition_payload(raw_text)
-                    candidate = validate_decomposition_payload(
-                        payload=payload,
+                    candidate, salvaged = self._parse_decomposition_candidate(
+                        raw_text=raw_text,
                         rollout_config=request.rollout_config,
                         fallback_id=fallback_id,
                     )
-                    candidate = self._set_decomposition_artifacts(
+                except (ValueError, TypeError, KeyError) as exc:
+                    pending.append(_DecompositionRepairState(
+                        result_index=result_index, request=request, prompt_text=prompt_text,
+                        fallback_id=fallback_id, initial_raw_text=raw_text, initial_error=str(exc),
+                        last_raw_text=raw_text, last_error=str(exc),
+                    ))
+                    continue
+                results[result_index] = self._set_decomposition_artifacts(
+                    candidate=candidate,
+                    prompt_text=prompt_text,
+                    validation={
+                        "backend": self.backend_name,
+                        "attempt": 0,
+                        "errors_before_success": [],
+                        "fallback_used": False,
+                        "raw_model_text": raw_text,
+                        "batch_generated": True,
+                        "entropy": entropy,
+                        **({"local_salvage_used": True} if salvaged else {}),
+                    },
+                )
+
+            repair_count = len(pending)
+            # Preserve the former per-candidate regeneration budget. The initial
+            # batch was followed by max_format_retries + 1 single generations.
+            repair_rounds = self.config.max_format_retries + 1
+            for attempt in range(repair_rounds):
+                if not pending:
+                    break
+                started_at = time.monotonic()
+                print(
+                    f"[hierarchical-rema][generation-repair] role=decomposer event=round_start "
+                    f"model={model_path} round={attempt + 1}/{repair_rounds} "
+                    f"pending={len(pending)} total_candidates={len(grouped_requests)} "
+                    f"batch_size={self.config.controller_batch_size}",
+                    flush=True,
+                )
+                repaired = self._generate_text_batch(
+                    base_model_path=model_path,
+                    prompt_texts=[self._decomposition_repair_prompt(state.prompt_text, state.last_error)
+                                  for state in pending],
+                    system_prompt=DECOMPOSER_SYSTEM_PROMPT,
+                    max_new_tokens=self._controller_max_new_tokens("decomposer"),
+                    batch_size=self.config.controller_batch_size,
+                    temperature=self._controller_temperature(),
+                    sampling_overrides=self._controller_sampling_overrides("decomposer"),
+                    log_label=f"decomposer_repair_round_{attempt + 1}",
+                )
+                if len(repaired) != len(pending):
+                    raise RuntimeError("Decomposition repair returned an unexpected number of results")
+                remaining: List[_DecompositionRepairState] = []
+                for state, (raw_text, entropy) in zip(pending, repaired):
+                    state.last_raw_text = raw_text
+                    audit = {"round": attempt + 1, "raw_model_text": raw_text, "entropy": entropy}
+                    try:
+                        candidate, salvaged = self._parse_decomposition_candidate(
+                            raw_text=raw_text, rollout_config=state.request.rollout_config,
+                            fallback_id=state.fallback_id,
+                        )
+                    except (ValueError, TypeError, KeyError) as exc:
+                        state.last_error = str(exc)
+                        state.errors.append(str(exc))
+                        audit["error"] = str(exc)
+                        state.history.append(audit)
+                        remaining.append(state)
+                        continue
+                    audit["accepted"] = True
+                    state.history.append(audit)
+                    results[state.result_index] = self._set_decomposition_artifacts(
                         candidate=candidate,
-                        prompt_text=prompt_text,
+                        prompt_text=state.prompt_text,
                         validation={
                             "backend": self.backend_name,
-                            "attempt": 0,
-                            "errors_before_success": [],
+                            "attempt": attempt,
+                            "errors_before_success": list(state.errors),
                             "fallback_used": False,
                             "raw_model_text": raw_text,
                             "batch_generated": True,
+                            "batch_repair_fallback": True,
+                            "repair_round": attempt + 1,
+                            "initial_raw_model_text": state.initial_raw_text,
+                            "initial_generation_error": state.initial_error,
+                            "repair_history": list(state.history),
                             "entropy": entropy,
+                            **({"local_salvage_used": True} if salvaged else {}),
                         },
                     )
-                except Exception:
-                    salvaged_candidate = _try_salvage_decomposition_candidate(
-                        raw_text=raw_text,
-                        payload=payload,
-                        rollout_config=request.rollout_config,
-                        fallback_id=fallback_id,
-                    )
-                    if salvaged_candidate is not None:
-                        candidate = self._set_decomposition_artifacts(
-                            candidate=salvaged_candidate,
-                            prompt_text=prompt_text,
-                            validation={
-                                "backend": self.backend_name,
-                                "attempt": 0,
-                                "errors_before_success": [],
-                                "fallback_used": False,
-                                "local_salvage_used": True,
-                                "raw_model_text": raw_text,
-                                "batch_generated": True,
-                                "entropy": entropy,
-                            },
-                        )
-                    else:
-                        repair_count += 1
-                        candidate = self._generate_validated_decomposition(
-                            prompt_text=prompt_text,
-                            task=request.task,
-                            policy_config=request.policy_config,
-                            rollout_config=request.rollout_config,
-                            fallback_id=fallback_id,
-                            repair_progress=(repair_count, len(grouped_requests)),
-                        )
-                        candidate.raw_payload.setdefault("validation", {})
-                        candidate.raw_payload["validation"].update(
-                            {
-                                "batch_generated": True,
-                                "batch_repair_fallback": True,
-                            }
-                        )
-                        candidate.raw_text = format_decomposition_plan(candidate)
-                results[result_index] = candidate
+                print(
+                    f"[hierarchical-rema][generation-repair] role=decomposer event=round_done "
+                    f"model={model_path} round={attempt + 1}/{repair_rounds} "
+                    f"accepted={len(pending) - len(remaining)} remaining={len(remaining)} "
+                    f"elapsed_s={time.monotonic() - started_at:.1f}",
+                    flush=True,
+                )
+                pending = remaining
+
+            for state in pending:
+                print(
+                    f"[hierarchical-rema][generation-repair] role=decomposer event=fallback "
+                    f"model={model_path} task_id={state.request.task.task_id} "
+                    f"decomposition_id={state.fallback_id} request_index={state.result_index + 1} "
+                    f"total_requests={len(requests)} exhausted_attempts=true last_error={state.last_error}",
+                    flush=True,
+                )
+                candidate = build_fallback_decomposition(
+                    task_id=state.request.task.task_id, task_prompt=state.request.task.prompt,
+                    raw_text=state.last_raw_text,
+                    error_message=" | ".join(state.errors) or state.initial_error,
+                    rollout_config=state.request.rollout_config,
+                )
+                candidate.raw_payload["controller_prompt"] = state.prompt_text
+                candidate.raw_payload.setdefault("validation", {}).update({
+                    "backend": self.backend_name,
+                    "errors": list(state.errors),
+                    "batch_generated": True,
+                    "batch_repair_fallback": True,
+                    "initial_raw_model_text": state.initial_raw_text,
+                    "initial_generation_error": state.initial_error,
+                    "repair_history": list(state.history),
+                })
+                candidate.raw_text = format_decomposition_plan(candidate)
+                results[state.result_index] = candidate
             if repair_count:
                 print(
                     f"[hierarchical-rema][generation] role=decomposer "
-                    f"model={model_path} repair_fallbacks={repair_count}/{len(grouped_requests)}"
+                    f"model={model_path} repair_requests={repair_count} total_candidates={len(grouped_requests)} "
+                    f"recovered_after_repair={repair_count - len(pending)} fallback_plans={len(pending)}",
+                    flush=True,
                 )
 
         if any(candidate is None for candidate in results):
