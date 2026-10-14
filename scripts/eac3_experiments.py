@@ -28,6 +28,21 @@ def sha_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def repository_data_files(cfg):
+    files = {}
+    for split in ('train', 'eval'):
+        value = cfg.get(split + '_file', '')
+        path = Path(value)
+        if (not re.fullmatch(r'[A-Za-z0-9_./\-]+', value)
+                or path.is_absolute() or '..' in path.parts
+                or len(path.parts) < 3 or path.parts[0] != 'data'
+                or path.parts[1] not in ('MATH', 'overall_math')
+                or path.suffix != '.parquet'):
+            raise ValueError(f'{split}_file must be a parquet under data/MATH or data/overall_math')
+        files[split] = path.as_posix()
+    return files
+
+
 def validate_study(cfg):
     if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', cfg['study']):
         raise ValueError('study must be a filesystem-safe, unique study name')
@@ -52,6 +67,10 @@ def validate_study(cfg):
         raise ValueError('Specify distinct training seeds')
     if any(type(seed) is not int or seed < 0 for seed in cfg['seeds'] + [cfg['eval_seed']]):
         raise ValueError('Seeds must be non-negative integers')
+    if cfg.get('data_source', 'remote') not in ('remote', 'repository'):
+        raise ValueError('data_source must be remote or repository')
+    if cfg.get('data_source') == 'repository':
+        repository_data_files(cfg)
 
 
 def run_name(cfg, phase, arm, seed):
@@ -65,13 +84,15 @@ def worker_export(cfg, arm, seed):
 def make_runs(cfg, phase):
     validate_study(cfg)
     jobs = []
+    evaluation = (repository_data_files(cfg)['eval'] if cfg.get('data_source') == 'repository'
+                  else cfg['eval_remote'])
 
     def add(arm, seed, planner, worker, mode):
         jobs.append({
             'schema_version': 1, 'run_name': run_name(cfg, phase, arm, seed),
             'phase': phase, 'arm': arm, 'seed': seed, 'mode': mode,
             'planner': planner, 'worker': worker,
-            'evaluation_remote': cfg['common_plan_remote'] if mode == 'replay_eval' else cfg['eval_remote'],
+            'evaluation_remote': cfg['common_plan_remote'] if mode == 'replay_eval' else evaluation,
             'study_config': cfg,
         })
 
@@ -114,7 +135,10 @@ def run_environment(run):
         run.get(key) != value for key, value in expected[run['run_name']].items()
     ):
         raise ValueError('Run differs from its declared experimental design; regenerate it')
-    for artifact in (run['planner'], run['worker'], cfg['train_remote'], run['evaluation_remote'], cfg['remote_root']):
+    repository_data = cfg.get('data_source') == 'repository'
+    data_files = repository_data_files(cfg) if repository_data else {}
+    train_source = data_files['train'] if repository_data else cfg['train_remote']
+    for artifact in (run['planner'], run['worker'], train_source, run['evaluation_remote'], cfg['remote_root']):
         if not artifact or 'SET_ME' in artifact or not re.fullmatch(r'[A-Za-z0-9_./:@+\-]+', artifact):
             raise ValueError(f'Replace the unresolved/invalid artifact before launch: {artifact!r}')
     if int(os.environ.get('SLURM_NNODES', cfg['nodes'])) != cfg['nodes']:
@@ -150,13 +174,17 @@ def run_environment(run):
         'DECOMPOSER_USE_REMOVE_PADDING': 'true', 'WORKER_USE_REMOVE_PADDING': 'true',
         'PREFIX_PROBE_ENABLE': 'false',
         'AGENT2_PILOT': 'false', 'GENERATE_TEACHER_DATA': 0, 'ONLINE_TEACHER_GENERATION': 'false',
-        'TEACHER_TRAIN_REMOTE': cfg['train_remote'], 'TEACHER_TRAIN_SHARDS_REMOTE': '',
+        'TEACHER_TRAIN_REMOTE': '' if repository_data else train_source, 'TEACHER_TRAIN_SHARDS_REMOTE': '',
         'TEACHER_ASSISTED_VALIDATION': 'false', 'TEACHER_ROLLOUT_N': 1, 'TEACHER_SAMPLES_PER_CALL': 1,
         'BASE_QUESTION_BATCH_SIZE': cfg['train_question_batch_size'],
         'OPTIMIZER_PROMPT_BATCH_SIZE': cfg['train_question_batch_size'],
         'ROLLOUT_N': cfg['rollout_n'], 'C3_CONTINUATIONS_PER_ACTION': cfg['continuations_per_action'],
         'TOTAL_STEPS': cfg['rollout_step_limit'], 'TEST_FREQ': cfg['test_freq'], 'SAVE_FREQ': cfg['save_freq'],
         'EXPERIMENT_MODE': run['mode'], 'EXPERIMENT_VAL_REMOTE': run['evaluation_remote'],
+        'EXPERIMENT_DATA_SOURCE': 'repository' if repository_data else 'remote',
+        # The common launcher copies data/MATH and data/overall_math into JOB_TMP.
+        'EXPERIMENT_TRAIN_RELATIVE': data_files['train'][len('data/'):] if repository_data else '',
+        'EXPERIMENT_EVAL_RELATIVE': data_files['eval'][len('data/'):] if repository_data else '',
     }
     env.update(model_env('DECOMPOSER', run['planner']))
     env.update(model_env('WORKER', run['worker']))
@@ -169,6 +197,9 @@ def run_environment(run):
 
 def write_runs(cfg, phase, directory):
     runs = make_runs(cfg, phase)
+    data_fingerprint = {}
+    if cfg.get('data_source') == 'repository':
+        data_fingerprint = {name: sha_file(ROOT / name) for name in repository_data_files(cfg).values()}
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     git_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
@@ -187,6 +218,8 @@ def write_runs(cfg, phase, directory):
     commands = []
     for run in runs:
         run.update(git_sha=git_sha, code_sha256=fingerprint)
+        if data_fingerprint:
+            run['data_sha256'] = data_fingerprint
         path = directory / (run['run_name'] + '.json')
         path.write_text(json.dumps(run, indent=2) + '\n')
         command = ['sbatch', f"--nodes={cfg['nodes']}",
@@ -275,6 +308,9 @@ def main():
         for name, digest in run.get('code_sha256', {}).items():
             if sha_file(ROOT / name) != digest:
                 raise ValueError(f'Code changed after manifest creation: {name}; regenerate manifests')
+        for name, digest in run.get('data_sha256', {}).items():
+            if sha_file(ROOT / name) != digest:
+                raise ValueError(f'Data changed after manifest creation: {name}; regenerate manifests')
         # Drop inherited node-local paths; each independent experiment starts fresh.
         print('unset JOB_TMP RAY_NODE_TMP CHECKPOINT_ROOT TEACHER_TRAIN_FILE TEACHER_CANDIDATES_FILE')
         for name, value in run_environment(run).items():

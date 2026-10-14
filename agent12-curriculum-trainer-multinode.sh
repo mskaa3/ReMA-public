@@ -167,6 +167,18 @@ COMMON_MOUNTS=(
     --mount "type=bind,src=${RAY_NODE_TMP},dst=${RAY_NODE_TMP}"
 )
 
+if [[ -n "${EAC3_RUN_FILE:-}" && "${EXPERIMENT_DATA_SOURCE:-remote}" == "repository" ]]; then
+    export TEACHER_TRAIN_FILE=${JOB_TMP}/experiment_data/train.parquet
+    export AGENT12_VAL_FILE=${JOB_TMP}/experiment_data/eval.parquet
+    echo "Preparing question-only experiment data from the repository on all nodes (no teacher generation or S3 data transfer)"
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 /root/ReMA-public/scripts/eac3_experiments.py prepare-data \
+            --train "$JOB_TMP/$EXPERIMENT_TRAIN_RELATIVE" \
+            --eval "$JOB_TMP/$EXPERIMENT_EVAL_RELATIVE" \
+            --deduplicate-train --output-dir "$JOB_TMP/experiment_data"
+fi
+
 if [[ -n "$WORKER_MODEL_REMOTE" ]]; then
     # An explicit export takes precedence over the base model. Stage into an
     # empty directory so stale weights cannot hide an incomplete S3 export.
@@ -667,6 +679,8 @@ python3 -m verl.trainer.main_generation \
         echo "Teacher data uploaded to ${TEACHER_TRAIN_REMOTE}"
     fi
     stop_ray
+elif [[ -n "${EAC3_RUN_FILE:-}" && "${EXPERIMENT_DATA_SOURCE:-remote}" == "repository" ]]; then
+    echo "Using locally prepared experiment questions: $TEACHER_TRAIN_FILE"
 else
     reuse_teacher_data
 fi
@@ -687,8 +701,11 @@ if [[ "$AGENT2_PILOT" == "true" || "$AGENT2_PILOT" == "1" ]]; then
 fi
 
 if [[ -n "${EAC3_RUN_FILE:-}" ]]; then
-    export AGENT12_VAL_FILE=${JOB_TMP}/experiment-val.parquet
-    download_remote_file_on_head "$EXPERIMENT_VAL_REMOTE" "$AGENT12_VAL_FILE" "experiment evaluation data"
+    # Only fixed-plan replay needs an external bank in repository-data mode.
+    if [[ "${EXPERIMENT_DATA_SOURCE:-remote}" != "repository" || "$EXPERIMENT_MODE" == "replay_eval" ]]; then
+        export AGENT12_VAL_FILE=${JOB_TMP}/experiment-val.parquet
+        download_remote_file_on_head "$EXPERIMENT_VAL_REMOTE" "$AGENT12_VAL_FILE" "experiment evaluation data"
+    fi
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
         apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         python3 /root/ReMA-public/scripts/eac3_experiments.py validate-data \

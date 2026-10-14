@@ -13,7 +13,10 @@ the planners, or require an external LLM judge.
 | `transfer` | Initial workers vs workers trained under either planner | Exact, reviewed, answer-free held-out plans; all worker prompts and routing | Did worker execution improve, beyond dependence on their own training planner? |
 | `cross` (optional) | Each learned worker model under both frozen planners | Same held-out questions, decoding, and protocol | How much improvement survives a change of planning partner? |
 
-Primary sequence: `planners`, `workers`, `transfer`. The cross-partner matrix is
+Primary sequence: `workers`, `transfer`, using existing planner-training
+evaluations as the starting comparison when their conditions match. `planners`
+is optional for export verification or collecting complete evaluation records;
+it is not a prerequisite for worker training. The cross-partner matrix is
 a follow-up, not required for the first pilot. With the default three worker
 training seeds these are 2 evaluation jobs, 6 training jobs, and 7 replay jobs.
 `cross` adds 12 evaluation jobs. Every job currently uses the existing two-pool
@@ -139,9 +142,69 @@ duplicates or contamination in model pretraining.
 The common plan remote can remain `SET_ME...` until phase 3. Templates can be
 generated with placeholders, but launch refuses unresolved required artifacts.
 
-## 2. Inspect planners and train workers
+### Configured step-110 worker-learning comparison (no data upload)
+
+`config/eac3-worker-learning-qwen7-step110.json` is a separate, single-seed
+configuration for the recovered Qwen-7B decomposers. It does not change the
+generic template or the ordinary Agent-1/Agent-2 training defaults.
+
+- Baseline: job 6084339, snapshot `global_step_110`.
+- EAC3: job 6084338, snapshot `global_step_110`.
+- Both worker arms start from Agent-2 job 6055460, snapshot `global_step_50`.
+- One paired training seed (11), 100 completed updates, evaluation every 10,
+  checkpoint saves every 50, four nodes with four GPUs each per job.
+- All other controlled worker-learning choices above still apply: frozen D,
+  no teacher solutions, full question for non-terminal workers, and no probe
+  gates in either arm. The EAC3 label identifies the frozen planner's training
+  condition, not a different worker reward in this experiment.
+
+The planner remotes name the intended **merged HF exports**. Uploading raw
+rank shards alone does not create these directories. Merge and upload both
+models first; remote existence has not been checked by writing this config.
+
+This configuration uses `data_source: repository` with `train_file` and
+`eval_file` pointing at the existing repository datasets. No dataset upload,
+teacher generation, or manual preprocessing is needed. Each node prepares the
+copied datasets inside the training container before loading the models. The
+same duplicate removal, question-only column selection, and overlap checks
+apply as in the remote-data workflow. Manifests record the original data file
+checksums and reject changed inputs; evaluation metadata records prepared-file
+checksums. Other configurations still default to `data_source: remote`.
+
+Once the merged model exports are available, generate NEW manifests ON THE
+CLUSTER, after pulling the final code. Old manifests contain the old S3 data
+paths and code hashes and must not be reused. Skip the separate `planners`
+phase: the decomposer-training runs already evaluated these checkpoints with
+the same frozen workers. Worker training retains its built-in initial
+validation and evaluations every 10 completed updates.
+
+```bash
+CFG=config/eac3-worker-learning-qwen7-step110.json
+RUN_DIR="experiments/runs/qwen7-step110-workers-$(date +%Y%m%d-%H%M%S)"
+python3 scripts/eac3_experiments.py plan --config "$CFG" --phase workers \
+  --output-dir "$RUN_DIR"
+cat "$RUN_DIR/commands.txt"
+bash "$RUN_DIR/commands.txt"
+```
+
+The last command submits the two worker-training jobs, each requesting four
+nodes with four GPUs per node (eight nodes total if both run together). Output
+directories must be new; do not overwrite old manifests. Change JSON fields
+before generating manifests, since each manifest captures its configuration.
+`common_plan_remote` intentionally remains unresolved until the later transfer
+evaluation and does not block `planners` or `workers`.
+
+Periodic saves remain **node-local**, not periodic S3 backups. Successful
+completion exports each trained worker under
+`<remote_root>/<study>--workers-<baseline|eac3>-s11/workers/huggingface`.
+This configuration does not add crash-safe checkpoint uploads.
+
+## 2. Train workers (optional standalone planner evaluation)
 
 On the cluster, from the repository root, after all code changes are in place:
+
+If you need a new standalone planner evaluation rather than the evaluations
+already recorded during decomposer training:
 
 ```bash
 python3 scripts/eac3_experiments.py plan --phase planners \

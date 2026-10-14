@@ -40,6 +40,15 @@ def frame(question):
                              reward_model={'style': 'rule', 'ground_truth': '7'})])
 
 
+def repository_config():
+    result = config()
+    result.pop('train_remote')
+    result.pop('eval_remote')
+    result.update(data_source='repository', train_file='data/MATH/train_lv3to5_8k.parquet',
+                  eval_file='data/overall_math/test.parquet')
+    return result
+
+
 def record(question='q', plan='PLAN:\n- S1: Compute x.\n- S2: Use S1.', score=1., item=None):
     row = dict(question=question, question_id=evidence.question_id(question),
                plan_id=evidence.plan_id(plan), decomposer_output=plan, raw_score=score,
@@ -73,6 +82,109 @@ class ExperimentTests(unittest.TestCase):
         for key in ('AGENT12_RUN_NAME', 'AGENT12_WANDB_RUN_ID', 'DECOMPOSER_MODEL_REMOTE'):
             x.pop(key); y.pop(key)
         self.assertEqual(x, y)
+
+    def test_repository_data_needs_no_train_or_eval_remote(self):
+        cfg = repository_config()
+        for phase in suite.PHASES:
+            for run in suite.make_runs(cfg, phase):
+                env = suite.run_environment(run)
+                self.assertEqual(env['EXPERIMENT_DATA_SOURCE'], 'repository')
+                self.assertEqual(env['TEACHER_TRAIN_REMOTE'], '')
+                self.assertEqual(env['GENERATE_TEACHER_DATA'], 0)
+                self.assertEqual(env['EXPERIMENT_TRAIN_RELATIVE'], 'MATH/train_lv3to5_8k.parquet')
+                self.assertEqual(env['EXPERIMENT_EVAL_RELATIVE'], 'overall_math/test.parquet')
+                if phase == 'transfer':
+                    self.assertEqual(env['EXPERIMENT_VAL_REMOTE'], cfg['common_plan_remote'])
+                else:
+                    self.assertEqual(env['EXPERIMENT_VAL_REMOTE'], cfg['eval_file'])
+        a, b = [suite.run_environment(run) for run in suite.make_runs(cfg, 'workers')[:2]]
+        for key in ('AGENT12_RUN_NAME', 'AGENT12_WANDB_RUN_ID', 'DECOMPOSER_MODEL_REMOTE'):
+            a.pop(key); b.pop(key)
+        self.assertEqual(a, b)
+
+    def test_repository_paths_stay_in_staged_directories(self):
+        for path in ('/tmp/train.parquet', 'data/MATH/../../train.parquet',
+                     'data/unknown/train.parquet', 'data/MATH/train.csv', 'SET_ME'):
+            with self.subTest(path=path):
+                cfg = repository_config()
+                cfg['train_file'] = path
+                with self.assertRaisesRegex(ValueError, 'train_file'):
+                    suite.make_runs(cfg, 'workers')
+        cfg = repository_config()
+        cfg['data_source'] = 'unknown'
+        with self.assertRaisesRegex(ValueError, 'data_source'):
+            suite.validate_study(cfg)
+
+    def test_repository_manifests_pin_dataset_contents(self):
+        cfg = repository_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / 'runs'
+            suite.write_runs(cfg, 'workers', directory)
+            path = next(directory.glob('*.json'))
+            run = suite.read_json(path)
+            self.assertEqual(run['data_sha256'], {
+                name: suite.sha_file(ROOT / name) for name in (cfg['train_file'], cfg['eval_file'])})
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/eac3_experiments.py'),
+                                     'environment', '--run', str(path)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('export EXPERIMENT_DATA_SOURCE=repository', result.stdout)
+            run['data_sha256'][cfg['train_file']] = '0' * 64
+            path.write_text(json.dumps(run))
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/eac3_experiments.py'),
+                                     'environment', '--run', str(path)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Data changed after manifest creation', result.stderr)
+
+    def test_launcher_prepares_repository_data_without_remote_io(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        start = launcher.index('if [[ -n "${EAC3_RUN_FILE:-}" && "${EXPERIMENT_DATA_SOURCE:-remote}" == "repository" ]]; then')
+        block = launcher[start:launcher.index('\nif [[ -n "$WORKER_MODEL_REMOTE"', start)]
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            (job / 'MATH').mkdir()
+            (job / 'overall_math').mkdir()
+            train = pd.concat([frame('train'), frame(' train ')], ignore_index=True)
+            train['teacher_attempts'] = [['hidden solution']] * 2
+            train.to_parquet(job / 'MATH/train.parquet')
+            frame('held out').to_parquet(job / 'overall_math/test.parquet')
+            shell = r'''
+set -euo pipefail
+COMMON_MOUNTS=(--bind /tmp:/tmp)
+srun() {
+    printf '%s\n' "$*" >> "$CALLS"
+    while [[ "$1" != apptainer ]]; do shift; done
+    "$@"
+}
+apptainer() {
+    while [[ "$1" != python3 ]]; do shift; done
+    shift
+    [[ "$1" == /root/ReMA-public/scripts/eac3_experiments.py ]]
+    shift
+    "$PYTHON" "$SUITE" "$@"
+}
+rclone() { echo 'unexpected S3 transfer' >&2; return 99; }
+'''
+            env = {**os.environ, 'JOB_TMP': str(job), 'SLURM_NNODES': '4',
+                   'EXPERIMENT_DATA_SOURCE': 'repository', 'EAC3_RUN_FILE': 'run.json',
+                   'EXPERIMENT_TRAIN_RELATIVE': 'MATH/train.parquet',
+                   'EXPERIMENT_EVAL_RELATIVE': 'overall_math/test.parquet', 'SIF_NAME': 'test.sif',
+                   'CALLS': str(job / 'calls.txt'), 'PYTHON': sys.executable,
+                   'SUITE': str(ROOT / 'scripts/eac3_experiments.py')}
+            result = subprocess.run(['bash', '-c', shell + block + '\nprintf "%s\\n" "$TEACHER_TRAIN_FILE" "$AGENT12_VAL_FILE"'],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            prepared = job / 'experiment_data'
+            self.assertEqual(result.stdout.splitlines()[-2:], [str(prepared / 'train.parquet'), str(prepared / 'eval.parquet')])
+            self.assertIn('--nodes=4 --ntasks=4', (job / 'calls.txt').read_text())
+            self.assertEqual(len(pd.read_parquet(prepared / 'train.parquet')), 1)
+            self.assertNotIn('teacher_attempts', pd.read_parquet(prepared / 'train.parquet'))
+            self.assertEqual(len(pd.read_parquet(prepared / 'eval.parquet')), 1)
+            self.assertTrue((prepared / 'data.json').is_file())
+            # The prepared files must bypass the legacy teacher-cache loader.
+            self.assertIn('elif [[ -n "${EAC3_RUN_FILE:-}" && "${EXPERIMENT_DATA_SOURCE:-remote}" == "repository" ]]; then\n'
+                          '    echo "Using locally prepared experiment questions: $TEACHER_TRAIN_FILE"\n'
+                          'else\n    reuse_teacher_data', launcher)
+            self.assertIn('"${EXPERIMENT_DATA_SOURCE:-remote}" != "repository" || "$EXPERIMENT_MODE" == "replay_eval"', launcher)
 
     def test_invalid_manifest_fails_before_launch(self):
         cfg = config()
