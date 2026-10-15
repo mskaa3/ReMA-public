@@ -1,6 +1,7 @@
 """CPU-only experiment contract tests; runnable with unittest, without Ray/CUDA."""
 
 import ast
+from contextlib import nullcontext
 import csv
 import hashlib
 import json
@@ -132,6 +133,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(set(cfg['planners']), {'eac3'})
                 self.assertEqual(cfg['test_update_steps'], [1, 2, 5])
                 self.assertEqual(cfg['test_freq'], 10)
+                self.assertEqual(cfg['save_freq'], 10)
                 self.assertEqual(cfg['worker_updates'], 100)
                 directory = Path(tmp) / cfg['study']
                 suite.write_runs(cfg, 'workers', directory)
@@ -141,6 +143,7 @@ class ExperimentTests(unittest.TestCase):
                 env = suite.run_environment(run)
                 self.assertEqual(env['PREFIX_PROBE_ENABLE'], 'true')
                 self.assertEqual(env['TRAIN_DECOMPOSER'], 'false')
+                self.assertEqual(env['SAVE_FREQ'], 10)
                 self.assertIn('trainer.test_update_steps=[1, 2, 5]', env['AGENT12_EXPERIMENT_OVERRIDES'])
                 self.assertIn('trainer.resume_mode=disable', env['AGENT12_EXPERIMENT_OVERRIDES'])
                 self.assertIn('trainer.val_before_train=true', env['AGENT12_EXPERIMENT_OVERRIDES'])
@@ -171,7 +174,7 @@ class ExperimentTests(unittest.TestCase):
                 seen.append(step)
         self.assertEqual(seen, [1, 2, 5, 10, 20])
         state.actor_update_steps = 1
-        self.assertFalse(due(state, 50, True))  # Checkpoint cadence stays unchanged.
+        self.assertFalse(due(state, 50, True))  # Early validation does not force a checkpoint.
         state.actor_update_steps = 50
         self.assertTrue(due(state, 50, True))
         self.assertFalse(due(state, 0, True))
@@ -182,6 +185,57 @@ class ExperimentTests(unittest.TestCase):
             cfg['test_update_steps'] = bad
             with self.assertRaisesRegex(ValueError, 'test_update_steps'):
                 suite.validate_study(cfg)
+
+    def test_checkpoint_schedule_runs_before_validation_even_when_it_fails(self):
+        path = ROOT / 'src/verl/verl/rema_separated_trainer/ppo/ray_trainer.py'
+        trainer = next(node for node in ast.parse(path.read_text()).body
+                       if isinstance(node, ast.ClassDef) and node.name == 'RayReMASeparatedTrainer')
+        method = next(node for node in trainer.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_update_frequency_due')
+        fit = next(node for node in trainer.body if isinstance(node, ast.FunctionDef) and node.name == 'fit')
+        blocks = sorted((node for node in ast.walk(fit) if isinstance(node, ast.If) and any(
+            isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            and call.func.attr == '_update_frequency_due' for call in ast.walk(node.test)
+        )), key=lambda node: node.lineno)
+        self.assertEqual(len(blocks), 2)
+        namespace = {}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
+        due = namespace['_update_frequency_due']
+        scheduled = compile(ast.Module(body=blocks, type_ignores=[]), str(path), 'exec')
+        cases = [
+            (10, True, False, True, ['save', 'validate']),
+            (10, True, False, False, ['save', 'validate']),
+            (9, True, False, False, []),
+            (10, False, False, False, []),
+            (9, False, True, False, ['save', 'validate']),
+            (5, True, False, False, ['validate']),
+        ]
+        for updates, updated, ending, fail_validation, expected in cases:
+            with self.subTest(updates=updates, updated=updated, ending=ending, failure=fail_validation):
+                events = []
+
+                def validate():
+                    events.append('validate')
+                    if fail_validation:
+                        raise RuntimeError('validation failed')
+                    return {'val/acc': 0.5}
+
+                options = SimpleNamespace(save_freq=10, test_freq=10,
+                                          get={'test_update_steps': [1, 2, 5]}.get)
+                state = SimpleNamespace(actor_update_steps=updates, config=SimpleNamespace(trainer=options),
+                                        val_reward_fn=True, _validate=validate,
+                                        _save_checkpoint=lambda: events.append('save'))
+                state._update_frequency_due = lambda frequency, updated, extra_steps=(): due(
+                    state, frequency, updated, extra_steps)
+                env = dict(self=state, actor_updated=updated, is_session_last_step=ending,
+                           is_training_last_step=ending, timing_raw={}, metrics={},
+                           _timer=lambda *args: nullcontext())
+                if fail_validation:
+                    with self.assertRaisesRegex(RuntimeError, 'validation failed'):
+                        exec(scheduled, env)
+                else:
+                    exec(scheduled, env)
+                self.assertEqual(events, expected)
 
     def test_gated_pilot_preserves_controls_and_has_separate_outputs(self):
         off = suite.read_json(ROOT / 'config/eac3-worker-learning-qwen7-step110.json')

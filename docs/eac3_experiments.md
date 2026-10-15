@@ -35,6 +35,10 @@ identical sampled trajectories after filtering and policies diverge.
 
 After this code is committed/pushed and updated on the cluster, from the repo root:
 
+Regenerate both manifests after pulling the update; old manifests pin the old
+code and save interval. The v2 study names keep the new S3 outputs separate from
+the failed v1 attempts. Both conditions restart from the original worker export.
+
 ```bash
 RUN_DIR="experiments/runs/eac3-worker-gates-$(date +%Y%m%d-%H%M%S)"
 for mode in ungated gated; do
@@ -55,13 +59,18 @@ not modified. Do not resume these conditions from already-updated workers.
 Normal end-of-job exports use this root:
 `s3v2:s3min-tomasznaskret-1712063354/user/ajanz/eac3-experiments/`
 
-- Ungated: `eac3-worker-gates-qwen7-step110-ungated-v1--workers-eac3-s11/workers/huggingface`
-- Gated: `eac3-worker-gates-qwen7-step110-gated-v1--workers-eac3-s11/workers/huggingface`
+- Ungated: `eac3-worker-gates-qwen7-step110-ungated-v2--workers-eac3-s11/workers/huggingface`
+- Gated: `eac3-worker-gates-qwen7-step110-gated-v2--workers-eac3-s11/workers/huggingface`
 
 W&B run names contain the same distinct condition names. Periodic checkpoints
-still save locally every 50 completed updates under
+save locally every 10 completed updates under
 `/mnt/lscratch/slurm/<JOB_ID>/agent12/checkpoints/agent12/`; they are NOT periodic
-S3 backups. The normal final HF upload requires successful export. Use the
+S3 backups. Due checkpoints are written before validation, including at the
+normal session endpoint. A validation failure therefore cannot prevent a due
+save, but failures during saving or before the first save can still lose progress.
+The `global_step_<N>` directory suffix is the rollout step, not the actor-update
+count; do not assume the first checkpoint directory is `global_step_10`.
+The normal final HF upload requires successful export. Use the
 all-node snapshot procedure if saving an intermediate checkpoint or stopping a job.
 
 ## Questions and comparisons

@@ -1,5 +1,5 @@
 {
-  "study": "eac3-worker-gates-qwen7-step110-gated-v1",
+  "study": "eac3-worker-gates-qwen7-step110-gated-v2",
   "remote_root": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/eac3-experiments",
   "planners": {
     "eac3": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/agent1-eac3-qwen7-20261013-144231/snapshots/global_step_110/decomposer/huggingface"
@@ -16,7 +16,7 @@
   "rollout_step_limit": 1200,
   "test_freq": 10,
   "test_update_steps": [1, 2, 5],
-  "save_freq": 50,
+  "save_freq": 10,
   "train_question_batch_size": 48,
   "rollout_n": 32,
   "continuations_per_action": 4,

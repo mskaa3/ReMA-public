@@ -4310,6 +4310,13 @@ class RayReMASeparatedTrainer(object):
                         is_training_last_step = True
                         is_session_last_step = True
 
+                    # Persist completed updates before potentially failing validation.
+                    if is_session_last_step or (
+                        self._update_frequency_due(self.config.trainer.save_freq, actor_updated)
+                    ):
+                        with _timer('save_checkpoint', timing_raw):
+                            self._save_checkpoint()
+
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         (is_training_last_step or self._update_frequency_due(
@@ -4322,11 +4329,6 @@ class RayReMASeparatedTrainer(object):
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
-                    if is_session_last_step or (
-                        self._update_frequency_due(self.config.trainer.save_freq, actor_updated)
-                    ):
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
                 final_worker_curriculum = self.config.algorithm.get('final_worker_curriculum', {})
                 final_worker_warmup_steps = int(final_worker_curriculum.get('warmup_steps', 0))
                 metrics.update({
