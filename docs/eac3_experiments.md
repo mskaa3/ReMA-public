@@ -1,5 +1,10 @@
 # EAC3 experiments: behaviour, worker learning, and transfer
 
+For the next alternating round using worker jobs 6106013/6106014, see
+[the round-2 launch guide](eac3_round2.md). It adds question-only
+`adapt-planners` training followed by `adapt-workers`; existing phases retain
+their original meanings.
+
 This suite reuses the current trainer and mathematical datasets. It does not
 change the existing Agent-1-only or Agent-2-only defaults, submit jobs, retrain
 the planners, or require an external LLM judge.

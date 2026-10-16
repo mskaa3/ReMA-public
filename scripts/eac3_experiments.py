@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src/verl/verl/rema_separated_trainer/ppo'))
 from experiment_io import question_id, plan_id  # noqa: E402
 
-PHASES = ('planners', 'workers', 'transfer', 'cross')
+PHASES = ('planners', 'workers', 'transfer', 'cross', 'adapt-planners', 'adapt-workers')
 WORKER_ROLES = '[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4]'
 
 
@@ -58,6 +58,11 @@ def validate_study(cfg):
             raise ValueError(f'{key} must be a positive integer')
     if cfg['rollout_step_limit'] < cfg['worker_updates']:
         raise ValueError('Rollout cap cannot be smaller than the optimizer-update target')
+    if 'planner_updates' in cfg:
+        if type(cfg['planner_updates']) is not int or cfg['planner_updates'] <= 0:
+            raise ValueError('planner_updates must be a positive integer')
+        if cfg['rollout_step_limit'] < cfg['planner_updates']:
+            raise ValueError('Rollout cap cannot be smaller than planner_updates')
     n, m = cfg['rollout_n'], cfg['continuations_per_action']
     if n % m or n // m < 2:
         raise ValueError('C3 needs at least two actions and complete continuation groups')
@@ -85,12 +90,21 @@ def run_name(cfg, phase, arm, seed):
     return f"{cfg['study']}--{phase}-{arm}-s{seed}"
 
 
-def worker_export(cfg, arm, seed):
-    return f"{cfg['remote_root'].rstrip('/')}/{run_name(cfg, 'workers', arm, seed)}/workers/huggingface"
+def worker_export(cfg, arm, seed, phase='workers'):
+    return f"{cfg['remote_root'].rstrip('/')}/{run_name(cfg, phase, arm, seed)}/workers/huggingface"
+
+
+def adapted_planner_export(cfg, arm, seed):
+    return f"{cfg['remote_root'].rstrip('/')}/{run_name(cfg, 'adapt-planners', arm, seed)}/decomposer/huggingface"
 
 
 def make_runs(cfg, phase):
     validate_study(cfg)
+    if phase in ('adapt-planners', 'adapt-workers'):
+        if set(cfg['planners']) != {'eac3'} or 'planner_updates' not in cfg:
+            raise ValueError('Alternating phases require one eac3 planner and explicit planner_updates')
+        if cfg.get('data_source') != 'repository':
+            raise ValueError('Alternating phases require question-only repository data')
     jobs = []
     evaluation = (repository_data_files(cfg)['eval'] if cfg.get('data_source') == 'repository'
                   else cfg['eval_remote'])
@@ -111,6 +125,12 @@ def make_runs(cfg, phase):
         for seed in cfg['seeds']:
             for arm, planner in cfg['planners'].items():
                 add(arm, seed, planner, cfg['initial_worker'], 'worker_train')
+    elif phase in ('adapt-planners', 'adapt-workers'):
+        for seed in cfg['seeds']:
+            planner = (cfg['planners']['eac3'] if phase == 'adapt-planners'
+                       else adapted_planner_export(cfg, 'eac3', seed))
+            mode = 'planner_train' if phase == 'adapt-planners' else 'worker_train'
+            add('eac3', seed, planner, cfg['initial_worker'], mode)
     elif phase == 'transfer':
         # D is loaded for compatibility but never generates in fixed-plan evaluation.
         planner = next(iter(cfg['planners'].values()))
@@ -135,7 +155,7 @@ def model_env(prefix, artifact):
     return {prefix + '_MODEL_REMOTE': '', prefix + '_MODEL_PATH': artifact}
 
 
-def run_environment(run):
+def run_environment(run, *, check_allocation=True):
     cfg = run['study_config']
     validate_study(cfg)
     expected = {item['run_name']: item for item in make_runs(cfg, run['phase'])}
@@ -149,13 +169,14 @@ def run_environment(run):
     for artifact in (run['planner'], run['worker'], train_source, run['evaluation_remote'], cfg['remote_root']):
         if not artifact or 'SET_ME' in artifact or not re.fullmatch(r'[A-Za-z0-9_./:@+\-]+', artifact):
             raise ValueError(f'Replace the unresolved/invalid artifact before launch: {artifact!r}')
-    if int(os.environ.get('SLURM_NNODES', cfg['nodes'])) != cfg['nodes']:
+    if check_allocation and int(os.environ.get('SLURM_NNODES', cfg['nodes'])) != cfg['nodes']:
         raise ValueError('Slurm node allocation differs from the experiment manifest')
-    train = run['mode'] == 'worker_train'
+    train_planner = run['mode'] == 'planner_train'
+    train = train_planner or run['mode'] == 'worker_train'
     gate_mode = cfg.get('worker_gate_mode', 'off')
     overrides = {
         'algorithm.hierarchy.agent12_curriculum.enable': False,
-        'algorithm.hierarchy.start_agent': 'worker_stage_1',
+        'algorithm.hierarchy.start_agent': 'decomposer' if train_planner else 'worker_stage_1',
         'algorithm.hierarchy.scoped_c3_grpo.enable': True,
         'algorithm.hierarchy.scoped_c3_grpo.positive_only_nonterminal_workers': True,
         'algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_role': 'decomposer',
@@ -171,7 +192,8 @@ def run_environment(run):
         'trainer.val_only': not train,
         'trainer.val_before_train': True,
         'trainer.resume_mode': 'disable',
-        'trainer.max_actor_updates': cfg['worker_updates'] if train else None,
+        'trainer.max_actor_updates': (cfg['planner_updates'] if train_planner
+                                      else cfg['worker_updates'] if train else None),
         'trainer.test_update_steps': cfg.get('test_update_steps', []),
         'trainer.validation_output_dir': '${trainer.default_local_dir}/evaluations',
     }
@@ -179,12 +201,14 @@ def run_environment(run):
         'GPUS_PER_NODE': cfg['gpus_per_node'], 'POOL_GPUS_PER_NODE': cfg['gpus_per_node'] // 2,
         'AGENT12_RUN_NAME': run['run_name'], 'AGENT12_S3_REMOTE': cfg['remote_root'],
         'AGENT12_WANDB_RUN_ID': run['run_name'] + '-' + os.environ.get('SLURM_JOB_ID', 'local'),
-        'TRAIN_DECOMPOSER': 'false', 'TRAIN_AGENT_ROLES': WORKER_ROLES,
+        'TRAIN_DECOMPOSER': str(train_planner).lower(),
+        'TRAIN_AGENT_ROLES': '[decomposer]' if train_planner else WORKER_ROLES,
         'TERMINAL_WORKER_AS_ANSWER': 'true', 'NUM_WORKER_STAGES': 4,
         'MAX_PLANNED_SUBTASKS': 4, 'WORKER_CHECKPOINT_ROLE': 'worker_stage_4',
         'DECOMPOSER_USE_REMOVE_PADDING': 'true', 'WORKER_USE_REMOVE_PADDING': 'true',
-        'PREFIX_PROBE_ENABLE': str(gate_mode != 'off').lower(),
-        'PREFIX_PROBE_APPLY_TO_TRAINING': str(train and gate_mode == 'gated').lower(),
+        # Both adaptation chains use EAC3 for D, independent of their worker gate.
+        'PREFIX_PROBE_ENABLE': str(train_planner or gate_mode != 'off').lower(),
+        'PREFIX_PROBE_APPLY_TO_TRAINING': str(train_planner or (train and gate_mode == 'gated')).lower(),
         # Preserve the existing successful-group requirement in every arm.
         'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
         'PREFIX_PROBE_MAX_NEW_TOKENS': 256,
@@ -213,6 +237,9 @@ def run_environment(run):
 
 def write_runs(cfg, phase, directory):
     runs = make_runs(cfg, phase)
+    # Fail on unresolved artifacts before writing submission commands.
+    for run in runs:
+        run_environment(run, check_allocation=False)
     data_fingerprint = {}
     if cfg.get('data_source') == 'repository':
         data_fingerprint = {name: sha_file(ROOT / name) for name in repository_data_files(cfg).values()}
@@ -314,7 +341,7 @@ def main():
         command.add_argument('--eval', required=True)
     prepare.add_argument('--output-dir', required=True)
     prepare.add_argument('--deduplicate-train', action='store_true')
-    check.add_argument('--mode', choices=['worker_train', 'planner_eval', 'replay_eval'], required=True)
+    check.add_argument('--mode', choices=['worker_train', 'planner_train', 'planner_eval', 'replay_eval'], required=True)
     check.add_argument('--output-manifest')
     args = parser.parse_args()
     if args.command == 'plan':

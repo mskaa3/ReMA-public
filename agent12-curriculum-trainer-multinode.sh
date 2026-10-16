@@ -726,7 +726,7 @@ if [[ -n "${EAC3_RUN_FILE:-}" ]]; then
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
         rclone copy "$CHECKPOINT_ROOT/evaluations" "$REMOTE_RUN/evaluations" \
             --s3-no-check-bucket --stats=30s --stats-one-line
-    if [[ "$EXPERIMENT_MODE" != "worker_train" ]]; then
+    if [[ "$EXPERIMENT_MODE" != "worker_train" && "$EXPERIMENT_MODE" != "planner_train" ]]; then
         echo "Evaluation complete: $REMOTE_RUN/evaluations (no optimizer updates or model export)"
         exit 0
     fi

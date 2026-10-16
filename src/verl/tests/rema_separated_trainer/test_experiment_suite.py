@@ -16,6 +16,7 @@ import tempfile
 from types import SimpleNamespace
 import unicodedata
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -88,7 +89,7 @@ class ExperimentTests(unittest.TestCase):
         for mode in ('off', 'diagnostic', 'gated'):
             cfg = repository_config()
             cfg['worker_gate_mode'] = mode
-            for phase in suite.PHASES:
+            for phase in ('planners', 'workers', 'transfer', 'cross'):
                 with self.subTest(mode=mode, phase=phase):
                     run = suite.make_runs(cfg, phase)[0]
                     env = suite.run_environment(run)
@@ -287,7 +288,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_repository_data_needs_no_train_or_eval_remote(self):
         cfg = repository_config()
-        for phase in suite.PHASES:
+        for phase in ('planners', 'workers', 'transfer', 'cross'):
             for run in suite.make_runs(cfg, phase):
                 env = suite.run_environment(run)
                 self.assertEqual(env['EXPERIMENT_DATA_SOURCE'], 'repository')
@@ -316,6 +317,142 @@ class ExperimentTests(unittest.TestCase):
         cfg['data_source'] = 'unknown'
         with self.assertRaisesRegex(ValueError, 'data_source'):
             suite.validate_study(cfg)
+
+    def test_round2_uses_two_frozen_worker_partners_and_eac3_for_both_planners(self):
+        configs = [suite.read_json(ROOT / f'config/eac3-round2-{arm}.json')
+                   for arm in ('ungated', 'gated')]
+        self.assertEqual({k: v for k, v in configs[0].items()
+                          if k not in ('study', 'initial_worker', 'worker_gate_mode')},
+                         {k: v for k, v in configs[1].items()
+                          if k not in ('study', 'initial_worker', 'worker_gate_mode')})
+        self.assertIn('recovered-6106013/snapshots/global_step_63/', configs[0]['initial_worker'])
+        self.assertIn('recovered-6106014/snapshots/global_step_65/', configs[1]['initial_worker'])
+        planner_envs = []
+        exports = []
+        for cfg in configs:
+            planner_runs = suite.make_runs(cfg, 'adapt-planners')
+            self.assertEqual(len(planner_runs), 1)
+            run = planner_runs[0]
+            env = suite.run_environment(run)
+            planner_envs.append(env)
+            self.assertEqual(run['mode'], 'planner_train')
+            self.assertEqual(env['TRAIN_DECOMPOSER'], 'true')
+            self.assertEqual(env['TRAIN_AGENT_ROLES'], '[decomposer]')
+            self.assertEqual(env['WORKER_MODEL_REMOTE'], cfg['initial_worker'])
+            self.assertEqual(env['DECOMPOSER_MODEL_REMOTE'], cfg['planners']['eac3'])
+            self.assertEqual(env['PREFIX_PROBE_ENABLE'], 'true')
+            self.assertEqual(env['PREFIX_PROBE_APPLY_TO_TRAINING'], 'true')
+            self.assertEqual(env['C3_REQUIRE_ELIGIBLE_SUCCESS'], 'true')
+            self.assertIn('algorithm.hierarchy.start_agent=decomposer', env['AGENT12_EXPERIMENT_OVERRIDES'])
+            self.assertIn('trainer.max_actor_updates=40', env['AGENT12_EXPERIMENT_OVERRIDES'])
+            self.assertIn('agent12_curriculum.enable=false', env['AGENT12_EXPERIMENT_OVERRIDES'])
+            self.assertIn('trainer.resume_mode=disable', env['AGENT12_EXPERIMENT_OVERRIDES'])
+            self.assertEqual(env['TEACHER_TRAIN_REMOTE'], '')
+            self.assertEqual(env['EXPERIMENT_DATA_SOURCE'], 'repository')
+
+            workers = suite.make_runs(cfg, 'adapt-workers')
+            self.assertEqual(len(workers), 1)
+            worker_run = workers[0]
+            worker_env = suite.run_environment(worker_run)
+            self.assertEqual(worker_run['worker'], run['worker'])
+            self.assertEqual(worker_run['planner'], suite.adapted_planner_export(cfg, 'eac3', 11))
+            self.assertNotEqual(worker_run['planner'], run['planner'])
+            self.assertEqual(worker_env['TRAIN_DECOMPOSER'], 'false')
+            self.assertEqual(worker_env['TRAIN_AGENT_ROLES'], suite.WORKER_ROLES)
+            self.assertEqual(worker_env['PREFIX_PROBE_ENABLE'], 'true')
+            self.assertEqual(worker_env['PREFIX_PROBE_APPLY_TO_TRAINING'],
+                             str(cfg['worker_gate_mode'] == 'gated').lower())
+            self.assertIn('trainer.max_actor_updates=40', worker_env['AGENT12_EXPERIMENT_OVERRIDES'])
+            exports.append(suite.worker_export(cfg, 'eac3', 11, phase='adapt-workers'))
+        self.assertEqual({key for key in planner_envs[0] if planner_envs[0][key] != planner_envs[1][key]},
+                         {'AGENT12_RUN_NAME', 'AGENT12_WANDB_RUN_ID', 'WORKER_MODEL_REMOTE'})
+        self.assertNotEqual(*exports)
+
+    def test_round2_configuration_rejects_ambiguous_or_invalid_adaptation(self):
+        good = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        for value in (0, -1, True, None, '40', 1201):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'planner_updates'):
+                suite.make_runs(dict(good, planner_updates=value), 'adapt-planners')
+        for phase in ('adapt-planners', 'adapt-workers'):
+            cfg = dict(good)
+            cfg.pop('planner_updates')
+            with self.assertRaisesRegex(ValueError, 'planner_updates'):
+                suite.make_runs(cfg, phase)
+            cfg = dict(good, planners={'baseline': good['planners']['eac3']})
+            with self.assertRaisesRegex(ValueError, 'one eac3 planner'):
+                suite.make_runs(cfg, phase)
+            with self.assertRaisesRegex(ValueError, 'question-only'):
+                suite.make_runs(dict(good, data_source='remote'), phase)
+
+    def test_round2_effective_shell_command_and_model_export(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        defaults = launcher[:launcher.index('\nif (( GPUS_PER_NODE')].replace('source ./env.sh', ':')
+        function = launcher[launcher.index('run_agent12_training() {'):launcher.index('\nif [[ "$ONLINE_TEACHER_GENERATION"')]
+        export_guard = launcher[launcher.index('    if [[ "$EXPERIMENT_MODE" != "worker_train"'):
+                                launcher.index('\nLATEST_STEP=')]
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp) / 'command'
+            for arm in ('ungated', 'gated'):
+                cfg = suite.read_json(ROOT / f'config/eac3-round2-{arm}.json')
+                for phase in ('adapt-planners', 'adapt-workers'):
+                    with self.subTest(arm=arm, phase=phase):
+                        run = suite.make_runs(cfg, phase)[0]
+                        env = {**os.environ, **{k: str(v) for k, v in suite.run_environment(run).items()},
+                               'SLURM_JOB_ID': '123', 'SLURM_NNODES': '4', 'CAPTURE': str(capture)}
+                        shell = defaults + '\nsrun() { printf "%s\\n" "${!#}" > "$CAPTURE"; }\n'
+                        shell += 'HEAD_NODE=head; IP_HEAD=head:6379; COMMON_MOUNTS=(--nv)\n' + function
+                        shell += '\nrun_agent12_training /tmp/train.parquet "$TOTAL_STEPS" True True\n'
+                        result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        command = shlex.split(capture.read_text().rsplit(';', 1)[-1])
+                        opts = dict(arg.split('=', 1) for arg in command if '=' in arg and not arg.startswith('--'))
+                        planner = phase == 'adapt-planners'
+                        self.assertEqual(opts['algorithm.hierarchy.train_agent_roles'],
+                                         '[decomposer]' if planner else suite.WORKER_ROLES)
+                        self.assertEqual(opts['algorithm.hierarchy.start_agent'],
+                                         'decomposer' if planner else 'worker_stage_1')
+                        self.assertEqual(opts['algorithm.hierarchy.agent12_curriculum.enable'], 'false')
+                        self.assertEqual(opts['trainer.max_actor_updates'], '40')
+                        self.assertEqual(opts['trainer.val_only'], 'false')
+                        self.assertEqual(opts['trainer.save_freq'], '10')
+                        self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training'],
+                                         str(planner or arm == 'gated').lower())
+                        # Both training modes must continue past evaluation upload to HF export.
+                        shell = 'if true; then\n' + export_guard + '\necho MODEL_EXPORT\n'
+                        result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), 'MODEL_EXPORT')
+            env['EXPERIMENT_MODE'] = 'planner_eval'
+            env['REMOTE_RUN'] = 's3:bucket/eval'
+            result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('MODEL_EXPORT', result.stdout)
+
+    def test_round2_manifests_and_unresolved_inputs(self):
+        cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        with tempfile.TemporaryDirectory() as tmp:
+            for phase in ('adapt-planners', 'adapt-workers'):
+                directory = Path(tmp) / phase
+                # Planning may happen inside a one-node recovery allocation.
+                with patch.dict(os.environ, {'SLURM_NNODES': '1'}):
+                    suite.write_runs(cfg, phase, directory)
+                run = next(directory.glob('*.json'))
+                result = subprocess.run([sys.executable, str(ROOT / 'scripts/eac3_experiments.py'),
+                                         'environment', '--run', str(run)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('trainer.resume_mode=disable', result.stdout)
+                self.assertIn('unset JOB_TMP', result.stdout)
+                self.assertIn('sbatch --nodes=4 --gres=gpu:hopper:4,storage:local:200G',
+                              (directory / 'commands.txt').read_text())
+                result = subprocess.run([sys.executable, str(ROOT / 'scripts/eac3_experiments.py'),
+                                         'environment', '--run', str(run)], capture_output=True, text=True,
+                                        env={**os.environ, 'SLURM_NNODES': '1'})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Slurm node allocation differs', result.stderr)
+            cfg['initial_worker'] = 'SET_ME_WORKERS'
+            with self.assertRaisesRegex(ValueError, 'unresolved'):
+                suite.write_runs(cfg, 'adapt-planners', Path(tmp) / 'invalid')
+            self.assertFalse((Path(tmp) / 'invalid').exists())
 
     def test_repository_manifests_pin_dataset_contents(self):
         cfg = repository_config()
