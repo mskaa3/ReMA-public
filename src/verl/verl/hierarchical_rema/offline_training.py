@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     import torch
 
 from .controller_data import ControllerReplaySample, load_samples_from_jsonl
+from .metrics import learner_tracking_metrics, moment_metrics
 from .throughput import LengthBucketBatchSampler, enabled
 
 
@@ -52,6 +53,8 @@ class OfflineTrainingConfig:
     prune_unselected_checkpoints: bool = False
     selected_checkpoint_mirror_dir: str = ""
     length_bucketing: bool = field(default_factory=lambda: enabled("REMA_LENGTH_BUCKETING"))
+    # Completed updates for this policy in earlier segments, never a W&B step offset.
+    optimizer_updates_offset: int = 0
 
 
 @dataclass
@@ -248,6 +251,25 @@ def _all_reduce_sum(value: float, device, context: DistributedTrainingContext) -
     tensor = torch.tensor(float(value), device=device, dtype=torch.float32)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return float(tensor.item())
+
+
+def _update_sample_moments(totals, rewards, advantages):
+    rewards = rewards.detach().double()
+    advantages = advantages.detach().double()
+    values = (rewards.numel(), rewards.sum().item(), rewards.square().sum().item(),
+              advantages.sum().item(), advantages.square().sum().item())
+    for index, value in enumerate(values):
+        totals[index] += value
+
+
+def _reduce_sample_moments(totals, device, context):
+    if context.enabled:
+        torch = _lazy_torch()
+        import torch.distributed as dist
+        values = torch.tensor(totals, dtype=torch.float64, device=device)
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        totals = values.tolist()
+    return moment_metrics(totals)
 
 
 def _distributed_barrier(context: DistributedTrainingContext, device) -> None:
@@ -962,15 +984,6 @@ def run_offline_policy_training(
             f"train_samples={len(train_samples)} val_samples={len(val_samples)} "
             f"updates={total_update_steps} world_size={distributed_context.world_size}"
         )
-        if tracking is not None:
-            tracking.log(
-                {
-                    "train/num_train_samples": len(train_samples),
-                    "train/num_val_samples": len(val_samples),
-                    "train/total_update_steps": total_update_steps,
-                },
-                step=log_step_offset,
-            )
 
     global_step = 0
     skipped_empty_batches = 0
@@ -983,6 +996,7 @@ def run_offline_policy_training(
     best_val_step = 0
     step_selector_format_counts = _empty_selector_format_counts()
     step_role_reward_stats = _empty_role_reward_stats()
+    step_sample_moments = [0.0] * 5
 
     for epoch in range(config.epochs):
         if train_sampler is not None:
@@ -1008,6 +1022,7 @@ def run_offline_policy_training(
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
                 step_role_reward_stats = _empty_role_reward_stats()
+                step_sample_moments = [0.0] * 5
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping empty batch "
@@ -1028,6 +1043,7 @@ def run_offline_policy_training(
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
                 step_role_reward_stats = _empty_role_reward_stats()
+                step_sample_moments = [0.0] * 5
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping locally-empty filtered batch "
@@ -1044,6 +1060,7 @@ def run_offline_policy_training(
                 optimizer.zero_grad(set_to_none=True)
                 step_selector_format_counts = _empty_selector_format_counts()
                 step_role_reward_stats = _empty_role_reward_stats()
+                step_sample_moments = [0.0] * 5
                 if is_primary:
                     print(
                         f"[hierarchical-rema][grpo] skipping non-finite {nonfinite_reason} "
@@ -1063,6 +1080,7 @@ def run_offline_policy_training(
                 rewards=batch["reward"],
                 roles=batch["role"],
             )
+            _update_sample_moments(step_sample_moments, batch["reward"], batch["advantage"])
             loss = objective["loss"] / max(config.grad_accum_steps, 1)
             loss.backward()
             # Only detached scalar metrics survive into the next forward/eval.
@@ -1075,7 +1093,7 @@ def run_offline_policy_training(
 
             should_step = (batch_idx + 1) % max(config.grad_accum_steps, 1) == 0 or (batch_idx + 1) == len(train_loader)
             if should_step:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm).item())
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1108,6 +1126,7 @@ def run_offline_policy_training(
                 )
                 metrics = {
                     "step": global_step,
+                    "optimizer_updates": config.optimizer_updates_offset + global_step,
                     "epoch": epoch,
                     "loss": _all_reduce_mean(
                         float(loss.detach().item() * max(config.grad_accum_steps, 1)),
@@ -1116,6 +1135,8 @@ def run_offline_policy_training(
                     ),
                     "lr": float(scheduler.get_last_lr()[0]),
                     "objective": "grpo",
+                    **_reduce_sample_moments(step_sample_moments, device, distributed_context),
+                    "grad_norm": _all_reduce_mean(grad_norm, device, distributed_context),
                     "mean_reward": _all_reduce_mean(float(batch["reward"].mean().item()), device, distributed_context),
                     "mean_advantage": _all_reduce_mean(float(batch["advantage"].mean().item()), device, distributed_context),
                     "approx_kl": _all_reduce_mean(float(approx_kl.detach().item()), device, distributed_context),
@@ -1149,6 +1170,7 @@ def run_offline_policy_training(
                     metrics["worker_reward_count"] = worker_reward_count
                 step_selector_format_counts = _empty_selector_format_counts()
                 step_role_reward_stats = _empty_role_reward_stats()
+                step_sample_moments = [0.0] * 5
                 if is_primary:
                     with metrics_log_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(metrics, sort_keys=True) + "\n")
@@ -1157,28 +1179,7 @@ def run_offline_policy_training(
                         or global_step % max(config.logging_steps, 1) == 0
                         or global_step == total_update_steps
                     ):
-                        concise_metrics = {
-                            f"{tracking_prefix}train/loss": metrics["loss"],
-                            f"{tracking_prefix}train/lr": metrics["lr"],
-                            f"{tracking_prefix}train/mean_reward": metrics["mean_reward"],
-                            f"{tracking_prefix}train/overall_mean_reward": metrics["mean_reward"],
-                            f"{tracking_prefix}train/mean_advantage": metrics["mean_advantage"],
-                            f"{tracking_prefix}train/overall_mean_advantage": metrics["mean_advantage"],
-                            f"{tracking_prefix}train/approx_kl": metrics["approx_kl"],
-                            f"{tracking_prefix}train/entropy": metrics["entropy"],
-                            f"{tracking_prefix}train/clipfrac": metrics["clipfrac"],
-                            f"{tracking_prefix}train/selector_samples_total": metrics["selector_samples_total"],
-                            f"{tracking_prefix}train/selector_samples_clean": metrics["selector_samples_clean"],
-                            f"{tracking_prefix}train/selector_samples_locally_repaired": metrics["selector_samples_locally_repaired"],
-                            f"{tracking_prefix}train/selector_samples_model_repaired": metrics["selector_samples_model_repaired"],
-                            f"{tracking_prefix}train/selector_samples_hard_fallback": metrics["selector_samples_hard_fallback"],
-                        }
-                        if "selector_mean_reward" in metrics:
-                            concise_metrics[f"{tracking_prefix}train/selector_mean_reward"] = metrics["selector_mean_reward"]
-                        if "decomposer_mean_reward" in metrics:
-                            concise_metrics[f"{tracking_prefix}train/decomposer_mean_reward"] = metrics["decomposer_mean_reward"]
-                        if "worker_mean_reward" in metrics:
-                            concise_metrics[f"{tracking_prefix}train/worker_mean_reward"] = metrics["worker_mean_reward"]
+                        concise_metrics = learner_tracking_metrics(metrics, tracking_prefix)
                         selector_format_log = ""
                         if metrics["selector_samples_total"] > 0:
                             selector_format_log = (
@@ -1232,11 +1233,6 @@ def run_offline_policy_training(
                             f"[hierarchical-rema][grpo] eval step={global_step} "
                             f"val_loss={val_metrics['val_loss']:.6f}"
                         )
-                        if tracking is not None:
-                            tracking.log(
-                                {f"{tracking_prefix}val/val_loss": val_metrics["val_loss"]},
-                                step=log_step_offset + global_step,
-                            )
 
                 if (
                     config.save_intermediate_checkpoints
@@ -1327,6 +1323,7 @@ def run_offline_policy_training(
     summary = {
         "output_dir": str(output_dir),
         "steps": global_step,
+        "optimizer_updates": config.optimizer_updates_offset + global_step,
         "num_train_samples": len(train_samples),
         "num_val_samples": len(val_samples),
         "objective": "grpo",
@@ -1365,36 +1362,8 @@ def run_offline_policy_training(
             f"empty_after_filtering={empty_after_filtering_total} "
             f"selected_model_source={selected_model_source}"
         )
-        if tracking is not None:
-            final_metrics = {
-                f"{tracking_prefix}train/final_steps": global_step,
-                f"{tracking_prefix}train/num_train_samples": len(train_samples),
-                f"{tracking_prefix}train/num_val_samples": len(val_samples),
-                f"{tracking_prefix}train/skipped_empty_batches": skipped_empty_batches,
-                f"{tracking_prefix}train/skipped_non_finite_batches": skipped_non_finite_batches,
-                f"{tracking_prefix}train/empty_due_to_truncation": empty_due_to_truncation_total,
-                f"{tracking_prefix}train/empty_due_to_empty_completion": empty_due_to_empty_completion_total,
-                f"{tracking_prefix}train/empty_after_filtering": empty_after_filtering_total,
-            }
-            train_dataset_diagnostics = summary.get("train_dataset_diagnostics", {})
-            if isinstance(train_dataset_diagnostics, dict):
-                for field in (
-                    "retained_response_tokens",
-                    "truncated_prompt_tokens",
-                    "truncated_response_tokens",
-                    "zero_loss_rows",
-                ):
-                    if field in train_dataset_diagnostics:
-                        final_metrics[f"{tracking_prefix}train_dataset/{field}"] = int(
-                            train_dataset_diagnostics[field]
-                        )
-            if "val_loss" in summary:
-                final_metrics[f"{tracking_prefix}val/final_loss"] = summary["val_loss"]
-            if best_val_loss is not None:
-                final_metrics[f"{tracking_prefix}val/best_loss"] = float(best_val_loss)
-            tracking.log(final_metrics, step=log_step_offset + max(global_step, 1))
-            if owns_tracking:
-                _finish_tracking(tracking)
+        if tracking is not None and owns_tracking:
+            _finish_tracking(tracking)
     _destroy_distributed_training(distributed_context)
     return summary
 

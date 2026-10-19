@@ -19,6 +19,11 @@ from .backends import MockHierarchicalBackend, RayVLLMHierarchicalBackend, Trans
 from .audit_answers import audit_tasks, record_verification_failures, skip_unverified_tasks, write_audit
 from .controller_data import controller_samples_from_task_rollouts, write_samples_to_jsonl
 from .demo import make_demo_tasks, make_worker_pool
+from .metrics import (
+    allocated_gpu_count, learner_tracking_metrics, merge_monitoring, performance_metrics,
+    rollout_monitoring_totals, rollout_tracking_metrics, validation_tracking_metrics,
+    warn_verification_coverage,
+)
 from .offline_training import (
     OfflineTrainingConfig,
     RayOfflineGRPOWorker,
@@ -732,14 +737,6 @@ def _relay_offline_metrics_to_tracking(
     if tracking_last_step is not None:
         log_step_offset = max(int(log_step_offset), int(tracking_last_step))
 
-    tracking.log(
-        {
-            f"{tracking_prefix}train/num_train_samples": num_train_samples,
-            f"{tracking_prefix}train/num_val_samples": num_val_samples,
-        },
-        step=log_step_offset,
-    )
-
     queued_logs: List[tuple[int, int, Dict[str, float | int]]] = []
 
     metrics_log_path = output_dir / "train_metrics.jsonl"
@@ -751,86 +748,11 @@ def _relay_offline_metrics_to_tracking(
                     continue
                 record = json.loads(line)
                 step = log_step_offset + int(record["step"])
-                metrics = {
-                    f"{tracking_prefix}train/loss": float(record["loss"]),
-                    f"{tracking_prefix}train/lr": float(record["lr"]),
-                    f"{tracking_prefix}train/mean_reward": float(record["mean_reward"]),
-                    f"{tracking_prefix}train/overall_mean_reward": float(record["mean_reward"]),
-                    f"{tracking_prefix}train/mean_advantage": float(record["mean_advantage"]),
-                    f"{tracking_prefix}train/overall_mean_advantage": float(record["mean_advantage"]),
-                    f"{tracking_prefix}train/approx_kl": float(record["approx_kl"]),
-                    f"{tracking_prefix}train/entropy": float(record["entropy"]),
-                    f"{tracking_prefix}train/clipfrac": float(record["clipfrac"]),
-                }
-                optional_float_fields = {
-                    "selector_mean_reward": "selector_mean_reward",
-                    "decomposer_mean_reward": "decomposer_mean_reward",
-                    "worker_mean_reward": "worker_mean_reward",
-                }
-                optional_int_fields = {
-                    "selector_samples_total": "selector_samples_total",
-                    "selector_samples_clean": "selector_samples_clean",
-                    "selector_samples_locally_repaired": "selector_samples_locally_repaired",
-                    "selector_samples_model_repaired": "selector_samples_model_repaired",
-                    "selector_samples_hard_fallback": "selector_samples_hard_fallback",
-                }
-                for record_key, metric_suffix in optional_float_fields.items():
-                    if record_key in record:
-                        metrics[f"{tracking_prefix}train/{metric_suffix}"] = float(record[record_key])
-                for record_key, metric_suffix in optional_int_fields.items():
-                    if record_key in record:
-                        metrics[f"{tracking_prefix}train/{metric_suffix}"] = int(record[record_key])
+                metrics = learner_tracking_metrics(record, tracking_prefix)
                 queued_logs.append((step, 0, metrics))
-
-    eval_log_path = output_dir / "eval_metrics.jsonl"
-    if eval_log_path.exists():
-        with eval_log_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                step = log_step_offset + int(record["step"])
-                queued_logs.append(
-                    (
-                        step,
-                        1,
-                        {f"{tracking_prefix}val/val_loss": float(record["val_loss"])},
-                    )
-                )
 
     for step, _, metrics in sorted(queued_logs, key=lambda item: (item[0], item[1])):
         tracking.log(metrics, step=step)
-
-    summary_path = output_dir / "summary.json"
-    if summary_path.exists():
-        with summary_path.open("r", encoding="utf-8") as handle:
-            summary = json.load(handle)
-        final_metrics = {
-            f"{tracking_prefix}train/final_steps": int(summary.get("steps", 0)),
-            f"{tracking_prefix}train/skipped_empty_batches": int(summary.get("skipped_empty_batches", 0)),
-            f"{tracking_prefix}train/skipped_non_finite_batches": int(summary.get("skipped_non_finite_batches", 0)),
-            f"{tracking_prefix}train/empty_due_to_truncation": int(summary.get("empty_due_to_truncation", 0)),
-            f"{tracking_prefix}train/empty_due_to_empty_completion": int(summary.get("empty_due_to_empty_completion", 0)),
-            f"{tracking_prefix}train/empty_after_filtering": int(summary.get("empty_after_filtering", 0)),
-        }
-        train_dataset_diagnostics = summary.get("train_dataset_diagnostics")
-        if isinstance(train_dataset_diagnostics, dict):
-            for field in (
-                "retained_response_tokens",
-                "truncated_prompt_tokens",
-                "truncated_response_tokens",
-                "zero_loss_rows",
-            ):
-                if field in train_dataset_diagnostics:
-                    final_metrics[f"{tracking_prefix}train_dataset/{field}"] = int(
-                        train_dataset_diagnostics[field]
-                    )
-        if "val_loss" in summary:
-            final_metrics[f"{tracking_prefix}val/final_loss"] = float(summary["val_loss"])
-        if summary.get("best_val_loss") is not None:
-            final_metrics[f"{tracking_prefix}val/best_loss"] = float(summary["best_val_loss"])
-        tracking.log(final_metrics, step=log_step_offset + max(int(summary.get("steps", 0)), 1))
 
 
 def _offline_training_ray_runtime_env() -> Dict[str, Any]:
@@ -1543,6 +1465,7 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
     ]
     verified_correctness = [value for value in selection_correctness if value is not None]
     return {
+        "monitoring_totals": rollout_monitoring_totals(rollout),
         "best_decomposition_id": best_decomposition.decomposition.decomposition_id if best_decomposition else None,
         "best_decomposition_reward": best_decomposition.decomposition_reward if best_decomposition else float('nan'),
         "unscored_rollouts": sum(sel.reward.total_reward is None for dec in rollout.decompositions for sel in dec.selections),
@@ -1591,6 +1514,7 @@ def _available_mean(values):
 
 
 def _merge_reward_metric_coverage(target, summaries):
+    target.update(merge_monitoring(summaries))
     keys = [key for key in target if key.startswith('mean_') and 'reward' in key]
     counts = {}
     for key in keys:
@@ -1632,6 +1556,7 @@ def _verification_coverage(metrics):
     values = [item['best_final_correctness'] for item in metrics
               if math.isfinite(item['best_final_correctness'])]
     return {
+        **merge_monitoring(metrics),
         'num_verified_tasks': len(values), 'num_unverified_tasks': len(metrics) - len(values),
         'verification_coverage': len(values) / len(metrics) if metrics else 0.0,
         'num_correct': sum(values), 'mean_best_final_correctness': _available_mean(values),
@@ -2379,6 +2304,7 @@ def run_external_validation(
 
     print(
         f"[hierarchical-rema][validation] epoch={epoch_number} mode={mode} "
+        f"accuracy={summary['accuracy']:.4f} "
         f"mean_best_final_correctness={summary['mean_best_final_correctness']:.4f} "
         f"verified_tasks={summary['num_verified_tasks']}/{summary['num_tasks']} "
         f"unverified_rollouts={summary['unverified_rollouts']}"
@@ -2388,38 +2314,14 @@ def run_external_validation(
         print(
             f"[hierarchical-rema][validation][subset] epoch={epoch_number} "
             f"name={subset_name} "
-            f"acc={subset_summary['mean_best_final_correctness']:.4f} "
+            f"acc={subset_summary['accuracy']:.4f} "
             f"tasks={int(subset_summary.get('num_tasks', 0))} "
-            f"correct={int(subset_summary.get('num_correct', 0))}"
+            f"verified_rollouts={subset_summary['monitoring_totals'].get('verified_rollouts', 0)} "
+            f"correct_rollouts={subset_summary['monitoring_totals'].get('correct_rollouts', 0)}"
         )
+    warn_verification_coverage(summary, f"validation epoch={epoch_number}")
     if tracking is not None:
-        metrics = {
-            "val/mean_best_final_correctness": summary["mean_best_final_correctness"],
-            "val/num_tasks": summary["num_tasks"],
-            "val/verification_coverage": summary["verification_coverage"],
-            "val/unverified_rollouts": summary["unverified_rollouts"],
-            "val/num_verified_tasks": summary["num_verified_tasks"],
-            "val/reward_diagnostics_enabled": int(reward_model_enabled),
-            "val/elapsed_seconds": elapsed,
-            "val/seconds_per_task": summary["seconds_per_task"],
-        }
-        if reward_model_enabled:
-            for key in ("mean_best_selection_reward", "mean_best_selector_decision_reward",
-                        "mean_selector_decision_reward", "mean_best_decomposition_reward",
-                        "mean_worker_reward", "mean_executor_rollout_reward"):
-                metrics[f"val/{key}"] = summary[key]
-        for key, value in summary["diagnostics"].items():
-            if value is not None:
-                metrics[f"val/diagnostics/{key}"] = value
-        for subset_name, subset_summary in summary.get("subsets", {}).items():
-            if reward_model_enabled:
-                metrics[f"val/test_score/{subset_name}"] = subset_summary["mean_best_selection_reward"]
-            metrics[f"val/acc/{subset_name}"] = subset_summary["mean_best_final_correctness"]
-            metrics[f"val/verification_coverage/{subset_name}"] = subset_summary["verification_coverage"]
-            for key, value in subset_summary["diagnostics"].items():
-                if value is not None:
-                    metrics[f"val/diagnostics/{subset_name}/{key}"] = value
-        tracking.log(metrics, step=tracking_step)
+        tracking.log(validation_tracking_metrics(summary), step=tracking_step)
     return summary
 
 
@@ -2563,6 +2465,7 @@ def main() -> None:
     current_phase = AlternatingPhase(args.phase)
     tracking = _tracking(args, config_payload=vars(args))
     tracking_step_offset = 0
+    optimizer_updates_by_policy = {"shared_worker": 0, "shared_controller": 0}
     job_summary: Dict[str, Any] = {
         "task_source": args.task_source,
         "resolved_task_source": resolved_task_source,
@@ -2590,6 +2493,7 @@ def main() -> None:
         )
 
     for epoch_index in range(args.num_epochs):
+        round_start = time.monotonic()
         epoch_number = epoch_index + 1
         epoch_dir = output_dir / f"epoch_{epoch_number:04d}"
         rollout_dir = epoch_dir / "rollouts"
@@ -2837,44 +2741,10 @@ def main() -> None:
                         )
                         with rollout_progress_path.open("w", encoding="utf-8") as handle:
                             json.dump(_json_safe(progress_metrics), handle, indent=2, sort_keys=True)
-                        if tracking is not None:
-                            rollout_tracking_step += 1
-                            tracking.log(
-                                {
-                                    "rollout_progress/tasks_completed": progress_metrics["tasks_completed"],
-                                    "rollout_progress/num_tasks": progress_metrics["num_epoch_tasks"],
-                                    "rollout_progress/fraction": progress_metrics["progress_fraction"],
-                                    "rollout_progress/elapsed_s": progress_metrics["elapsed_s"],
-                                    "rollout_progress/eta_s": progress_metrics["eta_s"],
-                                    "rollout_progress/avg_best_executor_rollout_reward": progress_metrics[
-                                        "avg_best_executor_rollout_reward"
-                                    ],
-                                    "rollout_progress/avg_best_decomposition_reward": progress_metrics["avg_best_decomposition_reward"],
-                                    "rollout_progress/avg_mean_worker_reward": progress_metrics["avg_mean_worker_reward"],
-                                    "rollout_progress/verification_coverage": progress_metrics["verification_coverage"],
-                                    "rollout_progress/unverified_rollouts": running_unverified_rollouts,
-                                    "rollout_progress/avg_best_final_correctness": progress_metrics["avg_best_final_correctness"],
-                                },
-                                step=rollout_tracking_step,
-                            )
                 _clear_live_progress()
                 segment_rollout_summary = epoch_rollout_summary(segment_rollouts)
                 with (segment_train_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
                     json.dump(_json_safe(segment_rollout_summary), handle, indent=2, sort_keys=True)
-                if tracking is not None:
-                    tracking.log(
-                        {
-                            "rollout_segment/worker_grpo_min_group_size": segment_rollout_summary["worker_grpo_min_group_size"],
-                            "rollout_segment/worker_grpo_num_groups_total": segment_rollout_summary["worker_grpo_num_groups_total"],
-                            "rollout_segment/worker_grpo_num_groups_used": segment_rollout_summary["worker_grpo_num_groups_used"],
-                            "rollout_segment/worker_grpo_num_groups_skipped": segment_rollout_summary["worker_grpo_num_groups_skipped"],
-                            "rollout_segment/worker_grpo_num_samples_total": segment_rollout_summary["worker_grpo_num_samples_total"],
-                            "rollout_segment/worker_grpo_num_samples_used": segment_rollout_summary["worker_grpo_num_samples_used"],
-                            "rollout_segment/worker_grpo_num_samples_skipped": segment_rollout_summary["worker_grpo_num_samples_skipped"],
-                            "rollout_segment/worker_grpo_mean_group_size_used": segment_rollout_summary["worker_grpo_mean_group_size_used"],
-                        },
-                        step=rollout_tracking_step,
-                    )
             finally:
                 rollout_trainer.close()
                 del rollout_trainer
@@ -2956,6 +2826,7 @@ def main() -> None:
                         project_name=args.project_name,
                         experiment_name=experiment_name,
                         enable_wandb=False,
+                        optimizer_updates_offset=optimizer_updates_by_policy.get(policy_id, 0),
                         save_final_checkpoint=True,
                         save_best_checkpoint=False,
                         save_intermediate_checkpoints=args.checkpoint_mode == "all",
@@ -3005,6 +2876,12 @@ def main() -> None:
                                 os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
                             else:
                                 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = previous_alloc_conf
+                    # Only actual optimizer calls advance policy counters. Zero-update
+                    # segments still advance the independent logging index below.
+                    optimizer_updates_by_policy[policy_id] = (
+                        optimizer_updates_by_policy.get(policy_id, 0) + int(summary["steps"])
+                    )
+                    summary["optimizer_updates"] = optimizer_updates_by_policy[policy_id]
                     tracking_step_offset += max(int(summary["steps"]), 1)
                     final_model_path = str(policy_dir / "final")
                     selected_model_path = str(summary.get("selected_model_path") or final_model_path)
@@ -3074,7 +2951,8 @@ def main() -> None:
             batch_cursor += len(segment_batches)
 
         rollout_summary = epoch_rollout_summary(rollouts)
-        tracking_step_offset = max(tracking_step_offset, rollout_tracking_step)
+        # Reserve a round event even when every learner sample was excluded.
+        tracking_step_offset = max(tracking_step_offset, rollout_tracking_step) + 1
         print(
             f"[hierarchical-rema][integrated] epoch={epoch_number} "
             f"mean_best_selection_reward={rollout_summary['mean_best_selection_reward']:.4f} "
@@ -3083,28 +2961,18 @@ def main() -> None:
             f"mean_best_final_correctness={rollout_summary['mean_best_final_correctness']:.4f} "
             f"verified_tasks={rollout_summary['num_verified_tasks']}/{rollout_summary['num_tasks']}"
         )
+        warn_verification_coverage(rollout_summary, f"training epoch={epoch_number}")
+        rollout_summary["performance"] = performance_metrics(
+            time.monotonic() - round_start,
+            rollout_summary["monitoring_totals"].get("completed_rollouts", 0),
+            allocated_gpu_count(os.environ),
+        )
         if tracking is not None:
-            tracking.log(
-                {
-                    "rollout/mean_best_selection_reward": rollout_summary["mean_best_selection_reward"],
-                    "rollout/mean_best_decomposition_reward": rollout_summary["mean_best_decomposition_reward"],
-                    "rollout/mean_worker_reward": rollout_summary["mean_worker_reward"],
-                    "rollout/mean_best_final_correctness": rollout_summary["mean_best_final_correctness"],
-                    "rollout/num_tasks": rollout_summary["num_tasks"],
-                    "rollout/verification_coverage": rollout_summary["verification_coverage"],
-                    "rollout/unverified_rollouts": rollout_summary["unverified_rollouts"],
-                    "rollout/num_verified_tasks": rollout_summary["num_verified_tasks"],
-                    "rollout/worker_grpo_min_group_size": rollout_summary["worker_grpo_min_group_size"],
-                    "rollout/worker_grpo_num_groups_total": rollout_summary["worker_grpo_num_groups_total"],
-                    "rollout/worker_grpo_num_groups_used": rollout_summary["worker_grpo_num_groups_used"],
-                    "rollout/worker_grpo_num_groups_skipped": rollout_summary["worker_grpo_num_groups_skipped"],
-                    "rollout/worker_grpo_num_samples_total": rollout_summary["worker_grpo_num_samples_total"],
-                    "rollout/worker_grpo_num_samples_used": rollout_summary["worker_grpo_num_samples_used"],
-                    "rollout/worker_grpo_num_samples_skipped": rollout_summary["worker_grpo_num_samples_skipped"],
-                    "rollout/worker_grpo_mean_group_size_used": rollout_summary["worker_grpo_mean_group_size_used"],
-                },
-                step=tracking_step_offset,
-            )
+            tracking.log({**rollout_tracking_metrics(rollout_summary),
+                          **rollout_summary["performance"],
+                          **{f"{policy}/optimizer_updates": optimizer_updates_by_policy[policy]
+                             for policy in ("shared_worker", "shared_controller")}},
+                         step=tracking_step_offset)
 
         with (epoch_dir / "rollout_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(_json_safe(rollout_summary), handle, indent=2, sort_keys=True)
@@ -3179,6 +3047,7 @@ def main() -> None:
 
         epoch_summary = {
             "epoch": epoch_number,
+            "optimizer_updates_by_policy": dict(optimizer_updates_by_policy),
             "schedule": {
                 "mode": schedule.mode.value,
                 "phase": schedule.alternating_phase.value,
@@ -3204,6 +3073,7 @@ def main() -> None:
         with (epoch_dir / "epoch_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(_json_safe(epoch_summary), handle, indent=2, sort_keys=True)
         job_summary["epochs"].append(epoch_summary)
+        job_summary["optimizer_updates_by_policy"] = dict(optimizer_updates_by_policy)
         job_summary["best_validation_tracker"] = epoch_summary["best_validation_tracker"]
 
         if args.mode == "alternating":

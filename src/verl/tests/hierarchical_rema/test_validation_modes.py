@@ -80,8 +80,7 @@ def test_routine_never_constructs_scorer_and_preserves_accuracy(monkeypatch, tmp
     assert not result["reward_diagnostics_enabled"]
     assert result["diagnostics"]["worker_outputs"] > 0
     assert result["seconds_per_task"] >= 0
-    assert tracker.events[-1]["val/acc/math"] == 1
-    assert "val/test_score/math" not in tracker.events[-1]
+    assert tracker.events[-1] == {"val/accuracy": 1, "val/accuracy/math": 1}
     assert (tmp_path / "validation_accuracy.csv").exists()
     assert not (tmp_path / "routine" / "validation_diagnostics.jsonl").exists()
 
@@ -99,6 +98,7 @@ def test_diagnostics_score_same_generation_and_keep_accuracy_on_overflow(monkeyp
     assert result["mean_best_final_correctness"] == 1
     assert result["verification_coverage"] == 1
     assert result["reward_diagnostics_enabled"]
+    assert tracker.events[-1] == {"val/accuracy": 1, "val/accuracy/math": 1}
     examples = [json.loads(line) for line in (tmp_path / "diagnostic" / "validation_diagnostics.jsonl").read_text().splitlines()]
     assert len(examples) == 1
     assert examples[0]["task"]["ground_truth"] == "4"

@@ -1,5 +1,6 @@
 """CPU lifetime/gradient regression tests; no pretrained models or GPU needed."""
 import importlib
+import json
 import sys
 import weakref
 from types import ModuleType, SimpleNamespace
@@ -139,7 +140,9 @@ def test_invalid_objective_releases_forward_and_autograd(bad_stage):
 
 
 @pytest.mark.parametrize('nonfinite_training', [False, True])
-def test_training_loop_releases_outputs_before_next_forward_and_eval(tmp_path, monkeypatch, nonfinite_training):
+@pytest.mark.parametrize('tracking_prefix', ['', 'shared_worker/', 'shared_controller/'])
+def test_training_loop_releases_outputs_before_next_forward_and_eval(
+        tmp_path, monkeypatch, nonfinite_training, tracking_prefix):
     # Keep external trainer dependencies out of this CPU lifetime test.
     ppo = ModuleType('verl.trainer.ppo')
     ppo.core_algos = Algorithms
@@ -161,13 +164,45 @@ def test_training_loop_releases_outputs_before_next_forward_and_eval(tmp_path, m
             return self.rows[index]
 
     monkeypatch.setattr(offline, 'ControllerReplayDataset', Dataset)
+    optimizer_calls = []
+    original_step = torch.optim.AdamW.step
+    def counted_step(self, *args, **kwargs):
+        result = original_step(self, *args, **kwargs)
+        optimizer_calls.append(1)
+        return result
+    monkeypatch.setattr(torch.optim.AdamW, 'step', counted_step)
     config = offline.OfflineTrainingConfig('mock', str(tmp_path), epochs=2, train_batch_size=2,
         grad_accum_steps=2, entropy_coeff=0.001, eval_every_steps=1, save_final_checkpoint=False,
-        logging_steps=1, device='cpu')
+        logging_steps=1, device='cpu', optimizer_updates_offset=37)
     samples = [SimpleNamespace(role='worker', metadata={}) for _ in range(4)]
-    tracking = SimpleNamespace(last_step=0, log=lambda *args, **kwargs: None)
-    summary = offline.run_offline_policy_training(samples, samples[:2], config, tracking=tracking)
-    assert summary['steps'] == 2
+    events = []
+    tracking = SimpleNamespace(last_step=9000, log=lambda values, **kwargs: events.append(values))
+    summary = offline.run_offline_policy_training(samples, samples[:2], config, tracking=tracking,
+                                                  tracking_prefix=tracking_prefix)
+    assert summary['steps'] == len(optimizer_calls) == 2
+    assert summary['optimizer_updates'] == 39
     assert summary['skipped_non_finite_batches'] == int(nonfinite_training)
     assert len(model.references) >= 8
     assert all(reference() is None for reference in model.references)
+    metrics_api = importlib.import_module(api.__name__ + '.metrics')
+    assert len(events) == 2
+    expected_keys = {f'{tracking_prefix}train/{key}' for key in metrics_api.TRAIN_METRICS}
+    if tracking_prefix:
+        expected_keys.add(f'{tracking_prefix}optimizer_updates')
+        assert [event[f'{tracking_prefix}optimizer_updates'] for event in events] == [38, 39]
+    assert all(set(event) == expected_keys for event in events)
+    assert all(event[f'{tracking_prefix}train/reward_mean'] == 1
+               and event[f'{tracking_prefix}train/reward_std'] == 0
+               and event[f'{tracking_prefix}train/advantage_std'] == 0
+               and event[f'{tracking_prefix}train/grad_norm'] >= 0 for event in events)
+    records = [json.loads(line) for line in (tmp_path / 'train_metrics.jsonl').read_text().splitlines()]
+    assert len(records) == 2 and 'selector_samples_total' in records[0]
+    assert [record['optimizer_updates'] for record in records] == [38, 39]
+    assert (tmp_path / 'eval_metrics.jsonl').exists()
+    assert 'train_dataset_diagnostics' in json.loads((tmp_path / 'summary.json').read_text())
+    relayed = []
+    train = importlib.import_module(api.__name__ + '.train')
+    train._relay_offline_metrics_to_tracking(tmp_path,
+        SimpleNamespace(last_step=12345, log=lambda values, **kwargs: relayed.append(values)),
+        tracking_prefix, 0, 4, 2)
+    assert relayed == events
