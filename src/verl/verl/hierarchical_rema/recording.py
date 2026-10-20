@@ -44,7 +44,7 @@ class RolloutRecorder:
                         "executor_rollout": self._strip_worker_prompts(selection.to_dict()),
                     })
         task_payload = self._task_payload(rollout=rollout, timestamp=timestamp)
-        if self.config.save_all_rollouts:
+        if self.config.save_all_rollouts or rollout.rollout_config.worker_rollout_mode == "fixed_prefix":
             self._append_jsonl(self.output_dir / "all_rollouts.jsonl", task_payload)
 
         if not self.config.save_best_rollouts:
@@ -192,8 +192,11 @@ class RolloutRecorder:
     def _task_payload(self, rollout: TaskRollout, timestamp: str) -> Dict:
         # "All" must preserve the entire plan/repeat tree, even if best-only views
         # are compact. Otherwise all_rollouts.jsonl silently contains just a winner.
-        if self.config.save_all_rollouts or not self.config.compact_mode:
-            rollout_payload = self._strip_worker_prompts(rollout.to_dict())
+        if (self.config.save_all_rollouts or not self.config.compact_mode
+                or rollout.rollout_config.worker_rollout_mode == "fixed_prefix"):
+            rollout_payload = rollout.to_dict()
+            if rollout.rollout_config.worker_rollout_mode != "fixed_prefix":
+                rollout_payload = self._strip_worker_prompts(rollout_payload)
             if self._uses_gfam_rewards(rollout):
                 rollout_payload = self._strip_gfam_handcrafted_reward_fields(rollout_payload)
             return {
@@ -347,6 +350,7 @@ class RolloutRecorder:
             "training_eligible": selection_rollout.training_eligible,
             "selection_id": selection_rollout.selection.selection_id,
             "score": selection_rollout.reward.total_reward,
+            "branch_metadata": dict(selection_rollout.branch_metadata),
             "selection_raw_text": selection_rollout.selection.raw_text,
             "final_answer": selection_rollout.final_answer,
             "reward": selection_rollout.reward.to_dict(),

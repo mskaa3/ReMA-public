@@ -113,6 +113,27 @@ class RolloutConfig:
     preferred_node_count_max: int = 5
     node_count_target_penalty_per_step: float = 0.1
     node_count_target_max_penalty: float = 0.4
+    worker_rollout_mode: str = "repeated_execution"
+    worker_action_samples: int = 8
+    worker_continuations_per_action: int = 4
+    worker_branch_points_per_plan: int = 1
+    worker_update_rule: str = "both_signs"
+    worker_branch_seed: int = 42
+
+    def __post_init__(self) -> None:
+        if self.worker_rollout_mode not in {"repeated_execution", "fixed_prefix"}:
+            raise ValueError("Unknown worker_rollout_mode")
+        if self.worker_update_rule not in {"both_signs", "positive_only_nonterminal"}:
+            raise ValueError("Unknown worker_update_rule")
+        if self.worker_action_samples < 2:
+            raise ValueError("worker_action_samples must be at least 2")
+        if self.worker_continuations_per_action < 1 or self.worker_branch_points_per_plan < 1:
+            raise ValueError("Worker continuations and branch points must be positive")
+
+    def uses_fixed_prefix(self, schedule: TrainingScheduleConfig) -> bool:
+        return self.worker_rollout_mode == "fixed_prefix" and (
+            schedule.mode == TrainingMode.JOINT or schedule.alternating_phase.uses_executor
+        )
 
     def resolved_num_executor_rollouts_per_decomposition(self) -> int:
         preferred = int(self.num_executor_rollouts_per_decomposition or 0)
@@ -452,6 +473,7 @@ class SelectionRollout:
     reward: SelectionRewardBreakdown
     reward_model_outputs: Dict[str, Any] = field(default_factory=dict)
     selector_advantage: float = 0.0
+    branch_metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def training_excluded(self) -> bool:
@@ -470,6 +492,7 @@ class SelectionRollout:
             "reward_model_outputs": self.reward_model_outputs,
             "selector_advantage": self.selector_advantage,
             "training_eligible": self.training_eligible,
+            "branch_metadata": self.branch_metadata,
         }
 
 
@@ -480,10 +503,17 @@ class DecompositionRollout:
     base_decomposition_reward: Optional[float]
     decomposition_reward: Optional[float]
     decomposer_advantage: Optional[float] = 0.0
+    worker_comparisons: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def planner_selections(self) -> List[SelectionRollout]:
+        return [sel for sel in self.selections if not sel.branch_metadata]
 
     @property
     def training_eligible(self) -> bool:
-        return self.decomposition_reward is not None and all(sel.training_eligible for sel in self.selections)
+        return self.decomposition_reward is not None and all(
+            sel.training_eligible for sel in self.planner_selections
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -492,6 +522,7 @@ class DecompositionRollout:
             "base_decomposition_reward": self.base_decomposition_reward,
             "decomposition_reward": self.decomposition_reward,
             "decomposer_advantage": self.decomposer_advantage,
+            "worker_comparisons": self.worker_comparisons,
             "training_eligible": self.training_eligible,
             "training_excluded_executor_rollout_ids": [
                 sel.selection.selection_id for sel in self.selections if sel.training_excluded

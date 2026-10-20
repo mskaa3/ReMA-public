@@ -90,6 +90,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
     parser.add_argument("--num-executor-rollouts", type=int, default=0)
+    from .fixed_prefix import add_rollout_arguments
+    add_rollout_arguments(parser)
     parser.add_argument("--max-nodes-per-decomposition", type=int, default=None)
     parser.add_argument("--soft-max-hops", type=int, default=None)
     parser.add_argument("--hard-max-hops", type=int, default=None)
@@ -192,7 +194,9 @@ def main() -> None:
         if args.max_nodes_per_decomposition is not None
         else (args.hard_max_hops if args.hard_max_hops is not None else 4)
     )
+    from .fixed_prefix import rollout_arguments
     rollout_config = RolloutConfig(
+        **rollout_arguments(args),
         num_decompositions=args.num_decompositions,
         num_selections_per_decomposition=args.num_selections,
         num_executor_rollouts_per_decomposition=args.num_executor_rollouts,

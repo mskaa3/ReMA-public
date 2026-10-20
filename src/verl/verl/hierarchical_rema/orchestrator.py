@@ -55,6 +55,7 @@ from .schema import (
 from .structured import format_decomposition_plan, format_selection_plan
 from .training_safety import SaturatedFailureFilter
 from .reward_providers.base import COMPILED_SOURCES, RewardProvider, validate_result
+from .fixed_prefix import generate_branches, build_samples as build_fixed_prefix_samples
 
 if TYPE_CHECKING:
     from .gfam_reward import GFAMRewardScorer
@@ -72,6 +73,7 @@ class _SelectionExecutionState:
     next_node_index: int = 0
     outputs: Dict[str, str] = field(default_factory=dict)
     executions: List[WorkerExecution] = field(default_factory=list)
+    branch_metadata: Dict[str, object] = field(default_factory=dict)
 
 
 class HierarchicalReMAOrchestrator:
@@ -125,6 +127,7 @@ class HierarchicalReMAOrchestrator:
         self.reward_source = getattr(self.reward_provider, "source", "gfam_v1")
         self.saturated_failure_filter = SaturatedFailureFilter.from_environment()
         self._reported_verification_failures = set()
+        self._fixed_prefix_round = 0
 
     @staticmethod
     def _canonical_decomposition_completion(candidate: DecompositionCandidate) -> str:
@@ -206,10 +209,12 @@ class HierarchicalReMAOrchestrator:
         return normalized or "unknown_instruction"
 
     @staticmethod
-    def _worker_training_reward(selection: SelectionRollout, execution: WorkerExecution) -> float:
+    def _worker_training_reward(
+        selection: SelectionRollout, execution: WorkerExecution, *, allow_excluded: bool = False,
+    ) -> float:
         if selection.reward.total_reward is None:
             raise ValueError("Unscored rollout cannot produce a training reward")
-        if selection.training_excluded:
+        if selection.training_excluded and not allow_excluded:
             raise ValueError("Excluded rollout cannot produce a training reward")
         if execution.reward_model_reward is not None:
             return float(execution.reward_model_reward)
@@ -562,6 +567,11 @@ class HierarchicalReMAOrchestrator:
             rollout_config=rollout_config,
             schedule=schedule,
         )
+        fixed_prefix = rollout_config.uses_fixed_prefix(schedule)
+        if fixed_prefix and schedule.mode == TrainingMode.ALTERNATING:
+            # Executor branching replaces repeated full executions. Joint mode
+            # still needs independent, ordinary repeats for planner credit.
+            num_executor_rollouts = 0
         progress_suffix = f" {progress_label}" if progress_label else ""
         print(
             f"[hierarchical-rema][rollout] stage=decomposer "
@@ -626,6 +636,14 @@ class HierarchicalReMAOrchestrator:
             worker_pool=worker_pool,
             progress_label=progress_label,
         )
+        branch_rollouts, comparisons = {}, {}
+        if fixed_prefix:
+            self._fixed_prefix_round += 1
+            branch_rollouts, comparisons = generate_branches(
+                self, tasks, task_decompositions, worker_pool, rollout_config,
+                frozen_worker_performance, _SelectionExecutionState, progress_label,
+                self._fixed_prefix_round, num_executor_rollouts,
+            )
 
         task_rollouts: List[TaskRollout] = []
         for task_index, task in enumerate(tasks):
@@ -637,7 +655,7 @@ class HierarchicalReMAOrchestrator:
                 ]
 
                 # A partial mean would preferentially reward plans whose short repeats fit.
-                if any(sel.reward.total_reward is None for sel in selection_rollouts):
+                if not selection_rollouts or any(sel.reward.total_reward is None for sel in selection_rollouts):
                     decomposition_rollouts.append(DecompositionRollout(
                         decomposition=decomposition, selections=selection_rollouts,
                         base_decomposition_reward=None, decomposition_reward=None,
@@ -667,6 +685,11 @@ class HierarchicalReMAOrchestrator:
                         decomposition_reward=decomposition_reward,
                     )
                 )
+
+            for decomposition_index, item in enumerate(decomposition_rollouts):
+                key = (task_index, decomposition_index)
+                item.selections.extend(branch_rollouts.get(key, []))
+                item.worker_comparisons = comparisons.get(key, [])
 
             # Keep complete means for analysis, but never learn from a mean made by
             # dropping suspicious repeats (that would select the surviving outcomes).
@@ -702,6 +725,17 @@ class HierarchicalReMAOrchestrator:
                 )
             )
 
+        if fixed_prefix:
+            stats = [rollout.training_batch.worker_grpo_stats for rollout in task_rollouts]
+            print(
+                f"[hierarchical-rema][fixed-prefix]{progress_suffix} "
+                f"groups={sum(item.get('num_groups_total', 0) for item in stats)} "
+                f"used={sum(item.get('num_groups_used', 0) for item in stats)} "
+                f"incomplete={sum(item.get('num_groups_incomplete', 0) for item in stats)} "
+                f"zero_signal={sum(item.get('num_groups_zero_signal', 0) for item in stats)} "
+                f"training_actions={sum(item.get('num_samples_used', 0) for item in stats)}",
+                flush=True,
+            )
         return task_rollouts
 
     def _effective_rollout_counts(
@@ -755,6 +789,7 @@ class HierarchicalReMAOrchestrator:
             policy_config=policy_config,
             schedule=schedule,
             decompositions=decomposition_rollouts,
+            rollout_config=rollout_config,
         )
         return TaskRollout(
             task=task,
@@ -771,6 +806,8 @@ class HierarchicalReMAOrchestrator:
         worker_pool: WorkerPoolConfig,
         progress_label: str | None = None,
     ) -> Dict[tuple[int, int, int], SelectionRollout]:
+        if not selection_states:
+            return {}
         batch_size = max(1, int(getattr(self.reward_provider, "rollout_batch_size", 1)))
         with StageProgress("reward_scoring", len(selection_states), context=progress_label) as progress:
             with RewardPipeline(
@@ -792,10 +829,16 @@ class HierarchicalReMAOrchestrator:
             for state in selection_states
         }
         active_states = list(selection_states)
+        for state in active_states:
+            if state.next_node_index == len(state.topo_order):
+                key = (state.task_index, state.decomposition_index, state.selection_index)
+                pipeline.add(key, state)
+        pipeline.flush()
         frontier_step = 0
         total_states = len(active_states)
         total_tasks = len({state.task_index for state in active_states})
-        max_frontier_steps = max((len(state.topo_order) for state in active_states), default=0)
+        max_frontier_steps = max(
+            (len(state.topo_order) - state.next_node_index for state in active_states), default=0)
         progress_suffix = f" {progress_label}" if progress_label else ""
         while True:
             worker_requests: List[WorkerExecutionRequest] = []
@@ -917,7 +960,8 @@ class HierarchicalReMAOrchestrator:
                         (state.task_index, state.decomposition_index, state.selection_index)
                     ] = SelectionRollout(
                         selection=state.selection, executions=state.executions,
-                        final_answer=final_answer, reward=reward, reward_model_outputs=reward_model_outputs)
+                        final_answer=final_answer, reward=reward, reward_model_outputs=reward_model_outputs,
+                        branch_metadata=dict(state.branch_metadata))
                     progress.advance(unscored=reward.total_reward is None,
                                      unverified=reward.verification_status == "unverified")
         return selection_rollout_map
@@ -981,7 +1025,7 @@ class HierarchicalReMAOrchestrator:
         decompositions: List[DecompositionRollout],
     ) -> None:
         for decomposition_rollout in decompositions:
-            for selection_rollout in decomposition_rollout.selections:
+            for selection_rollout in decomposition_rollout.planner_selections:
                 if not selection_rollout.training_eligible:
                     continue
                 for execution in selection_rollout.executions:
@@ -999,6 +1043,7 @@ class HierarchicalReMAOrchestrator:
         policy_config: ControllerPolicyConfig,
         schedule: TrainingScheduleConfig,
         decompositions: List[DecompositionRollout],
+        rollout_config: RolloutConfig | None = None,
     ) -> HierarchicalTrainingBatch:
         decomposer_samples: List[ControllerTrainingSample] = []
         selector_samples: List[ControllerTrainingSample] = []
@@ -1201,8 +1246,16 @@ class HierarchicalReMAOrchestrator:
                             )
                         )
 
-        if include_worker:
+        if include_worker and rollout_config is not None and rollout_config.uses_fixed_prefix(schedule):
+            worker_samples, branch_stats = build_fixed_prefix_samples(
+                self, task, decompositions, rollout_config, self.min_worker_grpo_group_size)
+            worker_grpo_stats.update(branch_stats)
+        elif include_worker:
             worker_lookup = worker_pool.workers_by_id()
+            final_nodes = {
+                item.decomposition.decomposition_id: item.decomposition.final_node_id
+                for item in decompositions
+            }
             worker_groups: Dict[
                 tuple[str, str, str, str, str, str],
                 List[tuple[SelectionRollout, WorkerExecution, str, float, str, str]],
@@ -1304,6 +1357,15 @@ class HierarchicalReMAOrchestrator:
                         normalized_instruction,
                         decomposition_id,
                     ) = payload
+                    if (
+                        rollout_config is not None
+                        and rollout_config.worker_update_rule == "positive_only_nonterminal"
+                        and execution.node_id != final_nodes[decomposition_id]
+                        and advantage <= 0
+                    ):
+                        worker_grpo_stats["num_samples_used"] -= 1
+                        worker_grpo_stats["num_samples_skipped"] += 1
+                        continue
                     worker_samples.append(
                         ControllerTrainingSample(
                             role="worker",

@@ -306,6 +306,8 @@ def parse_args() -> argparse.Namespace:
             "helper files such as replay JSONL shards and config snapshots."
         ),
     )
+    from .fixed_prefix import add_rollout_arguments
+    add_rollout_arguments(parser)
     parser.add_argument("--num-decompositions", type=int, default=3)
     parser.add_argument("--num-selections", type=int, default=2)
     parser.add_argument(
@@ -1102,6 +1104,7 @@ def _rollout_config_for_schedule(
     schedule: TrainingScheduleConfig,
     use_gfam_reward_model: bool = False,
 ) -> RolloutConfig:
+    from .fixed_prefix import rollout_arguments
     num_decompositions = base_rollout_config.num_decompositions
     num_executor_rollouts = base_rollout_config.resolved_num_executor_rollouts_per_decomposition()
     if schedule.mode == TrainingMode.ALTERNATING:
@@ -1132,6 +1135,7 @@ def _rollout_config_for_schedule(
                     base_rollout_config.resolved_gfam_decomposer_max_executor_rollouts(),
                 )
     return RolloutConfig(
+        **rollout_arguments(base_rollout_config),
         num_decompositions=num_decompositions,
         num_selections_per_decomposition=num_executor_rollouts,
         num_executor_rollouts_per_decomposition=num_executor_rollouts,
@@ -1415,7 +1419,22 @@ def rollout_workload_estimate(
     worker_generations_per_task_upper_bound = (
         num_decompositions * num_executor_rollouts * max_nodes
     )
+    branch_groups = 0
+    if rollout_config.uses_fixed_prefix(schedule):
+        branch_groups = num_decompositions * min(
+            rollout_config.worker_branch_points_per_plan, max_nodes)
+        actions = rollout_config.worker_action_samples
+        continuations = 1 if max_nodes == 1 else rollout_config.worker_continuations_per_action
+        branch_cost = branch_groups * (
+            max_nodes - 1 + actions + actions * continuations * (max_nodes - 1))
+        if schedule.mode == TrainingMode.ALTERNATING:
+            worker_generations_per_task_upper_bound = 0
+            num_executor_rollouts = 0
+        worker_generations_per_task_upper_bound += branch_cost
+        num_executor_rollouts += min(
+            rollout_config.worker_branch_points_per_plan, max_nodes) * actions * continuations
     return {
+        "worker_branch_groups_per_task": branch_groups,
         "num_decompositions": num_decompositions,
         "num_executor_rollouts": num_executor_rollouts,
         "controller_generations_per_task": controller_generations_per_task,
@@ -1472,7 +1491,9 @@ def _best_rollout_metrics(rollout: TaskRollout) -> Dict[str, Any]:
         "best_decomposition_id": best_decomposition.decomposition.decomposition_id if best_decomposition else None,
         "best_decomposition_reward": best_decomposition.decomposition_reward if best_decomposition else float('nan'),
         "unscored_rollouts": sum(sel.reward.total_reward is None for dec in rollout.decompositions for sel in dec.selections),
-        "unscored_plans": sum(dec.decomposition_reward is None for dec in rollout.decompositions),
+        "unscored_plans": sum(
+            dec.decomposition_reward is None and bool(dec.planner_selections)
+            for dec in rollout.decompositions),
         "safety_excluded_rollouts": sum(sel.training_excluded for dec in rollout.decompositions for sel in dec.selections),
         "safety_excluded_plans": sum(any(sel.training_excluded for sel in dec.selections) for dec in rollout.decompositions),
         "safety_excluded_worker_executions": sum(len(sel.executions) for dec in rollout.decompositions for sel in dec.selections if sel.training_excluded),
@@ -2414,7 +2435,9 @@ def main() -> None:
         if args.max_nodes_per_decomposition is not None
         else (args.hard_max_hops if args.hard_max_hops is not None else 4)
     )
+    from .fixed_prefix import rollout_arguments
     base_rollout_config = RolloutConfig(
+        **rollout_arguments(args),
         num_decompositions=args.num_decompositions,
         num_selections_per_decomposition=args.num_selections,
         num_executor_rollouts_per_decomposition=(

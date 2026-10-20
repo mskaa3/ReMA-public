@@ -162,6 +162,12 @@ fi
 NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-3}
 NUM_SELECTIONS=${NUM_SELECTIONS:-2}
 NUM_EXECUTOR_ROLLOUTS=${NUM_EXECUTOR_ROLLOUTS:-$NUM_SELECTIONS}
+WORKER_ROLLOUT_MODE=${WORKER_ROLLOUT_MODE:-repeated_execution}
+WORKER_ACTION_SAMPLES=${WORKER_ACTION_SAMPLES:-8}
+WORKER_CONTINUATIONS_PER_ACTION=${WORKER_CONTINUATIONS_PER_ACTION:-4}
+WORKER_BRANCH_POINTS_PER_PLAN=${WORKER_BRANCH_POINTS_PER_PLAN:-1}
+WORKER_UPDATE_RULE=${WORKER_UPDATE_RULE:-both_signs}
+WORKER_BRANCH_SEED=${WORKER_BRANCH_SEED:-42}
 ALTERNATING_SELECTOR_NUM_DECOMPOSITIONS=${ALTERNATING_SELECTOR_NUM_DECOMPOSITIONS:-4}
 ALTERNATING_SELECTOR_NUM_SELECTIONS=${ALTERNATING_SELECTOR_NUM_SELECTIONS:-4}
 ALTERNATING_EXECUTOR_NUM_DECOMPOSITIONS=${ALTERNATING_EXECUTOR_NUM_DECOMPOSITIONS:-$ALTERNATING_SELECTOR_NUM_DECOMPOSITIONS}
@@ -1353,6 +1359,7 @@ write_run_metadata
 echo "[hierarchical-rema] starting run"
 echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
 echo "[hierarchical-rema] REWARD_SETTING=$REWARD_SETTING"
+echo "[hierarchical-rema] WORKER_ROLLOUT_MODE=$WORKER_ROLLOUT_MODE actions=$WORKER_ACTION_SAMPLES continuations=$WORKER_CONTINUATIONS_PER_ACTION branch_points=$WORKER_BRANCH_POINTS_PER_PLAN update_rule=$WORKER_UPDATE_RULE"
 if [[ "$REWARD_SETTING" == "llm_coach" ]]; then
     echo "[hierarchical-rema] coach_backend=$REMA_COACH_BACKEND coach_model=$REMA_COACH_MODEL"
 fi
@@ -1407,6 +1414,12 @@ ${GPU_PARTITION} --role reward -- ${COACH_SUPERVISOR} python3 -m hierarchical_re
   --num-decompositions ${NUM_DECOMPOSITIONS} \
   --num-selections ${NUM_SELECTIONS} \
   --num-executor-rollouts ${NUM_EXECUTOR_ROLLOUTS} \
+  --worker-rollout-mode ${WORKER_ROLLOUT_MODE} \
+  --worker-action-samples ${WORKER_ACTION_SAMPLES} \
+  --worker-continuations-per-action ${WORKER_CONTINUATIONS_PER_ACTION} \
+  --worker-branch-points-per-plan ${WORKER_BRANCH_POINTS_PER_PLAN} \
+  --worker-update-rule ${WORKER_UPDATE_RULE} \
+  --worker-branch-seed ${WORKER_BRANCH_SEED} \
   --max-nodes-per-decomposition ${MAX_NODES_PER_DECOMPOSITION} \
   --hard-max-hops ${HARD_MAX_HOPS} \
   --temperature ${TEMPERATURE} \
@@ -1479,6 +1492,12 @@ ${GPU_PARTITION} --role reward -- ${COACH_SUPERVISOR} python3 -m hierarchical_re
   --num-decompositions ${NUM_DECOMPOSITIONS} \
   --num-selections ${NUM_SELECTIONS} \
   --num-executor-rollouts ${NUM_EXECUTOR_ROLLOUTS} \
+  --worker-rollout-mode ${WORKER_ROLLOUT_MODE} \
+  --worker-action-samples ${WORKER_ACTION_SAMPLES} \
+  --worker-continuations-per-action ${WORKER_CONTINUATIONS_PER_ACTION} \
+  --worker-branch-points-per-plan ${WORKER_BRANCH_POINTS_PER_PLAN} \
+  --worker-update-rule ${WORKER_UPDATE_RULE} \
+  --worker-branch-seed ${WORKER_BRANCH_SEED} \
   --alternating-selector-num-decompositions ${ALTERNATING_SELECTOR_NUM_DECOMPOSITIONS} \
   --alternating-selector-num-selections ${ALTERNATING_SELECTOR_NUM_SELECTIONS} \
   --alternating-executor-num-decompositions ${ALTERNATING_EXECUTOR_NUM_DECOMPOSITIONS} \

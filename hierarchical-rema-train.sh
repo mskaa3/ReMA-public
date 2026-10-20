@@ -21,7 +21,8 @@ export RUN_KIND=${RUN_KIND:-train}
 # One reward source for the entire run. Restart a NEW run to compare settings.
 # Implemented: gnn_prm | llm_coach | handcrafted
 # Reserved: frozen_prm | finetuned_prm | gnn_only (raise NotImplementedError).
-export REWARD_SETTING=${REWARD_SETTING:-gnn_prm}
+# Baseline regression run: explicitly select the existing GraphPRM reward.
+export REWARD_SETTING=gnn_prm
 # The wrapper validates this after loading env.sh, before staging artifacts.
 # llm_coach defaults to a frozen local Qwen/Qwen3-32B on the reserved GPU.
 # Optional overrides: REMA_COACH_REVISION, REMA_COACH_MAX_MODEL_LEN (8192),
@@ -48,6 +49,15 @@ export MAX_TASKS=${MAX_TASKS:-0}
 # legacy selector aliases remain in hierarchical-rema-trainer.sh for compatibility.
 export NUM_DECOMPOSITIONS=${NUM_DECOMPOSITIONS:-16}
 export NUM_EXECUTOR_ROLLOUTS=${NUM_EXECUTOR_ROLLOUTS:-16}
+# Existing behavior: repeat full executions, retaining individual node rewards.
+# Edit these choices for a new experiment; fixed-prefix branching stays off.
+export WORKER_ROLLOUT_MODE=repeated_execution
+export WORKER_UPDATE_RULE=both_signs
+# Only used when WORKER_ROLLOUT_MODE=fixed_prefix.
+export WORKER_ACTION_SAMPLES=${WORKER_ACTION_SAMPLES:-8}
+export WORKER_CONTINUATIONS_PER_ACTION=${WORKER_CONTINUATIONS_PER_ACTION:-4}
+export WORKER_BRANCH_POINTS_PER_PLAN=${WORKER_BRANCH_POINTS_PER_PLAN:-1}
+export WORKER_BRANCH_SEED=${WORKER_BRANCH_SEED:-42}
 export ALTERNATING_EXECUTOR_NUM_DECOMPOSITIONS=${ALTERNATING_EXECUTOR_NUM_DECOMPOSITIONS:-4}
 export ALTERNATING_EXECUTOR_NUM_ROLLOUTS=${ALTERNATING_EXECUTOR_NUM_ROLLOUTS:-4}
 export ALTERNATING_DECOMPOSER_NUM_DECOMPOSITIONS=${ALTERNATING_DECOMPOSER_NUM_DECOMPOSITIONS:-8}
