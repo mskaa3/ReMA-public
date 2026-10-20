@@ -217,7 +217,7 @@ def test_unverified_training_is_skipped_before_loading_models(tmp_path, monkeypa
     dataset.write_text(json.dumps({"question": "Solve for x: 2x + 3 = 11.", "answer": r"\frac{}{2}"}) + "\n")
     monkeypatch.setattr(train, "run_offline_policy_training", lambda **kw: pytest.fail("No unverified training"))
     monkeypatch.setattr(train, "make_worker_pool", lambda **kw: pytest.fail("No model setup for empty training"))
-    monkeypatch.setattr(sys, "argv", ["train.py", "--task-source", str(dataset),
+    monkeypatch.setattr(sys, "argv", ["train.py", "--reward-setting", "handcrafted", "--task-source", str(dataset),
                                     "--val-task-source", str(dataset), "--backend", "mock",
                                     "--num-epochs", "1",
                                     "--rollout-progress-every", "1", "--output-dir", str(tmp_path / "run")])
@@ -273,7 +273,7 @@ def test_bad_references_never_reach_training_or_validation_rollouts(
         "steps": 1, "output_dir": str(kw["config"].output_dir),
         "num_train_samples": len(kw["train_samples"]), "num_val_samples": len(kw["val_samples"]),
     })
-    monkeypatch.setattr(sys, "argv", ["train.py", "--task-source", str(train_path),
+    monkeypatch.setattr(sys, "argv", ["train.py", "--reward-setting", "handcrafted", "--task-source", str(train_path),
                                     "--val-task-source", str(val_path), "--backend", "mock",
                                     "--num-epochs", "1", "--rollout-progress-every", "1",
                                     "--output-dir", str(tmp_path / "run")])

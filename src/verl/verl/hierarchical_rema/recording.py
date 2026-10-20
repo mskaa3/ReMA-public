@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from .schema import RolloutLoggingConfig, TaskRollout
+from .reward_providers.base import COMPILED_SOURCES
 
 
 @dataclass
@@ -142,7 +143,7 @@ class RolloutRecorder:
     @staticmethod
     def _uses_gfam_rewards(task_rollout: TaskRollout) -> bool:
         return any(
-            selection.reward.reward_model_source == "gfam_v1"
+            selection.reward.reward_model_source in COMPILED_SOURCES
             for decomposition in task_rollout.decompositions
             for selection in decomposition.selections
         )
@@ -283,15 +284,17 @@ class RolloutRecorder:
             ],
         }
         if any(
-            selection.reward.reward_model_source == "gfam_v1"
+            selection.reward.reward_model_source in COMPILED_SOURCES
             for selection in decomposition_rollout.selections
         ):
-            payload["reward_model_source"] = "gfam_v1"
+            payload["reward_model_source"] = next(
+                selection.reward.reward_model_source for selection in decomposition_rollout.selections
+                if selection.reward.reward_model_source in COMPILED_SOURCES)
             payload["graph_summary"] = next(
                 (
                     selection.reward_model_outputs.get("graph_summary", {})
                     for selection in decomposition_rollout.selections
-                    if selection.reward.reward_model_source == "gfam_v1"
+                    if selection.reward.reward_model_source in COMPILED_SOURCES
                 ),
                 {},
             )
@@ -308,7 +311,7 @@ class RolloutRecorder:
     ) -> Dict:
         if not self.config.compact_mode:
             selection_payload = self._strip_worker_prompts(selection_rollout.to_dict())
-            if selection_rollout.reward.reward_model_source == "gfam_v1":
+            if selection_rollout.reward.reward_model_source in COMPILED_SOURCES:
                 selection_payload = self._strip_gfam_handcrafted_reward_fields(selection_payload)
             return {
                 "timestamp": timestamp,
@@ -386,7 +389,7 @@ class RolloutRecorder:
                 for execution in selection_rollout.executions
             ],
         }
-        if selection_rollout.reward.reward_model_source == "gfam_v1":
+        if selection_rollout.reward.reward_model_source in COMPILED_SOURCES:
             payload["reward_model"] = self._gfam_reward_summary(
                 selection_rollout=selection_rollout,
                 decomposition_rollout=decomposition_rollout,

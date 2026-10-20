@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import importlib
 import math
 import re
+from .reward_providers.base import COMPILED_SOURCES
 from typing import Any, Dict, Iterable, List, Sequence
 
 from .schema import (
@@ -533,7 +534,7 @@ class WorkerPerformanceMemory:
             return
         stats = self._stats_for(execution.worker_id)
         uses_reward_model = (
-            selection_reward.reward_model_source == "gfam_v1"
+            selection_reward.reward_model_source in COMPILED_SOURCES
             and execution.reward_model_reward is not None
         )
         observed_reward = (

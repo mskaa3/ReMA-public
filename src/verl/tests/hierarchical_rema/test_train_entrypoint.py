@@ -61,6 +61,7 @@ def test_integrated_train_writes_epoch_artifacts(tmp_path, monkeypatch) -> None:
         "argv",
         [
             "train.py",
+            "--reward-setting", "handcrafted",
             "--task-source",
             "demo",
             "--backend",
@@ -78,16 +79,17 @@ def test_integrated_train_writes_epoch_artifacts(tmp_path, monkeypatch) -> None:
 
     summary = json.loads((output_dir / "training_summary.json").read_text(encoding="utf-8"))
     epoch_dir = output_dir / "epoch_0001"
-    manifest = json.loads((epoch_dir / "train" / "manifest.json").read_text(encoding="utf-8"))
+    segment_dir = epoch_dir / "train" / "segment_0001"
+    manifest = json.loads((segment_dir / "manifest.json").read_text(encoding="utf-8"))
 
     assert summary["num_epochs"] == 1
     assert len(summary["epochs"]) == 1
     assert (epoch_dir / "rollout_summary.json").exists()
     assert (epoch_dir / "epoch_summary.json").exists()
-    assert sorted(manifest["policies"].keys()) == ["decomposer_controller", "selector_controller"]
+    assert sorted(manifest["policies"].keys()) == ["decomposer_controller"]
 
     for policy_id in manifest["policies"]:
-        policy_dir = epoch_dir / "train" / policy_id
+        policy_dir = segment_dir / policy_id
         assert (policy_dir / "train_samples.jsonl").exists()
         assert (policy_dir / "all_samples.jsonl").exists()
 
@@ -133,6 +135,7 @@ def test_integrated_train_writes_external_validation_summary(tmp_path, monkeypat
         "argv",
         [
             "train.py",
+            "--reward-setting", "handcrafted",
             "--task-source",
             str(train_path),
             "--val-task-source",

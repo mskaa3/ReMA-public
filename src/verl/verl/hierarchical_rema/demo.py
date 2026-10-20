@@ -66,6 +66,18 @@ def make_worker_pool(base_model_path: str | None) -> WorkerPoolConfig:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hierarchical ReMA MVP demo")
+    from .reward_providers.factory import SETTINGS
+    parser.add_argument("--reward-setting", choices=SETTINGS, default=None)
+    parser.add_argument("--gfam-reward-model-pkl", default="")
+    parser.add_argument("--gfam-reward-model-device", default="cpu")
+    parser.add_argument("--gfam-reward-model-encoder-backend", default=None)
+    parser.add_argument("--gfam-reward-model-encoder-model", default=None)
+    parser.add_argument("--gfam-prm-device", default="cpu")
+    parser.add_argument("--gfam-prm-torch-dtype", default="auto")
+    parser.add_argument("--gfam-prm-max-length", type=int, default=0)
+    parser.add_argument("--gfam-feature-cache-dir", default=None)
+    parser.add_argument("--gfam-encoder-device", default=None)
+    parser.add_argument("--gfam-bad-class-penalty", type=float, default=1.)
     parser.add_argument("--backend", choices=["mock", "hf", "vllm"], default="mock")
     parser.add_argument("--task", choices=["all", "algebra", "analysis", "calculus_analysis"], default="all")
     parser.add_argument("--mode", choices=["joint", "alternating"], default="joint")
@@ -85,6 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trivial-single-node-penalty", type=float, default=1.0)
     parser.add_argument("--trivial-shallow-two-node-penalty", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--controller-temperature", type=float, default=None)
+    parser.add_argument("--worker-temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument(
         "--final-answer-correctness-reward-only",
@@ -92,10 +106,13 @@ def parse_args() -> argparse.Namespace:
         help="Make worker/selection reward depend only on final-answer correctness.",
     )
     parser.add_argument("--controller-max-new-tokens", type=int, default=768)
+    parser.add_argument("--decomposer-max-new-tokens", type=int, default=None)
+    parser.add_argument("--selector-max-new-tokens", type=int, default=None)
     parser.add_argument("--worker-max-new-tokens", type=int, default=256)
     parser.add_argument("--rollout-prompt-length", type=int, default=2048)
     parser.add_argument("--ray-nnodes", type=int, default=1)
     parser.add_argument("--ray-n-gpus-per-node", type=int, default=1)
+    parser.add_argument("--ray-cpus-per-node", type=int, default=0)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=16384)
@@ -124,11 +141,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def _rollout_summary(rollout) -> dict:
-    best_decomposition = max(rollout.decompositions, key=lambda item: item.decomposition_reward)
+    plan_rewards = [item.decomposition_reward for item in rollout.decompositions if item.decomposition_reward is not None]
+    best_decomposition = max((item for item in rollout.decompositions if item.decomposition_reward is not None),
+                             key=lambda item: item.decomposition_reward, default=None)
     best_selection_reward = max(
-        selection.reward.total_reward
+        (selection.reward.total_reward
         for decomposition in rollout.decompositions
-        for selection in decomposition.selections
+        for selection in decomposition.selections if selection.reward.total_reward is not None),
+        default=None,
     )
     return {
         "task_id": rollout.task.task_id,
@@ -136,17 +156,21 @@ def _rollout_summary(rollout) -> dict:
         "num_total_executor_rollouts": sum(
             len(decomposition.selections) for decomposition in rollout.decompositions
         ),
-        "best_decomposition_id": best_decomposition.decomposition.decomposition_id,
-        "best_decomposition_reward": best_decomposition.decomposition_reward,
-        "mean_decomposition_reward": sum(
-            decomposition.decomposition_reward for decomposition in rollout.decompositions
-        ) / max(len(rollout.decompositions), 1),
+        "best_decomposition_id": best_decomposition.decomposition.decomposition_id if best_decomposition else None,
+        "best_decomposition_reward": best_decomposition.decomposition_reward if best_decomposition else None,
+        "mean_decomposition_reward": sum(plan_rewards) / len(plan_rewards) if plan_rewards else None,
         "best_executor_rollout_reward": best_selection_reward,
     }
 
 
 def main() -> None:
     args = parse_args()
+    from .reward_providers.factory import build_reward_provider, validate_reward_setting, write_reward_manifest
+    from pathlib import Path
+    validate_reward_setting(args)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_reward_manifest(args, output_dir)
     tasks = make_demo_tasks()
     if args.task == "algebra":
         tasks = [task for task in tasks if task.metadata["skill_focus"] == "algebra"]
@@ -192,6 +216,7 @@ def main() -> None:
         )
 
     trainer = HierarchicalGRPOTrainer(
+        reward_provider=build_reward_provider(args),
         reward_weights=RewardWeights(
             worker_reward_mode=(
                 WorkerRewardMode.FINAL_ANSWER_CORRECTNESS_ONLY
@@ -202,19 +227,28 @@ def main() -> None:
         backend_type=args.backend,
         hf_backend_config=HFBackendConfig(
             temperature=args.temperature,
+            controller_temperature=args.controller_temperature,
+            worker_temperature=args.worker_temperature,
             top_p=args.top_p,
             controller_max_new_tokens=args.controller_max_new_tokens,
+            decomposer_max_new_tokens=args.decomposer_max_new_tokens,
+            selector_max_new_tokens=args.selector_max_new_tokens,
             worker_max_new_tokens=args.worker_max_new_tokens,
         ),
         vllm_backend_config=VLLMBackendConfig(
             temperature=args.temperature,
+            controller_temperature=args.controller_temperature,
+            worker_temperature=args.worker_temperature,
             top_p=args.top_p,
             do_sample=args.temperature > 0.0,
             prompt_length=args.rollout_prompt_length,
             controller_max_new_tokens=args.controller_max_new_tokens,
+            decomposer_max_new_tokens=args.decomposer_max_new_tokens,
+            selector_max_new_tokens=args.selector_max_new_tokens,
             worker_max_new_tokens=args.worker_max_new_tokens,
             nnodes=args.ray_nnodes,
             n_gpus_per_node=args.ray_n_gpus_per_node,
+            cpus_per_node=args.ray_cpus_per_node or None,
             tensor_model_parallel_size=args.vllm_tensor_parallel_size,
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             max_num_batched_tokens=args.vllm_max_num_batched_tokens,

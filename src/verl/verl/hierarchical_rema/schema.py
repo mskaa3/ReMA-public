@@ -432,7 +432,8 @@ class SelectionRewardBreakdown:
     verification_error: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        if self.reward_model_source == "gfam_v1":
+        from .reward_providers.base import COMPILED_SOURCES
+        if self.reward_model_source in COMPILED_SOURCES:
             return {
                 "total_reward": self.total_reward,
                 "reward_model_source": self.reward_model_source,

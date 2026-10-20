@@ -156,3 +156,26 @@ def test_routine_unverified_answer_is_not_reported_as_incorrect(monkeypatch, tmp
     assert result["verification_coverage"] == 0
     assert math.isnan(result["mean_best_final_correctness"])
     assert train._validation_primary_metric(result) is None
+
+
+@pytest.mark.parametrize("setting", ["gnn_prm", "llm_coach", "handcrafted"])
+def test_routine_never_constructs_any_reward_provider(monkeypatch, tmp_path, setting):
+    providers = importlib.import_module(api.__name__ + ".reward_providers")
+    monkeypatch.setattr(providers, "build_reward_provider", lambda *a: pytest.fail("Routine must skip ALL providers"))
+    args = args_for_run(monkeypatch)
+    args.validation_mode, args.reward_setting = "routine", setting
+    result = run_validation(args, tmp_path / setting, Tracker())
+    assert result["mean_best_final_correctness"] == 1
+    assert not result["reward_diagnostics_enabled"]
+
+
+def test_handcrafted_diagnostics_do_not_load_graphprm(monkeypatch, tmp_path):
+    monkeypatch.setattr(gfam, "load_cached_reward_scorer", lambda **kw: pytest.fail("No Graph+PRM for handcrafted"))
+    args = args_for_run(monkeypatch)
+    args.validation_mode, args.reward_setting = "diagnostic", "handcrafted"
+    result = run_validation(args, tmp_path / "rules", Tracker())
+    assert result["reward_diagnostics_enabled"]
+    examples = [json.loads(line) for line in (tmp_path / "rules/validation_diagnostics.jsonl").read_text().splitlines()]
+    output = examples[0]["execution"]["reward_model_outputs"]
+    assert output["source"] == "handcrafted_v1"
+    assert output["reward_evidence"]

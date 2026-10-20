@@ -18,6 +18,15 @@ set -euo pipefail
 
 export RUN_KIND=${RUN_KIND:-train}
 
+# One reward source for the entire run. Restart a NEW run to compare settings.
+# Implemented: gnn_prm | llm_coach | handcrafted
+# Reserved: frozen_prm | finetuned_prm | gnn_only (raise NotImplementedError).
+export REWARD_SETTING=${REWARD_SETTING:-gnn_prm}
+# The wrapper validates this after loading env.sh, before staging artifacts.
+# llm_coach defaults to a frozen local Qwen/Qwen3-32B on the reserved GPU.
+# Optional overrides: REMA_COACH_REVISION, REMA_COACH_MAX_MODEL_LEN (8192),
+# REMA_COACH_MAX_NUM_SEQS (1), REMA_COACH_GPU_MEMORY_UTILIZATION (0.90).
+
 # Experiment shape.
 export BACKEND=${BACKEND:-vllm}
 export MODE=${MODE:-alternating}
@@ -86,7 +95,7 @@ export GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
 # incompatible with expandable_segments:True.
 export OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF=${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# Graph+PRM rewards and training-sample controls.
+# Shared reward gates and training-sample controls.
 export CONTROLLER_FORMAT_RETRY_PENALTY=${CONTROLLER_FORMAT_RETRY_PENALTY:-0.2} # subtract from controller reward/advantage when output needed repair
 export CONTROLLER_FORMAT_FALLBACK_PENALTY=${CONTROLLER_FORMAT_FALLBACK_PENALTY:-0.25}
 export TRAIN_MIN_REWARD=${TRAIN_MIN_REWARD:-}
@@ -96,7 +105,7 @@ export TRAIN_MIN_REWARD=${TRAIN_MIN_REWARD:-}
 #   allow_local_repair = keep only clean or locally repaired controller samples
 #   clean_only = keep only clean controller samples
 export CONTROLLER_SAMPLE_QUALITY_FILTER=${CONTROLLER_SAMPLE_QUALITY_FILTER:-clean_only}
-# Still active: average each plan's Graph+PRM rewards over repeated executor runs.
+# Average each plan's provider rewards over repeated executor runs.
 export DECOMPOSER_REWARD_AGGREGATION=${DECOMPOSER_REWARD_AGGREGATION:-mean}
 export GFAM_REWARD_MODEL_PKL_PATH=${GFAM_REWARD_MODEL_PKL_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/jmoska/hierarchical_rema/best_overall_model.pkl}
 export GFAM_REWARD_MODEL_DEVICE=${GFAM_REWARD_MODEL_DEVICE:-cuda:0}

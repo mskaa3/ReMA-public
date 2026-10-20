@@ -91,6 +91,9 @@ def test_gfam_reward_overrides_handcrafted_selection_and_decomposer_rewards() ->
     assert selection.reward.to_dict() == {
         "total_reward": 0.33,
         "reward_model_source": "gfam_v1",
+        "final_answer_correctness": 1.,
+        "verification_status": "verified",
+        "verification_error": None,
     }
     assert selection.reward_model_outputs["source"] == "gfam_v1"
     assert math.isclose(selection.reward_model_outputs["selection_reward"], 0.33)
@@ -99,8 +102,9 @@ def test_gfam_reward_overrides_handcrafted_selection_and_decomposer_rewards() ->
         assignment.node_id: assignment.reward_model_reward
         for assignment in selection.selection.assignments
     }
-    assert math.isclose(assignment_rewards["1"], 0.61)
-    assert math.isclose(assignment_rewards["2"], 0.49)
+    # Shared-executor assignments are synthetic, not sampled selector actions.
+    assert assignment_rewards["1"] is None
+    assert assignment_rewards["2"] is None
     assert math.isclose(decomposition.base_decomposition_reward, 0.77)
     assert math.isclose(decomposition.decomposition_reward, 0.77)
 

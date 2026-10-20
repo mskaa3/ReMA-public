@@ -54,6 +54,7 @@ from .schema import (
 )
 from .structured import format_decomposition_plan, format_selection_plan
 from .training_safety import SaturatedFailureFilter
+from .reward_providers.base import COMPILED_SOURCES, RewardProvider, validate_result
 
 if TYPE_CHECKING:
     from .gfam_reward import GFAMRewardScorer
@@ -89,6 +90,7 @@ class HierarchicalReMAOrchestrator:
         train_worker_model: bool = False,
         min_worker_grpo_group_size: int = 3,
         gfam_reward_scorer: GFAMRewardScorer | None = None,
+        reward_provider: RewardProvider | None = None,
     ) -> None:
         self.backend = backend
         self.reward_weights = reward_weights
@@ -116,7 +118,11 @@ class HierarchicalReMAOrchestrator:
         self.track_workers_history = bool(track_workers_history)
         self.train_worker_model = bool(train_worker_model)
         self.min_worker_grpo_group_size = max(int(min_worker_grpo_group_size), 1)
-        self.gfam_reward_scorer = gfam_reward_scorer
+        if reward_provider is not None and gfam_reward_scorer is not None:
+            raise ValueError("Supply reward_provider or legacy gfam_reward_scorer, not both")
+        self.reward_provider = reward_provider if reward_provider is not None else gfam_reward_scorer
+        self.gfam_reward_scorer = self.reward_provider  # Compatibility for embedded callers.
+        self.reward_source = getattr(self.reward_provider, "source", "gfam_v1")
         self.saturated_failure_filter = SaturatedFailureFilter.from_environment()
         self._reported_verification_failures = set()
 
@@ -224,7 +230,7 @@ class HierarchicalReMAOrchestrator:
         if not selection_training_rewards:
             return 0.0
         uses_reward_model = any(
-            selection.reward.reward_model_source == "gfam_v1"
+            selection.reward.reward_model_source in COMPILED_SOURCES
             for selection in selection_rollouts
         )
         if self.decomposer_reward_aggregation == "best":
@@ -394,7 +400,7 @@ class HierarchicalReMAOrchestrator:
     def _reward_model_request(self, *, task, decomposition, selection, executions, final_answer, reward):
         request = dict(task=task, decomposition=decomposition, selection=selection,
                        executions=executions, final_answer=final_answer)
-        if getattr(self.gfam_reward_scorer, "supports_verified_final_correctness", False):
+        if getattr(self.reward_provider, "supports_verified_final_correctness", False):
             if task.ground_truth is not None and str(task.ground_truth).strip():
                 verifier_score = float(reward.final_answer_correctness)
                 if not math.isfinite(verifier_score):
@@ -402,7 +408,7 @@ class HierarchicalReMAOrchestrator:
                 request["verified_final_correctness"] = float(verifier_score >= 1.0)
         return request
 
-    def _apply_gfam_reward_model(
+    def _apply_reward_provider(
         self,
         *,
         task: TaskExample,
@@ -416,8 +422,8 @@ class HierarchicalReMAOrchestrator:
         if reward.verification_status == "unverified":
             # Do not substitute model-predicted success for failed verification.
             reward.total_reward = None
-            if self.gfam_reward_scorer is not None:
-                reward.reward_model_source = "gfam_v1"
+            if self.reward_provider is not None:
+                reward.reward_model_source = self.reward_source
             for execution in executions:
                 execution.reward_model_reward = None
             failure_key = (task.task_id, str(task.ground_truth))
@@ -429,7 +435,7 @@ class HierarchicalReMAOrchestrator:
             return reward, {"source": "answer_verifier", "status": "unscored",
                             "error": reward.verification_error, "selection_reward": None,
                             "compiled_rewards": {}, "graph_summary": {"verification_status": "unverified"}}
-        if self.gfam_reward_scorer is None:
+        if self.reward_provider is None:
             return reward, {}
 
         synthetic_executor_rollout = bool(
@@ -437,20 +443,24 @@ class HierarchicalReMAOrchestrator:
             and selection.raw_payload.get("synthetic_executor_rollout")
         )
         if scored is None:
-            scored = self.gfam_reward_scorer.score_rollout(**self._reward_model_request(
+            scored = self.reward_provider.score_rollout(**self._reward_model_request(
                 task=task, decomposition=decomposition, selection=selection,
                 executions=executions, final_answer=final_answer, reward=reward))
         if scored.get("status") == "unscored":
-            print(f"[graphprm] unscored task={task.task_id} plan={decomposition.decomposition_id} "
+            print(f"[reward:{self.reward_source}] unscored task={task.task_id} plan={decomposition.decomposition_id} "
                   f"executor_rollout={selection.selection_id} error={scored['error']}", flush=True)
             reward.total_reward = None
-            reward.reward_model_source = "gfam_v1"
+            reward.reward_model_source = self.reward_source
             for execution in executions:
                 execution.reward_model_reward = None
-            return reward, {"source": "gfam_v1", "status": "unscored",
+            return reward, {"source": self.reward_source, "status": "unscored",
                             "backend": scored.get("backend"), "error": scored["error"],
                             "selection_reward": None, "compiled_rewards": {},
                             "graph_summary": scored.get("graph_summary", {})}
+        # Legacy embedded scorer fixtures retain their original contract. All new
+        # providers must return a finite score for every executed node and scope.
+        if self.reward_source != "gfam_v1":
+            validate_result(scored, {"executions": executions})
         compiled_rewards = scored.get("compiled_rewards", {})
         selector_payload = compiled_rewards.get("selector", {})
         final_payload = compiled_rewards.get("final", {})
@@ -464,14 +474,14 @@ class HierarchicalReMAOrchestrator:
                     continue
                 assignment.reward_model_reward = float(assignment_payload["reward"])
                 selector_decision_rewards.append(assignment.reward_model_reward)
-        # Under GFAM, keep the selection-level reward aligned with whole-rollout
+        # Keep the selection-level reward aligned with whole-rollout
         # quality, not the mean selector-action reward. Per-assignment selector
         # rewards already flow through assignment.reward_model_reward.
         if "reward" in final_payload:
             reward.total_reward = float(final_payload["reward"])
         else:
             reward.total_reward = float(selector_payload.get("reward", reward.total_reward))
-        reward.reward_model_source = "gfam_v1"
+        reward.reward_model_source = self.reward_source
         for execution in executions:
             worker_payload = worker_payloads.get(execution.node_id)
             if worker_payload is not None and "reward" in worker_payload:
@@ -484,11 +494,12 @@ class HierarchicalReMAOrchestrator:
                   f"executor_rollout={selection.selection_id} reason={training_safety['reason']} "
                   f"threshold={training_safety['threshold']}; scores retained for audit", flush=True)
         return reward, {
-            "source": "gfam_v1",
+            "source": self.reward_source,
             "status": "scored",
             "training_safety": training_safety,
-            "backend": scored.get("backend", "gfam_v1"),
+            "backend": scored.get("backend", self.reward_source),
             "model_predictions": scored.get("model_predictions", {}),
+            "reward_evidence": scored.get("reward_evidence", {}),
             "prm_step_scores": scored.get("prm_step_scores", []),
             "selection_reward": reward.total_reward,
             "selector_reward_mean": (
@@ -502,7 +513,7 @@ class HierarchicalReMAOrchestrator:
 
     @staticmethod
     def _decomposer_reward_for_selection(selection_rollout: SelectionRollout) -> float:
-        if selection_rollout.reward.reward_model_source == "gfam_v1":
+        if selection_rollout.reward.reward_model_source in COMPILED_SOURCES:
             compiled_rewards = selection_rollout.reward_model_outputs.get("compiled_rewards", {})
             decomposer_payload = compiled_rewards.get("decomposer", {})
             if "reward" in decomposer_payload:
@@ -642,7 +653,7 @@ class HierarchicalReMAOrchestrator:
                     selection_training_rewards=decomposer_selection_rewards,
                 )
                 if any(
-                    selection.reward.reward_model_source == "gfam_v1"
+                    selection.reward.reward_model_source in COMPILED_SOURCES
                     for selection in selection_rollouts
                 ):
                     decomposition_reward = base_decomposition_reward
@@ -720,7 +731,7 @@ class HierarchicalReMAOrchestrator:
                     rollout_config.resolved_alternating_decomposer_num_executor_rollouts(),
                 )
                 if (
-                    self.gfam_reward_scorer is not None
+                    self.reward_provider is not None
                     and rollout_config.resolved_gfam_decomposer_max_executor_rollouts() > 0
                 ):
                     num_executor_rollouts = min(
@@ -760,13 +771,13 @@ class HierarchicalReMAOrchestrator:
         worker_pool: WorkerPoolConfig,
         progress_label: str | None = None,
     ) -> Dict[tuple[int, int, int], SelectionRollout]:
-        batch_size = max(1, int(getattr(self.gfam_reward_scorer, "rollout_batch_size", 1)))
+        batch_size = max(1, int(getattr(self.reward_provider, "rollout_batch_size", 1)))
         with StageProgress("reward_scoring", len(selection_states), context=progress_label) as progress:
             with RewardPipeline(
                 lambda states: self._score_selection_states(states, progress),
                 batch_size=batch_size,
                 max_pending=positive_env("GFAM_REWARD_QUEUE_BATCHES", 2),
-                overlap=self.gfam_reward_scorer is not None and enabled("GFAM_OVERLAP_REWARDS"),
+                overlap=self.reward_provider is not None and enabled("GFAM_OVERLAP_REWARDS"),
             ) as pipeline:
                 self._generate_selection_states(selection_states, worker_pool, pipeline, progress_label)
                 results = pipeline.finish()
@@ -864,8 +875,8 @@ class HierarchicalReMAOrchestrator:
 
     def _score_selection_states(self, active_states, progress):
         selection_rollout_map: Dict[tuple[int, int, int], SelectionRollout] = {}
-        score_batch = getattr(self.gfam_reward_scorer, "score_rollouts", None)
-        batch_size = max(1, int(getattr(self.gfam_reward_scorer, "rollout_batch_size", 1)))
+        score_batch = getattr(self.reward_provider, "score_rollouts", None)
+        batch_size = max(1, int(getattr(self.reward_provider, "rollout_batch_size", 1)))
         workers = positive_env("REMA_VERIFIER_WORKERS", 1)
         if workers > 16:
             raise ValueError("REMA_VERIFIER_WORKERS must be at most 16")
@@ -898,7 +909,7 @@ class HierarchicalReMAOrchestrator:
                         raise ValueError("Reward scorer returned misaligned batch results")
                     scored = dict(zip(request_indices, results))
                 for index, (state, final_answer, reward) in enumerate(pending):
-                    reward, reward_model_outputs = self._apply_gfam_reward_model(
+                    reward, reward_model_outputs = self._apply_reward_provider(
                         task=state.task, decomposition=state.decomposition, selection=state.selection,
                         executions=state.executions, final_answer=final_answer, reward=reward,
                         scored=scored.get(index))
@@ -948,7 +959,7 @@ class HierarchicalReMAOrchestrator:
             task_metadata=task.metadata,
             final_node_id=decomposition.final_node_id,
         )
-        reward, reward_model_outputs = self._apply_gfam_reward_model(
+        reward, reward_model_outputs = self._apply_reward_provider(
             task=task,
             decomposition=decomposition,
             selection=selection,
@@ -1387,6 +1398,7 @@ class HierarchicalGRPOTrainer:
     train_worker_model: bool = False
     min_worker_grpo_group_size: int = 3
     gfam_reward_scorer: GFAMRewardScorer | None = None
+    reward_provider: RewardProvider | None = None
 
     def __post_init__(self) -> None:
         if self.backend is None:
@@ -1416,6 +1428,7 @@ class HierarchicalGRPOTrainer:
             train_worker_model=self.train_worker_model,
             min_worker_grpo_group_size=self.min_worker_grpo_group_size,
             gfam_reward_scorer=self.gfam_reward_scorer,
+            reward_provider=self.reward_provider,
         )
         self._current_phase = AlternatingPhase.EXECUTOR
 

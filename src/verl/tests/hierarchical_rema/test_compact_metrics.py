@@ -125,7 +125,7 @@ def test_integrated_counters_accumulate_per_policy_not_logging_steps(tmp_path, m
     monkeypatch.setattr(train, 'run_offline_policy_training', learner)
     monkeypatch.setattr(train, '_tracking', lambda *a, **kw: NS(
         last_step=0, log=lambda values, step: events.append(values), finish=lambda: None))
-    monkeypatch.setattr(sys, 'argv', ['train.py', '--backend', 'mock', '--task-source', 'demo',
+    monkeypatch.setattr(sys, 'argv', ['train.py', '--reward-setting', 'handcrafted', '--backend', 'mock', '--task-source', 'demo',
         '--mode', 'alternating', '--phase', 'executor', '--num-epochs', '3',
         '--parameter-sharing', '--train-worker-model', '--num-decompositions', '3',
         '--num-executor-rollouts', '4', '--rollout-task-batch-size', '1',

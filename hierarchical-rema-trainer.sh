@@ -22,6 +22,7 @@ fi
 if [[ -f "$SOURCE_DIR/env.sh" ]]; then
     source "$SOURCE_DIR/env.sh"
 fi
+source "$SOURCE_DIR/scripts/reward-setting.sh"
 
 JOB_ID=${SLURM_JOB_ID:-manual}
 RUN_KIND=${RUN_KIND:-rollout}  # rollout | train
@@ -77,6 +78,10 @@ else
 fi
 SIF_IMAGE_PATH=${SIF_IMAGE_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v3.sif}
 GFAM_REWARD_MODEL_PKL_PATH=${GFAM_REWARD_MODEL_PKL_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/jmoska/hierarchical_rema/best_overall_model.pkl}
+if [[ "$REWARD_SETTING" != "gnn_prm" ]]; then
+    # No S3 checkpoint staging, torch scorer or encoder bootstrap for these sources.
+    GFAM_REWARD_MODEL_PKL_PATH=""
+fi
 GFAM_REWARD_GPU_RESERVATION=${GFAM_REWARD_GPU_RESERVATION:-1}
 GFAM_REWARD_MODEL_DEVICE=${GFAM_REWARD_MODEL_DEVICE:-cuda:0}
 GFAM_REWARD_MODEL_ENCODER_BACKEND=${GFAM_REWARD_MODEL_ENCODER_BACKEND:-}
@@ -321,7 +326,7 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-true}
 TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-false}
 ENABLE_WANDB=${ENABLE_WANDB:-false}
 WANDB_PROJECT=${WANDB_PROJECT:-multi-grpo-rema}
-WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-${MODE_TAG}-${PARAMETER_SHARING_TAG}-${MODEL_NAME_TAG}-${JOB_ID}}
+WANDB_EXPERIMENT_NAME=${WANDB_EXPERIMENT_NAME:-${MODE_TAG}-${PARAMETER_SHARING_TAG}-${MODEL_NAME_TAG}-${REWARD_SETTING}-${JOB_ID}}
 WANDB_DIR=${WANDB_DIR:-$RUN_ROOT/wandb}
 WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-$RUN_ROOT/wandb_cache}
 WANDB_ARTIFACT_DIR=${WANDB_ARTIFACT_DIR:-$RUN_ROOT/wandb_artifacts}
@@ -508,10 +513,9 @@ if [[ "$VLLM_ENABLE_SLEEP_MODE" == "1" || "$VLLM_ENABLE_SLEEP_MODE" == "true" ||
     VLLM_SLEEP_MODE_FLAG="--enable-vllm-sleep-mode"
 fi
 
-GFAM_REWARD_MODEL_FLAGS=""
+GFAM_REWARD_MODEL_FLAGS="--gfam-bad-class-penalty ${GFAM_BAD_CLASS_PENALTY}"
 if [[ -n "$GFAM_REWARD_MODEL_PKL_PATH" ]]; then
-    GFAM_REWARD_MODEL_FLAGS="--gfam-reward-model-pkl ${LOCAL_GFAM_REWARD_MODEL_PKL_PATH} --gfam-reward-model-device ${GFAM_REWARD_MODEL_DEVICE}"
-    GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-bad-class-penalty ${GFAM_BAD_CLASS_PENALTY}"
+    GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-reward-model-pkl ${LOCAL_GFAM_REWARD_MODEL_PKL_PATH} --gfam-reward-model-device ${GFAM_REWARD_MODEL_DEVICE}"
     GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-prm-device ${GFAM_PRM_DEVICE} --gfam-prm-torch-dtype ${GFAM_PRM_TORCH_DTYPE} --gfam-prm-max-length ${GFAM_PRM_MAX_LENGTH} --gfam-encoder-device ${GFAM_ENCODER_DEVICE}"
     if [[ -n "$GFAM_FEATURE_CACHE_DIR" ]]; then
         GFAM_REWARD_MODEL_FLAGS="${GFAM_REWARD_MODEL_FLAGS} --gfam-feature-cache-dir ${GFAM_FEATURE_CACHE_DIR}"
@@ -536,6 +540,14 @@ fi
 GPU_PARTITION="python3 /verl/verl/hierarchical_rema/gpu_partition.py --reserve ${GFAM_REWARD_GPU_RESERVATION}"
 if [[ "$GFAM_REWARD_GPU_RESERVATION" != "0" && "$GFAM_REWARD_GPU_RESERVATION" != "1" ]]; then
     echo "GFAM_REWARD_GPU_RESERVATION must be 0 or 1" >&2; exit 1
+fi
+COACH_SUPERVISOR=""
+if [[ "$REWARD_SETTING" == "llm_coach" && "${REMA_COACH_BACKEND:-}" == "local_vllm" ]]; then
+    if [[ "$GFAM_REWARD_GPU_RESERVATION" != "1" ]]; then
+        echo "Local vLLM coach requires GFAM_REWARD_GPU_RESERVATION=1; refusing policy GPU sharing" >&2
+        exit 1
+    fi
+    COACH_SUPERVISOR="python3 -m hierarchical_rema.reward_providers.local_coach --output-dir ${LOCAL_OUTPUT_DIR} --"
 fi
 if [[ "$GFAM_REWARD_GPU_RESERVATION" == "1" ]]; then
     if [[ "$BACKEND" != "vllm" || "$POLICY_GPU_CAPACITY" -lt 1 || -z "${SLURM_JOB_NODELIST:-}" ]]; then
@@ -1006,6 +1018,13 @@ RAY_CPUS_PER_NODE=$RAY_CPUS_PER_NODE
 MULTINODE_RAY_ENABLED=$MULTINODE_RAY_ENABLED
 RAY_NNODES=$RAY_NNODES
 RAY_N_GPUS_PER_NODE=$RAY_N_GPUS_PER_NODE
+REWARD_SETTING=$REWARD_SETTING
+REMA_COACH_BACKEND=${REMA_COACH_BACKEND:-<unused>}
+REMA_COACH_MODEL=${REMA_COACH_MODEL:-<unused>}
+REMA_COACH_REVISION=${REMA_COACH_REVISION:-<unused>}
+REMA_COACH_MAX_MODEL_LEN=${REMA_COACH_MAX_MODEL_LEN:-<unused>}
+REMA_COACH_MAX_NUM_SEQS=${REMA_COACH_MAX_NUM_SEQS:-<unused>}
+REMA_COACH_GPU_MEMORY_UTILIZATION=${REMA_COACH_GPU_MEMORY_UTILIZATION:-<unused>}
 GFAM_REWARD_GPU_RESERVATION=$GFAM_REWARD_GPU_RESERVATION
 GFAM_FEATURE_CACHE_DIR=$GFAM_FEATURE_CACHE_DIR
 GFAM_REWARD_BATCH_SIZE=$GFAM_REWARD_BATCH_SIZE
@@ -1333,6 +1352,10 @@ write_run_metadata
 
 echo "[hierarchical-rema] starting run"
 echo "[hierarchical-rema] RUN_KIND=$RUN_KIND"
+echo "[hierarchical-rema] REWARD_SETTING=$REWARD_SETTING"
+if [[ "$REWARD_SETTING" == "llm_coach" ]]; then
+    echo "[hierarchical-rema] coach_backend=$REMA_COACH_BACKEND coach_model=$REMA_COACH_MODEL"
+fi
 echo "[hierarchical-rema] LOCAL_OUTPUT_DIR=$LOCAL_OUTPUT_DIR"
 echo "[hierarchical-rema] DISTRIBUTED_OFFLINE_INPUT_ROOT=$DISTRIBUTED_OFFLINE_INPUT_ROOT"
 echo "[hierarchical-rema] reward_gpu_reservation_per_node=$GFAM_REWARD_GPU_RESERVATION policy_gpus_per_node=$RAY_N_GPUS_PER_NODE reward_device=$GFAM_PRM_DEVICE"
@@ -1370,7 +1393,9 @@ export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
 export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
-${GPU_PARTITION} --role reward -- python3 -m hierarchical_rema.demo \
+${GPU_PARTITION} --role reward -- ${COACH_SUPERVISOR} python3 -m hierarchical_rema.demo \
+  --reward-setting ${REWARD_SETTING} \
+  ${GFAM_REWARD_MODEL_FLAGS} \
   --backend ${BACKEND} \
   --task ${TASK} \
   --mode ${MODE} \
@@ -1396,10 +1421,6 @@ ${GPU_PARTITION} --role reward -- python3 -m hierarchical_rema.demo \
   --ray-nnodes ${RAY_NNODES} \
   --ray-n-gpus-per-node ${RAY_N_GPUS_PER_NODE} \
   --ray-cpus-per-node ${RAY_CPUS_PER_NODE} \
-  ${OFFLINE_GRPO_DISTRIBUTED_FLAG} \
-  --offline-grpo-nnodes ${OFFLINE_GRPO_NNODES} \
-  --offline-grpo-gpus-per-node ${OFFLINE_GRPO_GPUS_PER_NODE} \
-  --offline-grpo-master-port ${OFFLINE_GRPO_MASTER_PORT} \
   --vllm-tensor-parallel-size ${VLLM_TENSOR_PARALLEL_SIZE} \
   --vllm-gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION} \
   --vllm-max-num-batched-tokens ${VLLM_MAX_NUM_BATCHED_TOKENS} \
@@ -1424,7 +1445,8 @@ export RAY_TMPDIR=${RAY_LOCAL_TMPDIR}; \
 export RAY_ADDRESS=\${RAY_ADDRESS:-}; \
 export RAY_NAMESPACE=\${RAY_NAMESPACE:-}; \
 mkdir -p ${LOCAL_OUTPUT_DIR}; \
-${GPU_PARTITION} --role reward -- python3 -m hierarchical_rema.train \
+${GPU_PARTITION} --role reward -- ${COACH_SUPERVISOR} python3 -m hierarchical_rema.train \
+  --reward-setting ${REWARD_SETTING} \
   --task-source ${TASK_SOURCE_RUNTIME} \
   --task-format ${TASK_FORMAT} \
   --prompt-key ${PROMPT_KEY} \

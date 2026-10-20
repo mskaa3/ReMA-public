@@ -206,6 +206,9 @@ def _refresh_best_model_snapshots(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Integrated hierarchical ReMA training: tasks -> rollouts -> GRPO update")
+    from .reward_providers.factory import SETTINGS
+    parser.add_argument("--reward-setting", choices=SETTINGS, default=os.environ.get("REWARD_SETTING", "gnn_prm"),
+                        help="One fixed reward provider for this run; no silent fallback")
     parser.add_argument("--task-source", default="demo", help="Task dataset path or the special value 'demo'")
     parser.add_argument("--task-format", choices=["auto", "demo", "jsonl", "json", "parquet"], default="auto")
     parser.add_argument("--prompt-key", default="question")
@@ -1940,22 +1943,8 @@ def _build_rollout_trainer(
         if args.final_answer_correctness_reward_only
         else WorkerRewardMode.CURRENT
     )
-    gfam_reward_scorer = None
-    if score_reward_model and getattr(args, "gfam_reward_model_pkl", ""):
-        from .gfam_reward import load_cached_reward_scorer
-
-        gfam_reward_scorer = load_cached_reward_scorer(
-            checkpoint_path=args.gfam_reward_model_pkl,
-            device=args.gfam_reward_model_device,
-            encoder_backend=args.gfam_reward_model_encoder_backend,
-            encoder_model=args.gfam_reward_model_encoder_model,
-            prm_device=getattr(args, "gfam_prm_device", "cpu"),
-            bad_class_penalty=getattr(args, "gfam_bad_class_penalty", 1.0),
-            prm_torch_dtype=getattr(args, "gfam_prm_torch_dtype", "auto"),
-            prm_max_length=getattr(args, "gfam_prm_max_length", 0),
-            feature_cache_dir=getattr(args, "gfam_feature_cache_dir", None),
-            encoder_device=getattr(args, "gfam_encoder_device", None),
-        )
+    from .reward_providers import build_reward_provider
+    reward_provider = build_reward_provider(args) if score_reward_model else None
     return HierarchicalGRPOTrainer(
         reward_weights=RewardWeights(
             final_answer=args.final_answer_reward_weight,
@@ -2019,7 +2008,7 @@ def _build_rollout_trainer(
         track_workers_history=args.track_workers_history,
         train_worker_model=args.train_worker_model,
         min_worker_grpo_group_size=args.min_worker_grpo_group_size,
-        gfam_reward_scorer=gfam_reward_scorer,
+        reward_provider=reward_provider,
     )
 
 
@@ -2108,7 +2097,8 @@ def run_external_validation(
     from .validation import validation_mode, ValidationAudit, hide_uncomputed_rewards, diagnostic_examples
     mode = validation_mode(args, epoch_number)
     score_rewards = mode == "diagnostic"
-    reward_model_enabled = score_rewards and bool(getattr(args, "gfam_reward_model_pkl", ""))
+    from .reward_providers import reward_setting
+    reward_model_enabled = score_rewards and reward_setting(args) is not None
     examples_limit = int(getattr(args, "val_diagnostic_examples", 30))
     if examples_limit < 0:
         raise ValueError("val_diagnostic_examples must be nonnegative")
@@ -2369,6 +2359,8 @@ def _sync_worker_pool_model_path(worker_pool, current_paths: Dict[str, str]) -> 
 
 def main() -> None:
     args = parse_args()
+    from .reward_providers.factory import validate_reward_setting, reward_setting, write_reward_manifest
+    validate_reward_setting(args)
     if args.val_task_source and not args.disable_external_validation:
         from .validation import validation_mode
         validation_mode(args, 1)  # Fail before training on incompatible validation settings.
@@ -2379,6 +2371,7 @@ def main() -> None:
         raise ValueError("Persistent policy engines require vLLM and distributed offline GRPO")
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    write_reward_manifest(args, output_dir)
     resolved_task_source = _resolve_task_source_path(args.task_source)
     resolved_val_task_source = None if args.disable_external_validation or not args.val_task_source else _resolve_task_source_path(args.val_task_source)
 
@@ -2519,7 +2512,7 @@ def main() -> None:
         rollout_config = _rollout_config_for_schedule(
             base_rollout_config,
             schedule,
-            use_gfam_reward_model=bool(getattr(args, "gfam_reward_model_pkl", "")),
+            use_gfam_reward_model=reward_setting(args) is not None,
         )
         if (
             rollout_config.num_decompositions != base_rollout_config.num_decompositions
