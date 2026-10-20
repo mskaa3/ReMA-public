@@ -63,20 +63,43 @@ them or that every worker performed the correct subtask.
 
 ## Frozen endpoint
 
+The default evaluator is **`Qwen/Qwen3-4B-Instruct-2507`**, using its original
+instruction-tuned weights, independently of the worker and decomposer models.
+This choice applies only to these five evaluation metrics, not the existing
+training leakage probes or reward gates.
+
 The evaluator must be separate from the actors being trained. Serve one fixed
 SLM checkpoint with an OpenAI-compatible `/v1/chat/completions` API. Do not
 hot-swap its weights or reuse a moving actor behind the same model name. The
 response's `model` identifier must match `VALIDATION_PROBE_MODEL`.
 
-For example, in a separate allocated GPU session with vLLM available:
+Use a separate allocated GPU session with a Qwen3-compatible environment. The
+[official model card](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
+specifies vLLM >= 0.8.5 and Transformers >= 4.51.0. This is the non-thinking
+variant; no thinking-mode flag is needed. The training container does not need
+these upgrades because it only sends HTTP requests to the evaluator.
+
+Choose one immutable Hugging Face commit revision for the experiment and set
+`PROBE_REVISION` to its full hash. Reuse it on every server restart. The client
+checks the served name, not the underlying weights, so retain the revision and
+server environment with the experiment records.
 
 ```bash
+: "${PROBE_REVISION:?Set the fixed Hugging Face commit hash for the probe}"
 python3 -m vllm.entrypoints.openai.api_server \
-  --model /path/to/immutable/probe-huggingface \
-  --served-model-name eac3-probe-v1 \
+  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --revision "$PROBE_REVISION" \
+  --tokenizer-revision "$PROBE_REVISION" \
+  --served-model-name Qwen/Qwen3-4B-Instruct-2507 \
   --host 0.0.0.0 --port 8000 \
+  --max-model-len 16384 \
   --generation-config vllm
 ```
+
+The server context limit above includes input and output tokens; it is not the
+output budget. Increase it if the captured inputs require it rather than
+silently truncating them. Before training, check `/v1/models` at the chosen
+server address and confirm the served model name.
 
 Use a cluster-internal address accessible from the trainer's Ray TaskRunner,
 not `localhost` on the login node. Follow cluster networking rules and restrict
@@ -87,7 +110,8 @@ Enable it for the usual Agent-1/Agent-2 or experiment launcher:
 
 ```bash
 export VALIDATION_PROBE_URL="http://PROBE_NODE:8000/v1"
-export VALIDATION_PROBE_MODEL="eac3-probe-v1"
+# Optional: already the default when VALIDATION_PROBE_URL is supplied.
+export VALIDATION_PROBE_MODEL="Qwen/Qwen3-4B-Instruct-2507"
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=32
 export VALIDATION_PROBE_MAX_NEW_TOKENS=256
 # Optional if the server requires authentication:
@@ -96,14 +120,16 @@ export VALIDATION_PROBE_MAX_NEW_TOKENS=256
 # Then use your existing sbatch command and checkpoint/model settings.
 ```
 
-Both URL and model must be specified. Without them the new probes remain off;
-accuracy and the reorganized diagnostics still log normally. The same options
-are available to direct Hydra invocations:
+Setting the URL enables the new metrics and defaults to the model above.
+An explicit `VALIDATION_PROBE_MODEL` can override the served name. With neither
+variable set, probes remain off; specifying only a model is a configuration
+error. Accuracy and the reorganized diagnostics still log normally when probes
+are off. The same options are available to direct Hydra invocations:
 
 ```text
 trainer.validation_probe.enable=True
 trainer.validation_probe.base_url=http://PROBE_NODE:8000/v1
-trainer.validation_probe.model=eac3-probe-v1
+trainer.validation_probe.model=Qwen/Qwen3-4B-Instruct-2507
 trainer.validation_probe.samples_per_dataset=32
 trainer.validation_probe.max_new_tokens=256
 ```
@@ -113,6 +139,11 @@ trainer.validation_probe.max_new_tokens=256
 generations per selected trajectory, before input deduplication. For seven
 datasets with 32 questions each, that is at most 672 generations, independent
 of the existing gate probes. Avoid silently truncating prompts at the server.
+
+The output budget remains 256 tokens. Calibrate truncation and recovery rates
+on a small sample before adopting this budget for the study; changing models
+does not establish that 256 tokens is sufficient. Freeze the chosen budget
+and rerun both experimental conditions if it changes.
 
 ## Logging layout
 

@@ -388,11 +388,11 @@ trainer:
   # Optional full JSONL evidence, independent of console/W&B sample selection.
   validation_output_dir: null
   # Separate frozen SLM endpoint; never reused from the actors being trained.
-  # Set VALIDATION_PROBE_URL and VALIDATION_PROBE_MODEL to enable in Slurm scripts.
+  # Set VALIDATION_PROBE_URL to enable in Slurm scripts; model override is optional.
   validation_probe:
     enable: False
     base_url: null
-    model: null
+    model: Qwen/Qwen3-4B-Instruct-2507
     samples_per_dataset: 32
     max_new_tokens: 256
     timeout_seconds: 180

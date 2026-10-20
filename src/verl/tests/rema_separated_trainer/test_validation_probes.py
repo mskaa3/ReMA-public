@@ -7,7 +7,9 @@ import io
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -45,6 +47,39 @@ def extract_method(name):
 
 
 class ValidationProbeTests(unittest.TestCase):
+    def test_launcher_defaults_to_qwen_only_when_endpoint_is_configured(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        start = launcher.index('export VALIDATION_PROBE_URL=')
+        end = launcher.index('\nexport SIF_NAME=', start)
+        shell = 'set -euo pipefail\n' + launcher[start:end]
+        shell += '\nprintf "MODEL=%s\\n" "$VALIDATION_PROBE_MODEL"\n'
+        clean_env = {key: value for key, value in os.environ.items()
+                     if not key.startswith('VALIDATION_PROBE_')}
+        cases = [
+            ({}, '', 0),
+            ({'VALIDATION_PROBE_URL': 'http://probe:8000/v1'}, 'Qwen/Qwen3-4B-Instruct-2507', 0),
+            ({'VALIDATION_PROBE_URL': 'http://probe:8000/v1',
+              'VALIDATION_PROBE_MODEL': 'custom-frozen-v1'}, 'custom-frozen-v1', 0),
+            ({'VALIDATION_PROBE_MODEL': 'custom-frozen-v1'}, None, 1),
+        ]
+        for overrides, model, code in cases:
+            with self.subTest(overrides=overrides):
+                result = subprocess.run(['bash', '-c', shell], env={**clean_env, **overrides},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, code, result.stderr)
+                if code == 0:
+                    self.assertIn(f'MODEL={model}\n', result.stdout)
+                else:
+                    self.assertIn('Set VALIDATION_PROBE_URL', result.stderr)
+
+    def test_configured_probe_model_matches_launcher_default(self):
+        for path in (ROOT / 'config/rema-rl.yaml',
+                     ROOT / 'src/verl/verl/rema_separated_trainer/config/ppo_trainer.yaml'):
+            with self.subTest(path=path):
+                config = path.read_text().split('  validation_probe:\n', 1)[1]
+                self.assertTrue(config.startswith('    enable: False\n    base_url: null\n'
+                                                 '    model: Qwen/Qwen3-4B-Instruct-2507\n'))
+
     def test_context_conditions_preserve_boundaries(self):
         inputs = example().inputs
         self.assertEqual(inputs['terminal_only'], 'CURRENT TASK:\nS2: Add 20 to S1.')

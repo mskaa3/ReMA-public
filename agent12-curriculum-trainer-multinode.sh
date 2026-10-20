@@ -22,9 +22,11 @@ export VALIDATION_PROBE_URL=${VALIDATION_PROBE_URL:-}
 export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-}
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=${VALIDATION_PROBE_SAMPLES_PER_DATASET:-32}
 export VALIDATION_PROBE_MAX_NEW_TOKENS=${VALIDATION_PROBE_MAX_NEW_TOKENS:-256}
-if [[ -n "$VALIDATION_PROBE_URL" && -z "$VALIDATION_PROBE_MODEL" ]] || \
-   [[ -z "$VALIDATION_PROBE_URL" && -n "$VALIDATION_PROBE_MODEL" ]]; then
-    echo "Set both VALIDATION_PROBE_URL and VALIDATION_PROBE_MODEL for frozen evaluation probes" >&2
+if [[ -n "$VALIDATION_PROBE_URL" ]]; then
+    export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-Qwen/Qwen3-4B-Instruct-2507}
+    echo "Frozen validation probe: ${VALIDATION_PROBE_MODEL} (evaluation only)"
+elif [[ -n "$VALIDATION_PROBE_MODEL" ]]; then
+    echo "Set VALIDATION_PROBE_URL to use the frozen evaluation probe" >&2
     exit 1
 fi
 

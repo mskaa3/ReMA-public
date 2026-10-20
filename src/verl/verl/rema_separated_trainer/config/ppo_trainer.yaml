@@ -216,7 +216,7 @@ trainer:
   validation_probe:
     enable: False
     base_url: null
-    model: null
+    model: Qwen/Qwen3-4B-Instruct-2507
     samples_per_dataset: 32
     max_new_tokens: 256
     timeout_seconds: 180
