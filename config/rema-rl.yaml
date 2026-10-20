@@ -387,6 +387,16 @@ trainer:
   val_only: False  # True for evaluation only
   # Optional full JSONL evidence, independent of console/W&B sample selection.
   validation_output_dir: null
+  # Separate frozen SLM endpoint; never reused from the actors being trained.
+  # Set VALIDATION_PROBE_URL and VALIDATION_PROBE_MODEL to enable in Slurm scripts.
+  validation_probe:
+    enable: False
+    base_url: null
+    model: null
+    samples_per_dataset: 32
+    max_new_tokens: 256
+    timeout_seconds: 180
+    concurrency: 4
   val_generations_to_log_to_wandb: 0
   nnodes: 1
   n_gpus_per_node: 2

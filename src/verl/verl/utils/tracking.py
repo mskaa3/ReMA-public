@@ -169,6 +169,7 @@ def _flatten_dict(raw: Dict[str, Any], *, sep: str) -> Dict[str, Any]:
 
 @dataclasses.dataclass
 class ValidationGenerationsLogger:
+    metric_key: str = "val/generations"
 
     def log(self, loggers, samples, step):
         if 'wandb' in loggers:
@@ -200,7 +201,7 @@ class ValidationGenerationsLogger:
         new_table.add_data(*row_data)
 
         # Update reference and log
-        wandb.log({"val/generations": new_table}, step=step)
+        wandb.log({self.metric_key: new_table}, step=step)
         self.validation_table = new_table
 
     def log_generations_to_swanlab(self, samples, step):
@@ -223,4 +224,4 @@ class ValidationGenerationsLogger:
             swanlab_text_list.append(swanlab.Text(row_text, caption=f"sample {i+1}"))
 
         # Log to swanlab
-        swanlab.log({"val/generations": swanlab_text_list}, step=step)
+        swanlab.log({self.metric_key: swanlab_text_list}, step=step)

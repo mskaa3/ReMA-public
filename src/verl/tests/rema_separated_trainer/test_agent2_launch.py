@@ -184,6 +184,19 @@ def test_routed_rollout_visibility_and_c3(launch_trainer, task_count, focal_inde
         assert "PREVIOUS LOCAL RESULTS:" not in terminal_input
         assert "PRIVATE_" not in terminal_input and question not in terminal_input
         assert "\\boxed{10}" not in terminal_input
+        terminal_record = next(record for record in records if record['role'] == terminal)
+        if validation:
+            inputs = terminal_record['validation_probe_inputs']
+            for text in inputs.values():
+                assert question not in text and 'PRIVATE_' not in text
+                assert terminal_constraints in text
+            assert 'PREVIOUS LOCAL RESULTS:' not in inputs['terminal_only']
+            assert 'Compute intermediate 1' in inputs['with_instructions']
+            assert ('PREVIOUS LOCAL RESULTS:' in inputs['with_results']) is (task_count > 1)
+            if task_count > 1:
+                assert 'Compute intermediate 1' not in inputs['with_results']
+        else:
+            assert 'validation_probe_inputs' not in terminal_record
         for earlier in range(1, task_count):
             assert f"Compute intermediate {earlier}" not in terminal_input
     for chat in generated_chats["decomposer"]:
@@ -253,12 +266,14 @@ def test_paired_validation_keeps_standard_accuracy_namespace():
     metrics = trainer._validate()
     assert calls == [False, True]
     assert metrics["val/acc/math"] == .25
-    assert metrics["val/teacher_assisted/acc/math"] == .75
-    assert metrics["val/leakage/terminal/rate"] == 0
-    assert metrics["val/teacher_assisted/leakage/terminal/rate"] == 1
+    assert metrics["val_diagnostics/teacher_assisted/acc/math"] == .75
+    assert metrics["val_diagnostics/leakage/terminal/rate"] == 0
+    assert metrics["val_diagnostics/teacher_assisted/leakage/terminal/rate"] == 1
 
 
 def test_real_validation_loop_preserves_context_isolation_and_probe_metrics(launch_trainer, tmp_path):
+    from verl.rema_separated_trainer.ppo.validation_probes import make_probe_inputs, ProbeResponse
+
     trainer = launch_trainer
     trainer.config.data.teacher_assisted_validation = True
     trainer.global_steps = 0
@@ -292,7 +307,9 @@ def test_real_validation_loop_preserves_context_isolation_and_probe_metrics(laun
                 record.update(content=r"LOCAL_RESULT: \boxed{6}", executed=True, assigned_subtasks=["S1"])
             elif record["role"] == "worker_stage_2":
                 record.update(content=r"LOCAL_RESULT: \boxed{26}" if assisted else r"LOCAL_RESULT: \boxed{27}",
-                              executed=True, assigned_subtasks=["S2"], terminal_probe_input="Add 20 to S1.")
+                              executed=True, assigned_subtasks=["S2"], terminal_probe_input="Add 20 to S1.",
+                              validation_probe_inputs=make_probe_inputs(
+                                  'S2: Add 20 to S1.', 'S1: Calculate a.', r'S1 LOCAL_RESULT: \boxed{6}'))
         history = np.empty(1, dtype=object)
         history[0] = records
         return DataProto.from_dict(
@@ -317,6 +334,13 @@ def test_real_validation_loop_preserves_context_isolation_and_probe_metrics(laun
 
     trainer.multi_turn_generate_sequences = generate
     trainer.val_reward_fn = Reward()
+    probe_messages = []
+
+    def generate_frozen_probe(messages):
+        probe_messages.extend(messages)
+        return [ProbeResponse(r'\boxed{UNKNOWN}', 'stop')] * len(messages)
+
+    trainer.validation_probe_client = SimpleNamespace(generate=generate_frozen_probe)
     trainer._generate_prefix_probe_responses = lambda messages: (
         [r"\boxed{UNKNOWN}"] * len(messages), [3] * len(messages), ["stop"] * len(messages),
     )
@@ -326,6 +350,11 @@ def test_real_validation_loop_preserves_context_isolation_and_probe_metrics(laun
     assert contexts == [False, True]
     assert len(logged_tables) == 1
     assert metrics["val/acc/math"] == 0
-    assert metrics["val/teacher_assisted/acc/math"] == 1
-    assert metrics["val/leakage/gated_accuracy"] == 0
-    assert metrics["val/teacher_assisted/leakage/gated_accuracy"] == 1
+    assert metrics["val_diagnostics/teacher_assisted/acc/math"] == 1
+    assert metrics["val_diagnostics/leakage/gated_accuracy"] == 0
+    assert metrics["val_diagnostics/teacher_assisted/leakage/gated_accuracy"] == 1
+    assert metrics['val/probe/math/with_results_acc'] == 0
+    assert metrics['val_diagnostics/probe/math/sample_count'] == 1
+    assert metrics['val_diagnostics/teacher_assisted/probe/math/sample_count'] == 1
+    assert len(probe_messages) == 6
+    assert all('private attempt' not in text and 'held-out question' not in text for text in probe_messages)

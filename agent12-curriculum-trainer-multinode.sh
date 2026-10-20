@@ -17,6 +17,17 @@ export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 export POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
 export RAY_PORT=${RAY_PORT:-6379}
 
+# Independent evaluation endpoint, shared across worker/planner comparisons.
+export VALIDATION_PROBE_URL=${VALIDATION_PROBE_URL:-}
+export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-}
+export VALIDATION_PROBE_SAMPLES_PER_DATASET=${VALIDATION_PROBE_SAMPLES_PER_DATASET:-32}
+export VALIDATION_PROBE_MAX_NEW_TOKENS=${VALIDATION_PROBE_MAX_NEW_TOKENS:-256}
+if [[ -n "$VALIDATION_PROBE_URL" && -z "$VALIDATION_PROBE_MODEL" ]] || \
+   [[ -z "$VALIDATION_PROBE_URL" && -n "$VALIDATION_PROBE_MODEL" ]]; then
+    echo "Set both VALIDATION_PROBE_URL and VALIDATION_PROBE_MODEL for frozen evaluation probes" >&2
+    exit 1
+fi
+
 export SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
 export SIF_REMOTE=${SIF_REMOTE:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/${SIF_NAME}}
 
@@ -416,6 +427,19 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   trainer.wandb_run_id=${AGENT12_WANDB_RUN_ID} \
   trainer.wandb_resume=allow \
   trainer.default_local_dir=${CHECKPOINT_ROOT}"
+
+    if [[ -n "$VALIDATION_PROBE_URL" ]]; then
+        local probe_argument
+        for probe_argument in \
+            "trainer.validation_probe.enable=True" \
+            "trainer.validation_probe.base_url=${VALIDATION_PROBE_URL}" \
+            "trainer.validation_probe.model=${VALIDATION_PROBE_MODEL}" \
+            "trainer.validation_probe.samples_per_dataset=${VALIDATION_PROBE_SAMPLES_PER_DATASET}" \
+            "trainer.validation_probe.max_new_tokens=${VALIDATION_PROBE_MAX_NEW_TOKENS}"; do
+            printf -v probe_argument '%q' "$probe_argument"
+            train_command+=" ${probe_argument}"
+        done
+    fi
 
     # Generated only by the opt-in experiment wrapper; defaults above stay intact.
     train_command+=" ${AGENT12_EXPERIMENT_OVERRIDES:-}"

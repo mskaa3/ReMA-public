@@ -11,6 +11,7 @@ import unicodedata
 import re
 import hashlib
 from verl.rema_separated_trainer.ppo.local_results import extract_local_result
+from verl.rema_separated_trainer.ppo.validation_probes import make_probe_inputs
 
 
 def curriculum_context_is_visible(
@@ -1915,6 +1916,7 @@ class MultiAgentRollout:
             }
             completed_results_by_idx = {idx: [] for idx in revise_indices}
             terminal_probe_input_by_idx = {}
+            validation_probe_inputs_by_idx = {}
             max_stage_count = max(
                 [len(ordered_stages_by_idx[idx]) for idx in revise_indices],
                 default=0,
@@ -2043,6 +2045,17 @@ class MultiAgentRollout:
                             # Same static task input as the terminal, with only
                             # upstream results and their wrapper withheld.
                             terminal_probe_input_by_idx[idx] = question_block + task_block
+                            if prompts.meta_info.get('validate', False):
+                                upstream_tasks = [
+                                    task
+                                    for _, _, tasks in ordered_stages_by_idx[idx][:stage_idx]
+                                    for task in tasks
+                                ]
+                                validation_probe_inputs_by_idx[idx] = make_probe_inputs(
+                                    assigned_subtasks_text,
+                                    self._format_subtasks(upstream_tasks),
+                                    work_so_far,
+                                )
                     stage_records = self._generate_from_hierarchical_chat_map(
                         stage_role,
                         stage_indices,
@@ -2149,6 +2162,8 @@ class MultiAgentRollout:
                             history[idx][-1]["assigned_subtasks"] = assigned_subtask_ids
                             if stage_role == terminal_stage_roles[idx] and idx in terminal_probe_input_by_idx:
                                 history[idx][-1]["terminal_probe_input"] = terminal_probe_input_by_idx[idx]
+                            if stage_role == terminal_stage_roles[idx] and idx in validation_probe_inputs_by_idx:
+                                history[idx][-1]["validation_probe_inputs"] = validation_probe_inputs_by_idx[idx]
 
             if i_turn + 1 < max_num_turns:
                 for idx in revise_indices:

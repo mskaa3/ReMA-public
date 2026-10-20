@@ -73,6 +73,13 @@ from verl.rema_separated_trainer.ppo.prefix_probe import (
     select_console_probe_indices,
     select_stratified_probe_indices,
 )
+from verl.rema_separated_trainer.ppo.validation_probes import (
+    FrozenProbeClient,
+    ProbeExample,
+    evaluate_probes,
+    select_probe_examples,
+    validation_metric_namespace,
+)
 
 
 WorkerType = Type[Worker]
@@ -861,7 +868,7 @@ class RayReMASeparatedTrainer(object):
         self.use_reference_policy = Role.Agent0_RefPolicy in role_worker_mapping
         self.use_rm = Role.Agent0_RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
-        self.validation_generations_logger = ValidationGenerationsLogger()
+        self.validation_generations_logger = ValidationGenerationsLogger(metric_key='val_diagnostics/generations')
 
         # define KL control
         if self.use_reference_policy:
@@ -892,6 +899,25 @@ class RayReMASeparatedTrainer(object):
         self._create_dataloader()
         self._init_scoped_c3_grpo()
         self._init_prefix_probe()
+        self._init_validation_probes()
+
+    def _init_validation_probes(self):
+        config = self.config.trainer.get('validation_probe', {}) or {}
+        self.validation_probe_client = None
+        if not config.get('enable', False):
+            return
+        if not self._get_hierarchy_config().get('terminal_worker_as_answer', False):
+            raise ValueError('Validation information probes require terminal_worker_as_answer=True')
+        if int(config.get('samples_per_dataset', 32)) < 1:
+            raise ValueError('validation_probe.samples_per_dataset must be positive')
+        self.validation_probe_client = FrozenProbeClient(config)
+        print(
+            f'[validation/probe] frozen_model={self.validation_probe_client.model} '
+            f'max_new_tokens={self.validation_probe_client.max_new_tokens} '
+            f'samples_per_dataset={config.get("samples_per_dataset", 32)} '
+            'conditions=terminal_only,with_instructions,with_results; evaluation only',
+            flush=True,
+        )
 
     def _tokenizer_for_role(self, role):
         return getattr(self, 'role_tokenizers', {}).get(role, self.tokenizer)
@@ -2524,13 +2550,10 @@ class RayReMASeparatedTrainer(object):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
-        metrics = self._validate_context(teacher_assisted=False)
+        metrics = validation_metric_namespace(self._validate_context(teacher_assisted=False))
         if self.config.data.get('teacher_assisted_validation', False):
             assisted = self._validate_context(teacher_assisted=True)
-            metrics.update({
-                key.replace('val/', 'val/teacher_assisted/', 1): value
-                for key, value in assisted.items()
-            })
+            metrics.update(validation_metric_namespace(assisted, teacher_assisted=True))
         return metrics
 
     def _validate_context(self, *, teacher_assisted=False):
@@ -2566,6 +2589,8 @@ class RayReMASeparatedTrainer(object):
         probe_extra_infos = []
         probe_strata = []
         val_leakage_metrics = {}
+        information_probe_examples = []
+        information_probe_records = None
         validation_max_samples = int(
             self.prefix_probe_config.get('validation_max_samples', 128)
         ) if self.prefix_probe_enabled else 0
@@ -2720,6 +2745,26 @@ class RayReMASeparatedTrainer(object):
             acc_tensor_lst.append(reward_tensor['acc'])
 
             histories = test_output_gen_batch.non_tensor_batch['history'].tolist()
+            if getattr(self, 'validation_probe_client', None) is not None:
+                from verl.rema_separated_trainer.ppo.experiment_io import question_id
+
+                for index, history in enumerate(histories):
+                    terminal_role = str(dynamic_score_roles[index]) if dynamic_score_roles is not None else score_role
+                    records = answer_round_records(
+                        history, terminal_role, self._get_hierarchy_config().get('decomposer_role', 'decomposer'),
+                    )
+                    terminal = next((record for record in reversed(records)
+                                     if record.get('role') == terminal_role and record.get('executed', True)), {})
+                    source = test_batch.non_tensor_batch['data_source'][index]
+                    information_probe_examples.append(ProbeExample(
+                        question_id=question_id(input_texts[index]),
+                        dataset=str(test_batch.non_tensor_batch.get('subset', ['unknown'] * len(test_batch))[index]),
+                        data_source=source,
+                        ground_truth=ground_truths[index],
+                        extra_info=test_batch.non_tensor_batch.get('extra_info', [None] * len(test_batch))[index],
+                        inputs=terminal.get('validation_probe_inputs'),
+                        system_score=float(reward_tensor['acc'][index].item()),
+                    ))
             if recorder is not None:
                 recorder.add_batch(
                     test_batch.non_tensor_batch, histories, output_texts,
@@ -2999,6 +3044,29 @@ class RayReMASeparatedTrainer(object):
         for data_source, accs in data_source_acc.items():
             metric_dict[f'val/acc/{data_source}'] = np.mean(accs)
         metric_dict.update(val_leakage_metrics)
+        if information_probe_examples:
+            examples = select_probe_examples(
+                information_probe_examples,
+                int(self.config.trainer.validation_probe.get('samples_per_dataset', 32)),
+            )
+            probe_metrics, information_probe_records = evaluate_probes(
+                examples, self.validation_probe_client.generate,
+                lambda responses: self._run_prefix_math_checks(
+                    'parse', responses, metric_dict, validation=True,
+                ),
+                self.val_reward_fn.score_responses,
+            )
+            metric_dict.update(probe_metrics)
+            for dataset in sorted({example.dataset for example in examples}):
+                prefix = f'val/probe/{dataset}'
+                print(
+                    f'[probe/{validation_context}] dataset={dataset} '
+                    f'n={probe_metrics[f"val_diagnostics/probe/{dataset}/sample_count"]} '
+                    + ' '.join(f'{name}={probe_metrics[f"{prefix}/{name}"]:.3f}' for name in (
+                        'terminal_only_acc', 'with_instructions_acc', 'with_results_acc',
+                        'information_gain', 'result_advantage',
+                    )), flush=True,
+                )
 
         # ``round_N_acc`` is the correctness of the answer state after N
         # rounds. Samples that stopped earlier retain their latest candidate.
@@ -3059,7 +3127,8 @@ class RayReMASeparatedTrainer(object):
             metric_dict['val/completion_tokens/min'] = completion_tokens_tensor.min().item()
 
         if recorder is not None:
-            print(f'[validation/records] {recorder.finish(metric_dict)}', flush=True)
+            recorded_metrics = validation_metric_namespace(metric_dict, teacher_assisted=teacher_assisted)
+            print(f'[validation/records] {recorder.finish(recorded_metrics, probe_records=information_probe_records)}', flush=True)
 
         # Save generation results to a JSON file
         if self.config.trainer.get('save_val_generations', False):
@@ -3606,7 +3675,7 @@ class RayReMASeparatedTrainer(object):
             tracker = logger.logger.get(backend)
             if tracker is not None:
                 tracker.define_metric('train/actor_update_step')
-                for pattern in ('val/*', 'actor/*'):
+                for pattern in ('val/*', 'val_diagnostics/*', 'actor/*'):
                     tracker.define_metric(pattern, step_metric='train/actor_update_step')
 
         # perform validation before training

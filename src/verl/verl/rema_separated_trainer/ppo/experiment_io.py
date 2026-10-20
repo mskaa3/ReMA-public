@@ -81,13 +81,21 @@ class ValidationRecorder:
                 stream.write(json.dumps(record, ensure_ascii=True, default=json_default) + "\n")
                 self.count += 1
 
-    def finish(self, metrics):
+    def finish(self, metrics, *, probe_records=None):
         if self.count != self.expected_rows:
             raise ValueError(f"Incomplete evaluation: {self.count}/{self.expected_rows} rows")
         metadata = {
             "schema_version": 1, "rows": self.count, "metrics": metrics,
             "config": self.config, "records_sha256": hashlib.sha256(self.partial.read_bytes()).hexdigest(),
         }
+        if probe_records is not None:
+            probe_path = self.path.with_suffix('.probes.jsonl')
+            probe_partial = probe_path.with_suffix('.jsonl.partial')
+            with probe_partial.open('x') as stream:
+                for record in probe_records:
+                    stream.write(json.dumps(record, ensure_ascii=True, default=json_default) + '\n')
+            metadata['probe_records_sha256'] = hashlib.sha256(probe_partial.read_bytes()).hexdigest()
+            os.replace(probe_partial, probe_path)
         meta_partial = self.path.with_suffix('.metadata.json.partial')
         meta_partial.write_text(json.dumps(metadata, indent=2, ensure_ascii=True, default=json_default) + '\n')
         os.replace(self.partial, self.path)

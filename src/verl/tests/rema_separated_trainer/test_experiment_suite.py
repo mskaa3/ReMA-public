@@ -398,7 +398,11 @@ class ExperimentTests(unittest.TestCase):
                     with self.subTest(arm=arm, phase=phase):
                         run = suite.make_runs(cfg, phase)[0]
                         env = {**os.environ, **{k: str(v) for k, v in suite.run_environment(run).items()},
-                               'SLURM_JOB_ID': '123', 'SLURM_NNODES': '4', 'CAPTURE': str(capture)}
+                               'SLURM_JOB_ID': '123', 'SLURM_NNODES': '4', 'CAPTURE': str(capture),
+                               'VALIDATION_PROBE_URL': 'http://probe-node:8000/v1',
+                               'VALIDATION_PROBE_MODEL': 'frozen-probe-v1',
+                               'VALIDATION_PROBE_SAMPLES_PER_DATASET': '12',
+                               'VALIDATION_PROBE_MAX_NEW_TOKENS': '256'}
                         shell = defaults + '\nsrun() { printf "%s\\n" "${!#}" > "$CAPTURE"; }\n'
                         shell += 'HEAD_NODE=head; IP_HEAD=head:6379; COMMON_MOUNTS=(--nv)\n' + function
                         shell += '\nrun_agent12_training /tmp/train.parquet "$TOTAL_STEPS" True True\n'
@@ -415,6 +419,10 @@ class ExperimentTests(unittest.TestCase):
                         self.assertEqual(opts['trainer.max_actor_updates'], '40')
                         self.assertEqual(opts['trainer.val_only'], 'false')
                         self.assertEqual(opts['trainer.save_freq'], '10')
+                        self.assertEqual(opts['trainer.validation_probe.enable'], 'True')
+                        self.assertEqual(opts['trainer.validation_probe.model'], 'frozen-probe-v1')
+                        self.assertEqual(opts['trainer.validation_probe.base_url'], 'http://probe-node:8000/v1')
+                        self.assertEqual(opts['trainer.validation_probe.samples_per_dataset'], '12')
                         self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training'],
                                          str(planner or arm == 'gated').lower())
                         # Both training modes must continue past evaluation upload to HF export.
@@ -686,6 +694,10 @@ rclone() { echo 'unexpected S3 transfer' >&2; return 99; }
         tree = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0), *definitions], type_ignores=[])
         ast.fix_missing_locations(tree)
         namespace = dict(np=np, re=re, hashlib=hashlib, unicodedata=unicodedata, extract_local_result=extract_local_result)
+        probe_path = path.with_name('validation_probes.py')
+        helper = next(node for node in ast.parse(probe_path.read_text()).body
+                      if isinstance(node, ast.FunctionDef) and node.name == 'make_probe_inputs')
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(probe_path), 'exec'), namespace)
         exec(compile(tree, str(path), 'exec'), namespace)
         previous = sys.modules.get('verl.rema_separated_trainer.ppo.experiment_io')
         sys.modules['verl.rema_separated_trainer.ppo.experiment_io'] = evidence
@@ -719,6 +731,14 @@ rclone() { echo 'unexpected S3 transfer' >&2; return 99; }
         self.assertNotIn('QUESTION_SENTINEL', str(chats_seen['worker_stage_2']))
         self.assertIn('\\boxed{7}', str(chats_seen['worker_stage_2']))
         self.assertIn('\\boxed{7}', outputs[0])
+        terminal = next(record for record in histories[0] if record['role'] == 'worker_stage_2')
+        inputs = terminal['validation_probe_inputs']
+        self.assertEqual(inputs['terminal_only'], 'CURRENT TASK:\n- S2: Use the result of S1.')
+        self.assertIn('S1: Compute x.', inputs['with_instructions'])
+        self.assertNotIn('\\boxed{7}', inputs['with_instructions'])
+        self.assertIn('S1 LOCAL_RESULT: \\boxed{7}', inputs['with_results'])
+        self.assertNotIn('QUESTION_SENTINEL', str(inputs))
+        self.assertNotIn('REASONING:', str(inputs))
 
 
 if __name__ == '__main__':
