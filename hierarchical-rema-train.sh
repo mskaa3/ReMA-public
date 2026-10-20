@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=hierarchical-rema-train-rolechanged
+#SBATCH --job-name=hierarchical-rema-train
 #SBATCH --nodes=2
 #SBATCH --cpus-per-gpu=4
 #SBATCH --time=168:00:00
@@ -8,10 +8,19 @@
 #SBATCH --gpus-per-node=hopper:4
 #SBATCH --verbose
 #SBATCH --exclude=r10-8,r12-1
-#SBATCH --gres=storage:local:500G
+#SBATCH --gres=storage:local:500G,storage:lustre:1
 
 set -euo pipefail
+# Require shared scratch instead of falling back to home.
+: "${TMPDIR_LUSTRE:?Shared Lustre scratch is required}"
+: "${SLURM_JOB_ID:?Run this script through sbatch}"
 
+export SHARED_RUNTIME_MODEL_ROOT="${TMPDIR_LUSTRE}/hierarchical_rema_train_${SLURM_JOB_ID}/_runtime_active_models"
+
+# Expose shared scratch inside Apptainer containers.
+export APPTAINER_BINDPATH="${APPTAINER_BINDPATH:+${APPTAINER_BINDPATH},}${TMPDIR_LUSTRE}:${TMPDIR_LUSTRE}"
+
+echo "Shared checkpoint storage: $SHARED_RUNTIME_MODEL_ROOT"
 # High-level training preset for the hierarchical trainer wrapper.
 # Keep this file opinionated and short: commonly tuned experiment knobs live here,
 # while low-level defaults remain in hierarchical-rema-trainer.sh.
@@ -24,7 +33,7 @@ export MODE=${MODE:-alternating}
 export PHASE=${PHASE:-executor}
 export PARAMETER_SHARING=${PARAMETER_SHARING:-true}
 export LEARNING_RATE=${LEARNING_RATE:-5e-6}
-export ENTROPY_COEFF=${ENTROPY_COEFF:-0.001}
+export ENTROPY_COEFF=${ENTROPY_COEFF:-0.0001}
 # Preferred subset-based names for the hierarchical training loop:
 #   TRAIN_SUBSET_ROUNDS = number of outer rounds
 #   TRAIN_SUBSET_SIZE   = tasks per outer round
@@ -55,11 +64,11 @@ export TEMPERATURE=${TEMPERATURE:-0.3}
 export CONTROLLER_TEMPERATURE=${CONTROLLER_TEMPERATURE:-$TEMPERATURE}
 export WORKER_TEMPERATURE=${WORKER_TEMPERATURE:-$TEMPERATURE}
 export CONTROLLER_CONSTRAINED_DECODING=${CONTROLLER_CONSTRAINED_DECODING:-true}
-export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-1024}
-export DECOMPOSER_MAX_NEW_TOKENS=${DECOMPOSER_MAX_NEW_TOKENS:-1024}
-export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-512}
-export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-32}
-export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-32}
+export CONTROLLER_MAX_NEW_TOKENS=${CONTROLLER_MAX_NEW_TOKENS:-2048}
+export DECOMPOSER_MAX_NEW_TOKENS=${DECOMPOSER_MAX_NEW_TOKENS:-2048}
+export WORKER_MAX_NEW_TOKENS=${WORKER_MAX_NEW_TOKENS:-1024}
+export CONTROLLER_BATCH_SIZE=${CONTROLLER_BATCH_SIZE:-96}
+export WORKER_BATCH_SIZE=${WORKER_BATCH_SIZE:-96}
 
 # Two 4-GPU nodes by default: Ray gets 3 GPUs per node, excluding the reward
 # reservation. Only the driver's reserved GPU scores rewards; the other is idle.
@@ -76,12 +85,16 @@ export VLLM_TENSOR_PARALLEL_SIZE=${VLLM_TENSOR_PARALLEL_SIZE:-1}
 export VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.7}
 export VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-16384}
 export VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-2048}
+# Reuse engines across updates; requires TP=1 and distributed learner handoff.
+# The first HPC run must verify CUDA/vLLM sleep and checkpoint refresh.
+export REMA_PERSISTENT_ROLLOUT=${REMA_PERSISTENT_ROLLOUT:-true}
 
 # Offline GRPO update cadence.
-export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
-export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
-export MAX_LENGTH=${MAX_LENGTH:-1024}
-export GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-false}
+export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
+export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
+export MAX_LENGTH=${MAX_LENGTH:-4096}
+export GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-true}
+export TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
 # Keep allocator tuning scoped to offline GRPO workers. vLLM rollout actors are
 # incompatible with expandable_segments:True.
 export OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF=${OFFLINE_GRPO_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -98,7 +111,7 @@ export TRAIN_MIN_REWARD=${TRAIN_MIN_REWARD:-}
 export CONTROLLER_SAMPLE_QUALITY_FILTER=${CONTROLLER_SAMPLE_QUALITY_FILTER:-clean_only}
 # Still active: average each plan's Graph+PRM rewards over repeated executor runs.
 export DECOMPOSER_REWARD_AGGREGATION=${DECOMPOSER_REWARD_AGGREGATION:-mean}
-export GFAM_REWARD_MODEL_PKL_PATH=${GFAM_REWARD_MODEL_PKL_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/jmoska/hierarchical_rema/best_overall_model.pkl}
+export GFAM_REWARD_MODEL_PKL_PATH=${GFAM_REWARD_MODEL_PKL_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/jmoska/hierarchical_rema/best_overall_model_17102026.pkl}
 export GFAM_REWARD_MODEL_DEVICE=${GFAM_REWARD_MODEL_DEVICE:-cuda:0}
 export GFAM_REWARD_MODEL_ENCODER_BACKEND=${GFAM_REWARD_MODEL_ENCODER_BACKEND:-}
 export GFAM_REWARD_MODEL_ENCODER_MODEL=${GFAM_REWARD_MODEL_ENCODER_MODEL:-}
@@ -110,6 +123,24 @@ export GFAM_PRM_TORCH_DTYPE=${GFAM_PRM_TORCH_DTYPE:-auto}
 export GFAM_PRM_MAX_LENGTH=${GFAM_PRM_MAX_LENGTH:-0}
 export GFAM_ENCODER_DEVICE=${GFAM_ENCODER_DEVICE:-$GFAM_REWARD_MODEL_DEVICE}
 export GFAM_FEATURE_CACHE_DIR=${GFAM_FEATURE_CACHE_DIR:-}
+
+# Independent of policy-generation batches. Qwen backs off on CUDA OOM.
+export GFAM_REWARD_BATCH_SIZE=${GFAM_REWARD_BATCH_SIZE:-64}
+export GFAM_PRM_BATCH_SIZE=${GFAM_PRM_BATCH_SIZE:-16}
+export GFAM_BGE_BATCH_SIZE=${GFAM_BGE_BATCH_SIZE:-32}
+export GFAM_BGE_RAM_CACHE_SIZE=${GFAM_BGE_RAM_CACHE_SIZE:-8192}
+export GFAM_GRAPH_RAM_CACHE_SIZE=${GFAM_GRAPH_RAM_CACHE_SIZE:-128}
+
+# Keep suspicious failed executions in logs, not in policy updates.
+export GFAM_VERIFIED_FAILURE_POSITIVE_SCALE=${GFAM_VERIFIED_FAILURE_POSITIVE_SCALE:-0.25}
+export GFAM_SKIP_SATURATED_FAILURES=${GFAM_SKIP_SATURATED_FAILURES:-true}
+export GFAM_SATURATED_FAILURE_THRESHOLD=${GFAM_SATURATED_FAILURE_THRESHOLD:-0.95}
+
+# Training throughput.
+export GFAM_OVERLAP_REWARDS=${GFAM_OVERLAP_REWARDS:-true}
+export GFAM_REWARD_QUEUE_BATCHES=${GFAM_REWARD_QUEUE_BATCHES:-2}
+export REMA_LENGTH_BUCKETING=${REMA_LENGTH_BUCKETING:-true}
+export REMA_VERIFIER_WORKERS=${REMA_VERIFIER_WORKERS:-1}
 
 export TRACK_WORKERS_HISTORY=${TRACK_WORKERS_HISTORY:-false}
 export TRAIN_WORKER_MODEL=${TRAIN_WORKER_MODEL:-true}
@@ -133,15 +164,16 @@ export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-64}
 export VAL_CONTROLLER_BATCH_SIZE=${VAL_CONTROLLER_BATCH_SIZE:-32}
 export VAL_WORKER_BATCH_SIZE=${VAL_WORKER_BATCH_SIZE:-32}
 export EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS:-6}
-
+export VALIDATION_MODE=${VALIDATION_MODE:-auto}
+export VAL_DIAGNOSTICS_EVERY=${VAL_DIAGNOSTICS_EVERY:-4}
 # Logging / checkpointing defaults tuned for long runs.
 export DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}
-export ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-best}
+export ROLLOUT_LOG_MODE=${ROLLOUT_LOG_MODE:-all}
 export ROLLOUT_LOG_DETAIL=${ROLLOUT_LOG_DETAIL:-full}
 export BEST_K=${BEST_K:-1}
 export CHECKPOINT_MODE=${CHECKPOINT_MODE:-final}
 export SAVE_STEPS=${SAVE_STEPS:-200}
-export EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-20}
+export EVAL_EVERY_STEPS=${EVAL_EVERY_STEPS:-100}
 export EPOCH_S3_SYNC=${EPOCH_S3_SYNC:-true}
 export EPOCH_S3_SYNC_INTERVAL=${EPOCH_S3_SYNC_INTERVAL:-120}
 export PRUNE_STALE_POLICY_MODELS=${PRUNE_STALE_POLICY_MODELS:-true}
