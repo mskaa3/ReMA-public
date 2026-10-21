@@ -157,8 +157,11 @@ not these `adapt-workers` exports. Do not use them unchanged for round-2 transfe
 Use this after the adapted planner exports already exist. It preserves the
 round-2 input models, creates fresh output identities, and evaluates both arms
 with the same pinned Qwen3-4B probe inside each job. No probe server is needed.
-The local backend requires a compatible job container and adds one node to the
-allocation; see [resource and dependency details](validation_information_probes.md#local-inference-inside-the-training-job).
+This recipe requests **4 nodes x 4 GPUs per run**: six GPUs per model pool,
+one dedicated probe GPU, and three unused GPUs. It sets the training-pool
+size to three node equivalents and adds one node of probe capacity. Actual
+placement is managed by Ray; a particular host is not reserved exclusively
+for the probe. See [resource and dependency details](validation_information_probes.md#local-inference-inside-the-training-job).
 
 Set `PROBE_REVISION` to the same immutable HF commit for both runs. To resolve
 the current revision once (internet access required):
@@ -199,7 +202,11 @@ for chain in ('ungated', 'gated'):
                        stdout=subprocess.DEVNULL, check=True)
     cfg['planners'] = {'eac3': original['planner']}
     cfg['study'] += '-local-probe-' + os.environ['RUN_STAMP']
-    cfg['local_validation_probe'] = {'revision': os.environ['PROBE_REVISION']}
+    cfg['nodes'] = 3  # Two 6-GPU model pools; one extra node makes four total.
+    cfg['local_validation_probe'] = {
+        'revision': os.environ['PROBE_REVISION'],
+        'extra_nodes': 1,
+    }
     suite.write_runs(cfg, 'workers', Path(os.environ['RUN_DIR']) / chain)
 PY
 
@@ -210,8 +217,14 @@ PY
 
 This deliberately uses `workers` with the explicitly resolved adapted planner:
 renaming a study and using `adapt-workers` directly would look for a nonexistent
-new planner export. Training pools, starting weights, seeds, C3 and gate settings
-are unchanged. Standard checkpoint paths are assumed; replace them with actual
+new planner export. Starting weights, seeds, global batch size, C3 and gate
+settings are unchanged. Each model pool shrinks from eight GPUs to six;
+per-GPU memory usage and throughput can change, so smoke-test this allocation
+before a long run. Both arms together request 32 GPUs. Set `cfg['nodes'] = 4`
+instead to retain the earlier pool sizes and request five nodes per run.
+Regenerate manifests when changing capacity; do not override only `sbatch --nodes`.
+The original round-2 JSON configurations are left unchanged.
+Standard checkpoint paths are assumed; replace them with actual
 recovered HF paths if necessary. These remain two alternating histories, not a
 gate-only ablation with identical starting partners. New probe scores are
 evaluation diagnostics, not additions to either training reward.

@@ -502,6 +502,53 @@ class ExperimentTests(unittest.TestCase):
                         self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training'],
                                          str(phase == 'adapt-planners' or arm == 'gated').lower())
 
+    def test_round2_local_probe_rerun_recipe_allocates_four_nodes(self):
+        documentation = (ROOT / 'docs/eac3_round2.md').read_text()
+        recipe = documentation.split('## Rerun workers with local frozen probes', 1)[1]
+        code = recipe.split("python3 - <<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+        real_run = subprocess.run
+        remote_checks = []
+
+        def checked_run(command, *args, **kwargs):
+            if command[0] == 'rclone':
+                self.assertEqual(command[1], 'cat')
+                self.assertTrue(command[2].endswith('/config.json'))
+                remote_checks.append(command[2])
+                return subprocess.CompletedProcess(command, 0)
+            return real_run(command, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            environment = {'PROBE_REVISION': 'a' * 40, 'RUN_STAMP': 'test', 'RUN_DIR': tmp}
+            with patch.dict(os.environ, environment), patch.object(subprocess, 'run', side_effect=checked_run):
+                exec(compile(code, '<documented-round2-rerun>', 'exec'), {})
+            for arm in ('ungated', 'gated'):
+                cfg = suite.read_json(ROOT / f'config/eac3-round2-{arm}.json')
+                original = suite.make_runs(cfg, 'adapt-workers')[0]
+                directory = Path(tmp) / arm
+                manifest = suite.read_json(next(directory.glob('*.json')))
+                self.assertEqual(manifest['mode'], 'worker_train')
+                self.assertEqual(manifest['planner'], original['planner'])
+                self.assertEqual(manifest['worker'], original['worker'])
+                self.assertNotEqual(manifest['run_name'], original['run_name'])
+                self.assertEqual(manifest['study_config'], dict(
+                    cfg, nodes=3, study=cfg['study'] + '-local-probe-test',
+                    planners={'eac3': original['planner']},
+                    local_validation_probe={'revision': 'a' * 40, 'extra_nodes': 1},
+                ))
+                self.assertEqual(suite.allocated_nodes(manifest['study_config']), 4)
+                self.assertIn('sbatch --export=ALL --nodes=4 --gres=gpu:hopper:4,storage:local:200G',
+                              (directory / 'commands.txt').read_text())
+                with patch.dict(os.environ, {'SLURM_NNODES': '4'}):
+                    env = suite.run_environment(manifest)
+                self.assertEqual(env['TRAINING_NNODES'], 3)
+                self.assertEqual(env['POOL_GPUS_PER_NODE'], 2)
+                self.assertEqual(env['TRAIN_DECOMPOSER'], 'false')
+                self.assertEqual(env['PREFIX_PROBE_APPLY_TO_TRAINING'], str(arm == 'gated').lower())
+                self.assertEqual(env['VALIDATION_PROBE_BACKEND'], 'local')
+                self.assertEqual(env['BASE_QUESTION_BATCH_SIZE'], 48)
+                self.assertEqual(env['ROLLOUT_N'], 32)
+            self.assertEqual(len(remote_checks), 4)
+
     def test_local_probe_cli_pins_revision_in_manifests(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / 'runs'

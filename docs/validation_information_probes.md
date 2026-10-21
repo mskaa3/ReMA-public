@@ -102,12 +102,21 @@ see [the round-2 rerun recipe](eac3_round2.md#rerun-workers-with-local-frozen-pr
 Changing only the output directory does not change the S3 study identity.
 
 The manifest records `local_validation_probe.revision` and requests one extra
-node by default, without changing `nodes` for the training pools. For the
-current 4-node x 4-GPU configurations, Slurm allocates **5 nodes x 4 GPUs**:
-16 GPUs remain assigned to the two training pools, one GPU runs the probe,
-and three GPUs are unused. This is a homogeneous Slurm request, not a promise
-that an entire particular host is used only for the probe. Actual GPU placement
-is managed by Ray. Both arms together allocate 40 GPUs rather than 32.
+node by default, without automatically changing `nodes` for the training pools.
+The CLI example above preserves the original pool sizes and allocates five
+nodes. The round-2 rerun recipe explicitly reduces `nodes` to three instead:
+
+| Configuration | Decomposer GPUs | Worker GPUs | Probe GPUs | Unused GPUs |
+| --- | --- | --- | --- | --- |
+| `nodes=3`, `extra_nodes=1`: 4 nodes total | 6 | 6 | 1 | 3 |
+| `nodes=4`, `extra_nodes=1`: 5 nodes total | 8 | 8 | 1 | 3 |
+
+These are homogeneous 4-GPU-per-node requests, not a promise that an entire
+particular host is used only for the probe. Actual placement is managed by Ray.
+The four-node recipe allocates 32 GPUs for both arms rather than 40. Smaller
+training pools can increase per-GPU memory use and change throughput; cluster
+testing is still required. Generate new manifests for the chosen allocation
+rather than overriding only the node count on an old submission command.
 
 Optional manifest settings (defaults shown) are:
 
@@ -129,15 +138,15 @@ All nodes still join the Ray cluster and receive the code/container staging;
 used outside these question-only experiments, remains a separate earlier phase.
 
 For ordinary launchers (without an experiment manifest), reserve capacity
-explicitly. For example, a five-node allocation with four training nodes:
+explicitly. For example, a four-node allocation with three training-node equivalents:
 
 ```bash
 export VALIDATION_PROBE_BACKEND=local
 export VALIDATION_PROBE_MODEL=Qwen/Qwen3-4B-Instruct-2507
 export VALIDATION_PROBE_REVISION="$PROBE_REVISION"
-export TRAINING_NNODES=4
+export TRAINING_NNODES=3
 unset VALIDATION_PROBE_URL
-# Submit the usual launcher with --nodes=5 and its existing 4 GPUs per node.
+# Submit the usual launcher with --nodes=4 and its existing 4 GPUs per node.
 ```
 
 Missing capacity is an error, not a request to share a training GPU. The shell
