@@ -29,18 +29,86 @@ Assign the most suitable worker to one decomposition node at a time using the no
 """
 
 
-# WORKER_ONE_SHOT_EXAMPLE = """ONE-SHOT EXAMPLE:
-# NODE_INSTRUCTION: compute the value of x and return the final answer
-# FINAL_NODE: yes
-# DEPENDENCY_RESULTS:
-# - NODE 1 (rearrange the equation to isolate the variable term): 2x = 8
-# EXAMPLE_OUTPUT:
-# <worker_scratchpad>
-# From 2x = 8, divide both sides by 2.
-# </worker_scratchpad>
-# <worker_result>
-# 4
-# </worker_result>"""
+DECOMPOSER_FEW_SHOT_EXAMPLES = (
+    (2, """EXAMPLE TASK: A rhombus has perimeter 52 and one diagonal 24. Find its area.
+<decomposition_plan>
+TARGET_QUANTITY: area of the rhombus
+FINAL_ANSWER_FORMAT_HINT: integer
+NODE_ID: 1
+INSTRUCTION: Compute the side length s from perimeter 52; return s together with the given diagonal d = 24.
+DEPENDENCIES: none
+REQUIRED_SKILLS: geometry
+NODE_ID: 2
+INSTRUCTION: Using s and d from node 1, find the other diagonal from the right triangle formed by half-diagonals, then compute the rhombus area; return an integer.
+DEPENDENCIES: 1
+REQUIRED_SKILLS: geometry
+FINAL_NODE_ID: 2
+</decomposition_plan>"""),
+    (3, """EXAMPLE TASK: A committee contains two of five scientists and one of three artists. How many committees are possible?
+<decomposition_plan>
+TARGET_QUANTITY: number of committees
+FINAL_ANSWER_FORMAT_HINT: integer
+NODE_ID: 1
+INSTRUCTION: Count unordered pairs of distinct scientists from five; return scientist_pairs.
+DEPENDENCIES: none
+REQUIRED_SKILLS: combinatorics
+NODE_ID: 2
+INSTRUCTION: Count choices of one artist from three; return artist_choices.
+DEPENDENCIES: none
+REQUIRED_SKILLS: combinatorics
+NODE_ID: 3
+INSTRUCTION: Multiply scientist_pairs from node 1 by artist_choices from node 2; return the integer number of committees.
+DEPENDENCIES: 1,2
+REQUIRED_SKILLS: combinatorics
+FINAL_NODE_ID: 3
+</decomposition_plan>"""),
+    (1, """EXAMPLE TASK: Express 3/8 as a decimal.
+<decomposition_plan>
+TARGET_QUANTITY: decimal representation of 3/8
+FINAL_ANSWER_FORMAT_HINT: exact decimal
+NODE_ID: 1
+INSTRUCTION: Divide 3 by 8 and return the exact decimal.
+DEPENDENCIES: none
+REQUIRED_SKILLS: arithmetic
+FINAL_NODE_ID: 1
+</decomposition_plan>"""),
+)
+
+
+WORKER_FEW_SHOT_EXAMPLES = """EXAMPLE 1: symbolic intermediate artifact
+NODE_INSTRUCTION: Expand and simplify (z + 3)^2 - 6z; return the expression in z without evaluating z.
+FINAL_NODE: no
+DEPENDENCY_RESULTS: none
+<worker_scratchpad>
+Expand the square to z^2 + 6z + 9, then subtract 6z.
+</worker_scratchpad>
+<worker_result>
+z^2 + 9
+</worker_result>
+
+EXAMPLE 2: numerical intermediate artifact with a required given
+NODE_INSTRUCTION: Compute the rhombus side s from perimeter 52; return s together with its given diagonal d = 24.
+FINAL_NODE: no
+DEPENDENCY_RESULTS: none
+<worker_scratchpad>
+The four equal sides give s = 52/4. Keep the given diagonal for the next node; do not compute the area here.
+</worker_scratchpad>
+<worker_result>
+s = 13; d = 24
+</worker_result>
+
+EXAMPLE 3: final synthesis of independent results
+NODE_INSTRUCTION: Multiply scientist_pairs from node 1 by artist_choices from node 2; return the integer number of committees.
+FINAL_NODE: yes
+DEPENDENCY_RESULTS:
+- NODE 1: scientist_pairs = 10
+- NODE 2: artist_choices = 3
+<worker_scratchpad>
+The independent choices give 10 * 3 committees.
+</worker_scratchpad>
+<worker_result>
+30
+</worker_result>"""
 
 
 DEFAULT_CALCULATION_WORKER_PROMPT = """You are a calculation worker.
@@ -215,29 +283,16 @@ def render_decomposer_prompt(
     node_budget_contract = "\n".join(node_budget_lines)
     if node_budget_contract:
         node_budget_contract += "\n"
+    example_cap = min(max_nodes, max(1, int(hard_max_hops_hint or max_nodes)))
+    examples = "\n\n".join(
+        text for node_count, text in DECOMPOSER_FEW_SHOT_EXAMPLES
+        if node_count <= example_cap
+    )
     return (
         "OUTPUT CONTRACT:\n"
         "- You may optionally think inside <decomposer_scratchpad>...</decomposer_scratchpad>.\n"
         "- You must return exactly one <decomposition_plan> block.\n"
         "- Use only these keys inside <decomposition_plan>: TARGET_QUANTITY, FINAL_ANSWER_FORMAT_HINT, FINAL_NODE_ID, NODE_ID, INSTRUCTION, DEPENDENCIES, REQUIRED_SKILLS, REQUIRED_SKILLS_NOTE.\n"
-        "- Use this skeleton:\n"
-        "<decomposer_scratchpad>\n"
-        "Node 1 should rewrite the equation, then node 2 can isolate the value asked for.\n"
-        "</decomposer_scratchpad>\n"
-        "<decomposition_plan>\n"
-        "TARGET_QUANTITY: value of x\n"
-        "FINAL_ANSWER_FORMAT_HINT: integer\n"
-        "NODE_ID: 1\n"
-        "INSTRUCTION: rewrite the equation into the form 2x = 8\n"
-        "DEPENDENCIES: none\n"
-        "REQUIRED_SKILLS: algebra\n"
-        "REQUIRED_SKILLS_NOTE: equation manipulation\n"
-        "NODE_ID: 2\n"
-        "INSTRUCTION: use the equation from node 1 to isolate x and return the integer value of x\n"
-        "DEPENDENCIES: 1\n"
-        "REQUIRED_SKILLS: algebra\n"
-        "FINAL_NODE_ID: 2\n"
-        "</decomposition_plan>\n"
         "- Write TARGET_QUANTITY and FINAL_ANSWER_FORMAT_HINT first, then all node blocks. After the last node block, write exactly one FINAL_NODE_ID line immediately before </decomposition_plan>.\n"
         "- Choose FINAL_NODE_ID from the NODE_ID values you actually emitted, not the allowed-ID range or hard node cap. Do not put FINAL_NODE_ID in the header.\n"
         f"- Allowed node IDs: {allowed_node_ids}. Use contiguous numeric NODE_ID values in declaration order: 1, 2, ..., N.\n"
@@ -258,6 +313,9 @@ def render_decomposer_prompt(
         "- Every non-final node must produce a concrete intermediate mathematical artifact that is actually needed by a downstream node.\n"
         "- Keep node instructions short and concrete.\n"
         "- Every node instruction must name the concrete mathematical artifact it should output.\n"
+        "- Specify operations and given constants; leave computation of unknown intermediate values and the answer to the workers.\n"
+        "- Only root workers receive TASK. Every later node must have all needed givens, variable meanings, units, and constraints in its instruction or declared dependency artifacts; never assume it can read TASK.\n"
+        "- When a later node needs an unchanged given, include that given in its instruction or explicitly ask an upstream node to carry it in its result alongside the computed artifact.\n"
         "- Prefer grounded instructions like `rewrite ... as ...`, `return the simplified expression ...`, `name the chosen method ...`, or `return the final scalar answer ...`.\n"
         "- For root nodes, reference the actual equation, expression, case split, or target quantity from TASK instead of vague text like `simplify both sides`.\n"
         "- For intermediate nodes, preserve reusable symbolic state; avoid bare numbers unless the node explicitly asks for a numeric sub-result.\n"
@@ -269,6 +327,10 @@ def render_decomposer_prompt(
         "- The final node instruction must explicitly use TARGET_QUANTITY and match FINAL_ANSWER_FORMAT_HINT.\n"
         "- If the task says to return a letter, fraction, integer, expression, or other specific form, say that directly in FINAL_ANSWER_FORMAT_HINT and make the final node follow it.\n"
         "- Forbidden output patterns: markdown fences, JSON, bullets, prose outside tags, or keys other than the allowed ones.\n\n"
+        "ILLUSTRATIVE EXAMPLES (unrelated tasks):\n"
+        "Use the artifact and dependency principles, not the example wording, numbers, or node count. Choose the structure for the actual task; do not copy a template or add decorative nodes.\n"
+        f"{examples}\n\n"
+        "END EXAMPLES. Produce one plan for the actual task below.\n"
         f"TASK_ID: {task.task_id}\n"
         f"TASK: {task.prompt}\n"
         "Return ONLY the optional <decomposer_scratchpad> block followed by the required <decomposition_plan> block."
@@ -467,23 +529,20 @@ def render_worker_prompt(
         "- The scratchpad should show useful mathematical thinking such as a transformation, substitution, case split, geometric fact, or intermediate deduction that moves from the available context toward the required node artifact.\n"
         "- Do not use the scratchpad as filler, a paraphrase of NODE_INSTRUCTION, or a copied template; it should contain reasoning that is genuinely helpful for solving this task.\n"
         "- Return exactly one <worker_result> block. Only the content inside <worker_result> is passed to downstream nodes, so put the final node artifact there.\n"
-        "- Format example (replace the content with the actual task-specific reasoning and result; do not copy these literals):\n"
-        "<worker_scratchpad>\n"
-        "From 2x = 8, divide both sides by 2.\n"
-        "</worker_scratchpad>\n"
-        "<worker_result>\n"
-        "4\n"
-        "</worker_result>\n"
         "- Put only the node result inside the tags <worker_result>. Do not include field labels like `RESULT:` or `OUTPUT_KEY:`.\n"
         "- For expressions, equations, values, or short case splits, return just that content inside the tags.\n"
         "- Do not jump to a scalar too early; preserve an equation, expression, or other reusable symbolic state unless NODE_INSTRUCTION explicitly asks for a numeric result.\n"
         "- If there are multiple items, keep them compact and separate them with `;` when possible.\n"
+        "- Carry forward givens explicitly requested by NODE_INSTRUCTION; do not invent missing values or solve future nodes.\n"
         f"- TARGET_QUANTITY for this decomposition: {decomposition.target_quantity}.\n"
         f"- FINAL_ANSWER_FORMAT_HINT for this decomposition: {decomposition.final_answer_format_hint}.\n"
         f"{node_context_contract}"
         f"{final_node_contract}"
         "- Forbidden output patterns: prose outside the allowed tags, markdown fences, JSON, bullets, or solving nodes that were not assigned.\n\n"
-        # f"{WORKER_ONE_SHOT_EXAMPLE}\n\n"
+        "ILLUSTRATIVE EXAMPLES (unrelated nodes):\n"
+        "Choose the artifact appropriate to the actual NODE_INSTRUCTION. Do not copy example values or force every result into a scalar.\n"
+        f"{WORKER_FEW_SHOT_EXAMPLES}\n\n"
+        "END EXAMPLES. Execute only the actual node below.\n"
         "Task details:\n"
         f"TASK_ID: {task.task_id}\n"
         f"{task_line}"

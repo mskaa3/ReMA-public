@@ -2116,6 +2116,8 @@ def run_external_validation(
     base_rollout_config: RolloutConfig,
 ) -> Dict[str, Any]:
     from .validation import validation_mode, ValidationAudit, hide_uncomputed_rewards, diagnostic_examples
+    from .information_diversity import InformationDiversityAudit
+    from .evaluation_exports import write_evaluation_exports
     mode = validation_mode(args, epoch_number)
     score_rewards = mode == "diagnostic"
     from .reward_providers import reward_setting
@@ -2125,6 +2127,7 @@ def run_external_validation(
         raise ValueError("val_diagnostic_examples must be nonnegative")
     output_dir.mkdir(parents=True, exist_ok=True)
     audit = ValidationAudit()
+    ids_audit = InformationDiversityAudit()
     examples = []
     validation_start_time = time.monotonic()
     controller_max_new_tokens = (
@@ -2267,6 +2270,7 @@ def run_external_validation(
             record_verification_failures(output_dir / "verification_failures.jsonl", batch_rollouts)
             for rollout in batch_rollouts:
                 audit.add(rollout, _task_subset_name(rollout.task))
+                ids_audit.add(rollout, _task_subset_name(rollout.task))
             if score_rewards and len(examples) < examples_limit:
                 for example in diagnostic_examples(batch_rollouts):
                     examples.append(example)
@@ -2293,6 +2297,13 @@ def run_external_validation(
         include_subsets=True,
         include_tasks=False,
     )
+    # Separate frozen BGE evaluation after rollout resources have been released.
+    # Routine validation still never constructs a reward provider or Qwen PRM.
+    ids_report = ids_audit.finish()
+    summary["information_diversity"] = ids_report["overall"]
+    summary["ids_definition"] = ids_report["metadata"]
+    for name, subset in summary.get("subsets", {}).items():
+        subset["information_diversity"] = ids_report["subsets"].get(name, {})
     elapsed = time.monotonic() - validation_start_time
     summary.update(validation_mode=mode, reward_diagnostics_enabled=reward_model_enabled,
                    elapsed_seconds=elapsed, seconds_per_task=elapsed / max(len(val_tasks), 1),
@@ -2312,6 +2323,30 @@ def run_external_validation(
         epoch_number=epoch_number,
         summary=summary,
     )
+    write_evaluation_exports(
+        output_dir, summary, ids_report, epoch=epoch_number, tracking_step=tracking_step,
+        context={"experiment_name": getattr(args, "experiment_name", ""),
+                 "reward_setting": reward_setting(args),
+                 "worker_rollout_mode": getattr(args, "worker_rollout_mode", "repeated_execution"),
+                 "validation_candidates_per_task": (
+                     validation_rollout_config.num_decompositions
+                     * (args.val_num_executor_rollouts or args.val_num_selections)),
+                 "policy_paths": {
+                     "shared": policy_config.shared_model_path,
+                     "decomposer": policy_config.decomposer_model_path,
+                     "workers": {worker.worker_id: worker.base_model_path
+                                 for worker in worker_pool.workers}},
+                 "task_source": str(getattr(args, "val_task_source", "")),
+                 "seed": getattr(args, "seed", None)},
+    )
+    print(f"[hierarchical-rema][IDS] epoch={epoch_number} "
+          f"ids={ids_report['overall']['ids']} "
+          f"ids_exact={ids_report['overall']['ids_exact']} "
+          f"eligible_rollouts={ids_report['overall']['eligible_rollouts']}/"
+          f"{ids_report['overall']['total_rollouts']} "
+          f"exact_eligible_rollouts={ids_report['overall']['exact_eligible_rollouts']}/"
+          f"{ids_report['overall']['total_rollouts']} "
+          f"history={output_dir.parent / 'evaluation_history.csv'}", flush=True)
 
     print(
         f"[hierarchical-rema][validation] epoch={epoch_number} mode={mode} "

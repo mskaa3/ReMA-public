@@ -1513,7 +1513,10 @@ def test_worker_prompt_does_not_include_concise_result_placeholder() -> None:
     )
 
     assert "concise result" not in prompt
-    assert "From 2x = 8, divide both sides by 2." in prompt
+    assert "From 2x = 8, divide both sides by 2." not in prompt
+    assert "EXAMPLE 1: symbolic intermediate artifact" in prompt
+    assert "EXAMPLE 2: numerical intermediate artifact with a required given" in prompt
+    assert "EXAMPLE 3: final synthesis of independent results" in prompt
 
 
 def test_controller_sample_quality_filter_clean_only_keeps_only_clean_controller_samples() -> None:

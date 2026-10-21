@@ -110,6 +110,12 @@ export REMA_LENGTH_BUCKETING=${REMA_LENGTH_BUCKETING:-true}
 export REMA_VERIFIER_WORKERS=${REMA_VERIFIER_WORKERS:-1}
 # Requires a GPU smoke test with the installed vLLM V0/SPMD container first.
 export REMA_PERSISTENT_ROLLOUT=${REMA_PERSISTENT_ROLLOUT:-false}
+# Observational IDS, only at existing external validation events.
+export REMA_IDS_ENABLED=${REMA_IDS_ENABLED:-true}
+export REMA_IDS_MODEL=${REMA_IDS_MODEL:-BAAI/bge-m3}
+export REMA_IDS_REVISION=${REMA_IDS_REVISION:-main}
+export REMA_IDS_DEVICE=${REMA_IDS_DEVICE:-cuda:0}
+export REMA_IDS_BATCH_SIZE=${REMA_IDS_BATCH_SIZE:-16}
 
 # Frequently adjusted: high-level experiment shape.
 BACKEND=${BACKEND:-mock}
@@ -546,6 +552,12 @@ fi
 GPU_PARTITION="python3 /verl/verl/hierarchical_rema/gpu_partition.py --reserve ${GFAM_REWARD_GPU_RESERVATION}"
 if [[ "$GFAM_REWARD_GPU_RESERVATION" != "0" && "$GFAM_REWARD_GPU_RESERVATION" != "1" ]]; then
     echo "GFAM_REWARD_GPU_RESERVATION must be 0 or 1" >&2; exit 1
+fi
+if [[ "$RUN_KIND" == "train" && "$REMA_IDS_ENABLED" =~ ^([Tt][Rr][Uu][Ee]|1)$ && "$REMA_IDS_DEVICE" == cuda* ]]; then
+    if [[ "$GFAM_REWARD_GPU_RESERVATION" != "1" || "$REMA_IDS_DEVICE" != "cuda:0" ]]; then
+        echo "GPU IDS requires GFAM_REWARD_GPU_RESERVATION=1 and REMA_IDS_DEVICE=cuda:0; use cpu otherwise" >&2
+        exit 1
+    fi
 fi
 COACH_SUPERVISOR=""
 if [[ "$REWARD_SETTING" == "llm_coach" && "${REMA_COACH_BACKEND:-}" == "local_vllm" ]]; then
@@ -1046,6 +1058,11 @@ GFAM_REWARD_QUEUE_BATCHES=$GFAM_REWARD_QUEUE_BATCHES
 REMA_LENGTH_BUCKETING=$REMA_LENGTH_BUCKETING
 REMA_VERIFIER_WORKERS=$REMA_VERIFIER_WORKERS
 REMA_PERSISTENT_ROLLOUT=$REMA_PERSISTENT_ROLLOUT
+REMA_IDS_ENABLED=$REMA_IDS_ENABLED
+REMA_IDS_MODEL=$REMA_IDS_MODEL
+REMA_IDS_REVISION=$REMA_IDS_REVISION
+REMA_IDS_DEVICE=$REMA_IDS_DEVICE
+REMA_IDS_BATCH_SIZE=$REMA_IDS_BATCH_SIZE
 GFAM_REWARD_MODEL_DEVICE=$GFAM_REWARD_MODEL_DEVICE
 GFAM_PRM_DEVICE=$GFAM_PRM_DEVICE
 GFAM_ENCODER_DEVICE=$GFAM_ENCODER_DEVICE
@@ -1116,9 +1133,12 @@ print("1" if tracker.get("improved") else "0")
     fi
 
     if [[ -f "${LOCAL_OUTPUT_DIR}/validation_accuracy.csv" ]]; then
-        echo "[hierarchical-rema][s3] syncing validation_accuracy.csv -> ${S3_OUTPUT_PATH}/validation_accuracy.csv"
-        if ! rclone copy "${LOCAL_OUTPUT_DIR}" "${S3_OUTPUT_PATH}" --include "/validation_accuracy.csv"; then
-            echo "Warning: failed to sync validation_accuracy.csv" >&2
+        echo "[hierarchical-rema][s3] syncing accuracy/IDS histories -> ${S3_OUTPUT_PATH}"
+        if ! rclone copy "${LOCAL_OUTPUT_DIR}" "${S3_OUTPUT_PATH}" \
+            --include "/validation_accuracy.csv" \
+            --include "/evaluation_history.csv" \
+            --include "/evaluation_history.jsonl"; then
+            echo "Warning: failed to sync validation histories" >&2
             upload_status=1
         fi
     fi

@@ -34,7 +34,7 @@ export MODE=${MODE:-alternating}
 export PHASE=${PHASE:-executor}
 export PARAMETER_SHARING=${PARAMETER_SHARING:-true}
 export LEARNING_RATE=${LEARNING_RATE:-5e-6}
-export ENTROPY_COEFF=${ENTROPY_COEFF:-0.001}
+export ENTROPY_COEFF=${ENTROPY_COEFF:-0.0001}
 # Preferred subset-based names for the hierarchical training loop:
 #   TRAIN_SUBSET_ROUNDS = number of outer rounds
 #   TRAIN_SUBSET_SIZE   = tasks per outer round
@@ -152,6 +152,13 @@ export VAL_ROLLOUT_TASK_BATCH_SIZE=${VAL_ROLLOUT_TASK_BATCH_SIZE:-64}
 export VAL_CONTROLLER_BATCH_SIZE=${VAL_CONTROLLER_BATCH_SIZE:-32}
 export VAL_WORKER_BATCH_SIZE=${VAL_WORKER_BATCH_SIZE:-32}
 export EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS=${EXTERNAL_VALIDATION_EVERY_SUBSET_ROUNDS:-6}
+# IDS uses the same validation rollouts as per-dataset accuracy, never training batches.
+# Frozen BGE-M3 on the reserved reward GPU, after validation generation.
+export REMA_IDS_ENABLED=${REMA_IDS_ENABLED:-true}
+export REMA_IDS_MODEL=BAAI/bge-m3
+export REMA_IDS_REVISION=main
+export REMA_IDS_DEVICE=cuda:0
+export REMA_IDS_BATCH_SIZE=${REMA_IDS_BATCH_SIZE:-16}
 
 # Logging / checkpointing defaults tuned for long runs.
 export DISABLE_ROLLOUT_LOGGING=${DISABLE_ROLLOUT_LOGGING:-false}

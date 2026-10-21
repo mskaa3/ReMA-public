@@ -64,10 +64,12 @@ def assert_footer(text, final="2"):
 def test_prompt_example_and_instructions_require_footer():
     task = TaskExample("test", "Solve 2x + 3 = 11.", "4")
     prompt = render_decomposer_prompt(task, max_nodes_hint=8)
-    example = re.search(r"(?m)^<decomposition_plan>\n.*?^</decomposition_plan>", prompt, re.S)
-    assert example is not None
-    assert_footer(example.group())
-    assert parse(example.group()).final_node_id == "2"
+    examples = re.findall(r"(?m)^<decomposition_plan>\n.*?^</decomposition_plan>", prompt, re.S)
+    assert len(examples) == 3
+    for example in examples:
+        candidate = parse(example)
+        assert_footer(example, candidate.final_node_id)
+        assert not candidate.raw_payload.get("validation", {}).get("final_node_repair")
     assert "After the last node block, write exactly one FINAL_NODE_ID line" in prompt
     assert "Do not put FINAL_NODE_ID in the header" in prompt
     assert "not the allowed-ID range or hard node cap" in prompt

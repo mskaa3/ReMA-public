@@ -95,9 +95,15 @@ def rollout_tracking_metrics(summary):
 
 
 def validation_tracking_metrics(summary):
-    return {"val/accuracy": summary["accuracy"],
-            **{f"val/accuracy/{name}": subset["accuracy"]
-               for name, subset in summary.get("subsets", {}).items()}}
+    result = {"val/accuracy": summary["accuracy"],
+              **{f"val/acc/{name}": subset["accuracy"]
+                 for name, subset in summary.get("subsets", {}).items()}}
+    # Overall scores only; coverage and dataset detail stay in artifacts.
+    for name in ("ids", "ids_exact"):
+        value = summary.get("information_diversity", {}).get(name)
+        if value is not None and math.isfinite(value):
+            result[f"val/{name}"] = value
+    return result
 
 
 def warn_verification_coverage(summary, context):
