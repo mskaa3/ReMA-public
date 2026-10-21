@@ -387,16 +387,22 @@ trainer:
   val_only: False  # True for evaluation only
   # Optional full JSONL evidence, independent of console/W&B sample selection.
   validation_output_dir: null
-  # Separate frozen SLM endpoint; never reused from the actors being trained.
-  # Set VALIDATION_PROBE_URL to enable in Slurm scripts; model override is optional.
+  # Separate frozen SLM; never reused from the actors being trained.
+  # Enable HTTP via VALIDATION_PROBE_URL, or local with a pinned revision and spare GPU.
   validation_probe:
     enable: False
+    backend: http  # local uses a job-managed, dedicated-GPU inference actor
     base_url: null
     model: Qwen/Qwen3-4B-Instruct-2507
+    revision: null  # local HF models require an immutable 40-character commit hash
     samples_per_dataset: 32
     max_new_tokens: 256
     timeout_seconds: 180
     concurrency: 4
+    startup_timeout_seconds: 900
+    max_model_len: 16384
+    batch_size: 4
+    gpu_memory_utilization: 0.8
   val_generations_to_log_to_wandb: 0
   nnodes: 1
   n_gpus_per_node: 2

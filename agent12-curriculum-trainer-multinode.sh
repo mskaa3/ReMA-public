@@ -16,18 +16,47 @@ source ./env.sh
 export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 export POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
 export RAY_PORT=${RAY_PORT:-6379}
+export TRAINING_NNODES=${TRAINING_NNODES:-${SLURM_NNODES}}
 
-# Independent evaluation endpoint, shared across worker/planner comparisons.
+# Independent evaluation model, never a moving training role.
 export VALIDATION_PROBE_URL=${VALIDATION_PROBE_URL:-}
 export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-}
+export VALIDATION_PROBE_BACKEND=${VALIDATION_PROBE_BACKEND:-}
+export VALIDATION_PROBE_REVISION=${VALIDATION_PROBE_REVISION:-}
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=${VALIDATION_PROBE_SAMPLES_PER_DATASET:-32}
 export VALIDATION_PROBE_MAX_NEW_TOKENS=${VALIDATION_PROBE_MAX_NEW_TOKENS:-256}
-if [[ -n "$VALIDATION_PROBE_URL" ]]; then
+export VALIDATION_PROBE_MAX_MODEL_LEN=${VALIDATION_PROBE_MAX_MODEL_LEN:-16384}
+export VALIDATION_PROBE_BATCH_SIZE=${VALIDATION_PROBE_BATCH_SIZE:-4}
+if [[ -z "$VALIDATION_PROBE_BACKEND" ]]; then
+    if [[ -n "$VALIDATION_PROBE_URL" ]]; then
+        export VALIDATION_PROBE_BACKEND=http
+    elif [[ -n "$VALIDATION_PROBE_MODEL" ]]; then
+        echo "Set VALIDATION_PROBE_URL or VALIDATION_PROBE_BACKEND=local for frozen evaluation" >&2
+        exit 1
+    else
+        export VALIDATION_PROBE_BACKEND=off
+    fi
+fi
+case "$VALIDATION_PROBE_BACKEND" in
+    http)
+        : "${VALIDATION_PROBE_URL:?Set VALIDATION_PROBE_URL for the HTTP probe}"
+        ;;
+    local)
+        if [[ -n "$VALIDATION_PROBE_URL" ]]; then
+            echo "Unset VALIDATION_PROBE_URL when using the local probe" >&2
+            exit 1
+        fi
+        if [[ ! -d "$VALIDATION_PROBE_MODEL" && ! "$VALIDATION_PROBE_REVISION" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Set VALIDATION_PROBE_REVISION to a fixed 40-character HF commit hash" >&2
+            exit 1
+        fi
+        ;;
+    off) ;;
+    *) echo "VALIDATION_PROBE_BACKEND must be off, http or local" >&2; exit 1 ;;
+esac
+if [[ "$VALIDATION_PROBE_BACKEND" != off ]]; then
     export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-Qwen/Qwen3-4B-Instruct-2507}
-    echo "Frozen validation probe: ${VALIDATION_PROBE_MODEL} (evaluation only)"
-elif [[ -n "$VALIDATION_PROBE_MODEL" ]]; then
-    echo "Set VALIDATION_PROBE_URL to use the frozen evaluation probe" >&2
-    exit 1
+    echo "Frozen validation probe: backend=${VALIDATION_PROBE_BACKEND}, model=${VALIDATION_PROBE_MODEL} (evaluation only)"
 fi
 
 export SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
@@ -111,6 +140,15 @@ export TEACHER_TRAIN_FILE=${TEACHER_TRAIN_FILE:-${JOB_TMP}/agent12_data/train.pa
 export TEACHER_CANDIDATES_FILE=${TEACHER_CANDIDATES_FILE:-${JOB_TMP}/agent12_data/teacher_candidates.parquet}
 echo "Agent 1/2 scratch: job=${SLURM_JOB_ID}; JOB_TMP=${JOB_TMP}"
 
+if [[ ! "$TRAINING_NNODES" =~ ^[1-9][0-9]*$ ]] || (( TRAINING_NNODES > SLURM_NNODES )); then
+    echo "TRAINING_NNODES must be positive and no larger than the Slurm allocation" >&2
+    exit 1
+fi
+if [[ "$VALIDATION_PROBE_BACKEND" == local ]] && \
+        (( SLURM_NNODES * GPUS_PER_NODE < 2 * TRAINING_NNODES * POOL_GPUS_PER_NODE + 1 )); then
+    echo "Local probe needs one GPU outside both training pools. Reserve extra nodes/GPUs and set TRAINING_NNODES explicitly." >&2
+    exit 1
+fi
 if (( GPUS_PER_NODE % 2 != 0 )); then
     echo "GPUS_PER_NODE must be even because Agent 1 and Agent 2 use separate pools" >&2
     exit 1
@@ -416,7 +454,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES} \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
-  trainer.nnodes=${SLURM_NNODES} \
+  trainer.nnodes=${TRAINING_NNODES} \
   trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
   trainer.total_epochs=100 \
   trainer.total_training_steps=${TOTAL_STEPS} \
@@ -430,14 +468,18 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   trainer.wandb_resume=allow \
   trainer.default_local_dir=${CHECKPOINT_ROOT}"
 
-    if [[ -n "$VALIDATION_PROBE_URL" ]]; then
+    if [[ "$VALIDATION_PROBE_BACKEND" != off ]]; then
         local probe_argument
         for probe_argument in \
             "trainer.validation_probe.enable=True" \
-            "trainer.validation_probe.base_url=${VALIDATION_PROBE_URL}" \
+            "trainer.validation_probe.backend=${VALIDATION_PROBE_BACKEND}" \
+            "trainer.validation_probe.base_url=${VALIDATION_PROBE_URL:-null}" \
             "trainer.validation_probe.model=${VALIDATION_PROBE_MODEL}" \
+            "trainer.validation_probe.revision=${VALIDATION_PROBE_REVISION:-null}" \
             "trainer.validation_probe.samples_per_dataset=${VALIDATION_PROBE_SAMPLES_PER_DATASET}" \
-            "trainer.validation_probe.max_new_tokens=${VALIDATION_PROBE_MAX_NEW_TOKENS}"; do
+            "trainer.validation_probe.max_new_tokens=${VALIDATION_PROBE_MAX_NEW_TOKENS}" \
+            "trainer.validation_probe.max_model_len=${VALIDATION_PROBE_MAX_MODEL_LEN}" \
+            "trainer.validation_probe.batch_size=${VALIDATION_PROBE_BATCH_SIZE}"; do
             printf -v probe_argument '%q' "$probe_argument"
             train_command+=" ${probe_argument}"
         done

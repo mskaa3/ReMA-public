@@ -186,8 +186,11 @@ class TaskRunner:
                                 ray_worker_group_cls=ray_worker_group_cls,
                                 reward_fn=reward_fn,
                                 val_reward_fn=val_reward_fn)
-        trainer.init_workers()
-        trainer.fit()
+        try:
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            trainer.close_validation_probes()
 
 
 if __name__ == '__main__':

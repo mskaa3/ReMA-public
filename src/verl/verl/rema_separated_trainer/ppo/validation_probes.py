@@ -123,6 +123,16 @@ class FrozenProbeClient:
             return list(executor.map(self._generate_one, messages))
 
 
+def make_validation_probe_client(config):
+    backend = config.get('backend', 'http')
+    if backend == 'http':
+        return FrozenProbeClient(config)
+    if backend == 'local':
+        from .local_validation_probe import LocalFrozenProbeClient
+        return LocalFrozenProbeClient(config)
+    raise ValueError(f'Unknown validation_probe.backend: {backend!r}; use http or local')
+
+
 def evaluate_probes(examples, generate, parse_answers, score_responses):
     """Three paired measurements, with failures retained in each denominator."""
     unique_inputs, lookup, locations = [], {}, {}

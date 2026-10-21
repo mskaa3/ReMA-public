@@ -84,6 +84,26 @@ def validate_study(cfg):
             or any(type(step) is not int or step <= 0 for step in test_steps)
             or len(set(test_steps)) != len(test_steps)):
         raise ValueError('test_update_steps must be a list of distinct positive update numbers')
+    probe = cfg.get('local_validation_probe')
+    if probe is not None:
+        if not isinstance(probe, dict):
+            raise ValueError('local_validation_probe must be a configuration object')
+        if not re.fullmatch(r'[0-9a-fA-F]{40}', str(probe.get('revision', ''))):
+            raise ValueError('local_validation_probe.revision must be a fixed 40-character HF commit hash')
+        for key, default in (('extra_nodes', 1), ('samples_per_dataset', 32),
+                             ('max_new_tokens', 256), ('max_model_len', 16384), ('batch_size', 4)):
+            value = probe.get(key, default)
+            if type(value) is not int or value < 1:
+                raise ValueError(f'local_validation_probe.{key} must be a positive integer')
+        if probe.get('max_model_len', 16384) <= probe.get('max_new_tokens', 256):
+            raise ValueError('Local probe context must exceed its output budget')
+        if not re.fullmatch(r'[A-Za-z0-9_./\-]+', probe.get('model', 'Qwen/Qwen3-4B-Instruct-2507')):
+            raise ValueError('local_validation_probe.model must identify a Hugging Face model')
+
+
+def allocated_nodes(cfg):
+    probe = cfg.get('local_validation_probe')
+    return cfg['nodes'] + (probe.get('extra_nodes', 1) if probe is not None else 0)
 
 
 def run_name(cfg, phase, arm, seed):
@@ -169,7 +189,7 @@ def run_environment(run, *, check_allocation=True):
     for artifact in (run['planner'], run['worker'], train_source, run['evaluation_remote'], cfg['remote_root']):
         if not artifact or 'SET_ME' in artifact or not re.fullmatch(r'[A-Za-z0-9_./:@+\-]+', artifact):
             raise ValueError(f'Replace the unresolved/invalid artifact before launch: {artifact!r}')
-    if check_allocation and int(os.environ.get('SLURM_NNODES', cfg['nodes'])) != cfg['nodes']:
+    if check_allocation and int(os.environ.get('SLURM_NNODES', allocated_nodes(cfg))) != allocated_nodes(cfg):
         raise ValueError('Slurm node allocation differs from the experiment manifest')
     train_planner = run['mode'] == 'planner_train'
     train = train_planner or run['mode'] == 'worker_train'
@@ -199,6 +219,7 @@ def run_environment(run, *, check_allocation=True):
     }
     env = {
         'GPUS_PER_NODE': cfg['gpus_per_node'], 'POOL_GPUS_PER_NODE': cfg['gpus_per_node'] // 2,
+        'TRAINING_NNODES': cfg['nodes'],
         'AGENT12_RUN_NAME': run['run_name'], 'AGENT12_S3_REMOTE': cfg['remote_root'],
         'AGENT12_WANDB_RUN_ID': run['run_name'] + '-' + os.environ.get('SLURM_JOB_ID', 'local'),
         'TRAIN_DECOMPOSER': str(train_planner).lower(),
@@ -228,6 +249,17 @@ def run_environment(run, *, check_allocation=True):
     }
     env.update(model_env('DECOMPOSER', run['planner']))
     env.update(model_env('WORKER', run['worker']))
+    probe = cfg.get('local_validation_probe')
+    if probe is not None:
+        env.update({
+            'VALIDATION_PROBE_BACKEND': 'local', 'VALIDATION_PROBE_URL': '',
+            'VALIDATION_PROBE_MODEL': probe.get('model', 'Qwen/Qwen3-4B-Instruct-2507'),
+            'VALIDATION_PROBE_REVISION': probe['revision'],
+            'VALIDATION_PROBE_SAMPLES_PER_DATASET': probe.get('samples_per_dataset', 32),
+            'VALIDATION_PROBE_MAX_NEW_TOKENS': probe.get('max_new_tokens', 256),
+            'VALIDATION_PROBE_MAX_MODEL_LEN': probe.get('max_model_len', 16384),
+            'VALIDATION_PROBE_BATCH_SIZE': probe.get('batch_size', 4),
+        })
     # Shell quoting protects Hydra interpolations and strings from bash expansion.
     env['AGENT12_EXPERIMENT_OVERRIDES'] = ' '.join(shlex.quote(
         key + '=' + (json.dumps(value) if not isinstance(value, str) else value)
@@ -265,7 +297,7 @@ def write_runs(cfg, phase, directory):
             run['data_sha256'] = data_fingerprint
         path = directory / (run['run_name'] + '.json')
         path.write_text(json.dumps(run, indent=2) + '\n')
-        command = ['sbatch', f"--nodes={cfg['nodes']}",
+        command = ['sbatch', '--export=ALL', f"--nodes={allocated_nodes(cfg)}",
                    f"--gres=gpu:hopper:{cfg['gpus_per_node']},storage:local:200G",
                    'eac3-experiment-multinode.sh', str(path)]
         commands.append(shlex.join(command))
@@ -332,6 +364,7 @@ def main():
     plan.add_argument('--config', default='config/eac3-experiments.json')
     plan.add_argument('--phase', choices=PHASES, required=True)
     plan.add_argument('--output-dir', required=True)
+    plan.add_argument('--local-probe-revision', help='Enable a frozen local Qwen3-4B probe at this HF commit')
     env = sub.add_parser('environment')
     env.add_argument('--run', required=True)
     prepare = sub.add_parser('prepare-data')
@@ -345,7 +378,13 @@ def main():
     check.add_argument('--output-manifest')
     args = parser.parse_args()
     if args.command == 'plan':
-        write_runs(read_json(args.config), args.phase, args.output_dir)
+        cfg = read_json(args.config)
+        if args.local_probe_revision:
+            cfg['local_validation_probe'] = {
+                **(cfg.get('local_validation_probe') or {}),
+                'revision': args.local_probe_revision,
+            }
+        write_runs(cfg, args.phase, args.output_dir)
     elif args.command == 'environment':
         run = read_json(args.run)
         for name, digest in run.get('code_sha256', {}).items():

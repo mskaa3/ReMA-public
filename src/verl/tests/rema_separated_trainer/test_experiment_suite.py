@@ -450,7 +450,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('trainer.resume_mode=disable', result.stdout)
                 self.assertIn('unset JOB_TMP', result.stdout)
-                self.assertIn('sbatch --nodes=4 --gres=gpu:hopper:4,storage:local:200G',
+                self.assertIn('sbatch --export=ALL --nodes=4 --gres=gpu:hopper:4,storage:local:200G',
                               (directory / 'commands.txt').read_text())
                 result = subprocess.run([sys.executable, str(ROOT / 'scripts/eac3_experiments.py'),
                                          'environment', '--run', str(run)], capture_output=True, text=True,
@@ -461,6 +461,67 @@ class ExperimentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unresolved'):
                 suite.write_runs(cfg, 'adapt-planners', Path(tmp) / 'invalid')
             self.assertFalse((Path(tmp) / 'invalid').exists())
+
+    def test_local_probe_reserves_capacity_without_changing_training_pools(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        defaults = launcher[:launcher.index('\nif (( GPUS_PER_NODE')].replace('source ./env.sh', ':')
+        function = launcher[launcher.index('run_agent12_training() {'):launcher.index('\nif [[ "$ONLINE_TEACHER_GENERATION"')]
+        with tempfile.TemporaryDirectory() as tmp:
+            for arm in ('ungated', 'gated'):
+                cfg = suite.read_json(ROOT / f'config/eac3-round2-{arm}.json')
+                for phase in ('adapt-workers', 'adapt-planners'):
+                    with self.subTest(arm=arm, phase=phase):
+                        original = suite.run_environment(suite.make_runs(cfg, phase)[0], check_allocation=False)
+                        local_cfg = dict(cfg, local_validation_probe={'revision': 'a' * 40})
+                        run = suite.make_runs(local_cfg, phase)[0]
+                        env = suite.run_environment(run, check_allocation=False)
+                        self.assertEqual(suite.allocated_nodes(local_cfg), 5)
+                        self.assertEqual({k: v for k, v in env.items() if not k.startswith('VALIDATION_PROBE_')},
+                                         original)
+                        with patch.dict(os.environ, {'SLURM_NNODES': '4'}):
+                            with self.assertRaisesRegex(ValueError, 'allocation differs'):
+                                suite.run_environment(run)
+                        with patch.dict(os.environ, {'SLURM_NNODES': '5'}):
+                            suite.run_environment(run)
+                        capture = Path(tmp) / 'command'
+                        env = {**os.environ, **{k: str(v) for k, v in env.items()},
+                               'SLURM_JOB_ID': '123', 'SLURM_NNODES': '5', 'CAPTURE': str(capture)}
+                        shell = defaults + '\nsrun() { printf "%s\\n" "${!#}" > "$CAPTURE"; }\n'
+                        shell += 'HEAD_NODE=head; IP_HEAD=head:6379; COMMON_MOUNTS=(--nv)\n' + function
+                        shell += '\nrun_agent12_training /tmp/train.parquet "$TOTAL_STEPS" True True\n'
+                        result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        command = shlex.split(capture.read_text().rsplit(';', 1)[-1])
+                        opts = dict(arg.split('=', 1) for arg in command if '=' in arg and not arg.startswith('--'))
+                        self.assertEqual(opts['trainer.nnodes'], '4')
+                        self.assertEqual(opts['trainer.n_gpus_per_node'], '2')
+                        self.assertEqual(opts['trainer.validation_probe.backend'], 'local')
+                        self.assertEqual(opts['trainer.validation_probe.base_url'], 'null')
+                        self.assertEqual(opts['trainer.validation_probe.revision'], 'a' * 40)
+                        self.assertEqual(opts['trainer.validation_probe.max_new_tokens'], '256')
+                        self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training'],
+                                         str(phase == 'adapt-planners' or arm == 'gated').lower())
+
+    def test_local_probe_cli_pins_revision_in_manifests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / 'runs'
+            result = subprocess.run([
+                sys.executable, str(ROOT / 'scripts/eac3_experiments.py'), 'plan',
+                '--config', str(ROOT / 'config/eac3-round2-gated.json'),
+                '--phase', 'adapt-workers', '--output-dir', str(directory),
+                '--local-probe-revision', 'a' * 40,
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('sbatch --export=ALL --nodes=5', (directory / 'commands.txt').read_text())
+            manifest = suite.read_json(next(directory.glob('*.json')))
+            self.assertEqual(manifest['study_config']['local_validation_probe']['revision'], 'a' * 40)
+            self.assertIn('src/verl/verl/rema_separated_trainer/ppo/local_validation_probe.py', manifest['code_sha256'])
+        for probe_cfg in ({'revision': 'main'}, {'revision': 'a' * 40, 'extra_nodes': 0},
+                          {'revision': 'a' * 40, 'max_new_tokens': 16384}):
+            cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+            cfg['local_validation_probe'] = probe_cfg
+            with self.assertRaises(ValueError):
+                suite.make_runs(cfg, 'adapt-workers')
 
     def test_repository_manifests_pin_dataset_contents(self):
         cfg = repository_config()

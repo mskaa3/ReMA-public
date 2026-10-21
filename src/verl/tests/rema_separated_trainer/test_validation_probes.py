@@ -14,7 +14,7 @@ import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import URLError
 
 
@@ -28,6 +28,7 @@ spec = importlib.util.spec_from_file_location(PACKAGE + '.validation_probes', PP
 probe = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = probe
 spec.loader.exec_module(probe)
+local_probe = importlib.import_module(PACKAGE + '.local_validation_probe')
 
 
 def example(key='q', dataset='gsm8k', system_score=1.):
@@ -41,7 +42,7 @@ def extract_method(name):
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'RayReMASeparatedTrainer')
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name)
     namespace = {'validation_metric_namespace': probe.validation_metric_namespace,
-                 'FrozenProbeClient': probe.FrozenProbeClient}
+                 'make_validation_probe_client': probe.make_validation_probe_client}
     exec(compile(ast.Module(body=[method], type_ignores=[]), '<trainer-method>', 'exec'), namespace)
     return namespace[name]
 
@@ -77,8 +78,37 @@ class ValidationProbeTests(unittest.TestCase):
                      ROOT / 'src/verl/verl/rema_separated_trainer/config/ppo_trainer.yaml'):
             with self.subTest(path=path):
                 config = path.read_text().split('  validation_probe:\n', 1)[1]
-                self.assertTrue(config.startswith('    enable: False\n    base_url: null\n'
-                                                 '    model: Qwen/Qwen3-4B-Instruct-2507\n'))
+                self.assertTrue(config.startswith('    enable: False\n    backend: http'))
+                self.assertIn('    model: Qwen/Qwen3-4B-Instruct-2507\n', config)
+
+    def test_local_launcher_needs_revision_not_endpoint(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        start = launcher.index('export VALIDATION_PROBE_URL=')
+        end = launcher.index('\nexport SIF_NAME=', start)
+        shell = 'set -euo pipefail\n' + launcher[start:end]
+        clean = {k: v for k, v in os.environ.items() if not k.startswith('VALIDATION_PROBE_')}
+        env = {**clean, 'VALIDATION_PROBE_BACKEND': 'local', 'VALIDATION_PROBE_REVISION': 'a' * 40}
+        result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('backend=local, model=Qwen/Qwen3-4B-Instruct-2507', result.stdout)
+        for changes in ({'VALIDATION_PROBE_REVISION': ''}, {'VALIDATION_PROBE_REVISION': 'main'},
+                        {'VALIDATION_PROBE_URL': 'http://old-probe/v1'}, {'VALIDATION_PROBE_BACKEND': 'typo'}):
+            result = subprocess.run(['bash', '-c', shell], env={**env, **changes}, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, changes)
+
+    def test_local_launcher_rejects_full_training_allocation(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        start = launcher.index('if [[ ! "$TRAINING_NNODES"')
+        end = launcher.index('\nif (( GPUS_PER_NODE', start)
+        env = {**os.environ, 'TRAINING_NNODES': '4', 'SLURM_NNODES': '4',
+               'GPUS_PER_NODE': '4', 'POOL_GPUS_PER_NODE': '2', 'VALIDATION_PROBE_BACKEND': 'local'}
+        shell = 'set -euo pipefail\n' + launcher[start:end]
+        result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('one GPU outside', result.stderr)
+        result = subprocess.run(['bash', '-c', shell], env={**env, 'SLURM_NNODES': '5'},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_context_conditions_preserve_boundaries(self):
         inputs = example().inputs
@@ -238,6 +268,146 @@ class ValidationProbeTests(unittest.TestCase):
             metadata = json.loads(path.with_suffix('.metadata.json').read_text())
             self.assertEqual(metadata['probe_records_sha256'], hashlib.sha256(saved.read_bytes()).hexdigest())
             self.assertEqual(metadata['config']['trainer']['validation_probe']['model'], 'frozen-v1')
+
+
+class LocalValidationProbeTests(unittest.TestCase):
+    def config(self, **kwargs):
+        return {'backend': 'local', 'model': 'Qwen/Qwen3-4B-Instruct-2507',
+                'revision': 'a' * 40, **kwargs}
+
+    def test_factory_keeps_local_independent_of_http(self):
+        client = probe.make_validation_probe_client(self.config())
+        self.assertIsInstance(client, local_probe.LocalFrozenProbeClient)
+        self.assertIsNone(client.actor)
+        with self.assertRaisesRegex(ValueError, 'Unknown'):
+            probe.make_validation_probe_client({'backend': 'typo'})
+        for config in (self.config(revision=None), self.config(revision='main'),
+                       self.config(base_url='http://probe/v1'), self.config(batch_size=0),
+                       self.config(max_model_len=256), self.config(gpu_memory_utilization=1.1)):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                probe.make_validation_probe_client(config)
+
+    def test_local_capacity_includes_both_training_pools_plus_probe(self):
+        client = local_probe.LocalFrozenProbeClient(self.config())
+        ray = SimpleNamespace(available_resources=lambda: {'GPU': 16})
+        with patch.dict(sys.modules, {'ray': ray}), patch.object(local_probe, 'check_local_probe_dependencies'):
+            with self.assertRaisesRegex(RuntimeError, '16 training GPUs plus 1'):
+                client.check_capacity(16)
+            ray.available_resources = lambda: {'GPU': 20}
+            client.check_capacity(16)
+
+    def test_dependencies_fail_clearly_without_automatic_upgrades(self):
+        from importlib.metadata import PackageNotFoundError
+        for versions in (['0.8.4'], ['0.8.5', '4.50.0'], PackageNotFoundError('vllm')):
+            with patch('importlib.metadata.version', side_effect=versions):
+                with self.assertRaisesRegex(RuntimeError, 'compatible container or the HTTP backend'):
+                    local_probe.check_local_probe_dependencies()
+        with patch('importlib.metadata.version', side_effect=['0.8.5', '4.51.0']):
+            local_probe.check_local_probe_dependencies()
+
+    def test_actor_lifecycle_reserves_one_gpu_and_is_closed_once(self):
+        actor = Mock()
+        actor_type = Mock()
+        actor_type.options.return_value.remote.return_value = actor
+        ray = Mock()
+        ray.available_resources.return_value = {'GPU': 4}
+        ray.remote.return_value.return_value = actor_type
+        ray.get.return_value = {'model': 'fixed'}
+        client = local_probe.LocalFrozenProbeClient(self.config())
+        with patch.dict(sys.modules, {'ray': ray}):
+            client.start()
+            client.start()
+            ray.remote.assert_called_once_with(num_cpus=1, num_gpus=1, max_restarts=0, max_task_retries=0)
+            actor_type.options.assert_called_once_with(scheduling_strategy='DEFAULT')
+            ray.get.assert_called_once_with(actor.ready.remote.return_value, timeout=900)
+            client.close()
+            client.close()
+        ray.kill.assert_called_once_with(actor, no_restart=True)
+
+    def test_startup_timeout_kills_actor(self):
+        ray = Mock()
+        ray.available_resources.return_value = {'GPU': 1}
+        ray.get.side_effect = TimeoutError('startup')
+        client = local_probe.LocalFrozenProbeClient(self.config())
+        with patch.dict(sys.modules, {'ray': ray}):
+            with self.assertRaises(TimeoutError):
+                client.start()
+        self.assertIsNone(client.actor)
+        ray.kill.assert_called_once()
+
+    def test_cleanup_failure_preserves_original_error(self):
+        ray = Mock()
+        ray.available_resources.return_value = {'GPU': 1}
+        ray.get.side_effect = TimeoutError('startup')
+        ray.kill.side_effect = RuntimeError('Ray disconnected')
+        client = local_probe.LocalFrozenProbeClient(self.config())
+        with patch.dict(sys.modules, {'ray': ray}), self.assertLogs(local_probe.__name__, level='WARNING'):
+            with self.assertRaisesRegex(TimeoutError, 'startup'):
+                client.start()
+        self.assertIsNone(client.actor)
+
+    def test_generation_batches_are_ordered_and_timeout_is_not_zero_accuracy(self):
+        ray = Mock()
+        client = local_probe.LocalFrozenProbeClient(self.config(batch_size=2))
+        client.actor = Mock()
+        outputs = [probe.ProbeResponse(str(i), 'stop') for i in range(5)]
+        ray.get.side_effect = [outputs[:2], outputs[2:4], outputs[4:]]
+        with patch.dict(sys.modules, {'ray': ray}):
+            self.assertEqual(client.generate(list('abcde')), outputs)
+            self.assertEqual([call.args[0] for call in client.actor.generate.remote.call_args_list],
+                             [list('ab'), list('cd'), list('e')])
+            ray.get.side_effect = TimeoutError('inference')
+            with self.assertRaises(TimeoutError):
+                client.generate(['another'])
+            self.assertIsNone(client.actor)
+            ray.kill.assert_called_once()
+
+    def test_local_engine_is_frozen_pinned_and_uses_its_own_template(self):
+        engine = Mock()
+        tokenizer = engine.get_tokenizer.return_value
+        tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        engine.generate.return_value = [SimpleNamespace(outputs=[
+            SimpleNamespace(text=r'\boxed{7}', finish_reason='length')])]
+        vllm = SimpleNamespace(LLM=Mock(return_value=engine), SamplingParams=Mock())
+        ray = SimpleNamespace(get_gpu_ids=lambda: [3])
+        with patch.dict(sys.modules, {'vllm': vllm, 'ray': ray}), \
+                patch.object(local_probe, 'check_local_probe_dependencies'):
+            worker = local_probe.LocalProbeWorker(self.config())
+            result = worker.generate(['CURRENT TASK: use S1'])
+        kwargs = vllm.LLM.call_args.kwargs
+        self.assertEqual(kwargs['revision'], 'a' * 40)
+        self.assertEqual(kwargs['tokenizer_revision'], 'a' * 40)
+        self.assertEqual(kwargs['distributed_executor_backend'], 'uni')
+        self.assertEqual(kwargs['tensor_parallel_size'], 1)
+        self.assertEqual(kwargs['generation_config'], 'vllm')
+        self.assertEqual(vllm.SamplingParams.call_args.kwargs['temperature'], 0)
+        self.assertEqual(vllm.SamplingParams.call_args.kwargs['max_tokens'], 256)
+        messages = tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(messages, [{'role': 'system', 'content': probe.SYSTEM_PROMPT},
+                                    {'role': 'user', 'content': 'CURRENT TASK: use S1'}])
+        self.assertEqual(result, [probe.ProbeResponse(r'\boxed{7}', 'length')])
+        self.assertFalse(hasattr(worker, 'optimizer'))
+        engine.generate.reset_mock()
+        tokenizer.apply_chat_template.return_value = list(range(16384))
+        with self.assertRaisesRegex(ValueError, 'rather than truncate'):
+            worker.generate(['too long'])
+        engine.generate.assert_not_called()
+
+    def test_training_finally_closes_probe_even_on_failure(self):
+        source = ast.parse((PPO.parent / 'main_ppo.py').read_text())
+        runner = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == 'TaskRunner')
+        run = next(node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == 'run')
+        lifecycle = next(node for node in run.body if isinstance(node, ast.Try))
+        code = compile(ast.Module(body=[lifecycle], type_ignores=[]), '<probe-cleanup>', 'exec')
+        for failure in ('init_workers', 'fit', None):
+            trainer = Mock()
+            if failure:
+                getattr(trainer, failure).side_effect = RuntimeError('test failure')
+                with self.assertRaises(RuntimeError):
+                    exec(code, {'trainer': trainer})
+            else:
+                exec(code, {'trainer': trainer})
+            trainer.close_validation_probes.assert_called_once()
 
 
 if __name__ == '__main__':

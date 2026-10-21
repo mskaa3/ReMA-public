@@ -151,3 +151,67 @@ not a fixed independent measure of improved collaboration.
 
 The legacy `transfer` and `cross` phases resolve the original `workers` exports,
 not these `adapt-workers` exports. Do not use them unchanged for round-2 transfer.
+
+## Rerun workers with local frozen probes
+
+Use this after the adapted planner exports already exist. It preserves the
+round-2 input models, creates fresh output identities, and evaluates both arms
+with the same pinned Qwen3-4B probe inside each job. No probe server is needed.
+The local backend requires a compatible job container and adds one node to the
+allocation; see [resource and dependency details](validation_information_probes.md#local-inference-inside-the-training-job).
+
+Set `PROBE_REVISION` to the same immutable HF commit for both runs. To resolve
+the current revision once (internet access required):
+
+```bash
+export PROBE_REVISION="$(curl --fail --silent --show-error \
+  https://huggingface.co/api/models/Qwen/Qwen3-4B-Instruct-2507 \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+echo "$PROBE_REVISION"
+```
+
+Retain that hash for future repeats rather than resolving a new revision.
+Then, from the updated repository on the login node:
+
+```bash
+(
+  set -euo pipefail
+  cd ~/projects/ReMA-public
+  : "${PROBE_REVISION:?Set the fixed probe revision first}"
+  export RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
+  export RUN_DIR="experiments/runs/round2-workers-local-probe-${RUN_STAMP}"
+
+  python3 - <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+import eac3_experiments as suite
+
+for chain in ('ungated', 'gated'):
+    cfg = suite.read_json(f'config/eac3-round2-{chain}.json')
+    assert len(cfg['seeds']) == 1
+    original = suite.make_runs(cfg, 'adapt-workers')[0]
+    for remote in (original['planner'], original['worker']):
+        print(f'Checking {remote}', flush=True)
+        subprocess.run(['rclone', 'cat', remote.rstrip('/') + '/config.json'],
+                       stdout=subprocess.DEVNULL, check=True)
+    cfg['planners'] = {'eac3': original['planner']}
+    cfg['study'] += '-local-probe-' + os.environ['RUN_STAMP']
+    cfg['local_validation_probe'] = {'revision': os.environ['PROBE_REVISION']}
+    suite.write_runs(cfg, 'workers', Path(os.environ['RUN_DIR']) / chain)
+PY
+
+  bash "$RUN_DIR/ungated/commands.txt"
+  bash "$RUN_DIR/gated/commands.txt"
+)
+```
+
+This deliberately uses `workers` with the explicitly resolved adapted planner:
+renaming a study and using `adapt-workers` directly would look for a nonexistent
+new planner export. Training pools, starting weights, seeds, C3 and gate settings
+are unchanged. Standard checkpoint paths are assumed; replace them with actual
+recovered HF paths if necessary. These remain two alternating histories, not a
+gate-only ablation with identical starting partners. New probe scores are
+evaluation diagnostics, not additions to either training reward.

@@ -74,7 +74,7 @@ from verl.rema_separated_trainer.ppo.prefix_probe import (
     select_stratified_probe_indices,
 )
 from verl.rema_separated_trainer.ppo.validation_probes import (
-    FrozenProbeClient,
+    make_validation_probe_client,
     ProbeExample,
     evaluate_probes,
     select_probe_examples,
@@ -910,14 +910,20 @@ class RayReMASeparatedTrainer(object):
             raise ValueError('Validation information probes require terminal_worker_as_answer=True')
         if int(config.get('samples_per_dataset', 32)) < 1:
             raise ValueError('validation_probe.samples_per_dataset must be positive')
-        self.validation_probe_client = FrozenProbeClient(config)
+        self.validation_probe_client = make_validation_probe_client(config)
         print(
-            f'[validation/probe] frozen_model={self.validation_probe_client.model} '
+            f'[validation/probe] backend={config.get("backend", "http")} '
+            f'frozen_model={self.validation_probe_client.model} '
             f'max_new_tokens={self.validation_probe_client.max_new_tokens} '
             f'samples_per_dataset={config.get("samples_per_dataset", 32)} '
             'conditions=terminal_only,with_instructions,with_results; evaluation only',
             flush=True,
         )
+
+    def close_validation_probes(self):
+        client = getattr(self, 'validation_probe_client', None)
+        if client is not None and hasattr(client, 'close'):
+            client.close()
 
     def _tokenizer_for_role(self, role):
         return getattr(self, 'role_tokenizers', {}).get(role, self.tokenizer)
@@ -3159,6 +3165,9 @@ class RayReMASeparatedTrainer(object):
 
     def init_workers(self):
         """Init resource pool and worker group"""
+        probe_client = getattr(self, 'validation_probe_client', None)
+        if probe_client is not None and hasattr(probe_client, 'check_capacity'):
+            probe_client.check_capacity(self.resource_pool_manager.get_n_gpus())
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -3281,6 +3290,8 @@ class RayReMASeparatedTrainer(object):
             self.role_tokenizers,
             self.actor_rollout_wg,
         )
+        if probe_client is not None and hasattr(probe_client, 'start'):
+            probe_client.start()
 
     def _get_schedule_step(self):
         """One-based next actor update, distinct from bounded rollout attempts."""

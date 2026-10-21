@@ -61,17 +61,107 @@ Positive `result_advantage` means results help this frozen probe more than the
 instructions do; it does not establish that the actual terminal causally used
 them or that every worker performed the correct subtask.
 
-## Frozen endpoint
+## Frozen model and backends
 
 The default evaluator is **`Qwen/Qwen3-4B-Instruct-2507`**, using its original
 instruction-tuned weights, independently of the worker and decomposer models.
 This choice applies only to these five evaluation metrics, not the existing
 training leakage probes or reward gates.
 
-The evaluator must be separate from the actors being trained. Serve one fixed
-SLM checkpoint with an OpenAI-compatible `/v1/chat/completions` API. Do not
-hot-swap its weights or reuse a moving actor behind the same model name. The
-response's `model` identifier must match `VALIDATION_PROBE_MODEL`.
+The evaluator must be separate from the actors being trained. Two backends use
+the same input construction, system prompt, greedy decoding, verifier, sampling,
+and metrics: a job-managed local vLLM actor, or an external HTTP endpoint.
+Neither backend receives gradients or training-role weight updates. Do not
+switch backends or inference versions midway through a comparison: the
+measurement protocol is shared, but bitwise identical generations are not
+guaranteed across inference environments.
+
+## Local inference inside the training job
+
+This mode needs no HTTP server, endpoint address, or separate interactive
+session. A Ray actor loads the fixed model once on one exclusive GPU, outside
+both training placement groups. It stays resident across validations and is
+killed when the trainer finishes or fails. Inference is batched; no training
+optimizer is created for the probe and its weights are never synchronized
+with the workers or decomposer.
+
+For experiment manifests, add the immutable HF revision when generating runs:
+
+```bash
+: "${PROBE_REVISION:?Set the fixed 40-character HF commit hash first}"
+python3 scripts/eac3_experiments.py plan \
+  --config config/eac3-round2-gated.json \
+  --phase adapt-workers \
+  --local-probe-revision "$PROBE_REVISION" \
+  --output-dir experiments/runs/round2-local-probe-gated
+```
+
+This generates commands only. For a repeat of an existing experiment, use a
+fresh study name and explicitly retain its original adapted planner first;
+see [the round-2 rerun recipe](eac3_round2.md#rerun-workers-with-local-frozen-probes).
+Changing only the output directory does not change the S3 study identity.
+
+The manifest records `local_validation_probe.revision` and requests one extra
+node by default, without changing `nodes` for the training pools. For the
+current 4-node x 4-GPU configurations, Slurm allocates **5 nodes x 4 GPUs**:
+16 GPUs remain assigned to the two training pools, one GPU runs the probe,
+and three GPUs are unused. This is a homogeneous Slurm request, not a promise
+that an entire particular host is used only for the probe. Actual GPU placement
+is managed by Ray. Both arms together allocate 40 GPUs rather than 32.
+
+Optional manifest settings (defaults shown) are:
+
+```json
+"local_validation_probe": {
+  "model": "Qwen/Qwen3-4B-Instruct-2507",
+  "revision": "REPLACE_WITH_IMMUTABLE_HF_COMMIT_HASH",
+  "extra_nodes": 1,
+  "samples_per_dataset": 32,
+  "max_new_tokens": 256,
+  "max_model_len": 16384,
+  "batch_size": 4
+}
+```
+
+The experiment wrapper clears inherited HTTP probe settings for local runs.
+All nodes still join the Ray cluster and receive the code/container staging;
+`TRAINING_NNODES` controls only the two training pools. Teacher generation, if
+used outside these question-only experiments, remains a separate earlier phase.
+
+For ordinary launchers (without an experiment manifest), reserve capacity
+explicitly. For example, a five-node allocation with four training nodes:
+
+```bash
+export VALIDATION_PROBE_BACKEND=local
+export VALIDATION_PROBE_MODEL=Qwen/Qwen3-4B-Instruct-2507
+export VALIDATION_PROBE_REVISION="$PROBE_REVISION"
+export TRAINING_NNODES=4
+unset VALIDATION_PROBE_URL
+# Submit the usual launcher with --nodes=5 and its existing 4 GPUs per node.
+```
+
+Missing capacity is an error, not a request to share a training GPU. The shell
+checks requested capacity, the trainer checks Ray capacity before initializing
+training models, and the client checks for a free GPU after training placement
+groups are created. Actor startup has a 900-second limit; each inference batch
+uses `timeout_seconds` (180 by default). Failed startup/inference kills the
+probe actor and fails the run rather than manufacturing zero probe accuracy.
+Long prompts are rejected, never silently truncated.
+
+**Container prerequisite:** local mode requires vLLM >= 0.8.5 and Transformers
+>= 4.51.0 in the job's container. The dependency check fails early rather than
+upgrading packages automatically. Unlike HTTP mode, a separate compatible
+server environment cannot compensate for an incompatible training container.
+Validate that a newer container still supports the existing trainer before
+launching long runs. Local inference startup prints model revision and library
+versions; the experiment manifest and resolved config retain the revision.
+
+## HTTP endpoint (optional)
+
+Serve one fixed SLM checkpoint with an OpenAI-compatible
+`/v1/chat/completions` API. Do not hot-swap its weights or reuse a moving actor
+behind the same model name. The response's `model` identifier must match
+`VALIDATION_PROBE_MODEL`.
 
 Use a separate allocated GPU session with a Qwen3-compatible environment. The
 [official model card](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
@@ -110,6 +200,7 @@ Enable it for the usual Agent-1/Agent-2 or experiment launcher:
 
 ```bash
 export VALIDATION_PROBE_URL="http://PROBE_NODE:8000/v1"
+export VALIDATION_PROBE_BACKEND=http
 # Optional: already the default when VALIDATION_PROBE_URL is supplied.
 export VALIDATION_PROBE_MODEL="Qwen/Qwen3-4B-Instruct-2507"
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=32
@@ -120,14 +211,15 @@ export VALIDATION_PROBE_MAX_NEW_TOKENS=256
 # Then use your existing sbatch command and checkpoint/model settings.
 ```
 
-Setting the URL enables the new metrics and defaults to the model above.
+Setting the URL with no explicit backend selects HTTP and enables the metrics.
 An explicit `VALIDATION_PROBE_MODEL` can override the served name. With neither
-variable set, probes remain off; specifying only a model is a configuration
+variable or backend set, probes remain off; specifying only a model is a configuration
 error. Accuracy and the reorganized diagnostics still log normally when probes
 are off. The same options are available to direct Hydra invocations:
 
 ```text
 trainer.validation_probe.enable=True
+trainer.validation_probe.backend=http
 trainer.validation_probe.base_url=http://PROBE_NODE:8000/v1
 trainer.validation_probe.model=Qwen/Qwen3-4B-Instruct-2507
 trainer.validation_probe.samples_per_dataset=32
@@ -183,6 +275,8 @@ python3 src/verl/tests/rema_separated_trainer/test_validation_probes.py -v
 ```
 
 The stdlib suite exercises paired scoring, failure denominators, endpoint
-contracts, stable selection, and namespace isolation without GPUs. The existing
+contracts, local inference/resource contracts with mocked Ray/vLLM, stable
+selection, and namespace isolation without GPUs. It is not a GPU integration
+test. The existing
 `test_agent2_launch.py` additionally checks captured probe inputs at the actual
 rollout boundary when the trainer dependencies are installed.
