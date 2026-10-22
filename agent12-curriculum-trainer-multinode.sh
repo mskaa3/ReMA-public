@@ -21,6 +21,7 @@ export TRAINING_NNODES=${TRAINING_NNODES:-${SLURM_NNODES}}
 # Independent evaluation model, never a moving training role.
 export VALIDATION_PROBE_URL=${VALIDATION_PROBE_URL:-}
 export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-}
+export VALIDATION_PROBE_MODEL_REMOTE=${VALIDATION_PROBE_MODEL_REMOTE:-}
 export VALIDATION_PROBE_BACKEND=${VALIDATION_PROBE_BACKEND:-}
 export VALIDATION_PROBE_REVISION=${VALIDATION_PROBE_REVISION:-}
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=${VALIDATION_PROBE_SAMPLES_PER_DATASET:-32}
@@ -30,12 +31,18 @@ export VALIDATION_PROBE_BATCH_SIZE=${VALIDATION_PROBE_BATCH_SIZE:-4}
 if [[ -z "$VALIDATION_PROBE_BACKEND" ]]; then
     if [[ -n "$VALIDATION_PROBE_URL" ]]; then
         export VALIDATION_PROBE_BACKEND=http
+    elif [[ -n "$VALIDATION_PROBE_MODEL_REMOTE" ]]; then
+        export VALIDATION_PROBE_BACKEND=local
     elif [[ -n "$VALIDATION_PROBE_MODEL" ]]; then
         echo "Set VALIDATION_PROBE_URL or VALIDATION_PROBE_BACKEND=local for frozen evaluation" >&2
         exit 1
     else
         export VALIDATION_PROBE_BACKEND=off
     fi
+fi
+if [[ -n "$VALIDATION_PROBE_MODEL_REMOTE" && "$VALIDATION_PROBE_BACKEND" != local ]]; then
+    echo "VALIDATION_PROBE_MODEL_REMOTE requires VALIDATION_PROBE_BACKEND=local" >&2
+    exit 1
 fi
 case "$VALIDATION_PROBE_BACKEND" in
     http)
@@ -46,7 +53,11 @@ case "$VALIDATION_PROBE_BACKEND" in
             echo "Unset VALIDATION_PROBE_URL when using the local probe" >&2
             exit 1
         fi
-        if [[ ! -d "$VALIDATION_PROBE_MODEL" && ! "$VALIDATION_PROBE_REVISION" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        if [[ -n "$VALIDATION_PROBE_MODEL_REMOTE" && -n "$VALIDATION_PROBE_REVISION" ]]; then
+            echo "Unset VALIDATION_PROBE_REVISION for a remote HF export; its immutable path identifies the checkpoint" >&2
+            exit 1
+        fi
+        if [[ -z "$VALIDATION_PROBE_MODEL_REMOTE" && ! -d "$VALIDATION_PROBE_MODEL" && ! "$VALIDATION_PROBE_REVISION" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "Set VALIDATION_PROBE_REVISION to a fixed 40-character HF commit hash" >&2
             exit 1
         fi
@@ -56,7 +67,7 @@ case "$VALIDATION_PROBE_BACKEND" in
 esac
 if [[ "$VALIDATION_PROBE_BACKEND" != off ]]; then
     export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-Qwen/Qwen2.5-7B-Instruct}
-    echo "Frozen validation probe: backend=${VALIDATION_PROBE_BACKEND}, model=${VALIDATION_PROBE_MODEL} (evaluation only)"
+    echo "Frozen validation probe: backend=${VALIDATION_PROBE_BACKEND}, model=${VALIDATION_PROBE_MODEL_REMOTE:-$VALIDATION_PROBE_MODEL} (evaluation only)"
 fi
 
 export SIF_NAME=${SIF_NAME:-verl-rema-v3.sif}
@@ -87,6 +98,24 @@ export WORKER_CHECKPOINT_ROLE=${WORKER_CHECKPOINT_ROLE:-worker_stage_${NUM_WORKE
 export PREFIX_PROBE_ENABLE=${PREFIX_PROBE_ENABLE:-false}
 export PREFIX_PROBE_APPLY_TO_TRAINING=${PREFIX_PROBE_APPLY_TO_TRAINING:-true}
 export PREFIX_PROBE_SOLVER_BACKEND=${PREFIX_PROBE_SOLVER_BACKEND:-role}
+# Optional immutable HF export, loaded separately from the trainable decomposer.
+export FROZEN_GATE_MODEL_REMOTE=${FROZEN_GATE_MODEL_REMOTE:-}
+export FROZEN_GATE_MODEL_PATH=${FROZEN_GATE_MODEL_PATH:-}
+export FROZEN_GATE_REVISION=${FROZEN_GATE_REVISION:-}
+export FROZEN_GATE_MAX_MODEL_LEN=${FROZEN_GATE_MAX_MODEL_LEN:-16384}
+export FROZEN_GATE_BATCH_SIZE=${FROZEN_GATE_BATCH_SIZE:-4}
+export FROZEN_GATE_ENABLE=false
+if [[ -n "$FROZEN_GATE_MODEL_REMOTE" || -n "$FROZEN_GATE_MODEL_PATH" ]]; then
+    export FROZEN_GATE_ENABLE=true
+    if [[ "$PREFIX_PROBE_SOLVER_BACKEND" != frozen_probe ]]; then
+        echo "A frozen gate checkpoint requires PREFIX_PROBE_SOLVER_BACKEND=frozen_probe" >&2
+        exit 1
+    fi
+    if [[ -z "$FROZEN_GATE_MODEL_REMOTE" && ! -d "$FROZEN_GATE_MODEL_PATH" && ! "$FROZEN_GATE_REVISION" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "Provide an immutable local/S3 HF export or a fixed FROZEN_GATE_REVISION" >&2
+        exit 1
+    fi
+fi
 export C3_REQUIRE_ELIGIBLE_SUCCESS=${C3_REQUIRE_ELIGIBLE_SUCCESS:-true}
 export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}
 export PREFIX_PROBE_VALIDATION_MAX_SAMPLES=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES:-128}
@@ -94,8 +123,8 @@ case "$PREFIX_PROBE_SOLVER_BACKEND" in
     role|frozen_probe) ;;
     *) echo "PREFIX_PROBE_SOLVER_BACKEND must be role or frozen_probe" >&2; exit 1 ;;
 esac
-if [[ "$PREFIX_PROBE_ENABLE" == true && "$PREFIX_PROBE_SOLVER_BACKEND" == frozen_probe && "$VALIDATION_PROBE_BACKEND" == off ]]; then
-    echo "Frozen gates require VALIDATION_PROBE_BACKEND=local or http; no role fallback" >&2
+if [[ "$PREFIX_PROBE_ENABLE" == true && "$PREFIX_PROBE_SOLVER_BACKEND" == frozen_probe && "$VALIDATION_PROBE_BACKEND" == off && "$FROZEN_GATE_ENABLE" == false ]]; then
+    echo "Frozen gates require a FROZEN_GATE_MODEL_REMOTE/PATH or VALIDATION_PROBE_BACKEND=local/http; no role fallback" >&2
     exit 1
 fi
 export AGENT2_PILOT=${AGENT2_PILOT:-false}
@@ -153,9 +182,11 @@ if [[ ! "$TRAINING_NNODES" =~ ^[1-9][0-9]*$ ]] || (( TRAINING_NNODES > SLURM_NNO
     echo "TRAINING_NNODES must be positive and no larger than the Slurm allocation" >&2
     exit 1
 fi
-if [[ "$VALIDATION_PROBE_BACKEND" == local ]] && \
-        (( SLURM_NNODES * GPUS_PER_NODE < 2 * TRAINING_NNODES * POOL_GPUS_PER_NODE + 1 )); then
-    echo "Local probe needs one GPU outside both training pools. Reserve extra nodes/GPUs and set TRAINING_NNODES explicitly." >&2
+probe_gpus=0
+if [[ "$VALIDATION_PROBE_BACKEND" == local ]]; then probe_gpus=$((probe_gpus + 1)); fi
+if [[ "${PREFIX_PROBE_ENABLE:-false}" == true && "${FROZEN_GATE_ENABLE:-false}" == true ]]; then probe_gpus=$((probe_gpus + 1)); fi
+if (( SLURM_NNODES * GPUS_PER_NODE < 2 * TRAINING_NNODES * POOL_GPUS_PER_NODE + probe_gpus )); then
+    echo "Local probes need ${probe_gpus} exclusive GPUs outside both training pools. Reserve extra nodes/GPUs and set TRAINING_NNODES explicitly." >&2
     exit 1
 fi
 if (( GPUS_PER_NODE % 2 != 0 )); then
@@ -277,6 +308,46 @@ if [[ -n "$DECOMPOSER_MODEL_REMOTE" ]]; then
     srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
         apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         python3 /root/ReMA-public/scripts/validate_hf_model_dir.py "$DECOMPOSER_MODEL_PATH"
+fi
+
+if [[ "$VALIDATION_PROBE_BACKEND" == local && -n "$VALIDATION_PROBE_MODEL_REMOTE" ]]; then
+    export VALIDATION_PROBE_MODEL=${JOB_TMP}/validation_probe_model
+    echo "Staging frozen metrics checkpoint from ${VALIDATION_PROBE_MODEL_REMOTE} on all nodes"
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+        set -euo pipefail
+        test ! -e "$VALIDATION_PROBE_MODEL"
+        test ! -e "$VALIDATION_PROBE_MODEL.partial"
+        mkdir -p "$VALIDATION_PROBE_MODEL.partial"
+        rclone copy "$VALIDATION_PROBE_MODEL_REMOTE" "$VALIDATION_PROBE_MODEL.partial" \
+            --s3-no-check-bucket --stats=30s --stats-one-line
+        test -s "$VALIDATION_PROBE_MODEL.partial/config.json"
+        mv "$VALIDATION_PROBE_MODEL.partial" "$VALIDATION_PROBE_MODEL"
+    '
+    srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
+        apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+        python3 /root/ReMA-public/scripts/validate_hf_model_dir.py "$VALIDATION_PROBE_MODEL"
+fi
+
+if [[ "$PREFIX_PROBE_ENABLE" == true && "$FROZEN_GATE_ENABLE" == true ]]; then
+    if [[ -n "$FROZEN_GATE_MODEL_REMOTE" ]]; then
+        export FROZEN_GATE_MODEL_PATH=${JOB_TMP}/frozen_gate_model
+        echo "Staging immutable gate checkpoint from ${FROZEN_GATE_MODEL_REMOTE} on all nodes"
+        srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" bash -lc '
+            set -euo pipefail
+            test ! -e "$FROZEN_GATE_MODEL_PATH"
+            test ! -e "$FROZEN_GATE_MODEL_PATH.partial"
+            mkdir -p "$FROZEN_GATE_MODEL_PATH.partial"
+            rclone copy "$FROZEN_GATE_MODEL_REMOTE" "$FROZEN_GATE_MODEL_PATH.partial" \
+                --s3-no-check-bucket --stats=30s --stats-one-line
+            test -s "$FROZEN_GATE_MODEL_PATH.partial/config.json"
+            mv "$FROZEN_GATE_MODEL_PATH.partial" "$FROZEN_GATE_MODEL_PATH"
+        '
+    fi
+    if [[ -d "$FROZEN_GATE_MODEL_PATH" ]]; then
+        srun --label --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" \
+            apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
+            python3 /root/ReMA-public/scripts/validate_hf_model_dir.py "$FROZEN_GATE_MODEL_PATH"
+    fi
 fi
 
 RAY_JOB_PIDS=()
@@ -485,6 +556,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
             "trainer.validation_probe.backend=${VALIDATION_PROBE_BACKEND}" \
             "trainer.validation_probe.base_url=${VALIDATION_PROBE_URL:-null}" \
             "trainer.validation_probe.model=${VALIDATION_PROBE_MODEL}" \
+            "trainer.validation_probe.checkpoint_source=${VALIDATION_PROBE_MODEL_REMOTE:-$VALIDATION_PROBE_MODEL}" \
             "trainer.validation_probe.revision=${VALIDATION_PROBE_REVISION:-null}" \
             "trainer.validation_probe.samples_per_dataset=${VALIDATION_PROBE_SAMPLES_PER_DATASET}" \
             "trainer.validation_probe.max_new_tokens=${VALIDATION_PROBE_MAX_NEW_TOKENS}" \
@@ -494,6 +566,17 @@ python3 -m verl.rema_separated_trainer.main_ppo \
             train_command+=" ${probe_argument}"
         done
     fi
+
+    local gate_argument
+    for gate_argument in \
+        "trainer.frozen_gate_probe.enable=${FROZEN_GATE_ENABLE}" \
+        "trainer.frozen_gate_probe.model=${FROZEN_GATE_MODEL_PATH:-null}" \
+        "trainer.frozen_gate_probe.revision=${FROZEN_GATE_REVISION:-null}" \
+        "trainer.frozen_gate_probe.max_model_len=${FROZEN_GATE_MAX_MODEL_LEN}" \
+        "trainer.frozen_gate_probe.batch_size=${FROZEN_GATE_BATCH_SIZE}"; do
+        printf -v gate_argument '%q' "$gate_argument"
+        train_command+=" ${gate_argument}"
+    done
 
     # Generated only by the opt-in experiment wrapper; defaults above stay intact.
     train_command+=" ${AGENT12_EXPERIMENT_OVERRIDES:-}"
@@ -889,6 +972,12 @@ worker_checkpoint_role=${WORKER_CHECKPOINT_ROLE}
 prefix_probe_enable=${PREFIX_PROBE_ENABLE}
 prefix_probe_apply_to_training=${PREFIX_PROBE_APPLY_TO_TRAINING}
 prefix_probe_solver_backend=${PREFIX_PROBE_SOLVER_BACKEND}
+frozen_gate_model_remote=${FROZEN_GATE_MODEL_REMOTE}
+frozen_gate_model_path=${FROZEN_GATE_MODEL_PATH}
+frozen_gate_revision=${FROZEN_GATE_REVISION}
+validation_probe_model_remote=${VALIDATION_PROBE_MODEL_REMOTE}
+validation_probe_model=${VALIDATION_PROBE_MODEL}
+validation_probe_revision=${VALIDATION_PROBE_REVISION}
 c3_require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS}
 prefix_probe_max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS}
 prefix_probe_validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES}

@@ -81,8 +81,23 @@ def validate_study(cfg):
         raise ValueError('worker_gate_mode must be off, diagnostic, or gated')
     if cfg.get('gate_solver_backend', 'role') not in ('role', 'frozen_probe'):
         raise ValueError('gate_solver_backend must be role or frozen_probe')
-    if cfg.get('gate_solver_backend', 'role') == 'frozen_probe' and not cfg.get('local_validation_probe'):
-        raise ValueError('Frozen-gate experiment manifests require a pinned local_validation_probe')
+    if (cfg.get('gate_solver_backend', 'role') == 'frozen_probe'
+            and not cfg.get('local_validation_probe') and not cfg.get('frozen_gate_probe')):
+        raise ValueError('Frozen-gate experiment manifests require a pinned local_validation_probe or frozen_gate_probe')
+    gate = cfg.get('frozen_gate_probe')
+    if gate is not None:
+        if not isinstance(gate, dict) or cfg.get('gate_solver_backend') != 'frozen_probe':
+            raise ValueError('frozen_gate_probe requires a configuration object and gate_solver_backend=frozen_probe')
+        model = gate.get('model', '')
+        if not model or 'SET_ME' in model or not re.fullmatch(r'[A-Za-z0-9_./:@+\-]+', model):
+            raise ValueError('frozen_gate_probe.model must identify an immutable HF export or pinned model')
+        if ':' not in model and not model.startswith('/') and not re.fullmatch(r'[0-9a-fA-F]{40}', str(gate.get('revision', ''))):
+            raise ValueError('frozen_gate_probe.revision must pin the HF model to a 40-character commit hash')
+        for key, default in (('extra_nodes', 1), ('max_model_len', 16384), ('batch_size', 4)):
+            if type(gate.get(key, default)) is not int or gate.get(key, default) < 1:
+                raise ValueError(f'frozen_gate_probe.{key} must be a positive integer')
+        if gate.get('max_model_len', 16384) <= 256:
+            raise ValueError('Frozen gate context must exceed its output budget')
     test_steps = cfg.get('test_update_steps', [])
     if (not isinstance(test_steps, list)
             or any(type(step) is not int or step <= 0 for step in test_steps)
@@ -92,7 +107,13 @@ def validate_study(cfg):
     if probe is not None:
         if not isinstance(probe, dict):
             raise ValueError('local_validation_probe must be a configuration object')
-        if not re.fullmatch(r'[0-9a-fA-F]{40}', str(probe.get('revision', ''))):
+        model = probe.get('model', 'Qwen/Qwen2.5-7B-Instruct')
+        if (not isinstance(model, str) or not model or 'SET_ME' in model
+                or not re.fullmatch(r'[A-Za-z0-9_./:@+\-]+', model)):
+            raise ValueError('local_validation_probe.model must identify an immutable HF export or pinned model')
+        if ':' in model and probe.get('revision'):
+            raise ValueError('Remote validation exports use an immutable path, not local_validation_probe.revision')
+        if ':' not in model and not model.startswith('/') and not re.fullmatch(r'[0-9a-fA-F]{40}', str(probe.get('revision', ''))):
             raise ValueError('local_validation_probe.revision must be a fixed 40-character HF commit hash')
         for key, default in (('extra_nodes', 1), ('samples_per_dataset', 32),
                              ('max_new_tokens', 256), ('max_model_len', 16384), ('batch_size', 4)):
@@ -101,13 +122,12 @@ def validate_study(cfg):
                 raise ValueError(f'local_validation_probe.{key} must be a positive integer')
         if probe.get('max_model_len', 16384) <= probe.get('max_new_tokens', 256):
             raise ValueError('Local probe context must exceed its output budget')
-        if not re.fullmatch(r'[A-Za-z0-9_./\-]+', probe.get('model', 'Qwen/Qwen2.5-7B-Instruct')):
-            raise ValueError('local_validation_probe.model must identify a Hugging Face model')
 
 
 def allocated_nodes(cfg):
-    probe = cfg.get('local_validation_probe')
-    return cfg['nodes'] + (probe.get('extra_nodes', 1) if probe is not None else 0)
+    probes = [cfg[key] for key in ('local_validation_probe', 'frozen_gate_probe') if cfg.get(key) is not None]
+    # One extra node can host both independent single-GPU inference actors.
+    return cfg['nodes'] + max((probe.get('extra_nodes', 1) for probe in probes), default=0)
 
 
 def run_name(cfg, phase, arm, seed):
@@ -236,6 +256,9 @@ def run_environment(run, *, check_allocation=True):
         'PREFIX_PROBE_ENABLE': str(train_planner or gate_mode != 'off').lower(),
         'PREFIX_PROBE_APPLY_TO_TRAINING': str(train_planner or (train and gate_mode == 'gated')).lower(),
         'PREFIX_PROBE_SOLVER_BACKEND': cfg.get('gate_solver_backend', 'role'),
+        # Never inherit an unrelated gate checkpoint from an earlier shell/run.
+        'FROZEN_GATE_MODEL_REMOTE': '', 'FROZEN_GATE_MODEL_PATH': '', 'FROZEN_GATE_REVISION': '',
+        'FROZEN_GATE_MAX_MODEL_LEN': 16384, 'FROZEN_GATE_BATCH_SIZE': 4,
         # Preserve the existing successful-group requirement in every arm.
         'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
         'PREFIX_PROBE_MAX_NEW_TOKENS': 256,
@@ -255,12 +278,22 @@ def run_environment(run, *, check_allocation=True):
     }
     env.update(model_env('DECOMPOSER', run['planner']))
     env.update(model_env('WORKER', run['worker']))
+    gate = cfg.get('frozen_gate_probe')
+    if gate is not None:
+        env.update(model_env('FROZEN_GATE', gate['model']))
+        env.update({
+            'FROZEN_GATE_REVISION': gate.get('revision') or '',
+            'FROZEN_GATE_MAX_MODEL_LEN': gate.get('max_model_len', 16384),
+            'FROZEN_GATE_BATCH_SIZE': gate.get('batch_size', 4),
+        })
     probe = cfg.get('local_validation_probe')
     if probe is not None:
+        probe_model = probe.get('model', 'Qwen/Qwen2.5-7B-Instruct')
         env.update({
             'VALIDATION_PROBE_BACKEND': 'local', 'VALIDATION_PROBE_URL': '',
-            'VALIDATION_PROBE_MODEL': probe.get('model', 'Qwen/Qwen2.5-7B-Instruct'),
-            'VALIDATION_PROBE_REVISION': probe['revision'],
+            'VALIDATION_PROBE_MODEL': '' if ':' in probe_model else probe_model,
+            'VALIDATION_PROBE_MODEL_REMOTE': probe_model if ':' in probe_model else '',
+            'VALIDATION_PROBE_REVISION': probe.get('revision') or '',
             'VALIDATION_PROBE_SAMPLES_PER_DATASET': probe.get('samples_per_dataset', 32),
             'VALIDATION_PROBE_MAX_NEW_TOKENS': probe.get('max_new_tokens', 256),
             'VALIDATION_PROBE_MAX_MODEL_LEN': probe.get('max_model_len', 16384),
@@ -371,8 +404,11 @@ def main():
     plan.add_argument('--phase', choices=PHASES, required=True)
     plan.add_argument('--output-dir', required=True)
     plan.add_argument('--local-probe-revision', help='Enable a frozen local Qwen2.5-7B probe at this HF commit')
+    plan.add_argument('--local-probe-checkpoint', help='Frozen metrics checkpoint: immutable S3/local HF export or pinned model ID')
     plan.add_argument('--gate-solver-backend', choices=('role', 'frozen_probe'),
                       help='Use the current decomposer or the pinned local probe for eligibility gates')
+    plan.add_argument('--frozen-gate-checkpoint', help='Immutable S3/local HF export for separate frozen gates')
+    plan.add_argument('--frozen-gate-revision', help='Fixed HF commit when the gate checkpoint is a model ID')
     env = sub.add_parser('environment')
     env.add_argument('--run', required=True)
     prepare = sub.add_parser('prepare-data')
@@ -389,7 +425,22 @@ def main():
         cfg = read_json(args.config)
         if args.gate_solver_backend:
             cfg['gate_solver_backend'] = args.gate_solver_backend
-        if args.local_probe_revision:
+        if args.frozen_gate_checkpoint:
+            if args.gate_solver_backend == 'role':
+                parser.error('--frozen-gate-checkpoint conflicts with --gate-solver-backend role')
+            cfg['gate_solver_backend'] = 'frozen_probe'
+            cfg['frozen_gate_probe'] = {
+                **(cfg.get('frozen_gate_probe') or {}), 'model': args.frozen_gate_checkpoint,
+                'revision': args.frozen_gate_revision,
+            }
+        elif args.frozen_gate_revision:
+            parser.error('--frozen-gate-revision requires --frozen-gate-checkpoint')
+        if args.local_probe_checkpoint:
+            cfg['local_validation_probe'] = {
+                **(cfg.get('local_validation_probe') or {}),
+                'model': args.local_probe_checkpoint, 'revision': args.local_probe_revision,
+            }
+        elif args.local_probe_revision:
             cfg['local_validation_probe'] = {
                 **(cfg.get('local_validation_probe') or {}),
                 'revision': args.local_probe_revision,

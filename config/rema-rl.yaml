@@ -350,7 +350,7 @@ algorithm:
         enable: False
         # False retains all leakage diagnostics without changing C3 rewards or masks.
         apply_to_training: True
-        # role reuses solver_role; frozen_probe shares trainer.validation_probe.
+        # frozen_probe uses frozen_gate_probe if enabled, otherwise validation_probe.
         solver_backend: role
         solver_role: decomposer
         max_new_tokens: 256
@@ -389,6 +389,19 @@ trainer:
   val_only: False  # True for evaluation only
   # Optional full JSONL evidence, independent of console/W&B sample selection.
   validation_output_dir: null
+  # Optional independent, frozen checkpoint for gates, not evaluation metrics.
+  # Load an immutable HF export, never a directory being written by the trainer.
+  frozen_gate_probe:
+    enable: False
+    backend: local
+    model: null
+    revision: null
+    max_new_tokens: 256
+    timeout_seconds: 180
+    startup_timeout_seconds: 900
+    max_model_len: 16384
+    batch_size: 4
+    gpu_memory_utilization: 0.8
   # Separate frozen SLM; never reused from the actors being trained.
   # Enable HTTP via VALIDATION_PROBE_URL, or local with a pinned revision and spare GPU.
   validation_probe:
@@ -396,6 +409,7 @@ trainer:
     backend: http  # local uses a job-managed, dedicated-GPU inference actor
     base_url: null
     model: Qwen/Qwen2.5-7B-Instruct
+    checkpoint_source: null  # original immutable export/ID, retained after local staging
     revision: null  # local HF models require an immutable 40-character commit hash
     samples_per_dataset: 32
     max_new_tokens: 256

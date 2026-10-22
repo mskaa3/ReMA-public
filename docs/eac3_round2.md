@@ -288,7 +288,27 @@ forward each arm's own workers instead measures the complete alternating history
 
 The base frozen Qwen and the trained decomposer may already have different
 weights at initialization. This tests practical evaluator designs, not solely
-evaluator drift. To isolate drift, initialize a pinned frozen gating copy and
-the trainable decomposer from identical weights. This implementation shares
-one frozen model for metrics and gates, so changing it also changes the metrics
-evaluator; keep that evaluator identical across the compared arms.
+evaluator drift. To isolate drift, initialize a frozen gating copy and the
+trainable decomposer from identical weights. The optional `frozen_gate_probe`
+now allows this without changing the metrics evaluator.
+
+For a paired decomposer-training experiment, use identical starting planners,
+workers, data and budgets in both manifests. In the fixed arm, set:
+
+```python
+cfg['gate_solver_backend'] = 'frozen_probe'
+cfg['frozen_gate_probe'] = {'model': cfg['planners']['eac3'], 'extra_nodes': 1}
+# Keep local_validation_probe identical in both arms.
+# Use a fresh cfg['study'] for each arm before write_runs(..., 'adapt-planners', ...).
+```
+
+In the adaptive arm, use `gate_solver_backend='role'` and omit
+`frozen_gate_probe`. The fixed arm loads an independent, inference-only copy
+of the starting planner; its weights do not change when the live planner is
+updated. Both gate models use the existing solver prompt, not their planning
+prompt. With local metrics, the fixed arm needs two spare GPUs; the same extra
+four-GPU node can accommodate them. This is a separate comparison from the
+base-Qwen-versus-trained-decomposer experiment above.
+
+See [snapshot configuration](validation_information_probes.md#frozen-trained-decomposer-snapshot)
+for ordinary launcher flags, immutable export requirements, and restart behavior.

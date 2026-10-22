@@ -62,7 +62,11 @@ tokens.
 
 The solver is configurable via `prefix_probe.solver_backend`: `role` (default)
 uses the current `solver_role`, normally the decomposer; `frozen_probe` uses the
-separate frozen inference model configured under `trainer.validation_probe`.
+separate frozen inference model configured under `trainer.validation_probe`,
+unless `trainer.frozen_gate_probe.enable=True` selects an independent checkpoint
+for gates. This can be the trainable decomposer's starting HF export, loaded
+into an inference-only copy that never receives its updates. The metrics model
+does not change when selecting this gate snapshot.
 Both use the same gate prompt and generation budget. The five information
 metrics always use the frozen evaluator when enabled and remain evaluation-only;
 selecting the frozen gate solver does not turn those metrics into rewards.

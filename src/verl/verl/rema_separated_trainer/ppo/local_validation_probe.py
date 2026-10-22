@@ -126,13 +126,13 @@ class LocalFrozenProbeClient:
         self.max_new_tokens = self.config['max_new_tokens']
         self.actor = None
 
-    def check_capacity(self, training_gpus):
+    def check_capacity(self, training_gpus, *, probe_gpus=1):
         import ray
         check_local_probe_dependencies()
         available = ray.available_resources().get('GPU', 0)
-        if available < training_gpus + 1:
-            raise RuntimeError(f'Local frozen probe needs {training_gpus} training GPUs plus 1 '
-                               f'exclusive inference GPU; Ray currently has {available} available. '
+        if available < training_gpus + probe_gpus:
+            raise RuntimeError(f'Local frozen probes need {training_gpus} training GPUs plus {probe_gpus} '
+                               f'exclusive inference GPUs; Ray currently has {available} available. '
                                'Reserve extra capacity; do not share a training GPU implicitly.')
 
     def start(self):

@@ -66,11 +66,13 @@ them or that every worker performed the correct subtask.
 
 The default evaluator is **`Qwen/Qwen2.5-7B-Instruct`**, using its original
 instruction-tuned weights. This is the decomposer's base model, but loaded as
-a separate frozen instance, not the current or fine-tuned decomposer checkpoint.
+a separate frozen instance, not the live decomposer. A trained decomposer HF
+export can also be selected as the metrics model; see below.
 Changing `DECOMPOSER_MODEL_PATH` does not change the probe. Pin a revision of
 `Qwen/Qwen2.5-7B-Instruct`; do not reuse a revision from the previous Qwen3 probe.
-This is always the evaluator for these five metrics. Training gates use this
-model only when `prefix_probe.solver_backend=frozen_probe` is selected.
+This remains the default evaluator for these five metrics. Training gates use
+this model when `prefix_probe.solver_backend=frozen_probe` is selected without
+a separate `trainer.frozen_gate_probe` checkpoint.
 
 The evaluator must be separate from the actors being trained. Two backends use
 the same input construction, system prompt, greedy decoding, verifier, sampling,
@@ -87,20 +89,22 @@ decides whether measured eligibility affects training:
 
 | `prefix_probe.solver_backend` | Gate solver | Five evaluation metrics |
 | --- | --- | --- |
-| `role` (default) | Current `solver_role`, normally the decomposer | Frozen Qwen |
-| `frozen_probe` | The same frozen inference instance used for evaluation | Frozen Qwen |
+| `role` (default) | Current `solver_role`, normally the decomposer | Configured frozen metrics model |
+| `frozen_probe` | The same frozen inference instance used for evaluation | Configured frozen metrics model |
+| `frozen_probe` + `trainer.frozen_gate_probe.enable=True` | Separate immutable checkpoint, e.g. a trained decomposer snapshot | Configured frozen metrics model, unchanged |
 
 For ordinary Agent-1/Agent-2 launchers, set `PREFIX_PROBE_SOLVER_BACKEND=role`
 or `PREFIX_PROBE_SOLVER_BACKEND=frozen_probe`. Enable the frozen evaluator in
 both arms using `VALIDATION_PROBE_BACKEND=local` with a pinned revision and
 reserved GPU, or `http` with the endpoint settings below. Frozen gates require
-the evaluator to be enabled and never fall back to a trainable role on failure.
+either the evaluator or a separate frozen gate checkpoint to be enabled, and
+never fall back to another model on failure.
 
 The equivalent Hydra key is
 `algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_backend`.
 Experiment manifests use `gate_solver_backend`, with the same choices. The
 experiment planner also accepts `--gate-solver-backend`; frozen-gate manifests
-require a pinned `local_validation_probe`. Regenerate existing manifests after
+require a pinned `local_validation_probe` or `frozen_gate_probe`. Regenerate existing manifests after
 changing the code, model, or backend; do not reuse old run/output identities.
 
 Only inference routing changes. Both gate solvers receive the same gate inputs,
@@ -128,6 +132,129 @@ independent guarantee against probe-specific exploitation.
 See [the controlled gate comparison](eac3_round2.md#compare-fixed-and-adaptive-gates)
 for commands that preserve identical starting partners rather than mixing the
 two existing alternating histories.
+
+## Trained decomposer for metrics
+
+The five metrics are not restricted to the base Qwen checkpoint. You can select
+an immutable, trained decomposer HF export and keep that copy frozen even while
+the live decomposer continues learning. Input construction, prompt, budgets,
+verifier, metric names, and dataset accuracy logging do not change.
+
+For ordinary launchers:
+
+```bash
+: "${DECOMPOSER_MODEL_REMOTE:?Set the immutable decomposer HF export on S3}"
+export VALIDATION_PROBE_BACKEND=local
+export VALIDATION_PROBE_MODEL_REMOTE="$DECOMPOSER_MODEL_REMOTE"
+unset VALIDATION_PROBE_URL VALIDATION_PROBE_MODEL VALIDATION_PROBE_REVISION
+
+# Optional: use this same frozen instance for both metrics and gates.
+export PREFIX_PROBE_SOLVER_BACKEND=frozen_probe
+unset FROZEN_GATE_MODEL_REMOTE FROZEN_GATE_MODEL_PATH FROZEN_GATE_REVISION
+```
+
+The export is staged on every node into `$JOB_TMP/validation_probe_model` and
+validated before inference starts. It is independent of the training actor and
+never receives its weight updates. A failed download/invalid export aborts;
+there is no fallback to base Qwen. The original remote source is retained in
+`trainer.validation_probe.checkpoint_source`, resolved logging configuration,
+and evaluation metadata, not only in a transient scratch path.
+
+Set `PREFIX_PROBE_SOLVER_BACKEND=role` instead to keep adaptive decomposer gates
+while still measuring metrics with this frozen snapshot. Alternatively, retain
+a distinct `FROZEN_GATE_MODEL_REMOTE` to use two different frozen checkpoints.
+Only the last option needs two probe GPUs. Sharing the metrics model for gates
+uses one probe GPU with separate per-request prompts/budgets. Explicitly setting
+both probe checkpoint configurations creates two actors, even for equal paths;
+omit the separate gate configuration when you intend to share.
+
+In experiment JSON, set `local_validation_probe.model` to the immutable export
+and omit `revision` (HF model IDs still require an immutable HF revision):
+
+```json
+"local_validation_probe": {
+  "model": "s3v2:YOUR_BUCKET/path/to/global_step_110/decomposer/huggingface",
+  "extra_nodes": 1,
+  "samples_per_dataset": 32,
+  "max_new_tokens": 256
+}
+```
+
+The CLI equivalent is `--local-probe-checkpoint "$DECOMPOSER_MODEL_REMOTE"`.
+Use it with the usual `plan --config ... --phase ... --output-dir ...` command
+and a fresh study identity. `--gate-solver-backend frozen_probe` shares this
+metrics instance when the configuration has no `frozen_gate_probe` entry.
+An absolute local HF directory visible inside the container on all nodes is
+also accepted (`VALIDATION_PROBE_MODEL` for ordinary launchers).
+
+**Comparison rule:** keep the same metrics checkpoint, budget and protocol
+across all arms and training steps. Changing the probe from base Qwen to a
+trained decomposer changes the measurement instrument; do not merge those
+scores into an unlabelled curve or attribute that difference to worker quality.
+Sharing metrics and gates also means this is not an independent auditor of
+the gate's own blind spots. Raw `val/acc/<dataset>` remains unchanged.
+
+## Frozen trained-decomposer snapshot
+
+To train a decomposer while using its initial checkpoint as a fixed gate solver,
+initialize two independent copies from the same immutable HF export:
+
+- Trainable decomposer: starts at D_0 and receives actor updates.
+- Gate solver: stays at D_0 for the entire run, with no optimizer or weight sync.
+- Metrics evaluator: stays at its separately selected frozen checkpoint.
+
+The snapshot still receives the existing solver/probe prompt, not the planning
+prompt. Gate equations and C3 rules do not change. Sharing initial weights does
+not mean sharing a Ray actor, tokenizer, KV cache, or optimizer. A resumed run
+loads the same gate export, not the resumed actor weights. Refreshing gates
+between alternating phases must be an explicit experiment decision.
+
+For ordinary launchers, retain the usual model/data/budget settings and add:
+
+```bash
+: "${DECOMPOSER_MODEL_REMOTE:?Set the immutable decomposer HF export on S3}"
+export PREFIX_PROBE_SOLVER_BACKEND=frozen_probe
+export FROZEN_GATE_MODEL_REMOTE="$DECOMPOSER_MODEL_REMOTE"
+unset FROZEN_GATE_MODEL_PATH FROZEN_GATE_REVISION
+# Keep VALIDATION_PROBE_* unchanged for comparable evaluation metrics.
+```
+
+The common launcher stages the gate export into a separate
+`$JOB_TMP/frozen_gate_model` on every node, validates the HF files, and loads
+one inference-only GPU actor. It never uploads over the source checkpoint.
+Use a step-specific S3 export that will not be overwritten. Alternatively,
+`FROZEN_GATE_MODEL_PATH` accepts an immutable local HF directory visible inside
+the container on every node, or a HF model ID with a fixed 40-character
+`FROZEN_GATE_REVISION`. Raw FSDP shards must be merged to HF format first.
+
+Experiment JSON accepts a separate configuration alongside the existing
+`local_validation_probe`:
+
+```json
+"gate_solver_backend": "frozen_probe",
+"frozen_gate_probe": {
+  "model": "s3v2:YOUR_BUCKET/path/to/global_step_110/decomposer/huggingface",
+  "extra_nodes": 1,
+  "max_model_len": 16384,
+  "batch_size": 4
+}
+```
+
+Replace the example path with the actual immutable export. The planner CLI also
+accepts `--frozen-gate-checkpoint "$DECOMPOSER_MODEL_REMOTE"` (and
+`--frozen-gate-revision` for a HF model ID); this selects `frozen_probe` and does
+not replace `local_validation_probe`. Regenerate under a fresh study/run name.
+
+**Capacity:** a separate local gate plus local evaluation consumes two reserved
+GPUs, not one. `nodes=3` with four GPUs/node and `extra_nodes=1` still fits:
+6 decomposer + 6 worker + 1 metric probe + 1 gate probe = 14 of 16 GPUs.
+The two probes share the extra allocation, not a GPU or model. Capacity checks
+include both actors. Gate-only runs can omit evaluation probes, but should not
+be used for comparisons requiring the five fixed-probe metrics.
+
+This controls gate drift while keeping metrics fixed. It does not eliminate
+blind spots inherited from D_0, nor guarantee independence from the policy's
+errors. Keep that distinction explicit when interpreting the experiment.
 
 ## Local inference inside the training job
 

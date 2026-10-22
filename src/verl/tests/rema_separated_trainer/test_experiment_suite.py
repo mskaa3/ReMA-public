@@ -62,6 +62,146 @@ def record(question='q', plan='PLAN:\n- S1: Compute x.\n- S2: Use S1.', score=1.
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_metrics_can_use_snapshot_with_shared_fixed_or_live_role_gates(self):
+        cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        snapshot = cfg['planners']['eac3']
+        cfg['local_validation_probe'] = {'model': snapshot}
+        for backend in ('role', 'frozen_probe'):
+            run = suite.make_runs(dict(cfg, gate_solver_backend=backend), 'adapt-planners')[0]
+            env = suite.run_environment(run, check_allocation=False)
+            self.assertEqual(env['VALIDATION_PROBE_MODEL_REMOTE'], snapshot)
+            self.assertEqual(env['VALIDATION_PROBE_MODEL'], '')
+            self.assertEqual(env['VALIDATION_PROBE_REVISION'], '')
+            self.assertEqual(env['FROZEN_GATE_MODEL_REMOTE'], '')
+            self.assertEqual(env['FROZEN_GATE_MODEL_PATH'], '')
+            self.assertEqual(env['PREFIX_PROBE_SOLVER_BACKEND'], backend)
+            self.assertEqual(suite.allocated_nodes(run['study_config']), cfg['nodes'] + 1)
+        for model in ('Qwen/unpinned', 'SET_ME', '', 'bad checkpoint'):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                suite.make_runs(dict(cfg, local_validation_probe={'model': model}), 'adapt-planners')
+        with self.assertRaisesRegex(ValueError, 'immutable path'):
+            suite.make_runs(dict(cfg, local_validation_probe={'model': snapshot, 'revision': 'a' * 40}), 'workers')
+        suite.make_runs(dict(cfg, local_validation_probe={'model': '/shared/immutable-decomposer'}), 'workers')
+
+    def test_metrics_checkpoint_cli_records_original_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / 'runs'
+            source = 's3:bucket/step110/decomposer/huggingface'
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/eac3_experiments.py'),
+                'plan', '--config', str(ROOT / 'config/eac3-round2-gated.json'),
+                '--phase', 'adapt-planners', '--output-dir', str(destination),
+                '--local-probe-checkpoint', source, '--gate-solver-backend', 'frozen_probe'],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = suite.read_json(next(destination.glob('*.json')))
+            self.assertEqual(manifest['study_config']['local_validation_probe']['model'], source)
+            env = suite.run_environment(manifest, check_allocation=False)
+            self.assertEqual(env['VALIDATION_PROBE_MODEL_REMOTE'], source)
+            self.assertEqual(env['FROZEN_GATE_MODEL_REMOTE'], '')
+
+    def test_metrics_snapshot_staging_and_effective_training_command(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        defaults = launcher[:launcher.index('\nif (( GPUS_PER_NODE')].replace('source ./env.sh', ':')
+        function = launcher[launcher.index('run_agent12_training() {'):launcher.index('\nif [[ "$ONLINE_TEACHER_GENERATION"')]
+        start = launcher.index('if [[ "$VALIDATION_PROBE_BACKEND" == local && -n "$VALIDATION_PROBE_MODEL_REMOTE" ]]; then')
+        stage = launcher[start:launcher.index('\nif [[ "$PREFIX_PROBE_ENABLE" == true && "$FROZEN_GATE_ENABLE" == true ]]; then', start)]
+        cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        source = 's3:bucket/step110/decomposer/huggingface'
+        cfg.update(gate_solver_backend='frozen_probe', local_validation_probe={'model': source})
+        run = suite.make_runs(cfg, 'adapt-planners')[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp) / 'command'
+            env = {**os.environ, **{k: str(v) for k, v in suite.run_environment(run, check_allocation=False).items()},
+                   'SLURM_JOB_ID': '123', 'SLURM_NNODES': '5', 'CAPTURE': str(capture), 'JOB_TMP': tmp}
+            shell = defaults + '\nsrun() { printf "%s\\n" "${!#}" >> "$CAPTURE"; }\n'
+            shell += 'HEAD_NODE=head; IP_HEAD=head:6379; COMMON_MOUNTS=(--nv)\n' + stage + '\n' + function
+            shell += '\nrun_agent12_training /tmp/train.parquet "$TOTAL_STEPS" True True\n'
+            result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = capture.read_text()
+            self.assertIn('rclone copy "$VALIDATION_PROBE_MODEL_REMOTE" "$VALIDATION_PROBE_MODEL.partial"', captured)
+            command = shlex.split(captured.rsplit(';', 1)[-1])
+            opts = dict(arg.split('=', 1) for arg in command if '=' in arg and not arg.startswith('--'))
+            self.assertEqual(opts['trainer.validation_probe.model'], tmp + '/validation_probe_model')
+            self.assertEqual(opts['trainer.validation_probe.checkpoint_source'], source)
+            self.assertEqual(opts['trainer.validation_probe.revision'], 'null')
+            self.assertEqual(opts['trainer.frozen_gate_probe.enable'], 'false')
+            result = subprocess.run(['bash', '-c', defaults], env=dict(env, SLURM_NNODES='4'),
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('1 exclusive GPUs', result.stderr)
+
+    def test_frozen_decomposer_snapshot_independent_of_trainable_copy_and_metrics(self):
+        cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        cfg['gate_solver_backend'] = 'frozen_probe'
+        cfg['local_validation_probe'] = {'revision': 'a' * 40}
+        cfg['frozen_gate_probe'] = {'model': cfg['planners']['eac3']}
+        run = suite.make_runs(cfg, 'adapt-planners')[0]
+        env = suite.run_environment(run, check_allocation=False)
+        self.assertEqual(env['TRAIN_DECOMPOSER'], 'true')
+        self.assertEqual(env['FROZEN_GATE_MODEL_REMOTE'], env['DECOMPOSER_MODEL_REMOTE'])
+        self.assertEqual(env['VALIDATION_PROBE_MODEL'], 'Qwen/Qwen2.5-7B-Instruct')
+        self.assertEqual(suite.allocated_nodes(cfg), cfg['nodes'] + 1)
+        # Fixed gates alone are supported, without silently allocating a metrics model.
+        del cfg['local_validation_probe']
+        env = suite.run_environment(suite.make_runs(cfg, 'adapt-planners')[0], check_allocation=False)
+        self.assertNotIn('VALIDATION_PROBE_MODEL', env)
+        self.assertEqual(suite.allocated_nodes(cfg), cfg['nodes'] + 1)
+        for gate in ({}, {'model': 'Qwen/unpinned'}, {'model': 'SET_ME'},
+                     {'model': 's3:bucket/snapshot', 'max_model_len': 256}):
+            with self.subTest(gate=gate), self.assertRaises(ValueError):
+                suite.make_runs(dict(cfg, frozen_gate_probe=gate), 'adapt-planners')
+        with self.assertRaisesRegex(ValueError, 'gate_solver_backend=frozen_probe'):
+            suite.make_runs(dict(cfg, gate_solver_backend='role'), 'adapt-planners')
+
+    def test_snapshot_cli_pins_separate_gate_and_retains_metrics_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / 'runs'
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/eac3_experiments.py'),
+                'plan', '--config', str(ROOT / 'config/eac3-round2-gated.json'),
+                '--phase', 'adapt-planners', '--output-dir', str(destination),
+                '--local-probe-revision', 'a' * 40,
+                '--frozen-gate-checkpoint', 's3:bucket/decomposer/step110/huggingface'],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = suite.read_json(next(destination.glob('*.json')))
+            env = suite.run_environment(manifest, check_allocation=False)
+            self.assertEqual(env['PREFIX_PROBE_SOLVER_BACKEND'], 'frozen_probe')
+            self.assertEqual(env['FROZEN_GATE_MODEL_REMOTE'], 's3:bucket/decomposer/step110/huggingface')
+            self.assertEqual(env['VALIDATION_PROBE_MODEL'], 'Qwen/Qwen2.5-7B-Instruct')
+
+    def test_snapshot_launcher_reserves_gpu_and_uses_dedicated_path(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        defaults = launcher[:launcher.index('\nif (( GPUS_PER_NODE')].replace('source ./env.sh', ':')
+        function = launcher[launcher.index('run_agent12_training() {'):launcher.index('\nif [[ "$ONLINE_TEACHER_GENERATION"')]
+        stage = launcher[launcher.index('if [[ "$PREFIX_PROBE_ENABLE" == true && "$FROZEN_GATE_ENABLE" == true ]]; then\n',
+                                         launcher.index('COMMON_MOUNTS=(')):launcher.index('\nRAY_JOB_PIDS=()')]
+        cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        cfg.update(gate_solver_backend='frozen_probe', local_validation_probe={'revision': 'a' * 40},
+                   frozen_gate_probe={'model': cfg['planners']['eac3']})
+        run = suite.make_runs(cfg, 'adapt-planners')[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp) / 'command'
+            env = {**os.environ, **{k: str(v) for k, v in suite.run_environment(run, check_allocation=False).items()},
+                   'SLURM_JOB_ID': '123', 'SLURM_NNODES': '5', 'CAPTURE': str(capture), 'JOB_TMP': tmp}
+            shell = defaults + '\nsrun() { printf "%s\\n" "${!#}" >> "$CAPTURE"; }\n'
+            shell += 'HEAD_NODE=head; IP_HEAD=head:6379; COMMON_MOUNTS=(--nv)\n' + stage + '\n' + function
+            shell += '\nrun_agent12_training /tmp/train.parquet "$TOTAL_STEPS" True True\n'
+            result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = capture.read_text()
+            self.assertIn('rclone copy "$FROZEN_GATE_MODEL_REMOTE" "$FROZEN_GATE_MODEL_PATH.partial"', captured)
+            command = shlex.split(captured.rsplit(';', 1)[-1])
+            opts = dict(arg.split('=', 1) for arg in command if '=' in arg and not arg.startswith('--'))
+            self.assertEqual(opts['trainer.frozen_gate_probe.model'], tmp + '/frozen_gate_model')
+            self.assertEqual(opts['trainer.frozen_gate_probe.enable'], 'true')
+            self.assertEqual(opts['trainer.validation_probe.model'], 'Qwen/Qwen2.5-7B-Instruct')
+            self.assertNotEqual(opts['trainer.frozen_gate_probe.model'], opts['actor_rollout_ref.model.path'])
+            result = subprocess.run(['bash', '-c', defaults], env=dict(env, SLURM_NNODES='4'),
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('2 exclusive GPUs', result.stderr)
+
     def test_gate_solver_backend_is_explicit_and_requires_pinned_probe(self):
         cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
         with self.assertRaisesRegex(ValueError, 'gate_solver_backend must'):

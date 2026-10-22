@@ -98,6 +98,24 @@ class ValidationProbeTests(unittest.TestCase):
             result = subprocess.run(['bash', '-c', shell], env={**env, **changes}, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0, changes)
 
+    def test_metrics_export_selects_local_backend_without_hf_revision(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        shell = 'set -euo pipefail\n' + launcher[launcher.index('export VALIDATION_PROBE_URL='):
+                                               launcher.index('\nexport SIF_NAME=')]
+        clean = {k: v for k, v in os.environ.items() if not k.startswith('VALIDATION_PROBE_')}
+        remote = 's3:bucket/decomposer/global_step_110/huggingface'
+        env = dict(clean, VALIDATION_PROBE_MODEL_REMOTE=remote)
+        result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('backend=local, model=' + remote, result.stdout)
+        for changes in ({'VALIDATION_PROBE_BACKEND': 'off'},
+                        {'VALIDATION_PROBE_URL': 'http://metrics/v1'},
+                        {'VALIDATION_PROBE_REVISION': 'a' * 40}):
+            with self.subTest(changes=changes):
+                result = subprocess.run(['bash', '-c', shell], env=dict(env, **changes),
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_local_launcher_rejects_full_training_allocation(self):
         launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
         start = launcher.index('if [[ ! "$TRAINING_NNODES"')
@@ -107,7 +125,7 @@ class ValidationProbeTests(unittest.TestCase):
         shell = 'set -euo pipefail\n' + launcher[start:end]
         result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('one GPU outside', result.stderr)
+        self.assertIn('1 exclusive GPUs outside', result.stderr)
         result = subprocess.run(['bash', '-c', shell], env={**env, 'SLURM_NNODES': '5'},
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -472,10 +490,124 @@ class LocalValidationProbeTests(unittest.TestCase):
 class GateBackendTests(unittest.TestCase):
     def trainer(self, backend='frozen_probe'):
         return SimpleNamespace(
+            config=SimpleNamespace(trainer={}),
             prefix_probe_config={'solver_backend': backend, 'max_new_tokens': 512, 'system_prompt': 'Gate system'},
             _get_hierarchy_config=lambda: {'decomposer_role': 'decomposer'},
             validation_probe_client=Mock(),
         )
+
+    def test_separate_checkpoint_preserves_evaluation_and_never_uses_trained_copy(self):
+        trainer = self.trainer()
+        trainer.prefix_probe_enabled = True
+        trainer._get_hierarchy_config = lambda: {'terminal_worker_as_answer': True}
+        with tempfile.TemporaryDirectory() as checkpoint:
+            trainer.config.trainer = {
+                'frozen_gate_probe': {'enable': True, 'model': checkpoint},
+                'validation_probe': {'enable': True, 'backend': 'http',
+                                     'base_url': 'http://metrics/v1', 'model': 'fixed-base-qwen'},
+            }
+            extract_method('_init_validation_probes')(trainer)
+            gate, metrics = trainer.frozen_gate_probe_client, trainer.validation_probe_client
+            self.assertIsInstance(gate, local_probe.LocalFrozenProbeClient)
+            self.assertEqual(gate.model, checkpoint)
+            self.assertEqual(metrics.model, 'fixed-base-qwen')
+            self.assertIsNone(gate.actor)
+            gate.generate = Mock(return_value=[probe.ProbeResponse(r'\boxed{7}', 'stop', 2)])
+            metrics.generate = Mock(side_effect=AssertionError('Must not use metrics model for gates'))
+            trainer.actor_rollout_wg = {'decomposer': Mock(side_effect=AssertionError('Trainable copy used'))}
+            generate = extract_method('_generate_prefix_probe_responses')
+            self.assertEqual(generate(trainer, ['task']), ([r'\boxed{7}'], [2], ['stop']))
+            # Replacing/updating the live role does not replace the frozen client.
+            trainer.actor_rollout_wg['decomposer'] = Mock()
+            generate(trainer, ['task'])
+            self.assertIs(trainer.frozen_gate_probe_client, gate)
+            metrics.generate.assert_not_called()
+            gate.generate.side_effect = RuntimeError('snapshot failed')
+            with self.assertRaisesRegex(RuntimeError, 'snapshot failed'):
+                generate(trainer, ['task'])
+            trainer.frozen_gate_probe_client = None
+            with self.assertRaisesRegex(RuntimeError, 'no evaluator fallback'):
+                generate(trainer, ['task'])
+            metrics.generate.assert_not_called()
+
+    def test_metrics_snapshot_can_also_share_frozen_gates_with_one_client(self):
+        trainer = self.trainer()
+        trainer.prefix_probe_enabled = True
+        trainer._get_hierarchy_config = lambda: {'terminal_worker_as_answer': True}
+        with tempfile.TemporaryDirectory() as checkpoint:
+            trainer.config.trainer = {'validation_probe': {
+                'enable': True, 'backend': 'local', 'model': checkpoint,
+                'checkpoint_source': 's3:bucket/step110/decomposer/huggingface',
+            }}
+            extract_method('_init_validation_probes')(trainer)
+            client = trainer.validation_probe_client
+            self.assertEqual(client.model, checkpoint)
+            self.assertIsNone(trainer.frozen_gate_probe_client)
+            self.assertEqual(client.config['checkpoint_source'], 's3:bucket/step110/decomposer/huggingface')
+            client.generate = Mock(return_value=[probe.ProbeResponse(r'\boxed{7}', 'stop', 2)])
+            self.assertEqual(extract_method('_generate_prefix_probe_responses')(trainer, ['task']),
+                             ([r'\boxed{7}'], [2], ['stop']))
+            client.generate.assert_called_once_with(['task'], system_prompt='Gate system', max_new_tokens=512)
+            self.assertEqual(client.max_new_tokens, 256)
+            client.close = Mock()
+            extract_method('close_validation_probes')(trainer)
+            client.close.assert_called_once()
+
+    def test_separate_gate_works_without_metrics_and_rejects_bad_config(self):
+        trainer = self.trainer()
+        trainer.prefix_probe_enabled = True
+        init = extract_method('_init_validation_probes')
+        with tempfile.TemporaryDirectory() as checkpoint:
+            trainer.config.trainer = {'frozen_gate_probe': {'enable': True, 'model': checkpoint}}
+            init(trainer)
+            self.assertIsNotNone(trainer.frozen_gate_probe_client)
+            self.assertIsNone(trainer.validation_probe_client)
+            gate_config = trainer.config.trainer['frozen_gate_probe']
+            for changes, error in (({'model': 'unpinned-model'}, 'fixed 40-character'),
+                                   ({'max_model_len': 512}, 'output budget'),
+                                   ({'backend': 'http'}, 'dedicated local')):
+                trainer.config.trainer['frozen_gate_probe'] = dict(gate_config, **changes)
+                with self.assertRaisesRegex(ValueError, error):
+                    init(trainer)
+            trainer.config.trainer['frozen_gate_probe'] = gate_config
+            trainer.prefix_probe_config['solver_backend'] = 'role'
+            with self.assertRaisesRegex(ValueError, 'solver_backend=frozen_probe'):
+                init(trainer)
+            trainer.prefix_probe_enabled = False
+            init(trainer)
+            self.assertIsNone(trainer.frozen_gate_probe_client)
+
+    def test_two_probes_capacity_startup_and_cleanup(self):
+        trainer = self.trainer()
+        trainer.validation_probe_client = local_probe.LocalFrozenProbeClient(
+            {'model': 'Qwen/base', 'revision': 'a' * 40})
+        trainer.frozen_gate_probe_client = local_probe.LocalFrozenProbeClient(
+            {'model': 'Qwen/snapshot', 'revision': 'b' * 40})
+        trainer.resource_pool_manager = Mock()
+        trainer.resource_pool_manager.get_n_gpus.return_value = 12
+        trainer.close_validation_probes = lambda: extract_method('close_validation_probes')(trainer)
+        tree = ast.parse((PPO / 'ray_trainer.py').read_text())
+        init = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'init_workers')
+        # Exercise the real preallocation and startup blocks without constructing training actors.
+        capacity = ast.Module(body=init.body[1:4], type_ignores=[])
+        startup = ast.Module(body=[init.body[-1]], type_ignores=[])
+        ray = Mock()
+        with patch.dict(sys.modules, {'ray': ray}), patch.object(local_probe, 'check_local_probe_dependencies'):
+            ray.available_resources.return_value = {'GPU': 13}
+            with self.assertRaisesRegex(RuntimeError, 'plus 2'):
+                exec(compile(capacity, '<capacity>', 'exec'), {'self': trainer})
+            trainer.resource_pool_manager.create_resource_pool.assert_not_called()
+            ray.available_resources.return_value = {'GPU': 14}
+            namespace = {'self': trainer}
+            exec(compile(capacity, '<capacity>', 'exec'), namespace)
+            trainer.resource_pool_manager.create_resource_pool.assert_called_once()
+            for client in namespace['local_probes']:
+                client.start, client.close = Mock(), Mock()
+            trainer.frozen_gate_probe_client.start.side_effect = RuntimeError('startup failed')
+            with self.assertRaisesRegex(RuntimeError, 'startup failed'):
+                exec(compile(startup, '<startup>', 'exec'), namespace)
+            trainer.validation_probe_client.close.assert_called_once()
+            trainer.frozen_gate_probe_client.close.assert_called_once()
 
     def test_frozen_gate_uses_external_client_without_training_roles(self):
         trainer = self.trainer()

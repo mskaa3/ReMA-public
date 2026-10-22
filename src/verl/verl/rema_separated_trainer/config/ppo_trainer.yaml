@@ -213,11 +213,23 @@ algorithm:
       - /fs-computility/mabasic/shared/models/Qwen2.5-3B-Instruct
 
 trainer:
+  frozen_gate_probe:
+    enable: False
+    backend: local
+    model: null
+    revision: null
+    max_new_tokens: 256
+    timeout_seconds: 180
+    startup_timeout_seconds: 900
+    max_model_len: 16384
+    batch_size: 4
+    gpu_memory_utilization: 0.8
   validation_probe:
     enable: False
     backend: http
     base_url: null
     model: Qwen/Qwen2.5-7B-Instruct
+    checkpoint_source: null
     revision: null
     samples_per_dataset: 32
     max_new_tokens: 256

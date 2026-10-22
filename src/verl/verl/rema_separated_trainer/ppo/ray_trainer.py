@@ -904,34 +904,51 @@ class RayReMASeparatedTrainer(object):
     def _init_validation_probes(self):
         config = self.config.trainer.get('validation_probe', {}) or {}
         self.validation_probe_client = None
+        self.frozen_gate_probe_client = None
+        gate_config = self.config.trainer.get('frozen_gate_probe', {}) or {}
         uses_frozen_gate = getattr(self, 'prefix_probe_enabled', False) and (
             self.prefix_probe_config.get('solver_backend', 'role') == 'frozen_probe')
-        if uses_frozen_gate and not config.get('enable', False):
-            raise ValueError('prefix_probe.solver_backend=frozen_probe requires trainer.validation_probe.enable=True')
+        separate_gate = bool(gate_config.get('enable', False))
+        if separate_gate and getattr(self, 'prefix_probe_enabled', False) and not uses_frozen_gate:
+            raise ValueError('frozen_gate_probe requires prefix_probe.solver_backend=frozen_probe')
+        if uses_frozen_gate and separate_gate:
+            if gate_config.get('backend', 'local') != 'local':
+                raise ValueError('frozen_gate_probe uses a dedicated local inference actor')
+            if int(self.prefix_probe_config.get('max_new_tokens', 256)) >= int(gate_config.get('max_model_len', 16384)):
+                raise ValueError('Frozen gate context must exceed the prefix-probe output budget')
+            self.frozen_gate_probe_client = make_validation_probe_client(dict(gate_config, backend='local'))
+            print(f'[prefix_probe] frozen_checkpoint={self.frozen_gate_probe_client.model} '
+                  f'revision={gate_config.get("revision")} separate_from_training=True; '
+                  'no weight sync or optimizer; evaluation model unchanged', flush=True)
+        if uses_frozen_gate and not separate_gate and not config.get('enable', False):
+            raise ValueError('prefix_probe.solver_backend=frozen_probe requires trainer.validation_probe.enable=True '
+                             'or trainer.frozen_gate_probe.enable=True')
         if not config.get('enable', False):
             return
         if not self._get_hierarchy_config().get('terminal_worker_as_answer', False):
             raise ValueError('Validation information probes require terminal_worker_as_answer=True')
         if int(config.get('samples_per_dataset', 32)) < 1:
             raise ValueError('validation_probe.samples_per_dataset must be positive')
-        if (uses_frozen_gate and config.get('backend', 'http') == 'local'
+        if (uses_frozen_gate and not separate_gate and config.get('backend', 'http') == 'local'
                 and int(self.prefix_probe_config.get('max_new_tokens', 256)) >= int(config.get('max_model_len', 16384))):
             raise ValueError('Frozen probe context must exceed the prefix-probe output budget')
         self.validation_probe_client = make_validation_probe_client(config)
         print(
             f'[validation/probe] backend={config.get("backend", "http")} '
             f'frozen_model={self.validation_probe_client.model} '
+            f'checkpoint_source={config.get("checkpoint_source") or self.validation_probe_client.model} '
             f'max_new_tokens={self.validation_probe_client.max_new_tokens} '
             f'samples_per_dataset={config.get("samples_per_dataset", 32)} '
             'conditions=terminal_only,with_instructions,with_results; metrics remain evaluation only; '
-            f'shared_with_prefix_gates={uses_frozen_gate}',
+            f'shared_with_prefix_gates={uses_frozen_gate and not separate_gate}',
             flush=True,
         )
 
     def close_validation_probes(self):
-        client = getattr(self, 'validation_probe_client', None)
-        if client is not None and hasattr(client, 'close'):
-            client.close()
+        for name in ('validation_probe_client', 'frozen_gate_probe_client'):
+            client = getattr(self, name, None)
+            if client is not None and hasattr(client, 'close'):
+                client.close()
 
     def _tokenizer_for_role(self, role):
         return getattr(self, 'role_tokenizers', {}).get(role, self.tokenizer)
@@ -1115,7 +1132,11 @@ class RayReMASeparatedTrainer(object):
             "with \\boxed{UNKNOWN}.",
         ))
         if self.prefix_probe_config.get('solver_backend', 'role') == 'frozen_probe':
-            client = getattr(self, 'validation_probe_client', None)
+            client = getattr(self, 'frozen_gate_probe_client', None)
+            if client is None:
+                if (self.config.trainer.get('frozen_gate_probe', {}) or {}).get('enable', False):
+                    raise RuntimeError('Configured frozen gate checkpoint is unavailable; no evaluator fallback')
+                client = getattr(self, 'validation_probe_client', None)
             if client is None:
                 raise RuntimeError('Frozen gate probe is not configured; refusing to fall back to a training role')
             responses = client.generate(
@@ -3200,9 +3221,10 @@ class RayReMASeparatedTrainer(object):
 
     def init_workers(self):
         """Init resource pool and worker group"""
-        probe_client = getattr(self, 'validation_probe_client', None)
-        if probe_client is not None and hasattr(probe_client, 'check_capacity'):
-            probe_client.check_capacity(self.resource_pool_manager.get_n_gpus())
+        local_probes = [client for name in ('validation_probe_client', 'frozen_gate_probe_client')
+                        if (client := getattr(self, name, None)) is not None and hasattr(client, 'check_capacity')]
+        for client in local_probes:
+            client.check_capacity(self.resource_pool_manager.get_n_gpus(), probe_gpus=len(local_probes))
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -3325,8 +3347,12 @@ class RayReMASeparatedTrainer(object):
             self.role_tokenizers,
             self.actor_rollout_wg,
         )
-        if probe_client is not None and hasattr(probe_client, 'start'):
-            probe_client.start()
+        try:
+            for client in local_probes:
+                client.start()
+        except Exception:
+            self.close_validation_probes()
+            raise
 
     def _get_schedule_step(self):
         """One-based next actor update, distinct from bounded rollout attempts."""
