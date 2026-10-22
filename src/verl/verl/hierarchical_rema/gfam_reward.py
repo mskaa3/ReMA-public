@@ -1818,6 +1818,10 @@ class GFAMRewardScorer:
         return self.checkpoint.get("feature_schema") == "graphprm_declared_provided_v2"
 
     @property
+    def required_auxiliary_checks(self):
+        return () if self.supports_verified_final_correctness else ("reference_answer_match", "answer_containment")
+
+    @property
     def rollout_batch_size(self):
         return getattr(self.graphprm, "rollout_batch_size", 1)
 

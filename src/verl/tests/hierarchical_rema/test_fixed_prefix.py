@@ -223,6 +223,71 @@ def test_overflow_skips_complete_comparison_not_just_one_suffix(monkeypatch):
     assert audit["reason"] == "incomplete_group"
     assert audit["actions"][3]["score"] is None
     assert len(results[0].decompositions[0].selections) == 32
+    assert audit["incomplete_causes"] == ["reward_model:test_overflow"]
+    stats = results[0].training_batch.worker_grpo_stats
+    assert stats["incomplete_groups_by_cause"] == {"reward_model:test_overflow": 1}
+    assert stats["unavailable_continuations_by_cause"] == {"reward_model:test_overflow": 1}
+
+
+@pytest.mark.parametrize("status", ["verified", "unverified"])
+def test_one_unknown_final_outcome_blocks_all_actions(monkeypatch, status):
+    results, _, _, trainer, _, config = run(monkeypatch)
+    dec = results[0].decompositions[0]
+    for rollout in dec.selections[:2]:
+        rollout.reward.final_answer_correctness = None
+        rollout.reward.verification_status = status
+        rollout.reward.verification_error = {"stage": "final_correctness", "code": "prediction_parse_failed"}
+    samples, stats = branch.build_samples(trainer.orchestrator, results[0].task, [dec], config, 2)
+    assert samples == []
+    assert dec.worker_comparisons[0]["actions"][0]["score"] is None
+    assert stats["incomplete_groups_by_cause"] == {"final_correctness:prediction_parse_failed": 1}
+    assert stats["unavailable_continuations_by_cause"] == {"final_correctness:prediction_parse_failed": 2}
+
+
+def test_missing_continuation_has_separate_cause(monkeypatch):
+    results, _, _, trainer, _, config = run(monkeypatch)
+    dec = results[0].decompositions[0]
+    dec.selections.pop()
+    samples, stats = branch.build_samples(trainer.orchestrator, results[0].task, [dec], config, 2)
+    assert samples == []
+    assert stats["incomplete_groups_by_cause"] == {"missing_continuation": 1}
+
+
+def test_optional_auxiliary_unknown_keeps_complete_comparison(monkeypatch):
+    results, _, _, trainer, _, config = run(monkeypatch)
+    dec = results[0].decompositions[0]
+    selection = dec.selections[0]
+    selection.reward.auxiliary_verification_status = "unverified"
+    selection.reward.auxiliary_verification_errors = [
+        {"stage": "answer_containment", "code": "verification_timeout"}]
+    selection.executions[0].answer_containment = None
+    samples, stats = branch.build_samples(trainer.orchestrator, results[0].task, [dec], config, 2)
+    assert len(samples) == 8
+    assert stats["num_groups_incomplete"] == 0
+    assert all(len(sample.metadata["continuation_rewards"]) == 4 for sample in samples)
+
+
+def test_required_auxiliary_failure_is_separate_and_counted_in_summary(monkeypatch):
+    metrics = importlib.import_module(api.__name__ + ".metrics")
+    results, _, _, trainer, _, config = run(monkeypatch)
+    dec = results[0].decompositions[0]
+    selection = dec.selections[0]
+    selection.reward.verification_status = "unverified"
+    selection.reward.verification_error = {"stage": "answer_containment", "code": "verification_timeout"}
+    samples, stats = branch.build_samples(trainer.orchestrator, results[0].task, [dec], config, 2)
+    assert samples == []
+    cause = "required_auxiliary:answer_containment:verification_timeout"
+    assert stats["incomplete_groups_by_cause"] == {cause: 1}
+    results[0].training_batch.worker_grpo_stats = stats
+    totals = metrics.rollout_monitoring_totals(results[0])
+    assert totals[f"fixed_prefix/incomplete_groups_by_cause/{cause}"] == 1
+    assert totals["verified_rollouts"] == 32
+
+
+def test_uniform_reward_scaling_preserves_normalized_advantages():
+    scores = [.2, .4, .8, -.3]
+    assert branch.action_advantages(scores)[2] == pytest.approx(
+        branch.action_advantages([.25 * value for value in scores])[2], abs=1e-6)
 
 
 def test_gate_failed_action_still_contributes_to_baselines(monkeypatch):

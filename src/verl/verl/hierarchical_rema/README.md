@@ -115,3 +115,69 @@ PYTHONPATH=src/verl/verl python -m hierarchical_rema.replay_train \
 ```
 
 Training artifacts are written per policy id, so shared-controller runs will produce one policy folder and separate decomposer/selector runs will produce two. Worker-role LoRA optimization is not implemented yet; see `worker_training.py` for the placeholder.
+
+## Optional Result-Only Failure Judge
+
+Set `REMA_MAST_ENABLED=true` in `hierarchical-rema-train.sh` to audit the same
+rollouts at every external validation event (routine and diagnostic). Default is
+off, with no judge model loading. Validation accuracy cadence does not change.
+The default frozen judge is `google/gemma-4-31B-it`; its Hugging Face revision is
+resolved to an immutable commit and recorded with package versions and prompt hash.
+
+This is an eight-category, artifact-level adaptation of
+[MAST](https://arxiv.org/abs/2503.13657), not a reproduction of the full taxonomy:
+task requirements (1.1), role violations (1.2), unnecessary repetition (1.3),
+context loss (1.4), derailment (2.3), missing handoff (2.4), disregarded input (2.5),
+and incomplete execution (3.1). The generic prompt and response schema live in
+`failure_judge_contract.py` and are also saved with every evaluation.
+
+The judge sees the task, role instructions, structured executed plan, assembled
+dependency snapshots, delivered outputs and final answer. It does not receive
+reference answers, correctness verdicts, rewards, private scratchpads, or rejected
+raw outputs. Non-root workers are not assumed to see the full task. Context loss
+means information was established but lost from an expected downstream input;
+missing handoff means it was never delivered; disregarded input means it arrived
+but was visibly ignored. Snapshots do not prove post-tokenization visibility.
+Equal output strings alone do not establish redundant work.
+
+Labels are 1 (observed failure), 0 (no observed failure with assessable artifacts),
+or null (not applicable / insufficient evidence). Positive labels need exact
+source excerpts and JSON Pointer paths; information-flow failures need two-sided
+evidence. These are observational judgments, not ground-truth error labels.
+They never influence rewards, advantages, or best-checkpoint selection.
+
+W&B adds only `val/failures/<category>` rates. Rates average assessed executions
+within each task, then weight tasks equally. Nulls and failed requests are excluded;
+coverage and status counts are saved per category, overall and per dataset. No
+valid judgments means an absent metric, not a zero failure rate.
+
+Each validation directory contains `validation_failures.jsonl` (safe input plus
+judgments/evidence/errors), `failure_judge_metrics.jsonl`,
+`failure_judge_definition.json`, and `failure_judge.log`. Run-level
+`failure_judge_history.csv` and `.jsonl` track numerical changes over evaluations.
+These use the existing epoch/root S3 uploader. Successful content-identical audits
+are cached against input, prompt, resolved model revision and inference identity;
+failed requests are not cached. Re-evaluating an epoch replaces its history rows.
+
+The judge runs after generation and IDS, in an evaluation-scoped subprocess on
+the isolated reward GPU. GraphPRM's cached models are released first and lazily
+reload on the next reward call. A supervised local coach uses explicit sleep/wake;
+Gemma exits before it is restored. An unsupported sleep API skips the judge;
+failure to restore a coach stops training rather than silently changing rewards.
+CPU offload during coach sleep requires sufficient host RAM for its weights.
+
+Requests are length-sorted and batched (`REMA_MAST_BATCH_SIZE=4` by default).
+The default context is 16,384 tokens, with 3,072 reserved for JSON output. Inputs
+that do not fit are recorded as unavailable, not truncated. Batch errors are
+isolated by splitting; only failed annotations are retried once. A 7,200-second
+evaluation timeout retains completed judgments and releases the subprocess.
+Batch size, context, output budget, GPU utilization, retries and timeout are
+configurable through the corresponding `REMA_MAST_*` variables in the launcher.
+
+Gemma 4 requires compatible vLLM/Transformers and authorized HF access. The policy
+container's pinned old vLLM is not assumed compatible. Nothing is installed or
+upgraded automatically: set `REMA_MAST_PYTHON` to a Gemma-compatible interpreter
+visible inside the container (or use an updated compatible container). A startup
+failure is recorded as unavailable, while accuracy/IDS and training continue.
+See the [official serving guide](https://docs.vllm.ai/projects/recipes/en/stable/Google/Gemma4.html).
+Real GPU memory and coach handoff behavior must be smoke-tested in the HPC image.

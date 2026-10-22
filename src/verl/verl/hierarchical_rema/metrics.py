@@ -49,6 +49,10 @@ def rollout_monitoring_totals(rollout):
                 totals["correct_rollouts"] += outcome
             else:
                 totals["unverified_rollouts"] += 1
+            auxiliary_errors = getattr(selection.reward, "auxiliary_verification_errors", [])
+            totals["auxiliary_unverified_rollouts"] += bool(auxiliary_errors)
+            for cause in {f"{error['stage']}:{error['code']}" for error in auxiliary_errors}:
+                totals[f"auxiliary_unverified/{cause}"] += 1
             reward = selection.reward.total_reward
             if reward is not None and math.isfinite(reward):
                 # The orchestrator routes the post-gate final reward here.
@@ -63,6 +67,9 @@ def rollout_monitoring_totals(rollout):
             for execution in selection.executions:
                 totals["worker_outputs"] += 1
                 totals["invalid_worker_outputs"] += bool(execution.invalid_reason)
+    for field in ("incomplete_groups_by_cause", "unavailable_continuations_by_cause"):
+        for cause, count in rollout.training_batch.worker_grpo_stats.get(field, {}).items():
+            totals[f"fixed_prefix/{field}/{cause}"] += count
     return dict(totals)
 
 
@@ -103,6 +110,10 @@ def validation_tracking_metrics(summary):
         value = summary.get("information_diversity", {}).get(name)
         if value is not None and math.isfinite(value):
             result[f"val/{name}"] = value
+    for category in summary.get("failure_judge", {}).get("categories", {}).values():
+        value = category.get("rate")
+        if value is not None and math.isfinite(value):
+            result[f"val/failures/{category['name']}"] = value
     return result
 
 
@@ -111,8 +122,13 @@ def warn_verification_coverage(summary, context):
     missing = totals.get("unverified_rollouts", 0)
     if missing:
         print(f"[hierarchical-rema][WARNING] {context}: {missing}/"
-              f"{totals['completed_rollouts']} rollouts unverified; accuracy excludes them, "
+              f"{totals['completed_rollouts']} final outcomes unavailable; accuracy excludes them, "
               "not counted as incorrect. See saved summary for coverage.", flush=True)
+    auxiliary = totals.get("auxiliary_unverified_rollouts", 0)
+    if auxiliary:
+        print(f"[hierarchical-rema][verification] {context}: {auxiliary}/"
+              f"{totals['completed_rollouts']} rollouts have unknown auxiliary checks; "
+              "only providers requiring those checks are blocked. See verification_failures.jsonl.", flush=True)
 
 
 def allocated_gpu_count(environ):

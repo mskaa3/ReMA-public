@@ -42,7 +42,8 @@ def _jsonl(path, rows):
     _atomic(path, write)
 
 
-def write_evaluation_exports(output_dir, summary, ids_report, *, epoch, tracking_step, context):
+def write_evaluation_exports(output_dir, summary, ids_report, *, epoch, tracking_step, context,
+                             failure_report=None):
     output_dir = Path(output_dir)
     metadata = ids_report["metadata"]
     definition = {key: value for key, value in metadata.items()
@@ -112,3 +113,39 @@ def write_evaluation_exports(output_dir, summary, ids_report, *, epoch, tracking
         writer.writeheader()
         writer.writerows(_safe(history))
     _atomic(output_dir.parent / "evaluation_history.csv", write_csv)
+    if failure_report and failure_report["metadata"]["enabled"]:
+        _write_failure_exports(output_dir, failure_report, common)
+
+
+def _write_failure_exports(output_dir, report, common):
+    metadata = report["metadata"]
+    # Do not repeat the full prompt in every rollout/history row.
+    identity = {key: value for key, value in metadata.items() if key not in ("prompt", "runtime_error")}
+    identity_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    _atomic(output_dir / "failure_judge_definition.json",
+            lambda handle: json.dump(_safe(metadata), handle, indent=2))
+    base = {key: common[key] for key in ("epoch", "tracking_step", "evaluated_at_utc", "validation_mode")}
+    base.update(judge_definition_id=identity_id, model=metadata["model"],
+                revision=metadata.get("resolved_revision"), prompt_sha256=metadata["prompt_sha256"])
+    _jsonl(output_dir / "validation_failures.jsonl", [{**base, **row} for row in report["rows"]])
+    rows = []
+    for dataset, summary in [("__overall__", report["overall"]), *sorted(report["subsets"].items())]:
+        for code, values in summary["categories"].items():
+            rows.append({**base, "dataset": dataset, "category_id": code, **values})
+    _jsonl(output_dir / "failure_judge_metrics.jsonl", rows)
+    path = output_dir.parent / "failure_judge_history.jsonl"
+    old = []
+    if path.exists():
+        with path.open() as handle:
+            old = [json.loads(line) for line in handle if line.strip()]
+    history = [row for row in old if row["epoch"] != common["epoch"]] + rows
+    history.sort(key=lambda row: (row["epoch"], row["dataset"], row["category_id"]))
+    _jsonl(path, history)
+
+    def write(handle):
+        columns = (*base, "dataset", "category_id", "name", "rate", "positive_rollouts",
+                   "assessed_rollouts", "assessed_tasks", "total_rollouts", "coverage")
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(history)
+    _atomic(output_dir.parent / "failure_judge_history.csv", write)

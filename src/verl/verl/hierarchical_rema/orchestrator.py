@@ -402,6 +402,14 @@ class HierarchicalReMAOrchestrator:
         )
         return adjusted_reward
 
+    def _required_auxiliary_checks(self):
+        if self.reward_provider is None:
+            return ("answer_containment",)
+        # Unknown/custom providers remain conservative until they declare which
+        # oracle diagnostics their reward actually requires.
+        return getattr(self.reward_provider, "required_auxiliary_checks",
+                       ("reference_answer_match", "answer_containment"))
+
     def _reward_model_request(self, *, task, decomposition, selection, executions, final_answer, reward):
         request = dict(task=task, decomposition=decomposition, selection=selection,
                        executions=executions, final_answer=final_answer)
@@ -727,13 +735,18 @@ class HierarchicalReMAOrchestrator:
 
         if fixed_prefix:
             stats = [rollout.training_batch.worker_grpo_stats for rollout in task_rollouts]
+            causes = {}
+            for item in stats:
+                for cause, count in item.get("incomplete_groups_by_cause", {}).items():
+                    causes[cause] = causes.get(cause, 0) + count
             print(
                 f"[hierarchical-rema][fixed-prefix]{progress_suffix} "
                 f"groups={sum(item.get('num_groups_total', 0) for item in stats)} "
                 f"used={sum(item.get('num_groups_used', 0) for item in stats)} "
                 f"incomplete={sum(item.get('num_groups_incomplete', 0) for item in stats)} "
                 f"zero_signal={sum(item.get('num_groups_zero_signal', 0) for item in stats)} "
-                f"training_actions={sum(item.get('num_samples_used', 0) for item in stats)}",
+                f"training_actions={sum(item.get('num_samples_used', 0) for item in stats)} "
+                f"incomplete_causes={json.dumps(causes, sort_keys=True)}",
                 flush=True,
             )
         return task_rollouts
@@ -929,7 +942,8 @@ class HierarchicalReMAOrchestrator:
             reward = build_selection_reward(
                 final_answer=final_answer, ground_truth=state.task.ground_truth,
                 executions=state.executions, weights=self.reward_weights,
-                task_metadata=state.task.metadata, final_node_id=state.decomposition.final_node_id)
+                task_metadata=state.task.metadata, final_node_id=state.decomposition.final_node_id,
+                required_auxiliary_checks=self._required_auxiliary_checks())
             return state, final_answer, reward
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rema-verify") as verifier:
@@ -1002,6 +1016,7 @@ class HierarchicalReMAOrchestrator:
             weights=self.reward_weights,
             task_metadata=task.metadata,
             final_node_id=decomposition.final_node_id,
+            required_auxiliary_checks=self._required_auxiliary_checks(),
         )
         reward, reward_model_outputs = self._apply_reward_provider(
             task=task,

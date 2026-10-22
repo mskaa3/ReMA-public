@@ -85,7 +85,8 @@ def record_verification_failures(path, rollouts):
     for rollout in rollouts:
         for plan in rollout.decompositions:
             for selection in plan.selections:
-                if selection.reward.verification_status == "unverified":
+                if (selection.reward.verification_status == "unverified"
+                        or selection.reward.auxiliary_verification_errors):
                     failures.append({
                         "task_id": rollout.task.task_id, "prompt": rollout.task.prompt,
                         "reference": rollout.task.ground_truth,
@@ -93,6 +94,10 @@ def record_verification_failures(path, rollouts):
                         "rollout_id": selection.selection.selection_id,
                         "final_answer": selection.final_answer,
                         "final_answer_correctness": selection.reward.final_answer_correctness,
+                        "reward_verification_status": selection.reward.verification_status,
+                        "final_verification_status": selection.reward.final_verification_status,
+                        "auxiliary_verification_status": selection.reward.auxiliary_verification_status,
+                        "auxiliary_errors": selection.reward.auxiliary_verification_errors,
                         "execution_checks": [
                             {"node_id": execution.node_id, "output_text": execution.output_text,
                              "verification_checks": execution.verification_checks}

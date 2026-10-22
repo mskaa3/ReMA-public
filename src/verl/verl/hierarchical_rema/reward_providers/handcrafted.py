@@ -65,6 +65,7 @@ def arithmetic_evidence(output, instruction):
 class HandcraftedRewardProvider:
     source = "handcrafted_v1"
     supports_verified_final_correctness = True
+    required_auxiliary_checks = ()
     rollout_batch_size = 64
 
     def __init__(self, bad_class_penalty=1., failure_scale=.25):

@@ -50,6 +50,7 @@ def validate_checkpoint(cp):
 
 class GraphPRMV2RewardScorer:
     supports_verified_final_correctness = True
+    required_auxiliary_checks = ()
 
     def __init__(self, checkpoint_path, device='cpu', encoder_backend=None, encoder_model=None,
                  prm_device='cpu', prm_torch_dtype='auto', prm_max_length=0,

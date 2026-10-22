@@ -437,7 +437,7 @@ class SelectionRewardBreakdown:
     total_reward: Optional[float]
     worker_format_penalty: float = 0.0
     intermediate_final_answer_penalty: float = 0.0
-    non_final_answer_containment_penalty: float = 0.0
+    non_final_answer_containment_penalty: Optional[float] = 0.0
     worker_unique_result_bonus: float = 0.0
     worker_duplicate_result_penalty: float = 0.0
     worker_downstream_used_bonus: float = 0.0
@@ -451,6 +451,13 @@ class SelectionRewardBreakdown:
     reward_model_source: str = "handcrafted"
     verification_status: str = "verified"
     verification_error: Optional[Dict[str, Any]] = None
+    # verification_status describes checks required by the selected reward.
+    auxiliary_verification_status: str = "not_checked"
+    auxiliary_verification_errors: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def final_verification_status(self) -> str:
+        return "verified" if self.final_answer_correctness is not None else "unverified"
 
     def to_dict(self) -> Dict[str, Any]:
         from .reward_providers.base import COMPILED_SOURCES
@@ -461,8 +468,11 @@ class SelectionRewardBreakdown:
                 "final_answer_correctness": self.final_answer_correctness,
                 "verification_status": self.verification_status,
                 "verification_error": self.verification_error,
+                "final_verification_status": self.final_verification_status,
+                "auxiliary_verification_status": self.auxiliary_verification_status,
+                "auxiliary_verification_errors": self.auxiliary_verification_errors,
             }
-        return asdict(self)
+        return {**asdict(self), "final_verification_status": self.final_verification_status}
 
 
 @dataclass

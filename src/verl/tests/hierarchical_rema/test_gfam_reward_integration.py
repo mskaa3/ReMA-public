@@ -94,6 +94,9 @@ def test_gfam_reward_overrides_handcrafted_selection_and_decomposer_rewards() ->
         "final_answer_correctness": 1.,
         "verification_status": "verified",
         "verification_error": None,
+        "final_verification_status": "verified",
+        "auxiliary_verification_status": "verified",
+        "auxiliary_verification_errors": [],
     }
     assert selection.reward_model_outputs["source"] == "gfam_v1"
     assert math.isclose(selection.reward_model_outputs["selection_reward"], 0.33)

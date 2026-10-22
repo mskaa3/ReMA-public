@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from functools import lru_cache
+import ast
 import re
 
 
@@ -26,7 +27,7 @@ class AnswerVerificationError(ValueError):
 
 # Restrict recovery to data-dependent symbolic failures. Missing dependencies,
 # resource failures and unrelated runtime bugs must still surface.
-_SYMBOLIC_ERRORS = (AttributeError, ValueError, TypeError, NotImplementedError, RecursionError)
+_SYMBOLIC_ERRORS = (AttributeError, ValueError, TypeError, SyntaxError, NotImplementedError, RecursionError)
 
 
 def _native_boolean(expression):
@@ -138,8 +139,77 @@ def _normalize_notation(text: str) -> str:
     return text
 
 
+def _parse_plain_expression(text):
+    """Construct a small arithmetic AST; never eval/sympify generated source."""
+    from sympy import Add, Mul, Pow, Rational, Symbol, pi
+    source = text.replace("^", "**").strip()
+    tree = ast.parse(source, mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > 128:
+        raise ValueError("Plain mathematical expression exceeds the AST limit")
+
+    def visit(node):
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            literal = ast.get_source_segment(source, node)
+            if not re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", literal):
+                raise ValueError("Unsupported numeric literal")
+            exponent = re.search(r"[eE]([+-]?\d+)$", literal)
+            if exponent and abs(int(exponent[1])) > 10000:
+                raise ValueError("Numeric literal exponent exceeds the safe limit")
+            return Rational(literal)
+        if isinstance(node, ast.Name):
+            if node.id == "pi":
+                return pi
+            if re.fullmatch(r"[a-zA-Z]", node.id):
+                return Symbol(node.id)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = visit(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else Mul(-1, value, evaluate=False)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "sqrt" and len(node.args) == 1 and not node.keywords:
+                return Pow(visit(node.args[0]), Rational(1, 2), evaluate=False)
+        if isinstance(node, ast.BinOp):
+            left, right = visit(node.left), visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return Add(left, right, evaluate=False)
+            if isinstance(node.op, ast.Sub):
+                return Add(left, Mul(-1, right, evaluate=False), evaluate=False)
+            if isinstance(node.op, ast.Mult):
+                return Mul(left, right, evaluate=False)
+            if isinstance(node.op, ast.Div):
+                if right.is_zero is True:
+                    raise ValueError("Division by zero")
+                return Mul(left, Pow(right, -1, evaluate=False), evaluate=False)
+            if isinstance(node.op, ast.Pow):
+                # Bound numeric powers and reject power towers before evaluation.
+                if right.has(Pow) or (right.is_number and abs(right) > 10000):
+                    raise ValueError("Exponent exceeds the safe arithmetic limit")
+                return Pow(left, right, evaluate=False)
+        raise ValueError("Unsupported plain mathematical syntax")
+
+    return (visit(tree.body),)
+
+
 @lru_cache(maxsize=16384)
 def _parse_expression(text, parse, latex_config):
+    if len(text) > 4096 or re.search(r"\d{129}", text):
+        raise ValueError("Mathematical expression exceeds the input limit")
+    # One +/- denotes two complete alternatives, not one arbitrarily chosen root.
+    alternatives = text.replace(r"\pm", "±")
+    if "±" in alternatives:
+        from sympy import Expr, FiniteSet
+        if alternatives.count("±") != 1:
+            raise ValueError("Multiple plus/minus signs require explicit alternatives")
+        members = []
+        for sign in ("+", "-"):
+            parsed = _parse_expression(alternatives.replace("±", sign), parse, latex_config)
+            if len(parsed) != 1 or not isinstance(parsed[0], Expr):
+                raise ValueError("Cannot parse complete plus/minus alternatives")
+            members.append(parsed[0])
+        return (FiniteSet(*members),)
+    # TeX can reject or reinterpret sqrt(...), ** and explicit multiplication.
+    # Select the strict whole-expression path for those plain-text artifacts.
+    if "\\" not in text and ("*" in text or re.search(r"\bsqrt\s*\(", text)):
+        return _parse_plain_expression(text)
     kwargs = dict(extraction_config=[latex_config()], fallback_mode="no_fallback",
                   extraction_mode="first_match", parsing_timeout=0)
     builder = re.fullmatch(r"(?:\\\{|\{)\s*([a-zA-Z])\s*(?:\||\\mid)\s*(.*?)\s*(?:\\\}|\})", text)
@@ -155,7 +225,12 @@ def _parse_expression(text, parse, latex_config):
                 return (_real_solution_set(expression),)
         # Do not let a failed set-builder parse fall back to a matching number.
         return ()
-    return tuple(parse("$" + text + "$", **kwargs))
+    parsed = tuple(parse("$" + text + "$", **kwargs))
+    if not parsed and "\\" not in text and re.fullmatch(r"[\w\s.+*/()^\-]+", text):
+        # One deterministic fallback on the same artifact, inside the parent's
+        # existing deadline. No generated replacements or new timeout budget.
+        return _parse_plain_expression(text)
+    return parsed
 
 
 def _validate_reference(ground_truth):
@@ -176,8 +251,6 @@ def _compute_answer_score(model_output: str, ground_truth: str) -> float:
     reference = _normalize_notation(ground_truth)
     if not prediction or not reference:
         return 0.0
-    if prediction == reference:
-        return 1.0
     # Do not interpret multiple-choice letters as algebraic variables.
     ref_choice = re.fullmatch(r"(?:\\text\{)?([A-E])\}?", reference)
     if ref_choice:
@@ -189,8 +262,13 @@ def _compute_answer_score(model_output: str, ground_truth: str) -> float:
     # expression avoids dropping pi, intervals, fractions or plain sqrt(...).
     gold = _parse_for_verification(reference, parse, latex_config, "reference")
     if not gold:
-        raise AnswerVerificationError(f"Cannot parse ground-truth mathematical answer: {ground_truth!r}")
+        raise AnswerVerificationError(f"Cannot parse comparison-reference expression: {ground_truth!r}")
+    if prediction == reference:
+        return 1.0
     answer = _parse_for_verification(prediction, parse, latex_config, "prediction")
+    if not answer:
+        raise AnswerVerificationError(
+            f"Cannot parse prediction expression: {model_output!r}", "prediction_parse_failed")
     # A one-variable inequality can be another notation for the reference set.
     from sympy import Set
     if len(gold) == len(answer) == 1 and isinstance(gold[0], Set):

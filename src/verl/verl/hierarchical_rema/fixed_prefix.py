@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
@@ -192,6 +193,23 @@ def generate_branches(orchestrator, tasks, plans, worker_pool, config, worker_pe
     return result, comparisons
 
 
+def _unavailable_causes(rollout):
+    reward = rollout.reward
+    error = reward.verification_error or {}
+    code = str(error.get("code") or "unknown")
+    if reward.final_answer_correctness not in (0.0, 1.0):
+        stage = "reference_validation" if error.get("stage") == "reference_validation" else "final_correctness"
+        return [f"{stage}:{code}"]
+    if reward.verification_status == "unverified":
+        return [f"required_auxiliary:{error.get('stage', 'unknown')}:{code}"]
+    if reward.total_reward is None:
+        model_error = rollout.reward_model_outputs.get("error") or {}
+        return [f"reward_model:{model_error.get('code') or model_error.get('type') or 'unavailable'}"]
+    if not math.isfinite(reward.total_reward):
+        return ["nonfinite_rollout_reward"]
+    return []
+
+
 def build_samples(orchestrator, task, decompositions, config, min_group_size):
     samples, sizes = [], []
     stats = {
@@ -199,6 +217,7 @@ def build_samples(orchestrator, task, decompositions, config, min_group_size):
         "num_samples_total": 0, "num_samples_used": 0, "num_samples_skipped": 0,
         "num_groups_incomplete": 0, "num_groups_zero_signal": 0,
         "num_actions_skipped_gate": 0, "num_actions_skipped_sign": 0,
+        "incomplete_groups_by_cause": {}, "unavailable_continuations_by_cause": {},
     }
     for decomposition in decompositions:
         by_group = {}
@@ -213,6 +232,7 @@ def build_samples(orchestrator, task, decompositions, config, min_group_size):
             stats["num_samples_total"] += count
             actions = {index: [] for index in range(count)}
             errors = []
+            details = []
             for rollout in by_group.get(comparison["group_id"], []):
                 meta = rollout.branch_metadata
                 if meta["action_index"] not in actions:
@@ -223,11 +243,25 @@ def build_samples(orchestrator, task, decompositions, config, min_group_size):
                 if (len(rollouts) != repeats
                         or {r.branch_metadata["continuation_index"] for r in rollouts} != set(range(repeats))):
                     errors.append(f"action_{index}:missing_or_duplicate_continuation")
+                    indices = [r.branch_metadata["continuation_index"] for r in rollouts]
+                    causes = []
+                    if set(range(repeats)) - set(indices):
+                        causes.append("missing_continuation")
+                    if len(indices) != len(set(indices)):
+                        causes.append("duplicate_continuation")
+                    if set(indices) - set(range(repeats)):
+                        causes.append("unexpected_continuation")
+                    details.append({"action_index": index, "causes": causes,
+                                    "expected_continuations": repeats, "observed_indices": indices})
                     continue
                 rewards, executions, gates = [], [], []
                 for rollout in sorted(rollouts, key=lambda r: r.branch_metadata["continuation_index"]):
-                    if rollout.reward.total_reward is None or rollout.reward.verification_status == "unverified":
+                    causes = _unavailable_causes(rollout)
+                    if causes:
                         errors.append(f"action_{index}:unscored_or_unverified")
+                        details.append({"action_index": index,
+                                        "continuation_index": rollout.branch_metadata["continuation_index"],
+                                        "rollout_id": rollout.selection.selection_id, "causes": causes})
                         continue
                     matched = [ex for ex in rollout.executions if ex.node_id == comparison["node_id"]]
                     if len(matched) != 1:
@@ -241,6 +275,10 @@ def build_samples(orchestrator, task, decompositions, config, min_group_size):
                     reward = orchestrator._worker_training_reward(rollout, execution, allow_excluded=True)
                     if not math.isfinite(reward):
                         errors.append(f"action_{index}:nonfinite_reward")
+                        details.append({"action_index": index,
+                                        "continuation_index": rollout.branch_metadata["continuation_index"],
+                                        "rollout_id": rollout.selection.selection_id,
+                                        "causes": ["nonfinite_focal_reward"]})
                         continue
                     rewards.append(reward)
                     executions.append(execution)
@@ -262,7 +300,18 @@ def build_samples(orchestrator, task, decompositions, config, min_group_size):
             comparison["actions"] = records
             if errors or count < min_group_size:
                 comparison.update(status="skipped", reason="incomplete_group" if errors else "minimum_group_size",
-                                  errors=errors)
+                                  errors=errors, incomplete_details=details)
+                # A group counts once per cause; several causes may affect it.
+                causes = sorted({cause for detail in details for cause in detail["causes"]})
+                comparison["incomplete_causes"] = causes
+                for cause in causes:
+                    counts = stats["incomplete_groups_by_cause"]
+                    counts[cause] = counts.get(cause, 0) + 1
+                counts = Counter(stats["unavailable_continuations_by_cause"])
+                for detail in details:
+                    if "rollout_id" in detail:
+                        counts.update(detail["causes"])
+                stats["unavailable_continuations_by_cause"] = dict(counts)
                 stats["num_groups_skipped"] += 1
                 stats["num_samples_skipped"] += count
                 stats["num_groups_incomplete"] += bool(errors)

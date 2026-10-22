@@ -50,7 +50,7 @@ def test_accuracy_is_all_verified_executions_not_best_of_n(capsys):
     })
     assert metrics.validation_tracking_metrics(summary) == {'val/accuracy': .5, 'val/acc/math': .5}
     metrics.warn_verification_coverage(summary, 'validation')
-    assert '1/3 rollouts unverified' in capsys.readouterr().out
+    assert '1/3 final outcomes unavailable' in capsys.readouterr().out
     assert value == before
     complete = train.epoch_rollout_summary([rollout([0, 1], [-.4, .8])])
     assert complete['accuracy'] == .5

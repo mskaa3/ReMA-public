@@ -281,8 +281,8 @@ def _score_single_prediction_candidate(
     if not str(prediction or "").strip() or not str(reference or "").strip():
         return 0.0
 
-    if exact_match(prediction, reference):
-        return 1.0
+    # The bounded verifier validates the reference even for identical strings;
+    # two identical malformed expressions are not verified mathematical answers.
     compute_score = _load_default_compute_score()
     metadata = task_metadata if isinstance(task_metadata, dict) else {}
     data_source = str(metadata.get("data_source") or "ReMA-math")
@@ -628,12 +628,41 @@ def _unverified_selection_reward(error, final_correctness=None):
     )
 
 
-def _record_failed_execution_check(execution, check, exc, final_correctness):
+def _record_failed_execution_check(execution, check, exc, reference_role="ground_truth"):
     setattr(execution, check, None)
     error = {"status": "unverified", "code": exc.code, "message": str(exc),
-             "stage": check, "node_id": execution.node_id}
+             "stage": check, "node_id": execution.node_id,
+             "prediction_role": "intermediate_artifact", "reference_role": reference_role}
     execution.verification_checks[check] = error
-    return _unverified_selection_reward(error, final_correctness)
+    return error
+
+
+def _check_answer_containment(execution, final_answer, ground_truth, task_metadata):
+    """Tri-state OR: a demonstrated match wins; unknown is not a non-match."""
+    checks = []
+    for role, reference in (("generated_final_answer", final_answer), ("ground_truth", ground_truth)):
+        try:
+            match = _verified_match(execution.output_text, reference, task_metadata)
+            checks.append({"status": "verified", "match": match, "reference_role": role})
+            if match:
+                execution.answer_containment = True
+                execution.verification_checks["answer_containment"] = {
+                    "status": "verified", "match": True, "comparisons": checks}
+                return None
+        except _math_verifier_module().AnswerVerificationError as exc:
+            checks.append({"status": "unverified", "code": exc.code, "message": str(exc),
+                           "reference_role": role, "prediction_role": "intermediate_artifact"})
+    errors = [check for check in checks if check["status"] == "unverified"]
+    if errors:
+        execution.answer_containment = None
+        result = {**errors[0], "stage": "answer_containment", "node_id": execution.node_id,
+                  "comparisons": checks}
+        execution.verification_checks["answer_containment"] = result
+        return result
+    execution.answer_containment = False
+    execution.verification_checks["answer_containment"] = {
+        "status": "verified", "match": False, "comparisons": checks}
+    return None
 
 
 def build_selection_reward(
@@ -643,8 +672,14 @@ def build_selection_reward(
     weights: RewardWeights,
     task_metadata: Dict[str, Any] | None = None,
     final_node_id: str | None = None,
+    required_auxiliary_checks: Sequence[str] = ("answer_containment",),
 ) -> SelectionRewardBreakdown:
+    required = set(required_auxiliary_checks)
+    if not required <= {"reference_answer_match", "answer_containment"}:
+        raise ValueError(f"Unknown required auxiliary checks: {sorted(required)}")
     verification = reference_verification_status(ground_truth, task_metadata)
+    if verification["status"] == "unverified":
+        verification = {**verification, "stage": "reference_validation", "reference_role": "ground_truth"}
     final_correct = None
     if verification["status"] != "unverified":
         try:
@@ -652,11 +687,14 @@ def build_selection_reward(
                 final_answer, ground_truth, task_metadata=task_metadata,
             )
         except _math_verifier_module().AnswerVerificationError as exc:
-            verification = {"status": "unverified", "code": exc.code, "message": str(exc)}
+            verification = {"status": "unverified", "code": exc.code, "message": str(exc),
+                            "stage": "final_correctness", "prediction_role": "generated_final_answer",
+                            "reference_role": "ground_truth"}
     if final_correct is None:
         return _unverified_selection_reward(verification)
     # A matching intermediate value is not proof of a role violation. Keep the
     # reference-based observation separate from delivered text and validity.
+    auxiliary_errors = []
     for execution in executions:
         eligible = bool(final_node_id is not None and execution.node_id != final_node_id
                         and str(ground_truth or "").strip() and execution.output_text.strip())
@@ -664,7 +702,8 @@ def build_selection_reward(
             execution.reference_answer_match = bool(eligible and is_non_final_answer_leak(
                 execution.output_text, ground_truth, task_metadata=task_metadata))
         except _math_verifier_module().AnswerVerificationError as exc:
-            return _record_failed_execution_check(execution, "reference_answer_match", exc, final_correct)
+            auxiliary_errors.append(_record_failed_execution_check(execution, "reference_answer_match", exc))
+            continue
         execution.verification_checks["reference_answer_match"] = {
             "status": "verified" if eligible else "not_applicable",
             "match": execution.reference_answer_match,
@@ -716,20 +755,9 @@ def build_selection_reward(
                 execution.answer_containment = False
                 execution.verification_checks["answer_containment"] = {"status": "not_applicable"}
                 continue
-            try:
-                matches_generated_final = _verified_match(
-                    execution.output_text, final_answer, task_metadata,
-                )
-                execution.answer_containment = (
-                    matches_generated_final or _verified_match(
-                        execution.output_text, ground_truth, task_metadata,
-                    )
-                )
-            except _math_verifier_module().AnswerVerificationError as exc:
-                return _record_failed_execution_check(execution, "answer_containment", exc, final_correct)
-            execution.verification_checks["answer_containment"] = {
-                "status": "verified", "match": execution.answer_containment,
-            }
+            error = _check_answer_containment(execution, final_answer, ground_truth, task_metadata)
+            if error:
+                auxiliary_errors.append(error)
             if execution.answer_containment:
                 non_final_answer_containment_count += 1
     non_final_answer_containment_penalty = (
@@ -794,6 +822,14 @@ def build_selection_reward(
             - worker_duplicate_result_penalty
             - final_ignores_hierarchy_penalty
         )
+    # The legacy scalar depends on containment. Do not manufacture its unknown
+    # penalty, even when a provider can supply an independent node reward later.
+    if any(error["stage"] == "answer_containment" for error in auxiliary_errors):
+        non_final_answer_containment_penalty = None
+        total_reward = None
+    required_errors = [error for error in auxiliary_errors if error["stage"] in required]
+    if required_errors:
+        total_reward = None
     return SelectionRewardBreakdown(
         final_answer_correctness=final_correct,
         confidence_reward=confidence_reward,
@@ -812,4 +848,8 @@ def build_selection_reward(
         dependency_usage_rate=float(hierarchy_stats["dependency_usage_rate"]),
         final_dependency_usage_rate=float(hierarchy_stats["final_dependency_usage_rate"]),
         final_raw_score_usage_multiplier=final_raw_score_usage_multiplier,
+        verification_status="unverified" if required_errors else "verified",
+        verification_error=required_errors[0] if required_errors else None,
+        auxiliary_verification_status="unverified" if auxiliary_errors else "verified",
+        auxiliary_verification_errors=auxiliary_errors,
     )

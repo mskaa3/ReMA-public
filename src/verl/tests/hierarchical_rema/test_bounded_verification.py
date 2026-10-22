@@ -127,7 +127,8 @@ def test_auxiliary_timeout_preserves_correctness_but_excludes_reward(monkeypatch
     monkeypatch.setattr(rewarding, "compute_final_answer_correctness", compare)
     if check == "answer_containment":
         monkeypatch.setattr(rewarding, "is_non_final_answer_leak", lambda *a, **k: False)
-    reward = rewarding.build_selection_reward(final_answer, "4", [worker], api.RewardWeights(), final_node_id="2")
+    reward = rewarding.build_selection_reward(final_answer, "4", [worker], api.RewardWeights(),
+                                              final_node_id="2", required_auxiliary_checks=(check,))
     assert reward.final_answer_correctness == float(final_answer == "4")
     assert reward.total_reward is None
     assert reward.verification_status == "unverified"

@@ -131,7 +131,7 @@ def test_unparseable_reference_is_not_silently_scored_as_wrong(monkeypatch):
     parent = rewarding.__package__.rpartition(".")[0]
     backend = importlib.import_module(f"{parent + '.' if parent else ''}utils.reward_score.math_verify")
     monkeypatch.setattr(backend, "_verifier", lambda: (lambda *a, **kw: [], None, lambda: None))
-    with pytest.raises(ValueError, match="Cannot parse ground-truth"):
+    with pytest.raises(ValueError, match="Cannot parse .*reference"):
         backend._compute_answer_score("0.32", "unparseable reference")
 
 

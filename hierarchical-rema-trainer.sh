@@ -6,6 +6,7 @@
 #SBATCH --mem=200gb
 #SBATCH -p lem-gpu-short
 #SBATCH --gpus-per-node=hopper:4
+#SBATCH --gres=storage:local:500G,storage:lustre:1
 #SBATCH --verbose
 #SBATCH --output=/lustre/tmp/slurm-%j.out
 #SBATCH --error=/lustre/tmp/slurm-%j.err
@@ -56,18 +57,15 @@ fi
 LOCAL_OUTPUT_DIR=${LOCAL_OUTPUT_DIR:-$DEFAULT_LOCAL_OUTPUT_DIR}
 DEFAULT_PERSIST_LOCAL_DIR=${SLURM_SUBMIT_DIR:-$PWD}/outputs/${OUTPUT_SUBDIR}/${JOB_ID}
 PERSIST_LOCAL_DIR=${PERSIST_LOCAL_DIR:-$DEFAULT_PERSIST_LOCAL_DIR}
-if [[ "$RUN_KIND" == "train" && -n "${TMPDIR_LUSTRE:-}" ]]; then
-    DEFAULT_DISTRIBUTED_OFFLINE_INPUT_ROOT="${TMPDIR_LUSTRE}/hierarchical_rema_train_${JOB_ID}/_distributed_offline_grpo"
+if [[ "$RUN_KIND" == "train" ]]; then
+    source "$SOURCE_DIR/scripts/shared-training-storage.sh"
+    rema_configure_shared_training_storage
 else
     DEFAULT_DISTRIBUTED_OFFLINE_INPUT_ROOT="${DEFAULT_PERSIST_LOCAL_DIR}/_distributed_offline_grpo"
-fi
-DISTRIBUTED_OFFLINE_INPUT_ROOT=${DISTRIBUTED_OFFLINE_INPUT_ROOT:-$DEFAULT_DISTRIBUTED_OFFLINE_INPUT_ROOT}
-if [[ "$RUN_KIND" == "train" && -n "${TMPDIR_LUSTRE:-}" ]]; then
-    DEFAULT_SHARED_RUNTIME_MODEL_ROOT="${TMPDIR_LUSTRE}/hierarchical_rema_train_${JOB_ID}/_runtime_active_models"
-else
     DEFAULT_SHARED_RUNTIME_MODEL_ROOT="$DEFAULT_PERSIST_LOCAL_DIR/_runtime_active_models"
+    DISTRIBUTED_OFFLINE_INPUT_ROOT=${DISTRIBUTED_OFFLINE_INPUT_ROOT:-$DEFAULT_DISTRIBUTED_OFFLINE_INPUT_ROOT}
+    SHARED_RUNTIME_MODEL_ROOT=${SHARED_RUNTIME_MODEL_ROOT:-$DEFAULT_SHARED_RUNTIME_MODEL_ROOT}
 fi
-SHARED_RUNTIME_MODEL_ROOT=${SHARED_RUNTIME_MODEL_ROOT:-$DEFAULT_SHARED_RUNTIME_MODEL_ROOT}
 RUNTIME_LOG=${RUNTIME_LOG:-$LOCAL_OUTPUT_DIR/runtime.log}
 RUN_METADATA_FILE=${RUN_METADATA_FILE:-$LOCAL_OUTPUT_DIR/run_metadata.txt}
 
@@ -116,6 +114,16 @@ export REMA_IDS_MODEL=${REMA_IDS_MODEL:-BAAI/bge-m3}
 export REMA_IDS_REVISION=${REMA_IDS_REVISION:-main}
 export REMA_IDS_DEVICE=${REMA_IDS_DEVICE:-cuda:0}
 export REMA_IDS_BATCH_SIZE=${REMA_IDS_BATCH_SIZE:-16}
+export REMA_MAST_ENABLED=${REMA_MAST_ENABLED:-false}
+export REMA_MAST_MODEL=${REMA_MAST_MODEL:-google/gemma-4-31B-it}
+export REMA_MAST_REVISION=${REMA_MAST_REVISION:-main}
+export REMA_MAST_BATCH_SIZE=${REMA_MAST_BATCH_SIZE:-4}
+export REMA_MAST_MAX_MODEL_LEN=${REMA_MAST_MAX_MODEL_LEN:-16384}
+export REMA_MAST_MAX_TOKENS=${REMA_MAST_MAX_TOKENS:-3072}
+export REMA_MAST_GPU_MEMORY_UTILIZATION=${REMA_MAST_GPU_MEMORY_UTILIZATION:-0.85}
+export REMA_MAST_RETRIES=${REMA_MAST_RETRIES:-1}
+export REMA_MAST_TIMEOUT=${REMA_MAST_TIMEOUT:-7200}
+export REMA_MAST_PYTHON=${REMA_MAST_PYTHON:-}
 
 # Frequently adjusted: high-level experiment shape.
 BACKEND=${BACKEND:-mock}
@@ -381,6 +389,9 @@ else
 fi
 
 mkdir -p "$RUN_ROOT" "$LOCAL_OUTPUT_DIR" "$SHARED_RUNTIME_MODEL_ROOT" "$DISTRIBUTED_OFFLINE_INPUT_ROOT"
+if [[ "$RUN_KIND" == "train" ]]; then
+    rema_verify_shared_training_storage host
+fi
 if [[ "$COPY_OUTPUTS_TO_PERSIST_LOCAL_DIR" == "1" || "$COPY_OUTPUTS_TO_PERSIST_LOCAL_DIR" == "true" || "$COPY_OUTPUTS_TO_PERSIST_LOCAL_DIR" == "True" ]]; then
     mkdir -p "$PERSIST_LOCAL_DIR"
 fi
@@ -550,6 +561,10 @@ if [[ "$BACKEND" == "vllm" && ( "${RAY_NNODES:-1}" -gt 1 || "$GFAM_REWARD_GPU_RE
     MULTINODE_RAY_ENABLED=1
 fi
 GPU_PARTITION="python3 /verl/verl/hierarchical_rema/gpu_partition.py --reserve ${GFAM_REWARD_GPU_RESERVATION}"
+if [[ "$RUN_KIND" == "train" && "$REMA_MAST_ENABLED" =~ ^([Tt][Rr][Uu][Ee]|1)$ && "$GFAM_REWARD_GPU_RESERVATION" != "1" ]]; then
+    echo "The local failure judge requires GFAM_REWARD_GPU_RESERVATION=1; refusing policy GPU sharing" >&2
+    exit 1
+fi
 if [[ "$GFAM_REWARD_GPU_RESERVATION" != "0" && "$GFAM_REWARD_GPU_RESERVATION" != "1" ]]; then
     echo "GFAM_REWARD_GPU_RESERVATION must be 0 or 1" >&2; exit 1
 fi
@@ -943,6 +958,8 @@ DEFAULT_SHARED_RUNTIME_MODEL_ROOT=$DEFAULT_SHARED_RUNTIME_MODEL_ROOT
 DEFAULT_RAY_TMP_BASE=$DEFAULT_RAY_TMP_BASE
 TMPDIR=${TMPDIR:-}
 TMPDIR_LUSTRE=${TMPDIR_LUSTRE:-}
+REMA_SHARED_STORAGE_BASE=${REMA_SHARED_STORAGE_BASE:-}
+APPTAINER_BINDPATH=${APPTAINER_BINDPATH:-}
 TMPDIR_LOCAL=${TMPDIR_LOCAL:-}
 TMPDIR_SHM=${TMPDIR_SHM:-}
 RUN_ROOT=$RUN_ROOT
@@ -1063,6 +1080,13 @@ REMA_IDS_MODEL=$REMA_IDS_MODEL
 REMA_IDS_REVISION=$REMA_IDS_REVISION
 REMA_IDS_DEVICE=$REMA_IDS_DEVICE
 REMA_IDS_BATCH_SIZE=$REMA_IDS_BATCH_SIZE
+REMA_MAST_ENABLED=$REMA_MAST_ENABLED
+REMA_MAST_MODEL=$REMA_MAST_MODEL
+REMA_MAST_REVISION=$REMA_MAST_REVISION
+REMA_MAST_BATCH_SIZE=$REMA_MAST_BATCH_SIZE
+REMA_MAST_MAX_MODEL_LEN=$REMA_MAST_MAX_MODEL_LEN
+REMA_MAST_MAX_TOKENS=$REMA_MAST_MAX_TOKENS
+REMA_MAST_PYTHON=$REMA_MAST_PYTHON
 GFAM_REWARD_MODEL_DEVICE=$GFAM_REWARD_MODEL_DEVICE
 GFAM_PRM_DEVICE=$GFAM_PRM_DEVICE
 GFAM_ENCODER_DEVICE=$GFAM_ENCODER_DEVICE
@@ -1133,11 +1157,13 @@ print("1" if tracker.get("improved") else "0")
     fi
 
     if [[ -f "${LOCAL_OUTPUT_DIR}/validation_accuracy.csv" ]]; then
-        echo "[hierarchical-rema][s3] syncing accuracy/IDS histories -> ${S3_OUTPUT_PATH}"
+        echo "[hierarchical-rema][s3] syncing accuracy/IDS/failure-judge histories -> ${S3_OUTPUT_PATH}"
         if ! rclone copy "${LOCAL_OUTPUT_DIR}" "${S3_OUTPUT_PATH}" \
             --include "/validation_accuracy.csv" \
             --include "/evaluation_history.csv" \
-            --include "/evaluation_history.jsonl"; then
+            --include "/evaluation_history.jsonl" \
+            --include "/failure_judge_history.csv" \
+            --include "/failure_judge_history.jsonl"; then
             echo "Warning: failed to sync validation histories" >&2
             upload_status=1
         fi
@@ -1372,6 +1398,9 @@ if [[ "$RUN_KIND" == "train" ]]; then
     stage_val_task_source
 fi
 stage_runtime_on_allocated_nodes
+if [[ "$RUN_KIND" == "train" ]]; then
+    rema_verify_shared_training_storage container
+fi
 start_ray_cluster
 
 write_run_metadata

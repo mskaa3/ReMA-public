@@ -73,6 +73,7 @@ def validate_reward_setting(args):
 class GraphPRMProvider:
     source = "gnn_prm"
     supports_verified_final_correctness = True
+    required_auxiliary_checks = ()
 
     def __init__(self, scorer):
         self.scorer = scorer

@@ -115,6 +115,7 @@ def coach_response_schema(record):
 class CoachRewardProvider:
     source = "llm_coach"
     supports_verified_final_correctness = True
+    required_auxiliary_checks = ()
 
     def __init__(self, *, model, base_url, cache_dir, api_key_env="REMA_COACH_API_KEY",
                  workers=4, timeout=120., retries=2, max_tokens=4096,

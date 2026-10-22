@@ -110,6 +110,9 @@ def server_environment(env, token):
     result["VLLM_API_KEY"] = token
     result["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     result["VLLM_USE_V1"] = "0"
+    if env.get("REMA_MAST_ENABLED", "false").lower() in ("true", "1"):
+        # Sleep/wake endpoints are loopback-only and used at validation boundaries.
+        result["VLLM_SERVER_DEV_MODE"] = "1"
     return result
 
 
@@ -213,7 +216,10 @@ def supervise(config, output_dir, command):
     save_receipt()
     try:
         with (output_dir / "coach_server.log").open("a", buffering=1) as log:
-            server = subprocess.Popen(server_command(config, revision, port),
+            launch = server_command(config, revision, port)
+            if env.get("REMA_MAST_ENABLED", "false").lower() in ("true", "1"):
+                launch.append("--enable-sleep-mode")
+            server = subprocess.Popen(launch,
                                       env=server_environment(env, token),
                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             wait_ready(server, endpoint, token, config.model, config.startup_timeout)

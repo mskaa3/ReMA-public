@@ -2117,6 +2117,7 @@ def run_external_validation(
 ) -> Dict[str, Any]:
     from .validation import validation_mode, ValidationAudit, hide_uncomputed_rewards, diagnostic_examples
     from .information_diversity import InformationDiversityAudit
+    from .failure_judge import FailureJudgeAudit
     from .evaluation_exports import write_evaluation_exports
     mode = validation_mode(args, epoch_number)
     score_rewards = mode == "diagnostic"
@@ -2128,6 +2129,7 @@ def run_external_validation(
     output_dir.mkdir(parents=True, exist_ok=True)
     audit = ValidationAudit()
     ids_audit = InformationDiversityAudit()
+    failure_audit = FailureJudgeAudit(worker_pool)
     examples = []
     validation_start_time = time.monotonic()
     controller_max_new_tokens = (
@@ -2271,6 +2273,7 @@ def run_external_validation(
             for rollout in batch_rollouts:
                 audit.add(rollout, _task_subset_name(rollout.task))
                 ids_audit.add(rollout, _task_subset_name(rollout.task))
+                failure_audit.add(rollout, _task_subset_name(rollout.task))
             if score_rewards and len(examples) < examples_limit:
                 for example in diagnostic_examples(batch_rollouts):
                     examples.append(example)
@@ -2300,6 +2303,11 @@ def run_external_validation(
     # Separate frozen BGE evaluation after rollout resources have been released.
     # Routine validation still never constructs a reward provider or Qwen PRM.
     ids_report = ids_audit.finish()
+    # The optional judge uses the same rollouts, after IDS releases its encoder.
+    # It neither sees the verifier verdict nor affects reward/accuracy selection.
+    failure_report = failure_audit.finish(output_dir)
+    if failure_report["metadata"]["enabled"]:
+        summary["failure_judge"] = failure_report["overall"]
     summary["information_diversity"] = ids_report["overall"]
     summary["ids_definition"] = ids_report["metadata"]
     for name, subset in summary.get("subsets", {}).items():
@@ -2324,7 +2332,8 @@ def run_external_validation(
         summary=summary,
     )
     write_evaluation_exports(
-        output_dir, summary, ids_report, epoch=epoch_number, tracking_step=tracking_step,
+        output_dir, summary, ids_report, failure_report=failure_report,
+        epoch=epoch_number, tracking_step=tracking_step,
         context={"experiment_name": getattr(args, "experiment_name", ""),
                  "reward_setting": reward_setting(args),
                  "worker_rollout_mode": getattr(args, "worker_rollout_mode", "repeated_execution"),
