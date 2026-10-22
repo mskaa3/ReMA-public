@@ -79,6 +79,10 @@ def validate_study(cfg):
         repository_data_files(cfg)
     if cfg.get('worker_gate_mode', 'off') not in ('off', 'diagnostic', 'gated'):
         raise ValueError('worker_gate_mode must be off, diagnostic, or gated')
+    if cfg.get('gate_solver_backend', 'role') not in ('role', 'frozen_probe'):
+        raise ValueError('gate_solver_backend must be role or frozen_probe')
+    if cfg.get('gate_solver_backend', 'role') == 'frozen_probe' and not cfg.get('local_validation_probe'):
+        raise ValueError('Frozen-gate experiment manifests require a pinned local_validation_probe')
     test_steps = cfg.get('test_update_steps', [])
     if (not isinstance(test_steps, list)
             or any(type(step) is not int or step <= 0 for step in test_steps)
@@ -97,7 +101,7 @@ def validate_study(cfg):
                 raise ValueError(f'local_validation_probe.{key} must be a positive integer')
         if probe.get('max_model_len', 16384) <= probe.get('max_new_tokens', 256):
             raise ValueError('Local probe context must exceed its output budget')
-        if not re.fullmatch(r'[A-Za-z0-9_./\-]+', probe.get('model', 'Qwen/Qwen3-4B-Instruct-2507')):
+        if not re.fullmatch(r'[A-Za-z0-9_./\-]+', probe.get('model', 'Qwen/Qwen2.5-7B-Instruct')):
             raise ValueError('local_validation_probe.model must identify a Hugging Face model')
 
 
@@ -200,6 +204,7 @@ def run_environment(run, *, check_allocation=True):
         'algorithm.hierarchy.scoped_c3_grpo.enable': True,
         'algorithm.hierarchy.scoped_c3_grpo.positive_only_nonterminal_workers': True,
         'algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_role': 'decomposer',
+        'algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_backend': cfg.get('gate_solver_backend', 'role'),
         'algorithm.hierarchy.accept_revise.enable': False,
         'actor_rollout_ref.rollout.max_num_turns': 1,
         'algorithm.hierarchy.worker_context_mode': 'full_question',
@@ -230,6 +235,7 @@ def run_environment(run, *, check_allocation=True):
         # Both adaptation chains use EAC3 for D, independent of their worker gate.
         'PREFIX_PROBE_ENABLE': str(train_planner or gate_mode != 'off').lower(),
         'PREFIX_PROBE_APPLY_TO_TRAINING': str(train_planner or (train and gate_mode == 'gated')).lower(),
+        'PREFIX_PROBE_SOLVER_BACKEND': cfg.get('gate_solver_backend', 'role'),
         # Preserve the existing successful-group requirement in every arm.
         'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
         'PREFIX_PROBE_MAX_NEW_TOKENS': 256,
@@ -253,7 +259,7 @@ def run_environment(run, *, check_allocation=True):
     if probe is not None:
         env.update({
             'VALIDATION_PROBE_BACKEND': 'local', 'VALIDATION_PROBE_URL': '',
-            'VALIDATION_PROBE_MODEL': probe.get('model', 'Qwen/Qwen3-4B-Instruct-2507'),
+            'VALIDATION_PROBE_MODEL': probe.get('model', 'Qwen/Qwen2.5-7B-Instruct'),
             'VALIDATION_PROBE_REVISION': probe['revision'],
             'VALIDATION_PROBE_SAMPLES_PER_DATASET': probe.get('samples_per_dataset', 32),
             'VALIDATION_PROBE_MAX_NEW_TOKENS': probe.get('max_new_tokens', 256),
@@ -364,7 +370,9 @@ def main():
     plan.add_argument('--config', default='config/eac3-experiments.json')
     plan.add_argument('--phase', choices=PHASES, required=True)
     plan.add_argument('--output-dir', required=True)
-    plan.add_argument('--local-probe-revision', help='Enable a frozen local Qwen3-4B probe at this HF commit')
+    plan.add_argument('--local-probe-revision', help='Enable a frozen local Qwen2.5-7B probe at this HF commit')
+    plan.add_argument('--gate-solver-backend', choices=('role', 'frozen_probe'),
+                      help='Use the current decomposer or the pinned local probe for eligibility gates')
     env = sub.add_parser('environment')
     env.add_argument('--run', required=True)
     prepare = sub.add_parser('prepare-data')
@@ -379,6 +387,8 @@ def main():
     args = parser.parse_args()
     if args.command == 'plan':
         cfg = read_json(args.config)
+        if args.gate_solver_backend:
+            cfg['gate_solver_backend'] = args.gate_solver_backend
         if args.local_probe_revision:
             cfg['local_validation_probe'] = {
                 **(cfg.get('local_validation_probe') or {}),

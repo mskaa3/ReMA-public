@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import re
 
-from .validation_probes import ProbeResponse, SYSTEM_PROMPT
+from .validation_probes import ProbeResponse, SYSTEM_PROMPT, probe_request_options
 
 
 def local_probe_config(config):
@@ -62,7 +62,7 @@ class LocalProbeWorker:
         if len(ray.get_gpu_ids()) != 1:
             raise RuntimeError('The local probe must own exactly one Ray-assigned GPU')
         # Do not let a nested vLLM engine create its own Ray GPU pool.
-        from vllm import LLM, SamplingParams
+        from vllm import LLM
 
         self.config = local_probe_config(config)
         self.engine = LLM(
@@ -77,30 +77,33 @@ class LocalProbeWorker:
             generation_config='vllm', enable_prefix_caching=False, seed=0,
         )
         self.tokenizer = self.engine.get_tokenizer()
-        self.sampling = SamplingParams(n=1, temperature=0, top_p=1, top_k=-1,
-                                       max_tokens=self.config['max_new_tokens'], seed=0)
 
     def ready(self):
         from importlib.metadata import version
         return {'model': self.config['model'], 'revision': self.config['revision'],
                 'vllm': version('vllm'), 'transformers': version('transformers')}
 
-    def generate(self, messages):
+    def generate(self, messages, *, system_prompt=SYSTEM_PROMPT, max_new_tokens=None):
+        from vllm import SamplingParams
+
+        system_prompt, budget = probe_request_options(
+            system_prompt, max_new_tokens, self.config['max_new_tokens'])
         if len(messages) > self.config['batch_size']:
             raise ValueError('Probe request exceeds its configured batch_size')
         prompts = []
         for message in messages:
             tokens = self.tokenizer.apply_chat_template(
-                [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': message}],
+                [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': message}],
                 tokenize=True, add_generation_prompt=True,
             )
-            if len(tokens) + self.config['max_new_tokens'] > self.config['max_model_len']:
+            if len(tokens) + budget > self.config['max_model_len']:
                 raise ValueError('Frozen probe context exceeds max_model_len; '
                                  'increase the limit rather than truncate the measured information')
             prompts.append({'prompt_token_ids': tokens})
         if not prompts:
             return []
-        outputs = self.engine.generate(prompts, self.sampling, use_tqdm=False)
+        sampling = SamplingParams(n=1, temperature=0, top_p=1, top_k=-1, max_tokens=budget, seed=0)
+        outputs = self.engine.generate(prompts, sampling, use_tqdm=False)
         if len(outputs) != len(messages):
             raise RuntimeError('Incomplete local probe generation batch')
         responses = []
@@ -110,7 +113,7 @@ class LocalProbeWorker:
             completion = output.outputs[0]
             if not isinstance(completion.text, str) or completion.finish_reason not in ('stop', 'length'):
                 raise RuntimeError('Malformed or aborted local probe generation')
-            responses.append(ProbeResponse(completion.text, completion.finish_reason))
+            responses.append(ProbeResponse(completion.text, completion.finish_reason, len(completion.token_ids)))
         return responses
 
 
@@ -149,8 +152,9 @@ class LocalFrozenProbeClient:
             self.close()
             raise
 
-    def generate(self, messages):
+    def generate(self, messages, *, system_prompt=SYSTEM_PROMPT, max_new_tokens=None):
         import ray
+        system_prompt, budget = probe_request_options(system_prompt, max_new_tokens, self.max_new_tokens)
         if not messages:
             return []
         if self.actor is None:
@@ -159,7 +163,9 @@ class LocalFrozenProbeClient:
         try:
             for start in range(0, len(messages), self.config['batch_size']):
                 chunk = messages[start:start + self.config['batch_size']]
-                result = ray.get(self.actor.generate.remote(chunk), timeout=self.config['timeout_seconds'])
+                result = ray.get(self.actor.generate.remote(
+                    chunk, system_prompt=system_prompt, max_new_tokens=budget),
+                    timeout=self.config['timeout_seconds'])
                 if len(result) != len(chunk):
                     raise RuntimeError('Incomplete local probe generation batch')
                 responses.extend(result)

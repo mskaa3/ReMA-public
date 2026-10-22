@@ -145,9 +145,10 @@ original planner in the config. Use the explicit `adapt-*` phases for round 2.
 Evaluate before and after each phase. This compares two alternating histories,
 not only the worker gate in isolation once the planners have diverged. Use fixed
 held-out plans or cross-partner evaluation to test whether worker gains transfer.
-Track actual sampling cost as well as completed updates. The training probe is
-the decomposer, so it evolves during planner training; its gate rates alone are
-not a fixed independent measure of improved collaboration.
+Track actual sampling cost as well as completed updates. By default the training
+probe is the decomposer, so it evolves during planner training; its gate rates
+alone are not a fixed independent measure of improved collaboration. The
+optional `gate_solver_backend=frozen_probe` uses a separate fixed evaluator.
 
 The legacy `transfer` and `cross` phases resolve the original `workers` exports,
 not these `adapt-workers` exports. Do not use them unchanged for round-2 transfer.
@@ -156,7 +157,7 @@ not these `adapt-workers` exports. Do not use them unchanged for round-2 transfe
 
 Use this after the adapted planner exports already exist. It preserves the
 round-2 input models, creates fresh output identities, and evaluates both arms
-with the same pinned Qwen3-4B probe inside each job. No probe server is needed.
+with the same pinned Qwen2.5-7B probe inside each job. No probe server is needed.
 This recipe requests **4 nodes x 4 GPUs per run**: six GPUs per model pool,
 one dedicated probe GPU, and three unused GPUs. It sets the training-pool
 size to three node equivalents and adds one node of probe capacity. Actual
@@ -164,11 +165,12 @@ placement is managed by Ray; a particular host is not reserved exclusively
 for the probe. See [resource and dependency details](validation_information_probes.md#local-inference-inside-the-training-job).
 
 Set `PROBE_REVISION` to the same immutable HF commit for both runs. To resolve
-the current revision once (internet access required):
+the current Qwen2.5-7B-Instruct revision once (internet access required; do not
+reuse a Qwen3 revision):
 
 ```bash
 export PROBE_REVISION="$(curl --fail --silent --show-error \
-  https://huggingface.co/api/models/Qwen/Qwen3-4B-Instruct-2507 \
+  https://huggingface.co/api/models/Qwen/Qwen2.5-7B-Instruct \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
 echo "$PROBE_REVISION"
 ```
@@ -204,6 +206,7 @@ for chain in ('ungated', 'gated'):
     cfg['study'] += '-local-probe-' + os.environ['RUN_STAMP']
     cfg['nodes'] = 3  # Two 6-GPU model pools; one extra node makes four total.
     cfg['local_validation_probe'] = {
+        'model': 'Qwen/Qwen2.5-7B-Instruct',
         'revision': os.environ['PROBE_REVISION'],
         'extra_nodes': 1,
     }
@@ -228,3 +231,64 @@ Standard checkpoint paths are assumed; replace them with actual
 recovered HF paths if necessary. These remain two alternating histories, not a
 gate-only ablation with identical starting partners. New probe scores are
 evaluation diagnostics, not additions to either training reward.
+
+## Compare fixed and adaptive gates
+
+This is a new two-arm experiment, not the earlier gated-versus-ungated comparison.
+Both arms apply eligibility gates. Only their solver differs:
+`role` uses the current decomposer, while `frozen_probe` uses the frozen
+`Qwen/Qwen2.5-7B-Instruct`. Both log the five metrics using that same frozen model.
+
+The recipe below uses the **gated history's** adapted round-2 decomposer and
+starting workers for BOTH arms. It does not use the ungated history's different
+checkpoints. It preserves data, seeds, C3, budgets and update targets, gives each
+arm a fresh identity, and allocates four nodes per arm. Existing configurations
+and checkpoints are not modified. Set the Qwen2.5 `PROBE_REVISION` as above first.
+
+```bash
+export GATE_COMPARISON_STAMP="$(date +%Y%m%d-%H%M%S)"
+export GATE_COMPARISON_DIR="experiments/runs/gate-solvers-${GATE_COMPARISON_STAMP}"
+: "${PROBE_REVISION:?Set the fixed Qwen2.5-7B revision first}"
+python3 - <<'PY'
+import copy
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+import eac3_experiments as suite
+
+source = suite.read_json('config/eac3-round2-gated.json')
+starting_run = suite.make_runs(source, 'adapt-workers')[0]
+for backend in ('role', 'frozen_probe'):
+    cfg = copy.deepcopy(source)
+    cfg['planners'] = {'eac3': starting_run['planner']}
+    cfg['initial_worker'] = starting_run['worker']
+    cfg['study'] += '-gate-' + backend + '-' + os.environ['GATE_COMPARISON_STAMP']
+    cfg['worker_gate_mode'] = 'gated'
+    cfg['gate_solver_backend'] = backend
+    cfg['nodes'] = 3
+    cfg['local_validation_probe'] = {
+        'model': 'Qwen/Qwen2.5-7B-Instruct',
+        'revision': os.environ['PROBE_REVISION'],
+        'extra_nodes': 1,
+    }
+    suite.write_runs(cfg, 'workers', Path(os.environ['GATE_COMPARISON_DIR']) / backend)
+PY
+
+# Submit only after confirming that the referenced HF exports exist:
+bash "$GATE_COMPARISON_DIR/role/commands.txt"
+bash "$GATE_COMPARISON_DIR/frozen_probe/commands.txt"
+```
+
+During this worker-only phase the decomposer is frozen, so the `role` evaluator
+does not evolve yet. To compare its evolution during decomposer training, use
+the same `gate_solver_backend` option in `adapt-planners` runs. Start paired
+planner runs from common checkpoints to isolate the evaluator choice; carrying
+forward each arm's own workers instead measures the complete alternating history.
+
+The base frozen Qwen and the trained decomposer may already have different
+weights at initialization. This tests practical evaluator designs, not solely
+evaluator drift. To isolate drift, initialize a pinned frozen gating copy and
+the trainable decomposer from identical weights. This implementation shares
+one frozen model for metrics and gates, so changing it also changes the metrics
+evaluator; keep that evaluator identical across the compared arms.

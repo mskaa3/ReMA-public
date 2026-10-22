@@ -37,12 +37,12 @@ def example(key='q', dataset='gsm8k', system_score=1.):
                                 r'PREVIOUS LOCAL RESULTS: S1 LOCAL_RESULT: \boxed{6}'), system_score)
 
 
-def extract_method(name):
+def extract_method(name, **bindings):
     tree = ast.parse((PPO / 'ray_trainer.py').read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'RayReMASeparatedTrainer')
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name)
     namespace = {'validation_metric_namespace': probe.validation_metric_namespace,
-                 'make_validation_probe_client': probe.make_validation_probe_client}
+                 'make_validation_probe_client': probe.make_validation_probe_client, **bindings}
     exec(compile(ast.Module(body=[method], type_ignores=[]), '<trainer-method>', 'exec'), namespace)
     return namespace[name]
 
@@ -58,7 +58,9 @@ class ValidationProbeTests(unittest.TestCase):
                      if not key.startswith('VALIDATION_PROBE_')}
         cases = [
             ({}, '', 0),
-            ({'VALIDATION_PROBE_URL': 'http://probe:8000/v1'}, 'Qwen/Qwen3-4B-Instruct-2507', 0),
+            ({'VALIDATION_PROBE_URL': 'http://probe:8000/v1'}, 'Qwen/Qwen2.5-7B-Instruct', 0),
+            ({'VALIDATION_PROBE_URL': 'http://probe:8000/v1',
+              'DECOMPOSER_MODEL_PATH': '/checkpoints/trained-decomposer'}, 'Qwen/Qwen2.5-7B-Instruct', 0),
             ({'VALIDATION_PROBE_URL': 'http://probe:8000/v1',
               'VALIDATION_PROBE_MODEL': 'custom-frozen-v1'}, 'custom-frozen-v1', 0),
             ({'VALIDATION_PROBE_MODEL': 'custom-frozen-v1'}, None, 1),
@@ -79,7 +81,7 @@ class ValidationProbeTests(unittest.TestCase):
             with self.subTest(path=path):
                 config = path.read_text().split('  validation_probe:\n', 1)[1]
                 self.assertTrue(config.startswith('    enable: False\n    backend: http'))
-                self.assertIn('    model: Qwen/Qwen3-4B-Instruct-2507\n', config)
+                self.assertIn('    model: Qwen/Qwen2.5-7B-Instruct\n', config)
 
     def test_local_launcher_needs_revision_not_endpoint(self):
         launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
@@ -90,7 +92,7 @@ class ValidationProbeTests(unittest.TestCase):
         env = {**clean, 'VALIDATION_PROBE_BACKEND': 'local', 'VALIDATION_PROBE_REVISION': 'a' * 40}
         result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('backend=local, model=Qwen/Qwen3-4B-Instruct-2507', result.stdout)
+        self.assertIn('backend=local, model=Qwen/Qwen2.5-7B-Instruct', result.stdout)
         for changes in ({'VALIDATION_PROBE_REVISION': ''}, {'VALIDATION_PROBE_REVISION': 'main'},
                         {'VALIDATION_PROBE_URL': 'http://old-probe/v1'}, {'VALIDATION_PROBE_BACKEND': 'typo'}):
             result = subprocess.run(['bash', '-c', shell], env={**env, **changes}, capture_output=True, text=True)
@@ -221,6 +223,26 @@ class ValidationProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'different model'):
                 client.generate(['task'])
 
+    def test_http_gate_request_does_not_change_evaluation_prompt_or_budget(self):
+        client = probe.FrozenProbeClient({'base_url': 'http://probe/v1', 'model': 'fixed'})
+        payloads = []
+
+        def respond(request, timeout):
+            payloads.append(json.loads(request.data))
+            return io.BytesIO(json.dumps({'model': 'fixed', 'usage': {'completion_tokens': 12},
+                'choices': [{'message': {'content': r'\boxed{UNKNOWN}'}, 'finish_reason': 'stop'}]}).encode())
+
+        with patch.object(probe, 'urlopen', respond):
+            gate = client.generate(['gate input'], system_prompt='Gate system', max_new_tokens=512)
+            client.generate(['eval input'])
+        self.assertEqual(gate[0].num_gen_tokens, 12)
+        self.assertEqual([p['max_tokens'] for p in payloads], [512, 256])
+        self.assertEqual([p['messages'][0]['content'] for p in payloads], ['Gate system', probe.SYSTEM_PROMPT])
+        self.assertEqual(client.max_new_tokens, 256)
+        for budget in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                client.generate(['task'], max_new_tokens=budget)
+
     def test_configuration_fails_early_or_stays_disabled(self):
         init = extract_method('_init_validation_probes')
         trainer = SimpleNamespace(config=SimpleNamespace(trainer={}))
@@ -272,7 +294,7 @@ class ValidationProbeTests(unittest.TestCase):
 
 class LocalValidationProbeTests(unittest.TestCase):
     def config(self, **kwargs):
-        return {'backend': 'local', 'model': 'Qwen/Qwen3-4B-Instruct-2507',
+        return {'backend': 'local', 'model': 'Qwen/Qwen2.5-7B-Instruct',
                 'revision': 'a' * 40, **kwargs}
 
     def test_factory_keeps_local_independent_of_http(self):
@@ -367,7 +389,7 @@ class LocalValidationProbeTests(unittest.TestCase):
         tokenizer = engine.get_tokenizer.return_value
         tokenizer.apply_chat_template.return_value = [1, 2, 3]
         engine.generate.return_value = [SimpleNamespace(outputs=[
-            SimpleNamespace(text=r'\boxed{7}', finish_reason='length')])]
+            SimpleNamespace(text=r'\boxed{7}', finish_reason='length', token_ids=[7, 8])])]
         vllm = SimpleNamespace(LLM=Mock(return_value=engine), SamplingParams=Mock())
         ray = SimpleNamespace(get_gpu_ids=lambda: [3])
         with patch.dict(sys.modules, {'vllm': vllm, 'ray': ray}), \
@@ -385,13 +407,50 @@ class LocalValidationProbeTests(unittest.TestCase):
         messages = tokenizer.apply_chat_template.call_args.args[0]
         self.assertEqual(messages, [{'role': 'system', 'content': probe.SYSTEM_PROMPT},
                                     {'role': 'user', 'content': 'CURRENT TASK: use S1'}])
-        self.assertEqual(result, [probe.ProbeResponse(r'\boxed{7}', 'length')])
+        self.assertEqual(result, [probe.ProbeResponse(r'\boxed{7}', 'length', 2)])
         self.assertFalse(hasattr(worker, 'optimizer'))
         engine.generate.reset_mock()
         tokenizer.apply_chat_template.return_value = list(range(16384))
-        with self.assertRaisesRegex(ValueError, 'rather than truncate'):
+        with patch.dict(sys.modules, {'vllm': vllm}), self.assertRaisesRegex(ValueError, 'rather than truncate'):
             worker.generate(['too long'])
         engine.generate.assert_not_called()
+
+    def test_local_gate_and_metrics_share_weights_not_request_settings(self):
+        engine = Mock()
+        tokenizer = engine.get_tokenizer.return_value
+        tokenizer.apply_chat_template.return_value = [1, 2]
+        engine.generate.return_value = [SimpleNamespace(outputs=[
+            SimpleNamespace(text=r'\boxed{7}', finish_reason='stop', token_ids=[7])])]
+        vllm = SimpleNamespace(LLM=Mock(return_value=engine), SamplingParams=Mock())
+        ray = SimpleNamespace(get_gpu_ids=lambda: [0])
+        with patch.dict(sys.modules, {'vllm': vllm, 'ray': ray}), \
+                patch.object(local_probe, 'check_local_probe_dependencies'):
+            worker = local_probe.LocalProbeWorker(self.config())
+            worker.generate(['gate input'], system_prompt='Gate system', max_new_tokens=512)
+            worker.generate(['eval input'])
+            tokenizer.apply_chat_template.return_value = list(range(16000))
+            with self.assertRaisesRegex(ValueError, 'rather than truncate'):
+                worker.generate(['gate too long'], max_new_tokens=512)
+        vllm.LLM.assert_called_once()
+        self.assertEqual([call.kwargs['max_tokens'] for call in vllm.SamplingParams.call_args_list], [512, 256])
+        self.assertEqual([call.args[0][0]['content'] for call in tokenizer.apply_chat_template.call_args_list[:2]],
+                         ['Gate system', probe.SYSTEM_PROMPT])
+        self.assertEqual(worker.config['max_new_tokens'], 256)
+
+    def test_local_client_forwards_gate_options_and_keeps_metrics_defaults(self):
+        client = local_probe.LocalFrozenProbeClient(self.config(batch_size=1))
+        client.actor = Mock()
+        actor = client.actor
+        ray = Mock()
+        ray.get.return_value = [probe.ProbeResponse(r'\boxed{UNKNOWN}', 'stop', 3)]
+        with patch.dict(sys.modules, {'ray': ray}):
+            client.generate(['a', 'b'], system_prompt='Gate system', max_new_tokens=512)
+            client.generate(['eval'])
+        calls = actor.generate.remote.call_args_list
+        self.assertEqual([call.kwargs['max_new_tokens'] for call in calls], [512, 512, 256])
+        self.assertEqual([call.kwargs['system_prompt'] for call in calls],
+                         ['Gate system', 'Gate system', probe.SYSTEM_PROMPT])
+        self.assertIs(client.actor, actor)
 
     def test_training_finally_closes_probe_even_on_failure(self):
         source = ast.parse((PPO.parent / 'main_ppo.py').read_text())
@@ -408,6 +467,95 @@ class LocalValidationProbeTests(unittest.TestCase):
             else:
                 exec(code, {'trainer': trainer})
             trainer.close_validation_probes.assert_called_once()
+
+
+class GateBackendTests(unittest.TestCase):
+    def trainer(self, backend='frozen_probe'):
+        return SimpleNamespace(
+            prefix_probe_config={'solver_backend': backend, 'max_new_tokens': 512, 'system_prompt': 'Gate system'},
+            _get_hierarchy_config=lambda: {'decomposer_role': 'decomposer'},
+            validation_probe_client=Mock(),
+        )
+
+    def test_frozen_gate_uses_external_client_without_training_roles(self):
+        trainer = self.trainer()
+        trainer.validation_probe_client.generate.return_value = [probe.ProbeResponse(r'\boxed{7}', 'stop', 10)]
+        generate = extract_method('_generate_prefix_probe_responses')
+        self.assertEqual(generate(trainer, ['input']), ([r'\boxed{7}'], [10], ['stop']))
+        trainer.validation_probe_client.generate.assert_called_once_with(
+            ['input'], system_prompt='Gate system', max_new_tokens=512)
+        self.assertEqual(generate(trainer, []), ([], [], []))
+        trainer.validation_probe_client.generate.return_value = []
+        with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+            generate(trainer, ['input'])
+        trainer.validation_probe_client.generate.side_effect = RuntimeError('endpoint failed')
+        with self.assertRaisesRegex(RuntimeError, 'endpoint failed'):
+            generate(trainer, ['input'])
+        trainer.validation_probe_client = None
+        with self.assertRaisesRegex(RuntimeError, 'refusing to fall back'):
+            generate(trainer, ['input'])
+
+    def test_role_gate_still_uses_current_decomposer_and_releases_generation_context(self):
+        generate = extract_method('_generate_prefix_probe_responses',
+            torch=SimpleNamespace(arange=lambda n: list(range(n))),
+            DataProto=SimpleNamespace(from_dict=lambda x: x),
+            pad_dataproto_to_divisor=lambda batch, divisor: (batch, 0))
+        trainer = self.trainer('role')
+        tokenizer, rollout = Mock(), Mock(world_size=1)
+        tokenizer.batch_decode.return_value = [r'\boxed{7}']
+        tokenizer.apply_chat_template.return_value = [[1, 2]]
+        trainer._tokenizer_for_role = lambda role: tokenizer
+        trainer.actor_rollout_wg = {'decomposer': rollout}
+        trainer.role_tokenizers = {'decomposer': tokenizer}
+        trainer.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(response_length=1024, prompt_length=8192)))
+        trainer.multi_agent_rollout = Mock()
+        trainer.multi_agent_rollout._generate_from_chat_list.return_value = ([''], [10], ['stop'], None, [[7]])
+        self.assertEqual(generate(trainer, ['input']), ([r'\boxed{7}'], [10], ['stop']))
+        call = trainer.multi_agent_rollout._generate_from_chat_list.call_args
+        self.assertEqual(call.args[0], 'decomposer')
+        self.assertEqual(call.args[1][0][0]['content'], 'Gate system')
+        self.assertFalse(call.args[3]['do_sample'])
+        self.assertEqual(call.kwargs['max_new_tokens'], 512)
+        rollout.enter_generate_context.assert_called_once()
+        rollout.exit_generate_context.assert_called_once()
+        trainer.validation_probe_client.generate.assert_not_called()
+        trainer.multi_agent_rollout._generate_from_chat_list.side_effect = RuntimeError('generation failed')
+        with self.assertRaisesRegex(RuntimeError, 'generation failed'):
+            generate(trainer, ['input'])
+        self.assertEqual(rollout.exit_generate_context.call_count, 2)
+        tokenizer.apply_chat_template.return_value = [list(range(8193))]
+        with self.assertRaisesRegex(ValueError, 'rather than truncate'):
+            generate(trainer, ['long input'])
+        self.assertEqual(rollout.enter_generate_context.call_count, 2)
+
+    def test_frozen_gate_requires_enabled_metrics_and_sufficient_context(self):
+        trainer = self.trainer()
+        trainer.prefix_probe_enabled = True
+        trainer.config = SimpleNamespace(trainer={})
+        init = extract_method('_init_validation_probes')
+        with self.assertRaisesRegex(ValueError, 'requires trainer.validation_probe.enable'):
+            init(trainer)
+        trainer._get_hierarchy_config = lambda: {'terminal_worker_as_answer': True}
+        trainer.config.trainer = {'validation_probe': {'enable': True, 'backend': 'local', 'max_model_len': 512}}
+        with self.assertRaisesRegex(ValueError, 'prefix-probe output budget'):
+            init(trainer)
+
+    def test_backend_validation_and_default_compatibility(self):
+        init = extract_method('_init_prefix_probe')
+        trainer = self.trainer()
+        trainer.scoped_c3_grpo_config = {'prefix_probe': {'enable': False, 'solver_backend': 'typo'}}
+        with self.assertRaisesRegex(ValueError, 'role or frozen_probe'):
+            init(trainer)
+        trainer.scoped_c3_grpo_config = {'prefix_probe': {'enable': True, 'solver_backend': 'frozen_probe'}}
+        trainer.scoped_c3_grpo_enabled = True
+        trainer._get_hierarchy_config = lambda: {'terminal_worker_as_answer': True, 'agent_roles': []}
+        trainer.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout={'max_num_turns': 1}))
+        with patch.dict(sys.modules, {'math_verify': SimpleNamespace(parse=Mock(), verify=Mock())}):
+            init(trainer)
+            trainer.scoped_c3_grpo_config['prefix_probe'].pop('solver_backend')
+            with self.assertRaisesRegex(ValueError, 'solver_role'):
+                init(trainer)
 
 
 if __name__ == '__main__':

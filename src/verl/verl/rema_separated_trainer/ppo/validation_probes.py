@@ -1,4 +1,4 @@
-"""Evaluation-only, fixed-budget information probes. Never used by reward gates."""
+"""Evaluation-only information metrics and a shared frozen inference client."""
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import os
+from functools import partial
+from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -49,6 +51,17 @@ class ProbeExample:
 class ProbeResponse:
     text: str
     stop_reason: str
+    num_gen_tokens: Optional[int] = None
+
+
+def probe_request_options(system_prompt, max_new_tokens, default_budget):
+    """Per-request settings must not mutate the evaluation protocol."""
+    budget = default_budget if max_new_tokens is None else max_new_tokens
+    if not isinstance(system_prompt, str) or not system_prompt.strip():
+        raise ValueError('Frozen probe system_prompt must be nonempty')
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+        raise ValueError('Frozen probe max_new_tokens must be a positive integer')
+    return system_prompt, budget
 
 
 def select_probe_examples(examples, samples_per_dataset):
@@ -88,12 +101,12 @@ class FrozenProbeClient:
         if min(self.max_new_tokens, self.timeout, self.concurrency) <= 0:
             raise ValueError('Validation probe budgets, concurrency and timeout must be positive')
 
-    def _generate_one(self, message):
+    def _generate_one(self, message, *, system_prompt, max_new_tokens):
         payload = {
             'model': self.model,
-            'messages': [{'role': 'system', 'content': SYSTEM_PROMPT},
+            'messages': [{'role': 'system', 'content': system_prompt},
                          {'role': 'user', 'content': message}],
-            'temperature': 0, 'top_p': 1, 'n': 1, 'max_tokens': self.max_new_tokens,
+            'temperature': 0, 'top_p': 1, 'n': 1, 'max_tokens': max_new_tokens,
             'stream': False,
         }
         headers = {'Content-Type': 'application/json'}
@@ -106,7 +119,7 @@ class FrozenProbeClient:
             with urlopen(request, timeout=self.timeout) as response:
                 result = json.load(response)
         except (HTTPError, URLError, TimeoutError) as exc:
-            raise RuntimeError('Frozen validation probe endpoint failed; no probe accuracy reported') from exc
+            raise RuntimeError('Frozen probe endpoint failed; no scores or gate decisions produced') from exc
         if result.get('model') != self.model:
             raise RuntimeError('Frozen probe returned a different model identifier')
         choices = result.get('choices', [])
@@ -114,13 +127,18 @@ class FrozenProbeClient:
             raise RuntimeError('Frozen probe must return exactly one completion per input')
         text = choices[0].get('message', {}).get('content')
         stop = choices[0].get('finish_reason')
-        if not isinstance(text, str) or not isinstance(stop, str):
+        if not isinstance(text, str) or stop not in ('stop', 'length'):
             raise RuntimeError('Malformed frozen probe response')
-        return ProbeResponse(text, stop)
+        tokens = (result.get('usage') or {}).get('completion_tokens')
+        if tokens is not None and (type(tokens) is not int or tokens < 0):
+            raise RuntimeError('Malformed frozen probe token count')
+        return ProbeResponse(text, stop, tokens)
 
-    def generate(self, messages):
+    def generate(self, messages, *, system_prompt=SYSTEM_PROMPT, max_new_tokens=None):
+        system_prompt, budget = probe_request_options(system_prompt, max_new_tokens, self.max_new_tokens)
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            return list(executor.map(self._generate_one, messages))
+            return list(executor.map(partial(self._generate_one, system_prompt=system_prompt,
+                                             max_new_tokens=budget), messages))
 
 
 def make_validation_probe_client(config):

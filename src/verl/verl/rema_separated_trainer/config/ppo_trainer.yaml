@@ -217,7 +217,7 @@ trainer:
     enable: False
     backend: http
     base_url: null
-    model: Qwen/Qwen3-4B-Instruct-2507
+    model: Qwen/Qwen2.5-7B-Instruct
     revision: null
     samples_per_dataset: 32
     max_new_tokens: 256

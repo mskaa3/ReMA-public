@@ -62,6 +62,69 @@ def record(question='q', plan='PLAN:\n- S1: Compute x.\n- S2: Use S1.', score=1.
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_gate_solver_backend_is_explicit_and_requires_pinned_probe(self):
+        cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        with self.assertRaisesRegex(ValueError, 'gate_solver_backend must'):
+            suite.make_runs(dict(cfg, gate_solver_backend='typo'), 'workers')
+        with self.assertRaisesRegex(ValueError, 'pinned local_validation_probe'):
+            suite.make_runs(dict(cfg, gate_solver_backend='frozen_probe'), 'workers')
+        cfg['local_validation_probe'] = {'revision': 'a' * 40}
+        for backend in ('role', 'frozen_probe'):
+            for phase in ('workers', 'adapt-planners'):
+                run = suite.make_runs(dict(cfg, gate_solver_backend=backend), phase)[0]
+                env = suite.run_environment(run, check_allocation=False)
+                self.assertEqual(env['PREFIX_PROBE_SOLVER_BACKEND'], backend)
+                self.assertEqual(env['PREFIX_PROBE_APPLY_TO_TRAINING'], 'true')
+                self.assertEqual(env['VALIDATION_PROBE_MODEL'], 'Qwen/Qwen2.5-7B-Instruct')
+                self.assertEqual(env['VALIDATION_PROBE_REVISION'], 'a' * 40)
+                self.assertIn('prefix_probe.solver_backend=' + backend, env['AGENT12_EXPERIMENT_OVERRIDES'])
+
+    def test_documented_gate_pair_preserves_identical_starting_partners(self):
+        recipe = (ROOT / 'docs/eac3_round2.md').read_text().split('## Compare fixed and adaptive gates', 1)[1]
+        code = recipe.split("python3 - <<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'PROBE_REVISION': 'a' * 40,
+                    'GATE_COMPARISON_STAMP': 'test', 'GATE_COMPARISON_DIR': tmp}):
+                exec(compile(code, '<documented-gate-pair>', 'exec'), {})
+            runs = [suite.read_json(next((Path(tmp) / backend).glob('*.json')))
+                    for backend in ('role', 'frozen_probe')]
+            self.assertEqual(runs[0]['planner'], runs[1]['planner'])
+            self.assertEqual(runs[0]['worker'], runs[1]['worker'])
+            self.assertNotEqual(runs[0]['run_name'], runs[1]['run_name'])
+            configs = [dict(run['study_config']) for run in runs]
+            for cfg in configs:
+                self.assertEqual(cfg['worker_gate_mode'], 'gated')
+                self.assertEqual(suite.allocated_nodes(cfg), 4)
+                cfg.pop('study')
+                cfg.pop('gate_solver_backend')
+            self.assertEqual(*configs)
+
+    def test_gate_solver_selection_reaches_actual_training_command(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        defaults = launcher[:launcher.index('\nif (( GPUS_PER_NODE')].replace('source ./env.sh', ':')
+        function = launcher[launcher.index('run_agent12_training() {'):launcher.index('\nif [[ "$ONLINE_TEACHER_GENERATION"')]
+        cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
+        cfg['local_validation_probe'] = {'revision': 'a' * 40}
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp) / 'command'
+            for backend in ('role', 'frozen_probe'):
+                for phase in ('workers', 'adapt-planners'):
+                    run = suite.make_runs(dict(cfg, gate_solver_backend=backend), phase)[0]
+                    env = {**os.environ, 'PREFIX_PROBE_SOLVER_BACKEND': 'bad-inherited-value',
+                           **{k: str(v) for k, v in suite.run_environment(run, check_allocation=False).items()},
+                           'SLURM_JOB_ID': '123', 'SLURM_NNODES': '5', 'CAPTURE': str(capture)}
+                    shell = defaults + '\nsrun() { printf "%s\\n" "${!#}" > "$CAPTURE"; }\n'
+                    shell += 'HEAD_NODE=head; IP_HEAD=head:6379; COMMON_MOUNTS=(--nv)\n' + function
+                    shell += '\nrun_agent12_training /tmp/train.parquet "$TOTAL_STEPS" True True\n'
+                    result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    command = shlex.split(capture.read_text().rsplit(';', 1)[-1])
+                    opts = dict(arg.split('=', 1) for arg in command if '=' in arg and not arg.startswith('--'))
+                    self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_backend'], backend)
+                    self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training'], 'true')
+                    self.assertEqual(opts['trainer.validation_probe.model'], 'Qwen/Qwen2.5-7B-Instruct')
+                    self.assertEqual(opts['trainer.validation_probe.enable'], 'True')
+
     def test_matrix_size_and_freezes(self):
         cfg = config()
         for phase, count in [('planners', 2), ('workers', 6), ('transfer', 7), ('cross', 12)]:
@@ -533,7 +596,8 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(manifest['study_config'], dict(
                     cfg, nodes=3, study=cfg['study'] + '-local-probe-test',
                     planners={'eac3': original['planner']},
-                    local_validation_probe={'revision': 'a' * 40, 'extra_nodes': 1},
+                    local_validation_probe={'model': 'Qwen/Qwen2.5-7B-Instruct',
+                                            'revision': 'a' * 40, 'extra_nodes': 1},
                 ))
                 self.assertEqual(suite.allocated_nodes(manifest['study_config']), 4)
                 self.assertIn('sbatch --export=ALL --nodes=4 --gres=gpu:hopper:4,storage:local:200G',
@@ -545,6 +609,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(env['TRAIN_DECOMPOSER'], 'false')
                 self.assertEqual(env['PREFIX_PROBE_APPLY_TO_TRAINING'], str(arm == 'gated').lower())
                 self.assertEqual(env['VALIDATION_PROBE_BACKEND'], 'local')
+                self.assertEqual(env['VALIDATION_PROBE_MODEL'], 'Qwen/Qwen2.5-7B-Instruct')
                 self.assertEqual(env['BASE_QUESTION_BATCH_SIZE'], 48)
                 self.assertEqual(env['ROLLOUT_N'], 32)
             self.assertEqual(len(remote_checks), 4)
@@ -557,11 +622,13 @@ class ExperimentTests(unittest.TestCase):
                 '--config', str(ROOT / 'config/eac3-round2-gated.json'),
                 '--phase', 'adapt-workers', '--output-dir', str(directory),
                 '--local-probe-revision', 'a' * 40,
+                '--gate-solver-backend', 'frozen_probe',
             ], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('sbatch --export=ALL --nodes=5', (directory / 'commands.txt').read_text())
             manifest = suite.read_json(next(directory.glob('*.json')))
             self.assertEqual(manifest['study_config']['local_validation_probe']['revision'], 'a' * 40)
+            self.assertEqual(manifest['study_config']['gate_solver_backend'], 'frozen_probe')
             self.assertIn('src/verl/verl/rema_separated_trainer/ppo/local_validation_probe.py', manifest['code_sha256'])
         for probe_cfg in ({'revision': 'main'}, {'revision': 'a' * 40, 'extra_nodes': 0},
                           {'revision': 'a' * 40, 'max_new_tokens': 16384}):

@@ -1,7 +1,8 @@
 # Frozen validation information probes
 
-These are evaluation metrics, not rewards or eligibility gates. The existing
-C3/prefix-probe training behavior is unchanged. They run at each validation,
+These are evaluation metrics, not rewards or eligibility gates. Their frozen
+inference model can optionally also serve the existing C3/prefix-probe gates,
+using separate request prompts and budgets. The metrics run at each validation,
 including `trainer.val_only=True` evaluation/test jobs, when enabled.
 
 ## Measurements
@@ -63,10 +64,13 @@ them or that every worker performed the correct subtask.
 
 ## Frozen model and backends
 
-The default evaluator is **`Qwen/Qwen3-4B-Instruct-2507`**, using its original
-instruction-tuned weights, independently of the worker and decomposer models.
-This choice applies only to these five evaluation metrics, not the existing
-training leakage probes or reward gates.
+The default evaluator is **`Qwen/Qwen2.5-7B-Instruct`**, using its original
+instruction-tuned weights. This is the decomposer's base model, but loaded as
+a separate frozen instance, not the current or fine-tuned decomposer checkpoint.
+Changing `DECOMPOSER_MODEL_PATH` does not change the probe. Pin a revision of
+`Qwen/Qwen2.5-7B-Instruct`; do not reuse a revision from the previous Qwen3 probe.
+This is always the evaluator for these five metrics. Training gates use this
+model only when `prefix_probe.solver_backend=frozen_probe` is selected.
 
 The evaluator must be separate from the actors being trained. Two backends use
 the same input construction, system prompt, greedy decoding, verifier, sampling,
@@ -75,6 +79,55 @@ Neither backend receives gradients or training-role weight updates. Do not
 switch backends or inference versions midway through a comparison: the
 measurement protocol is shared, but bitwise identical generations are not
 guaranteed across inference environments.
+
+## Fixed versus adaptive training gates
+
+The choice is independent of `prefix_probe.apply_to_training`, which still
+decides whether measured eligibility affects training:
+
+| `prefix_probe.solver_backend` | Gate solver | Five evaluation metrics |
+| --- | --- | --- |
+| `role` (default) | Current `solver_role`, normally the decomposer | Frozen Qwen |
+| `frozen_probe` | The same frozen inference instance used for evaluation | Frozen Qwen |
+
+For ordinary Agent-1/Agent-2 launchers, set `PREFIX_PROBE_SOLVER_BACKEND=role`
+or `PREFIX_PROBE_SOLVER_BACKEND=frozen_probe`. Enable the frozen evaluator in
+both arms using `VALIDATION_PROBE_BACKEND=local` with a pinned revision and
+reserved GPU, or `http` with the endpoint settings below. Frozen gates require
+the evaluator to be enabled and never fall back to a trainable role on failure.
+
+The equivalent Hydra key is
+`algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_backend`.
+Experiment manifests use `gate_solver_backend`, with the same choices. The
+experiment planner also accepts `--gate-solver-backend`; frozen-gate manifests
+require a pinned `local_validation_probe`. Regenerate existing manifests after
+changing the code, model, or backend; do not reuse old run/output identities.
+
+Only inference routing changes. Both gate solvers receive the same gate inputs,
+`prefix_probe.system_prompt`, greedy decoding, and `prefix_probe.max_new_tokens`.
+L_T, diagnostic L_D, mathematical worker/final equivalence, invalid-response
+handling, and C3 credit rules are unchanged. Role probes reject inputs longer
+than `rollout.prompt_length` instead of silently truncating; local frozen probes
+likewise reject inputs exceeding their context window. Keep inputs within both
+limits and preserve equivalent prompt/output budgets in a comparison.
+
+The five metrics retain their own system prompt and output budget: a gate
+request cannot change subsequent evaluation settings. The local frozen model
+is loaded once, on the existing dedicated probe GPU, not once per purpose.
+Gate inference runs every applicable training batch, so frozen gating adds
+work to that GPU and may be slower than the decomposer's multi-GPU replicas.
+
+`[prefix_probe]` and `[leakage/...]` console records identify `solver_backend`.
+Resolved W&B configuration, experiment manifests, evaluation metadata, and saved
+training trajectories record the choice. `val_diagnostics/leakage/*` describes
+the selected gate solver, not an independent fixed audit in `role` mode. Compare
+the five `val/probe/<dataset>/*` metrics under the fixed evaluator across arms.
+If that evaluator also supplies training gates, its metrics are not an
+independent guarantee against probe-specific exploitation.
+
+See [the controlled gate comparison](eac3_round2.md#compare-fixed-and-adaptive-gates)
+for commands that preserve identical starting partners rather than mixing the
+two existing alternating histories.
 
 ## Local inference inside the training job
 
@@ -122,7 +175,7 @@ Optional manifest settings (defaults shown) are:
 
 ```json
 "local_validation_probe": {
-  "model": "Qwen/Qwen3-4B-Instruct-2507",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
   "revision": "REPLACE_WITH_IMMUTABLE_HF_COMMIT_HASH",
   "extra_nodes": 1,
   "samples_per_dataset": 32,
@@ -142,7 +195,7 @@ explicitly. For example, a four-node allocation with three training-node equival
 
 ```bash
 export VALIDATION_PROBE_BACKEND=local
-export VALIDATION_PROBE_MODEL=Qwen/Qwen3-4B-Instruct-2507
+export VALIDATION_PROBE_MODEL=Qwen/Qwen2.5-7B-Instruct
 export VALIDATION_PROBE_REVISION="$PROBE_REVISION"
 export TRAINING_NNODES=3
 unset VALIDATION_PROBE_URL
@@ -158,7 +211,9 @@ probe actor and fails the run rather than manufacturing zero probe accuracy.
 Long prompts are rejected, never silently truncated.
 
 **Container prerequisite:** local mode requires vLLM >= 0.8.5 and Transformers
->= 4.51.0 in the job's container. The dependency check fails early rather than
+>= 4.51.0 in the job's container. These are the current backend's conservative
+dependency checks, retained from the previous probe, not minimum requirements
+claimed for Qwen2.5. The dependency check fails early rather than
 upgrading packages automatically. Unlike HTTP mode, a separate compatible
 server environment cannot compensate for an incompatible training container.
 Validate that a newer container still supports the existing trainer before
@@ -172,11 +227,10 @@ Serve one fixed SLM checkpoint with an OpenAI-compatible
 behind the same model name. The response's `model` identifier must match
 `VALIDATION_PROBE_MODEL`.
 
-Use a separate allocated GPU session with a Qwen3-compatible environment. The
-[official model card](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
-specifies vLLM >= 0.8.5 and Transformers >= 4.51.0. This is the non-thinking
-variant; no thinking-mode flag is needed. The training container does not need
-these upgrades because it only sends HTTP requests to the evaluator.
+Use a separate allocated GPU session with an environment that supports
+`Qwen/Qwen2.5-7B-Instruct`. Use its own tokenizer and chat template, not the
+worker's tokenizer. The HTTP client does not import the server's inference
+libraries, so their versions need not match the training container.
 
 Choose one immutable Hugging Face commit revision for the experiment and set
 `PROBE_REVISION` to its full hash. Reuse it on every server restart. The client
@@ -186,10 +240,10 @@ server environment with the experiment records.
 ```bash
 : "${PROBE_REVISION:?Set the fixed Hugging Face commit hash for the probe}"
 python3 -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --model Qwen/Qwen2.5-7B-Instruct \
   --revision "$PROBE_REVISION" \
   --tokenizer-revision "$PROBE_REVISION" \
-  --served-model-name Qwen/Qwen3-4B-Instruct-2507 \
+  --served-model-name Qwen/Qwen2.5-7B-Instruct \
   --host 0.0.0.0 --port 8000 \
   --max-model-len 16384 \
   --generation-config vllm
@@ -211,7 +265,7 @@ Enable it for the usual Agent-1/Agent-2 or experiment launcher:
 export VALIDATION_PROBE_URL="http://PROBE_NODE:8000/v1"
 export VALIDATION_PROBE_BACKEND=http
 # Optional: already the default when VALIDATION_PROBE_URL is supplied.
-export VALIDATION_PROBE_MODEL="Qwen/Qwen3-4B-Instruct-2507"
+export VALIDATION_PROBE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=32
 export VALIDATION_PROBE_MAX_NEW_TOKENS=256
 # Optional if the server requires authentication:
@@ -230,7 +284,7 @@ are off. The same options are available to direct Hydra invocations:
 trainer.validation_probe.enable=True
 trainer.validation_probe.backend=http
 trainer.validation_probe.base_url=http://PROBE_NODE:8000/v1
-trainer.validation_probe.model=Qwen/Qwen3-4B-Instruct-2507
+trainer.validation_probe.model=Qwen/Qwen2.5-7B-Instruct
 trainer.validation_probe.samples_per_dataset=32
 trainer.validation_probe.max_new_tokens=256
 ```

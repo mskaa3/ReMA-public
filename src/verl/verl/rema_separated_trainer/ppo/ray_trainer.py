@@ -904,19 +904,27 @@ class RayReMASeparatedTrainer(object):
     def _init_validation_probes(self):
         config = self.config.trainer.get('validation_probe', {}) or {}
         self.validation_probe_client = None
+        uses_frozen_gate = getattr(self, 'prefix_probe_enabled', False) and (
+            self.prefix_probe_config.get('solver_backend', 'role') == 'frozen_probe')
+        if uses_frozen_gate and not config.get('enable', False):
+            raise ValueError('prefix_probe.solver_backend=frozen_probe requires trainer.validation_probe.enable=True')
         if not config.get('enable', False):
             return
         if not self._get_hierarchy_config().get('terminal_worker_as_answer', False):
             raise ValueError('Validation information probes require terminal_worker_as_answer=True')
         if int(config.get('samples_per_dataset', 32)) < 1:
             raise ValueError('validation_probe.samples_per_dataset must be positive')
+        if (uses_frozen_gate and config.get('backend', 'http') == 'local'
+                and int(self.prefix_probe_config.get('max_new_tokens', 256)) >= int(config.get('max_model_len', 16384))):
+            raise ValueError('Frozen probe context must exceed the prefix-probe output budget')
         self.validation_probe_client = make_validation_probe_client(config)
         print(
             f'[validation/probe] backend={config.get("backend", "http")} '
             f'frozen_model={self.validation_probe_client.model} '
             f'max_new_tokens={self.validation_probe_client.max_new_tokens} '
             f'samples_per_dataset={config.get("samples_per_dataset", 32)} '
-            'conditions=terminal_only,with_instructions,with_results; evaluation only',
+            'conditions=terminal_only,with_instructions,with_results; metrics remain evaluation only; '
+            f'shared_with_prefix_gates={uses_frozen_gate}',
             flush=True,
         )
 
@@ -1027,6 +1035,9 @@ class RayReMASeparatedTrainer(object):
         self.prefix_probe_enabled = bool(
             self.prefix_probe_config.get('enable', False)
         )
+        solver_backend = self.prefix_probe_config.get('solver_backend', 'role')
+        if solver_backend not in ('role', 'frozen_probe'):
+            raise ValueError('prefix_probe.solver_backend must be role or frozen_probe')
         if not self.prefix_probe_enabled:
             return
         if not self.scoped_c3_grpo_enabled:
@@ -1047,7 +1058,7 @@ class RayReMASeparatedTrainer(object):
             'solver_role',
             hierarchy_config.get('decomposer_role', 'decomposer'),
         )
-        if solver_role not in hierarchy_config.get('agent_roles', []):
+        if solver_backend == 'role' and solver_role not in hierarchy_config.get('agent_roles', []):
             raise ValueError(
                 f"Prefix-probe solver_role={solver_role!r} is absent from "
                 "algorithm.hierarchy.agent_roles"
@@ -1064,6 +1075,9 @@ class RayReMASeparatedTrainer(object):
             raise ValueError(
                 "Prefix-probe validation_max_samples must be non-negative"
             )
+        print(f'[prefix_probe] solver_backend={solver_backend} '
+              f'solver_role={solver_role if solver_backend == "role" else "none"} '
+              f'max_new_tokens={self.prefix_probe_config.get("max_new_tokens", 256)}', flush=True)
 
     def _prefix_probe_gates_training(self):
         return self.prefix_probe_enabled and bool(
@@ -1100,12 +1114,32 @@ class RayReMASeparatedTrainer(object):
             "\\boxed{...}. If the requested answer cannot be inferred, end "
             "with \\boxed{UNKNOWN}.",
         ))
+        if self.prefix_probe_config.get('solver_backend', 'role') == 'frozen_probe':
+            client = getattr(self, 'validation_probe_client', None)
+            if client is None:
+                raise RuntimeError('Frozen gate probe is not configured; refusing to fall back to a training role')
+            responses = client.generate(
+                messages, system_prompt=system_prompt,
+                max_new_tokens=int(self.prefix_probe_config.get('max_new_tokens', 256)),
+            )
+            if len(responses) != len(messages):
+                raise RuntimeError('Prefix probe returned an incomplete generation batch')
+            return ([response.text for response in responses],
+                    [response.num_gen_tokens for response in responses],
+                    [response.stop_reason for response in responses])
         chats = [[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ] for message in messages]
 
         tokenizer = self._tokenizer_for_role(solver_role)
+        # The ordinary rollout helper truncates prompts; never silently remove
+        # information from a leakage measurement in only one experimental arm.
+        prompt_ids = tokenizer.apply_chat_template(
+            chats, add_generation_prompt=True, tokenize=True, padding=False, truncation=False,
+        )
+        if any(len(ids) > int(self.config.actor_rollout_ref.rollout.prompt_length) for ids in prompt_ids):
+            raise ValueError('Role gate probe input exceeds rollout.prompt_length; increase the limit rather than truncate')
         probe_meta_info = {
             'eos_token_id': tokenizer.eos_token_id,
             'pad_token_id': tokenizer.pad_token_id,
@@ -1274,6 +1308,7 @@ class RayReMASeparatedTrainer(object):
             f'[leakage/{scope}] step={self.global_steps} '
             f'actor_update_step={getattr(self, "actor_update_steps", 0)} '
             f'role={self._current_train_agent} gate=terminal_instruction '
+            f'solver_backend={getattr(self, "prefix_probe_config", {}).get("solver_backend", "role")} '
             f'training_gate_enabled={int(self._prefix_probe_gates_training())} '
             f'raw_acc={value("raw_accuracy")} gated_acc={value("gated_accuracy")} '
             f'plan_eligible={value("plan_eligible_rate")} '
@@ -4503,6 +4538,7 @@ class RayReMASeparatedTrainer(object):
                 if self.prefix_probe_enabled:
                     result.update({
                         "prefix_probe_gate_protocol": "terminal_instruction",
+                        "prefix_probe_solver_backend": self.prefix_probe_config.get('solver_backend', 'role'),
                         "prefix_probe_decomposer_score": [],
                         "prefix_probe_decomposer_response": [],
                         "prefix_probe_terminal_score": [],

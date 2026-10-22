@@ -55,7 +55,7 @@ case "$VALIDATION_PROBE_BACKEND" in
     *) echo "VALIDATION_PROBE_BACKEND must be off, http or local" >&2; exit 1 ;;
 esac
 if [[ "$VALIDATION_PROBE_BACKEND" != off ]]; then
-    export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-Qwen/Qwen3-4B-Instruct-2507}
+    export VALIDATION_PROBE_MODEL=${VALIDATION_PROBE_MODEL:-Qwen/Qwen2.5-7B-Instruct}
     echo "Frozen validation probe: backend=${VALIDATION_PROBE_BACKEND}, model=${VALIDATION_PROBE_MODEL} (evaluation only)"
 fi
 
@@ -86,9 +86,18 @@ export MAX_PLANNED_SUBTASKS=${MAX_PLANNED_SUBTASKS:-4}
 export WORKER_CHECKPOINT_ROLE=${WORKER_CHECKPOINT_ROLE:-worker_stage_${NUM_WORKER_STAGES}}
 export PREFIX_PROBE_ENABLE=${PREFIX_PROBE_ENABLE:-false}
 export PREFIX_PROBE_APPLY_TO_TRAINING=${PREFIX_PROBE_APPLY_TO_TRAINING:-true}
+export PREFIX_PROBE_SOLVER_BACKEND=${PREFIX_PROBE_SOLVER_BACKEND:-role}
 export C3_REQUIRE_ELIGIBLE_SUCCESS=${C3_REQUIRE_ELIGIBLE_SUCCESS:-true}
 export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-256}
 export PREFIX_PROBE_VALIDATION_MAX_SAMPLES=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES:-128}
+case "$PREFIX_PROBE_SOLVER_BACKEND" in
+    role|frozen_probe) ;;
+    *) echo "PREFIX_PROBE_SOLVER_BACKEND must be role or frozen_probe" >&2; exit 1 ;;
+esac
+if [[ "$PREFIX_PROBE_ENABLE" == true && "$PREFIX_PROBE_SOLVER_BACKEND" == frozen_probe && "$VALIDATION_PROBE_BACKEND" == off ]]; then
+    echo "Frozen gates require VALIDATION_PROBE_BACKEND=local or http; no role fallback" >&2
+    exit 1
+fi
 export AGENT2_PILOT=${AGENT2_PILOT:-false}
 export AGENT12_VAL_FILE=${AGENT12_VAL_FILE:-/root/tmpdir/overall_math/test.parquet}
 export TEACHER_ASSISTED_VALIDATION=${TEACHER_ASSISTED_VALIDATION:-false}
@@ -449,6 +458,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.train_agent_roles=${TRAIN_AGENT_ROLES} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.enable=${PREFIX_PROBE_ENABLE} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training=${PREFIX_PROBE_APPLY_TO_TRAINING} \
+  algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_backend=${PREFIX_PROBE_SOLVER_BACKEND} \
   algorithm.hierarchy.scoped_c3_grpo.require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS} \
   algorithm.hierarchy.scoped_c3_grpo.continuations_per_action=${C3_CONTINUATIONS_PER_ACTION} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
@@ -878,6 +888,7 @@ max_planned_subtasks=${MAX_PLANNED_SUBTASKS}
 worker_checkpoint_role=${WORKER_CHECKPOINT_ROLE}
 prefix_probe_enable=${PREFIX_PROBE_ENABLE}
 prefix_probe_apply_to_training=${PREFIX_PROBE_APPLY_TO_TRAINING}
+prefix_probe_solver_backend=${PREFIX_PROBE_SOLVER_BACKEND}
 c3_require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS}
 prefix_probe_max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS}
 prefix_probe_validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES}

@@ -60,6 +60,15 @@ measurement. Length-stopped probes, even with a complete box, and surfaced verif
 that the terminal instruction is safe. The generation limit remains configurable and defaults to 256
 tokens.
 
+The solver is configurable via `prefix_probe.solver_backend`: `role` (default)
+uses the current `solver_role`, normally the decomposer; `frozen_probe` uses the
+separate frozen inference model configured under `trainer.validation_probe`.
+Both use the same gate prompt and generation budget. The five information
+metrics always use the frozen evaluator when enabled and remain evaluation-only;
+selecting the frozen gate solver does not turn those metrics into rewards.
+See [fixed versus adaptive gates](validation_information_probes.md#fixed-versus-adaptive-training-gates)
+for configuration, resource requirements, and interpretation.
+
 Instruction gating currently happens after trajectory generation, before group
 selection and actor optimization. It saves optimizer work on rejected groups,
 not suffix generation. Moving it before branching is a separate performance
