@@ -13,7 +13,7 @@ LABELS = {
     "worker": ("task_fulfillment", "execution_discipline", "causal_utility"),
     "final": ("task_fulfillment", "execution_discipline", "causal_utility"),
 }
-COMPILED_SOURCES = frozenset(("gfam_v1", "gnn_prm", "llm_coach", "handcrafted_v1"))
+COMPILED_SOURCES = frozenset(("gfam_v1", "gnn_prm", "graph_prm_process_costs", "llm_coach", "handcrafted_v1"))
 
 
 class RewardProvider(Protocol):

@@ -238,7 +238,7 @@ class HierarchicalReMAOrchestrator:
             selection.reward.reward_model_source in COMPILED_SOURCES
             for selection in selection_rollouts
         )
-        if self.decomposer_reward_aggregation == "best":
+        if self.decomposer_reward_aggregation == "best" and not getattr(self.reward_provider, "uses_process_costs", False):
             aggregated_reward = max(selection_training_rewards)
         else:
             aggregated_reward = sum(selection_training_rewards) / max(
@@ -377,6 +377,8 @@ class HierarchicalReMAOrchestrator:
         role: str,
         upstream_payloads: Sequence[Dict[str, object]] = (),
     ) -> tuple[float, float, float]:
+        if getattr(self.reward_provider, "uses_process_costs", False):
+            return raw_reward, raw_reward, 0.0
         reward_after_fallback_mask = self._reward_after_fallback_mask(
             raw_reward,
             payload,
@@ -499,9 +501,12 @@ class HierarchicalReMAOrchestrator:
             worker_payload = worker_payloads.get(execution.node_id)
             if worker_payload is not None and "reward" in worker_payload:
                 execution.reward_model_reward = float(worker_payload["reward"])
-        training_safety = self.saturated_failure_filter.evaluate(
+        training_safety = ({"enabled": False, "excluded": False,
+                            "reason": "not_applicable_to_process_cost_objective"}
+                           if getattr(self.reward_provider, "uses_process_costs", False) else
+                           self.saturated_failure_filter.evaluate(
             task=task, decomposition=decomposition, executions=executions,
-            reward=reward, compiled_rewards=compiled_rewards)
+            reward=reward, compiled_rewards=compiled_rewards))
         if training_safety["excluded"]:
             print(f"[training-safety] excluded task={task.task_id} plan={decomposition.decomposition_id} "
                   f"executor_rollout={selection.selection_id} reason={training_safety['reason']} "
@@ -1095,6 +1100,11 @@ class HierarchicalReMAOrchestrator:
 
         if include_decomposer:
             for decomposition_rollout in decompositions:
+                if (getattr(self.reward_provider, "uses_process_costs", False)
+                        and self._uses_fallback_path(decomposition_rollout.decomposition.raw_payload)):
+                    # A synthetic fallback is not a sampled planner action. Retain
+                    # its raw costs for auditing, but never reinforce its completion.
+                    continue
                 if decomposition_rollout.decomposition_reward is None:
                     worker_grpo_stats["num_decomposer_samples_skipped_unscored"] += 1
                     continue

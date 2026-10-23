@@ -109,7 +109,7 @@ class GraphPRMV2RewardScorer:
                 'graph_summary': {'feature_schema': FEATURE_SCHEMA,
                                   'reward_status': 'unscored', 'reward_backend': 'graphprm_binary_v2'}}
 
-    def score_records(self, records, verified_final_correctness=None):
+    def score_records(self, records, verified_final_correctness=None, *, compile_reward=True):
         outcomes = [None] * len(records) if verified_final_correctness is None else verified_final_correctness
         if len(outcomes) != len(records):
             raise ValueError('One verified outcome is required per record')
@@ -128,7 +128,8 @@ class GraphPRMV2RewardScorer:
                     predictions = predictions_from_outputs(self.model(example, self.device))
                     compiled = compile_rewards(predictions, row, self.bad_class_penalty,
                                                verified_final_correctness=outcomes[start + index],
-                                               verified_failure_positive_scale=self.verified_failure_positive_scale)
+                                               verified_failure_positive_scale=self.verified_failure_positive_scale) if compile_reward else {
+                                                   'node_rewards': {}, 'graph_summary': {}}
                     summary = compiled['graph_summary']
                     summary.update(feature_schema=FEATURE_SCHEMA, reward_backend='graphprm_binary_v2',
                                    missing_prm_markers=0, prm_total_tokens=example.prm_alignment['total_tokens'],
@@ -142,6 +143,12 @@ class GraphPRMV2RewardScorer:
         rows = [live_record(item['task'], item['decomposition'], item['executions'], item['final_answer'])
                 for item in requests]
         return self.score_records(rows, [item.get('verified_final_correctness') for item in requests])
+
+    def predict_rollouts(self, requests):
+        """Raw predictions for alternative objectives; never invoke legacy gates."""
+        rows = [live_record(item['task'], item['decomposition'], item['executions'], item['final_answer'])
+                for item in requests]
+        return self.score_records(rows, compile_reward=False)
 
     def score_rollout(self, *, task, decomposition, selection, executions, final_answer,
                       verified_final_correctness=None):

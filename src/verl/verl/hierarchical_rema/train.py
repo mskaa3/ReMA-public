@@ -2996,6 +2996,11 @@ def main() -> None:
                     )
                     _release_memory()
 
+            from .reward_providers.process_cost_state import finish_process_cost_segment
+            if reward_setting(args) == "graph_prm_process_costs":
+                tracking_step_offset = max(tracking_step_offset, rollout_tracking_step) + 1
+            process_cost_update = finish_process_cost_segment(
+                args, segment_rollouts, segment_train_dir, tracking, tracking_step_offset)
             segment_summaries.append(
                 {
                     "segment": segment_index,
@@ -3005,6 +3010,7 @@ def main() -> None:
                     "rollout_summary": segment_rollout_summary,
                     "training_updates": segment_training_updates,
                     "training_skipped": segment_training_skipped,
+                    "process_cost_update": process_cost_update,
                 }
             )
             rollout_tracking_step = max(rollout_tracking_step, tracking_step_offset)

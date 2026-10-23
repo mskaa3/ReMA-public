@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace as NS
 
 import pytest
@@ -22,6 +23,41 @@ runtime = importlib.import_module(api.__name__ + ".failure_judge_runtime")
 def annotation(value=0):
     return {"categories": {code: {"value": value, "status": "assessed", "explanation": "Visible artifacts checked.",
                                   "evidence": []} for code in contract.CATEGORIES}}
+
+
+def test_prompt_schema_and_source_crosswalk_use_consecutive_ids():
+    ids = [str(index) for index in range(1, 9)]
+    assert list(contract.CATEGORIES) == ids
+    assert re.findall(r"^([1-8])\. ", contract.PROMPT, re.MULTILINE) == ids
+    schema = contract.OUTPUT_SCHEMA["properties"]["categories"]
+    assert schema["required"] == ids
+    assert list(schema["properties"]) == ids
+    assert contract.SOURCE_CATEGORY_IDS == dict(zip(ids, ["1.1", "1.2", "1.3", "1.4", "2.3", "2.4", "2.5", "3.1"]))
+    assert not re.search(r"\b[123]\.[1-5]\b", contract.PROMPT)
+    assert '"categories":{"1":' in contract.PROMPT
+    assert 'Use category IDs "1" through "8" as JSON keys.' in contract.PROMPT
+    assert "For any category assigned value 1" in contract.PROMPT
+    assert "information never delivered -> 6" in contract.PROMPT
+    assert "downstream input -> 4; received but visibly disregarded -> 7" in contract.PROMPT
+
+
+def test_intro_explains_roles_without_requiring_hidden_reasoning():
+    assert contract.PROMPT.startswith("You audit a multi-agent trajectory for failures.\nThe system has a planner/decomposer")
+    intro = contract.PROMPT.split("Assess only the supplied task", 1)[0]
+    for phrase in ("directed acyclic graph (DAG)", "not compute unknown",
+                   "An atomic task need not be split", "only their assigned node instructions",
+                   "Only root workers receive the full task", "Only delivered result artifacts",
+                   "required format", "unrequested\nexplanations"):
+        assert phrase in intro
+    assert "reference answers are intentionally absent" in contract.PROMPT
+
+
+def test_old_category_annotations_are_rejected_under_new_version():
+    assert contract.VERSION == "artifact_failures_v2"
+    old = {"categories": {contract.SOURCE_CATEGORY_IDS[code]: value
+                           for code, value in annotation()["categories"].items()}}
+    with pytest.raises(ValueError, match="exactly eight category IDs"):
+        contract.validate_annotation(old, {})
 
 
 def fixture():
@@ -75,15 +111,15 @@ def test_private_blocks_and_unclosed_blocks_never_escape():
 def test_annotation_evidence_and_unknown_contract():
     doc = {"executions": [{"output": ""}, {"output": "value=5"}]}
     result = annotation()
-    result["categories"]["3.1"].update(value=1, evidence=[{"path": "/executions/0/output", "quote": ""}])
-    result["categories"]["1.4"].update(value=None, status="insufficient_evidence")
+    result["categories"]["8"].update(value=1, evidence=[{"path": "/executions/0/output", "quote": ""}])
+    result["categories"]["4"].update(value=None, status="insufficient_evidence")
     assert contract.parse_annotation(json.dumps(result), doc) == result
-    result["categories"]["3.1"]["evidence"][0]["quote"] = "invented"
+    result["categories"]["8"]["evidence"][0]["quote"] = "invented"
     with pytest.raises(ValueError, match="not found"):
         contract.validate_annotation(result, doc)
 
 
-@pytest.mark.parametrize("code", ["1.4", "2.4", "2.5"])
+@pytest.mark.parametrize("code", ["4", "6", "7"])
 def test_flow_categories_require_both_sides(code):
     result = annotation()
     result["categories"][code].update(value=1, evidence=[{"path": "/output", "quote": "a"}])
@@ -95,13 +131,13 @@ def test_flow_categories_require_both_sides(code):
 def test_malformed_annotations_rejected(mutation):
     result = annotation()
     if mutation == "missing":
-        del result["categories"]["1.4"]
+        del result["categories"]["4"]
     elif mutation == "bool":
-        result["categories"]["1.1"]["value"] = True
+        result["categories"]["1"]["value"] = True
     elif mutation == "unknown_zero":
-        result["categories"]["1.1"]["status"] = "insufficient_evidence"
+        result["categories"]["1"]["status"] = "insufficient_evidence"
     else:
-        result["categories"]["1.1"]["value"] = 1
+        result["categories"]["1"]["value"] = 1
     with pytest.raises(ValueError):
         contract.validate_annotation(result, {})
 
@@ -172,11 +208,11 @@ def test_aggregation_excludes_unavailable_and_equal_weights_tasks():
             result["annotation"] = annotation(value)
         return result
     report = judge.aggregate([row("A", 1), row("A", 1), row("B", 0), row("C")])
-    label = report["categories"]["1.1"]
+    label = report["categories"]["1"]
     assert label["rate"] == .5  # Not 2/3 and not 2/4.
     assert label["coverage"] == .75
     assert label["assessed_tasks"] == 2
-    assert judge.aggregate([row("C")])["categories"]["1.1"]["rate"] is None
+    assert judge.aggregate([row("C")])["categories"]["1"]["rate"] is None
 
 
 def test_duplicate_content_restores_each_trajectory_id_and_isolates_failures(tmp_path):
@@ -190,14 +226,14 @@ def test_duplicate_content_restores_each_trajectory_id_and_isolates_failures(tmp
         return {"results": {key: {"status": "ok", "annotation": annotation()} for key in documents}}
     report = audit.finish(tmp_path, runner)
     assert [row["execution_id"] for row in report["rows"]] == ["exec1", "exec2"]
-    assert report["overall"]["categories"]["1.4"]["assessed_rollouts"] == 2
+    assert report["overall"]["categories"]["4"]["assessed_rollouts"] == 2
     audit = judge.FailureJudgeAudit(pool, judge.FailureJudgeConfig(enabled=True))
     audit.add(rollout, "math")
     def unavailable(*args):
         raise RuntimeError("unsupported model")
     report = audit.finish(tmp_path, unavailable)
     assert report["rows"][0]["status"] == "unavailable"
-    assert report["overall"]["categories"]["1.1"]["rate"] is None
+    assert report["overall"]["categories"]["1"]["rate"] is None
 
 
 def test_coach_handoff_wakes_on_judge_failure():
@@ -256,10 +292,16 @@ def test_validation_exports_and_accuracy_unchanged(monkeypatch, tmp_path, mode):
     assert tracker.events[-1]["val/failures/context_loss"] == 0
     assert (directory / "validation_failures.jsonl").exists()
     assert (directory / "failure_judge_definition.json").exists()
+    definition = json.loads((directory / "failure_judge_definition.json").read_text())
+    assert definition["version"] == contract.VERSION
+    assert definition["categories"] == contract.CATEGORIES
+    assert definition["source_category_ids"] == contract.SOURCE_CATEGORY_IDS
     assert (tmp_path / "failure_judge_history.csv").exists()
     helpers.run_validation(args, directory, tracker)
     rows = [json.loads(line) for line in (tmp_path / "failure_judge_history.jsonl").read_text().splitlines()]
     assert len(rows) == 16  # Eight categories x overall/dataset; no duplicate epoch.
+    assert {row["category_id"] for row in rows} == set(contract.CATEGORIES)
+    assert all(row["name"] == contract.CATEGORIES[row["category_id"]] for row in rows)
 
 
 def test_unknown_rates_never_become_clean_wandb_values():

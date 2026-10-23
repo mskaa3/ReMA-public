@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 
-from .failure_judge_contract import CATEGORIES, PROMPT, VERSION, artifact_text, digest, validate_annotation
+from .failure_judge_contract import CATEGORIES, PROMPT, SOURCE_CATEGORY_IDS, VERSION, artifact_text, digest, validate_annotation
 
 
 @dataclass(frozen=True)
@@ -149,6 +149,7 @@ class FailureJudgeAudit:
                     "model": self.config.model, "requested_revision": self.config.revision,
                     "prompt_sha256": digest(PROMPT), "prompt": PROMPT,
                     "taxonomy_source": "https://arxiv.org/abs/2503.13657",
+                    "categories": dict(CATEGORIES), "source_category_ids": dict(SOURCE_CATEGORY_IDS),
                     "adaptation": "Eight result-only categories; not full-taxonomy replication.",
                     "rate_definition": "Mean within task of assessed rollout labels, then equal mean across tasks.",
                     "coverage_definition": "Assessed rollouts / all observed rollouts, separately per category.",

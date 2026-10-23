@@ -9,7 +9,8 @@ from urllib.parse import urlsplit
 from .base import validate_result
 from ..graphprm_v2.rewards import validate_failure_positive_scale
 
-SETTINGS = ("gnn_prm", "llm_coach", "handcrafted", "frozen_prm", "finetuned_prm", "gnn_only")
+SETTINGS = ("gnn_prm", "graph_prm_process_costs", "llm_coach", "handcrafted", "frozen_prm", "finetuned_prm", "gnn_only")
+GRAPH_SETTINGS = ("gnn_prm", "graph_prm_process_costs")
 _CACHE = {}
 
 
@@ -45,8 +46,11 @@ def validate_reward_setting(args):
     if not math.isfinite(penalty) or penalty < 0:
         raise ValueError("Bad-class penalty must be finite and nonnegative")
     validate_failure_positive_scale(os.environ.get("GFAM_VERIFIED_FAILURE_POSITIVE_SCALE", ".25"))
-    if setting == "gnn_prm" and not getattr(args, "gfam_reward_model_pkl", ""):
-        raise ValueError("gnn_prm requires --gfam-reward-model-pkl")
+    if setting in GRAPH_SETTINGS and not getattr(args, "gfam_reward_model_pkl", ""):
+        raise ValueError(f"{setting} requires --gfam-reward-model-pkl")
+    if setting == "graph_prm_process_costs":
+        from .process_costs import ProcessCostConfig
+        ProcessCostConfig.from_environment()
     if setting == "llm_coach":
         backend = coach_backend()
         if backend not in ("api", "local_vllm"):
@@ -96,7 +100,7 @@ def build_reward_provider(args):
     setting = reward_setting(args)
     if setting is None:
         return None
-    if setting == "gnn_prm":
+    if setting in GRAPH_SETTINGS:
         from ..gfam_reward import load_cached_reward_scorer
         scorer = load_cached_reward_scorer(
             checkpoint_path=args.gfam_reward_model_pkl, device=args.gfam_reward_model_device,
@@ -109,7 +113,12 @@ def build_reward_provider(args):
             feature_cache_dir=getattr(args, "gfam_feature_cache_dir", None),
             encoder_device=getattr(args, "gfam_encoder_device", None))
         if not getattr(scorer, "supports_verified_final_correctness", False):
-            raise ValueError("gnn_prm requires a binary checkpoint with verified-outcome support")
+            raise ValueError(f"{setting} requires a binary checkpoint with verified-outcome support")
+        if setting == "graph_prm_process_costs":
+            from .process_costs import ProcessCostProvider
+            from .process_cost_state import state_for_args
+            state = state_for_args(args).read()
+            return ProcessCostProvider(getattr(scorer, "graphprm", scorer), state["lambdas"], state["update_count"])
         return GraphPRMProvider(scorer)
     options = dict(bad_class_penalty=float(getattr(args, "gfam_bad_class_penalty", 1.)),
                    failure_scale=validate_failure_positive_scale(
@@ -141,7 +150,7 @@ def reward_manifest(args):
               "ground_truth_in_provider_input": False,
               "saturated_failure_filter": os.environ.get("GFAM_SKIP_SATURATED_FAILURES", "true"),
               "saturated_failure_threshold": os.environ.get("GFAM_SATURATED_FAILURE_THRESHOLD", ".95")}
-    if setting == "gnn_prm":
+    if setting in GRAPH_SETTINGS:
         result["checkpoint"] = args.gfam_reward_model_pkl
         checkpoint = Path(args.gfam_reward_model_pkl).expanduser()
         if checkpoint.is_file():
@@ -150,6 +159,16 @@ def reward_manifest(args):
                 for block in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(block)
             result["checkpoint_sha256"] = digest.hexdigest()
+    if setting == "graph_prm_process_costs":
+        from dataclasses import asdict
+        from .process_costs import VERSION, ProcessCostConfig
+        result = {k: v for k, v in result.items() if k not in {
+            "bad_class_penalty", "verified_failure_positive_scale", "saturated_failure_filter",
+            "saturated_failure_threshold"}}
+        result.update(reward_contract=VERSION, process_cost_config=asdict(ProcessCostConfig.from_environment()),
+                      planner_aggregation="mean", legacy_reward_gates=False,
+                      protocol_invalid_discipline_cost=1.,
+                      initial_state=os.environ.get("REMA_PROCESS_COST_INITIAL_STATE") or None)
     if setting == "handcrafted":
         from .handcrafted import VERSION
         result["heuristic_version"] = VERSION

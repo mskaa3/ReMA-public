@@ -76,7 +76,7 @@ else
 fi
 SIF_IMAGE_PATH=${SIF_IMAGE_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/dmotyka/sif_images/verl-rema-v3.sif}
 GFAM_REWARD_MODEL_PKL_PATH=${GFAM_REWARD_MODEL_PKL_PATH:-s3v2:s3min-tomasznaskret-1712063354/user/jmoska/hierarchical_rema/best_overall_model.pkl}
-if [[ "$REWARD_SETTING" != "gnn_prm" ]]; then
+if [[ "$REWARD_SETTING" != "gnn_prm" && "$REWARD_SETTING" != "graph_prm_process_costs" ]]; then
     # No S3 checkpoint staging, torch scorer or encoder bootstrap for these sources.
     GFAM_REWARD_MODEL_PKL_PATH=""
 fi
@@ -1054,6 +1054,19 @@ MULTINODE_RAY_ENABLED=$MULTINODE_RAY_ENABLED
 RAY_NNODES=$RAY_NNODES
 RAY_N_GPUS_PER_NODE=$RAY_N_GPUS_PER_NODE
 REWARD_SETTING=$REWARD_SETTING
+REMA_PROCESS_COST_TARGET_COLLAPSE=${REMA_PROCESS_COST_TARGET_COLLAPSE:-<unused>}
+REMA_PROCESS_COST_TARGET_DISCIPLINE=${REMA_PROCESS_COST_TARGET_DISCIPLINE:-<unused>}
+REMA_PROCESS_COST_TARGET_TASK_FULFILLMENT=${REMA_PROCESS_COST_TARGET_TASK_FULFILLMENT:-<unused>}
+REMA_PROCESS_COST_TARGET_PLANNER_DISCIPLINE=${REMA_PROCESS_COST_TARGET_PLANNER_DISCIPLINE:-<unused>}
+REMA_PROCESS_COST_TARGET_PLANNER_TASK_FULFILLMENT=${REMA_PROCESS_COST_TARGET_PLANNER_TASK_FULFILLMENT:-<unused>}
+REMA_PROCESS_COST_INITIAL_COLLAPSE=${REMA_PROCESS_COST_INITIAL_COLLAPSE:-<unused>}
+REMA_PROCESS_COST_INITIAL_DISCIPLINE=${REMA_PROCESS_COST_INITIAL_DISCIPLINE:-<unused>}
+REMA_PROCESS_COST_INITIAL_TASK_FULFILLMENT=${REMA_PROCESS_COST_INITIAL_TASK_FULFILLMENT:-<unused>}
+REMA_PROCESS_COST_INITIAL_PLANNER_DISCIPLINE=${REMA_PROCESS_COST_INITIAL_PLANNER_DISCIPLINE:-<unused>}
+REMA_PROCESS_COST_INITIAL_PLANNER_TASK_FULFILLMENT=${REMA_PROCESS_COST_INITIAL_PLANNER_TASK_FULFILLMENT:-<unused>}
+REMA_PROCESS_COST_LEARNING_RATE=${REMA_PROCESS_COST_LEARNING_RATE:-<unused>}
+REMA_PROCESS_COST_MIN_COVERAGE=${REMA_PROCESS_COST_MIN_COVERAGE:-<unused>}
+REMA_PROCESS_COST_INITIAL_STATE=${REMA_PROCESS_COST_INITIAL_STATE:-<unused>}
 REMA_COACH_BACKEND=${REMA_COACH_BACKEND:-<unused>}
 REMA_COACH_MODEL=${REMA_COACH_MODEL:-<unused>}
 REMA_COACH_REVISION=${REMA_COACH_REVISION:-<unused>}
@@ -1165,6 +1178,14 @@ print("1" if tracker.get("improved") else "0")
             --include "/failure_judge_history.csv" \
             --include "/failure_judge_history.jsonl"; then
             echo "Warning: failed to sync validation histories" >&2
+            upload_status=1
+        fi
+    fi
+
+    if [[ -f "${LOCAL_OUTPUT_DIR}/process_costs/state.json" ]]; then
+        # Independent of validation cadence; segment sidecars also travel with each epoch.
+        if ! rclone copy "${LOCAL_OUTPUT_DIR}/process_costs" "${S3_OUTPUT_PATH}/process_costs"; then
+            echo "Warning: failed to sync adaptive process-cost state" >&2
             upload_status=1
         fi
     fi
