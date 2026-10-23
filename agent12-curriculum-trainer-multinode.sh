@@ -30,6 +30,16 @@ export VALIDATION_PROBE_MAX_MODEL_LEN=${VALIDATION_PROBE_MAX_MODEL_LEN:-16384}
 export VALIDATION_PROBE_BATCH_SIZE=${VALIDATION_PROBE_BATCH_SIZE:-8}
 export VALIDATION_PROBE_REPLICAS=${VALIDATION_PROBE_REPLICAS:-1}
 export KEEP_FROZEN_MODELS_RESIDENT=${KEEP_FROZEN_MODELS_RESIDENT:-true}
+export ROLLOUT_PROBE_PIPELINE=${ROLLOUT_PROBE_PIPELINE:-false}
+export ROLLOUT_PIPELINE_GROUPS_PER_CHUNK=${ROLLOUT_PIPELINE_GROUPS_PER_CHUNK:-12}
+case "$ROLLOUT_PROBE_PIPELINE" in
+    true|false) ;;
+    *) echo "ROLLOUT_PROBE_PIPELINE must be true or false" >&2; exit 1 ;;
+esac
+if [[ ! "$ROLLOUT_PIPELINE_GROUPS_PER_CHUNK" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ROLLOUT_PIPELINE_GROUPS_PER_CHUNK must be a positive integer" >&2
+    exit 1
+fi
 if [[ -z "$VALIDATION_PROBE_BACKEND" ]]; then
     if [[ -n "$VALIDATION_PROBE_URL" ]]; then
         export VALIDATION_PROBE_BACKEND=http
@@ -551,6 +561,8 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
   trainer.nnodes=${TRAINING_NNODES} \
   trainer.keep_frozen_models_resident=${KEEP_FROZEN_MODELS_RESIDENT} \
+  trainer.rollout_probe_pipeline.enable=${ROLLOUT_PROBE_PIPELINE} \
+  trainer.rollout_probe_pipeline.groups_per_chunk=${ROLLOUT_PIPELINE_GROUPS_PER_CHUNK} \
   trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
   trainer.total_epochs=100 \
   trainer.total_training_steps=${TOTAL_STEPS} \

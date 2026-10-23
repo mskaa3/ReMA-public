@@ -48,6 +48,28 @@ def extract_method(name, **bindings):
 
 
 class ValidationProbeTests(unittest.TestCase):
+    def test_pipeline_shell_settings_are_explicit_and_validated(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        start = launcher.index('export ROLLOUT_PROBE_PIPELINE=')
+        end = launcher.index('if [[ -z "$VALIDATION_PROBE_BACKEND" ]]', start)
+        shell = 'set -euo pipefail\n' + launcher[start:end]
+        shell += '\nprintf "%s %s\\n" "$ROLLOUT_PROBE_PIPELINE" "$ROLLOUT_PIPELINE_GROUPS_PER_CHUNK"\n'
+        base = {key: value for key, value in os.environ.items()
+                if key not in ('ROLLOUT_PROBE_PIPELINE', 'ROLLOUT_PIPELINE_GROUPS_PER_CHUNK')}
+        for env, expected, success in (
+            ({}, 'false 12', True),
+            ({'ROLLOUT_PROBE_PIPELINE': 'true', 'ROLLOUT_PIPELINE_GROUPS_PER_CHUNK': '6'}, 'true 6', True),
+            ({'ROLLOUT_PROBE_PIPELINE': 'maybe'}, '', False),
+            ({'ROLLOUT_PIPELINE_GROUPS_PER_CHUNK': '0'}, '', False),
+        ):
+            with self.subTest(env=env):
+                result = subprocess.run(['bash', '-c', shell], env={**base, **env},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+                if success:
+                    self.assertEqual(result.stdout.strip(), expected)
+        self.assertIn('trainer.rollout_probe_pipeline.enable=${ROLLOUT_PROBE_PIPELINE}', launcher)
+
     def test_launcher_defaults_to_qwen_only_when_endpoint_is_configured(self):
         launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
         start = launcher.index('export VALIDATION_PROBE_URL=')

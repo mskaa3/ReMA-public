@@ -15,6 +15,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src/verl/verl/rema_separated_trainer/ppo'))
 from experiment_io import question_id, plan_id  # noqa: E402
+from rollout_pipeline import pipeline_config  # noqa: E402
 
 PHASES = ('planners', 'workers', 'transfer', 'cross', 'adapt-planners', 'adapt-workers')
 WORKER_ROLES = '[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4]'
@@ -44,6 +45,7 @@ def repository_data_files(cfg):
 
 
 def validate_study(cfg):
+    pipeline_config(cfg.get('rollout_probe_pipeline'))
     if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', cfg['study']):
         raise ValueError('study must be a filesystem-safe, unique study name')
     planners = cfg['planners']
@@ -264,6 +266,8 @@ def run_environment(run, *, check_allocation=True):
         'FROZEN_GATE_MAX_MODEL_LEN': 16384, 'FROZEN_GATE_BATCH_SIZE': 8, 'FROZEN_GATE_REPLICAS': 1,
         'VALIDATION_PROBE_REPLICAS': 1,
         'KEEP_FROZEN_MODELS_RESIDENT': str(cfg.get('keep_frozen_models_resident', True)).lower(),
+        'ROLLOUT_PROBE_PIPELINE': str(pipeline_config(cfg.get('rollout_probe_pipeline'))['enable']).lower(),
+        'ROLLOUT_PIPELINE_GROUPS_PER_CHUNK': pipeline_config(cfg.get('rollout_probe_pipeline'))['groups_per_chunk'],
         # Preserve the existing successful-group requirement in every arm.
         'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
         'PREFIX_PROBE_MAX_NEW_TOKENS': 256,

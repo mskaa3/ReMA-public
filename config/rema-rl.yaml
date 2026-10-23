@@ -369,6 +369,10 @@ algorithm:
 trainer:
   # Only pools excluded from every training role retain their inference weights.
   keep_frozen_models_resident: True
+  # Opt-in: overlap frozen gate inference with complete C3 rollout chunks.
+  rollout_probe_pipeline:
+    enable: False
+    groups_per_chunk: 12
   debug_mode: False
   balance_batch: True
   total_epochs: 5

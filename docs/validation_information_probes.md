@@ -137,8 +137,74 @@ Regenerate manifests under new run names after these changes. Keep batch size,
 replica count, checkpoint and inference version identical across comparison
 arms: batching can change floating-point behavior even with greedy decoding.
 Benchmark completed updates/hour and phase timings, including backward-pass
-memory peaks; no particular speedup is guaranteed. This does not pipeline
-different rollout groups or introduce policy-stale asynchronous training.
+memory peaks; no particular speedup is guaranteed. Replica scheduling alone
+does not pipeline rollout groups. The separate opt-in below overlaps frozen
+inference, without policy-stale asynchronous training.
+
+## Optional rollout/probe pipeline
+
+For local frozen training gates, enable bounded overlap within each existing
+generation batch. In the experiment configuration, before generating fresh
+manifests for both arms:
+
+```python
+cfg['rollout_probe_pipeline'] = {'enable': True, 'groups_per_chunk': 12}
+```
+
+For ordinary launchers, the equivalent settings are:
+
+```bash
+export ROLLOUT_PROBE_PIPELINE=true
+export ROLLOUT_PIPELINE_GROUPS_PER_CHUNK=12
+```
+
+The default remains disabled, so old manifests and non-hierarchical training
+keep their original behavior. This option does not change the selected gate
+model or backend. It activates only for scoped C3 with prefix probes and a
+local frozen gate client (separate or shared with evaluation). Role-based gates,
+HTTP gates, and validation remain synchronous; the console prints the reason.
+Having only frozen **validation metrics** does not make role-based training
+gates eligible for overlap. No extra GPUs are requested.
+
+For 48 question groups and 32 rollouts per question, generation is split into
+four chunks of 12 complete groups. Each group retains all 8 focal actions and
+4 continuations per action. While chunk B generates, the independent frozen
+probe evaluates inputs from chunk A. There is at most one probe chunk in
+flight, and only one caller of each generation pool. A slow probe blocks the
+next submission instead of growing an unbounded queue. Generation pools enter
+and exit their lifecycle once per logical batch, not once per chunk.
+
+Only frozen-model inference runs in a background thread. Answer verification,
+symbolic equivalence, gates, C3 scoring, console examples and group filtering
+still run on the reassembled batch in the original order on the trainer thread.
+This avoids moving the verifier's process/signal machinery into another thread.
+Identical probe inputs with identical scoring contexts are deduplicated across
+all chunks, just as in the synchronous path. Raw probe responses are cached only
+within that logical batch, never across updates; missing responses are fatal,
+not zero scores or an invitation to rerun with another evaluator.
+
+All pending inference is drained before scoring/filtering and before any model
+update, role switch, validation or checkpoint. Probe/generation failures abort
+the batch and cancel outstanding frozen inference. No first-completed selection,
+additional dataloader reads, cross-update look-ahead, or partial C3 groups are
+introduced. The logical batch and generation-attempt counters are unchanged.
+The five evaluation metrics and their sampling remain unchanged.
+
+Monitor `rollout/pipeline/enabled`, `chunks`, `unique_probe_requests`,
+`generation_seconds`, `probe_seconds`, `probe_wait_seconds`, `overlap_seconds`,
+and `wall_seconds`. The intervals measure host-observed generation/inference
+calls for that logical batch, not CUDA kernel occupancy or a sum over earlier
+group-filter retries. `timing_s/gen` now includes the pipeline and
+its final probe wait when enabled; `timing_s/pipeline_generation` isolates the
+generation calls and `timing_s/pipeline_probe_wait` reports exposed waiting.
+The ordinary reward/prefix-probe timer covers the remaining synchronous scoring,
+so do not interpret its reduction alone as the end-to-end speedup.
+
+Both arms should use identical chunk and probe batching settings. Smaller
+chunks can lower GPU inference efficiency and batching can change generated
+outputs; the same learning objective is not a promise of bitwise equivalence.
+Benchmark updates/hour and peak host/GPU memory before long runs. Splitting
+decomposer generation from worker execution is not implemented by this option.
 
 ## Fixed versus adaptive training gates
 

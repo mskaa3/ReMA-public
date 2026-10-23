@@ -62,6 +62,22 @@ def record(question='q', plan='PLAN:\n- S1: Compute x.\n- S2: Use S1.', score=1.
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_pipeline_manifest_is_explicit_and_does_not_change_method(self):
+        cfg = config()
+        run = suite.make_runs(cfg, 'workers')[0]
+        original = suite.run_environment(run, check_allocation=False)
+        self.assertEqual(original['ROLLOUT_PROBE_PIPELINE'], 'false')
+        cfg['rollout_probe_pipeline'] = {'enable': True, 'groups_per_chunk': 12}
+        updated = suite.run_environment(suite.make_runs(cfg, 'workers')[0], check_allocation=False)
+        self.assertEqual(updated['ROLLOUT_PROBE_PIPELINE'], 'true')
+        self.assertEqual(updated['ROLLOUT_PIPELINE_GROUPS_PER_CHUNK'], 12)
+        for key in original:
+            if key not in ('ROLLOUT_PROBE_PIPELINE', 'ROLLOUT_PIPELINE_GROUPS_PER_CHUNK'):
+                self.assertEqual(original[key], updated[key], key)
+        for bad in ({'enable': 'yes'}, {'groups_per_chunk': 0}, {'groups_per_chunk': True}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                suite.make_runs(dict(cfg, rollout_probe_pipeline=bad), 'workers')
+
     def test_probe_replicas_reserve_enough_nodes_and_export_batch_settings(self):
         cfg = config()
         cfg['nodes'] = 3

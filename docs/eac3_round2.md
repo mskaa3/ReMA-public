@@ -235,6 +235,19 @@ recovered HF paths if necessary. These remain two alternating histories, not a
 gate-only ablation with identical starting partners. New probe scores are
 evaluation diagnostics, not additions to either training reward.
 
+For a rerun that already uses local frozen probes for training gates, optionally
+add the following before `write_runs` in each arm:
+
+```python
+cfg['rollout_probe_pipeline'] = {'enable': True, 'groups_per_chunk': 12}
+```
+
+This preserves the existing gate model/backend. It overlaps frozen gate
+inference with generation of the next complete-group chunk, and waits before
+filtering or updating. If `gate_solver_backend` is still `role`, the trainer
+explicitly stays synchronous; do not change evaluators just to enable overlap.
+See [pipeline constraints and timings](validation_information_probes.md#optional-rolloutprobe-pipeline).
+
 ## Compare fixed and adaptive gates
 
 This is a new two-arm experiment, not the earlier gated-versus-ungated comparison.

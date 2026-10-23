@@ -51,6 +51,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils import torch_functional as verl_F
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
 from verl.rema_separated_trainer.ppo.rollout_context import generation_context, frozen_pool_flags
+from verl.rema_separated_trainer.ppo.rollout_pipeline import (
+    cached_probe_responses, complete_group_slices, pipeline_config, run_probe_pipeline,
+)
+from verl.rema_separated_trainer.ppo.local_validation_probe import LocalFrozenProbeClient
 from verl.rema_separated_trainer.ppo.actor_batch import (
     pad_scoped_actor_batch,
     without_actor_padding,
@@ -901,6 +905,7 @@ class RayReMASeparatedTrainer(object):
         self._init_scoped_c3_grpo()
         self._init_prefix_probe()
         self._init_validation_probes()
+        pipeline_config(self.config.trainer.get('rollout_probe_pipeline'))
 
     def _init_validation_probes(self):
         config = self.config.trainer.get('validation_probe', {}) or {}
@@ -1114,6 +1119,34 @@ class RayReMASeparatedTrainer(object):
             repr(ground_truth),
             extra_key,
         )
+
+    def _collect_prefix_probe_items(self, non_tensor_batch, *, validation=False):
+        hierarchy = self._get_hierarchy_config()
+        histories = non_tensor_batch.get('history')
+        if histories is None:
+            raise ValueError('Prefix probe requires rollout history metadata')
+        size = len(histories)
+        terminal_roles = non_tensor_batch.get(
+            'terminal_stage_role', [hierarchy.get('score_role', '')] * size,
+        )
+        requests = collect_prefix_probe_requests(
+            histories, terminal_roles,
+            focal_role=None if validation else self._current_train_agent,
+            decomposer_role=hierarchy.get('decomposer_role', 'decomposer'),
+            stage_roles=hierarchy.get('stage_roles', []),
+        )
+        extra_infos = non_tensor_batch.get('extra_info', [None] * size)
+        unique_items, unique_indices, index_by_key = [], [], {}
+        for request in requests:
+            index = request.sample_index
+            item = (request.message, non_tensor_batch['data_source'][index],
+                    non_tensor_batch['reward_model'][index]['ground_truth'], extra_infos[index])
+            key = self._prefix_probe_context_key(*item)
+            if key not in index_by_key:
+                index_by_key[key] = len(unique_items)
+                unique_items.append(item)
+            unique_indices.append(index_by_key[key])
+        return requests, unique_items, unique_indices
 
     def _generate_prefix_probe_responses(self, messages):
         if not messages:
@@ -1372,6 +1405,7 @@ class RayReMASeparatedTrainer(object):
         *,
         validation=False,
         probe_reward_fn=None,
+        prefetched_responses=None,
     ):
         """Probe terminal instructions and plans, then compare worker answers."""
 
@@ -1391,9 +1425,8 @@ class RayReMASeparatedTrainer(object):
         )
         data_batch.non_tensor_batch['terminal_stage_role'] = np.asarray(terminal_roles, dtype=object)
         probe_reward_fn = probe_reward_fn or self.reward_fn
-        requests = collect_prefix_probe_requests(
-            histories, terminal_roles, focal_role=focal_role,
-            decomposer_role=decomposer_role, stage_roles=stage_roles,
+        requests, unique_items, unique_indices = self._collect_prefix_probe_items(
+            data_batch.non_tensor_batch, validation=validation,
         )
         probe_values = {
             source: {
@@ -1407,30 +1440,15 @@ class RayReMASeparatedTrainer(object):
             for source in ('decomposer', 'terminal')
         }
 
-        # Both probes use the same solver. Deduplicate identical inputs and
-        # scoring contexts, then broadcast each measurement to its recipients.
-        unique_items, unique_indices, index_by_key = [], [], {}
-        extra_infos = data_batch.non_tensor_batch.get(
-            'extra_info', np.array([None] * size, dtype=object),
-        )
-        for request in requests:
-            index = request.sample_index
-            item = (
-                request.message,
-                data_batch.non_tensor_batch['data_source'][index],
-                data_batch.non_tensor_batch['reward_model'][index]['ground_truth'],
-                extra_infos[index],
-            )
-            key = self._prefix_probe_context_key(*item)
-            if key not in index_by_key:
-                index_by_key[key] = len(unique_items)
-                unique_items.append(item)
-            unique_indices.append(index_by_key[key])
-
         if unique_items:
-            responses, tokens, stops = self._generate_prefix_probe_responses(
-                [item[0] for item in unique_items]
-            )
+            if prefetched_responses is None:
+                responses, tokens, stops = self._generate_prefix_probe_responses(
+                    [item[0] for item in unique_items]
+                )
+            else:
+                responses, tokens, stops = cached_probe_responses(
+                    unique_items, prefetched_responses, self._prefix_probe_context_key,
+                )
             if not (len(responses) == len(tokens) == len(stops) == len(unique_items)):
                 raise RuntimeError("Prefix probe returned an incomplete generation batch")
             answers = [extract_complete_boxed_answer(response) for response in responses]
@@ -3589,6 +3607,65 @@ class RayReMASeparatedTrainer(object):
         with generation_context(self.actor_rollout_wg.values(), dummy_batch):
             return self.multi_agent_rollout.generate(gen_batch)
 
+    def _generate_training_rollouts(self, gen_batch, source_batch, metrics, timing_raw):
+        """Prefetch frozen inference, then score/filter once at the original boundary."""
+        options = pipeline_config(self.config.trainer.get('rollout_probe_pipeline'))
+        reason = 'disabled'
+        client = None
+        if options['enable']:
+            if not self.scoped_c3_grpo_enabled or not self.prefix_probe_enabled:
+                reason = 'requires_c3_and_prefix_probes'
+            elif gen_batch.meta_info.get('validate', False):
+                reason = 'validation_is_synchronous'
+            elif self.prefix_probe_config.get('solver_backend', 'role') != 'frozen_probe':
+                reason = 'role_gates_are_synchronous'
+            else:
+                separate = (self.config.trainer.get('frozen_gate_probe', {}) or {}).get('enable', False)
+                client = (self.frozen_gate_probe_client if separate else self.validation_probe_client)
+                if client is None:
+                    raise RuntimeError('Pipeline frozen probe unavailable; no evaluator fallback')
+                reason = 'enabled' if isinstance(client, LocalFrozenProbeClient) else 'requires_local_probe'
+        if getattr(self, '_rollout_pipeline_status', None) != reason:
+            print(f'[rollout/pipeline] status={reason} groups_per_chunk={options["groups_per_chunk"]}', flush=True)
+            self._rollout_pipeline_status = reason
+        metrics['rollout/pipeline/enabled'] = float(reason == 'enabled')
+        if reason != 'enabled':
+            return self.multi_turn_generate_sequences(gen_batch), None
+
+        slices = complete_group_slices(
+            gen_batch.non_tensor_batch['uid'], int(self.config.actor_rollout_ref.rollout.n),
+            options['groups_per_chunk'],
+        )
+
+        def generate(selection):
+            chunk = gen_batch[selection]
+            chunk.meta_info = deepcopy(gen_batch.meta_info)
+            expected_uids = list(chunk.non_tensor_batch['uid'])
+            output = self.multi_agent_rollout.generate(chunk)
+            if len(output) != len(expected_uids) or list(output.non_tensor_batch['uid']) != expected_uids:
+                raise RuntimeError('Pipeline generation changed C3 group order or returned an incomplete chunk')
+            return output
+
+        def prepare(selection, output):
+            metadata = dict(source_batch[selection].non_tensor_batch)
+            metadata.update(output.non_tensor_batch)
+            _, items, _ = self._collect_prefix_probe_items(metadata)
+            return {self._prefix_probe_context_key(*item): item[0] for item in items}
+
+        dummy_batch = DataProto.from_dict({'dummy_tensor': torch.arange(0, len(gen_batch))})
+        for role in self.actor_rollout_wg:
+            assert role in gen_batch.meta_info['agent_roles']
+        # Keep one lifecycle/RNG scope per physical pool for the whole logical batch.
+        with generation_context(self.actor_rollout_wg.values(), dummy_batch):
+            outputs, cache, stats = run_probe_pipeline(
+                slices, generate, prepare, self._generate_prefix_probe_responses, client.close,
+            )
+        for name, value in stats.items():
+            metrics[f'rollout/pipeline/{name}'] = float(value)
+        timing_raw['pipeline_generation'] = stats['generation_seconds']
+        timing_raw['pipeline_probe_wait'] = stats['probe_wait_seconds']
+        return DataProto.concat(outputs), cache
+
     def _update_current_train_agent(self, epoch: int = None) -> None:
         """Update the current training agent based on switch config.
         
@@ -3895,7 +3972,9 @@ class RayReMASeparatedTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.multi_turn_generate_sequences(gen_batch)
+                        gen_batch_output, prefetched_probe_responses = self._generate_training_rollouts(
+                            gen_batch, new_batch, metrics, timing_raw,
+                        )
                     experiment_effort['trajectory_slots'] += len(gen_batch)
                     experiment_effort['generation_seconds'] += timing_raw['gen']
                         
@@ -4036,6 +4115,7 @@ class RayReMASeparatedTrainer(object):
                                     new_batch,
                                     reward_tensor_map['acc'],
                                     metrics,
+                                    prefetched_responses=prefetched_probe_responses,
                                 )
                         self._attach_scoped_c3_grpo_signals(
                             new_batch,

@@ -214,6 +214,9 @@ algorithm:
 
 trainer:
   keep_frozen_models_resident: True
+  rollout_probe_pipeline:
+    enable: False
+    groups_per_chunk: 12
   frozen_gate_probe:
     enable: False
     backend: local
