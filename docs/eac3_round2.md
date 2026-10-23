@@ -159,7 +159,8 @@ Use this after the adapted planner exports already exist. It preserves the
 round-2 input models, creates fresh output identities, and evaluates both arms
 with the same pinned Qwen2.5-7B probe inside each job. No probe server is needed.
 This recipe requests **4 nodes x 4 GPUs per run**: six GPUs per model pool,
-one dedicated probe GPU, and three unused GPUs. It sets the training-pool
+and four identical probe replicas (one GPU each, batch size 8 per replica).
+There are no unassigned GPUs. It sets the training-pool
 size to three node equivalents and adds one node of probe capacity. Actual
 placement is managed by Ray; a particular host is not reserved exclusively
 for the probe. See [resource and dependency details](validation_information_probes.md#local-inference-inside-the-training-job).
@@ -209,6 +210,8 @@ for chain in ('ungated', 'gated'):
         'model': 'Qwen/Qwen2.5-7B-Instruct',
         'revision': os.environ['PROBE_REVISION'],
         'extra_nodes': 1,
+        'batch_size': 8,
+        'replicas': 4,
     }
     suite.write_runs(cfg, 'workers', Path(os.environ['RUN_DIR']) / chain)
 PY

@@ -367,6 +367,8 @@ algorithm:
     train_agent_roles: [decomposer, worker_stage_1, worker_stage_2, worker_stage_3, worker_stage_4, worker_stage_5]
 
 trainer:
+  # Only pools excluded from every training role retain their inference weights.
+  keep_frozen_models_resident: True
   debug_mode: False
   balance_batch: True
   total_epochs: 5
@@ -400,7 +402,8 @@ trainer:
     timeout_seconds: 180
     startup_timeout_seconds: 900
     max_model_len: 16384
-    batch_size: 4
+    batch_size: 8
+    replicas: 1  # one dedicated GPU per replica; set 4 to use a spare four-GPU node
     gpu_memory_utilization: 0.8
   # Separate frozen SLM; never reused from the actors being trained.
   # Enable HTTP via VALIDATION_PROBE_URL, or local with a pinned revision and spare GPU.
@@ -417,7 +420,8 @@ trainer:
     concurrency: 4
     startup_timeout_seconds: 900
     max_model_len: 16384
-    batch_size: 4
+    batch_size: 8
+    replicas: 1
     gpu_memory_utilization: 0.8
   val_generations_to_log_to_wandb: 0
   nnodes: 1

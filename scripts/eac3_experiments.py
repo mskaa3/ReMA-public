@@ -93,7 +93,7 @@ def validate_study(cfg):
             raise ValueError('frozen_gate_probe.model must identify an immutable HF export or pinned model')
         if ':' not in model and not model.startswith('/') and not re.fullmatch(r'[0-9a-fA-F]{40}', str(gate.get('revision', ''))):
             raise ValueError('frozen_gate_probe.revision must pin the HF model to a 40-character commit hash')
-        for key, default in (('extra_nodes', 1), ('max_model_len', 16384), ('batch_size', 4)):
+        for key, default in (('extra_nodes', 1), ('max_model_len', 16384), ('batch_size', 8), ('replicas', 1)):
             if type(gate.get(key, default)) is not int or gate.get(key, default) < 1:
                 raise ValueError(f'frozen_gate_probe.{key} must be a positive integer')
         if gate.get('max_model_len', 16384) <= 256:
@@ -116,7 +116,7 @@ def validate_study(cfg):
         if ':' not in model and not model.startswith('/') and not re.fullmatch(r'[0-9a-fA-F]{40}', str(probe.get('revision', ''))):
             raise ValueError('local_validation_probe.revision must be a fixed 40-character HF commit hash')
         for key, default in (('extra_nodes', 1), ('samples_per_dataset', 32),
-                             ('max_new_tokens', 256), ('max_model_len', 16384), ('batch_size', 4)):
+                             ('max_new_tokens', 256), ('max_model_len', 16384), ('batch_size', 8), ('replicas', 1)):
             value = probe.get(key, default)
             if type(value) is not int or value < 1:
                 raise ValueError(f'local_validation_probe.{key} must be a positive integer')
@@ -126,8 +126,11 @@ def validate_study(cfg):
 
 def allocated_nodes(cfg):
     probes = [cfg[key] for key in ('local_validation_probe', 'frozen_gate_probe') if cfg.get(key) is not None]
-    # One extra node can host both independent single-GPU inference actors.
-    return cfg['nodes'] + max((probe.get('extra_nodes', 1) for probe in probes), default=0)
+    # Metrics and a separate gate pool must fit together outside training pools.
+    replicas = sum(probe.get('replicas', 1) for probe in probes)
+    required_extra = (replicas + cfg['gpus_per_node'] - 1) // cfg['gpus_per_node']
+    requested_extra = max((probe.get('extra_nodes', 1) for probe in probes), default=0)
+    return cfg['nodes'] + max(required_extra, requested_extra)
 
 
 def run_name(cfg, phase, arm, seed):
@@ -258,7 +261,9 @@ def run_environment(run, *, check_allocation=True):
         'PREFIX_PROBE_SOLVER_BACKEND': cfg.get('gate_solver_backend', 'role'),
         # Never inherit an unrelated gate checkpoint from an earlier shell/run.
         'FROZEN_GATE_MODEL_REMOTE': '', 'FROZEN_GATE_MODEL_PATH': '', 'FROZEN_GATE_REVISION': '',
-        'FROZEN_GATE_MAX_MODEL_LEN': 16384, 'FROZEN_GATE_BATCH_SIZE': 4,
+        'FROZEN_GATE_MAX_MODEL_LEN': 16384, 'FROZEN_GATE_BATCH_SIZE': 8, 'FROZEN_GATE_REPLICAS': 1,
+        'VALIDATION_PROBE_REPLICAS': 1,
+        'KEEP_FROZEN_MODELS_RESIDENT': str(cfg.get('keep_frozen_models_resident', True)).lower(),
         # Preserve the existing successful-group requirement in every arm.
         'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
         'PREFIX_PROBE_MAX_NEW_TOKENS': 256,
@@ -284,7 +289,8 @@ def run_environment(run, *, check_allocation=True):
         env.update({
             'FROZEN_GATE_REVISION': gate.get('revision') or '',
             'FROZEN_GATE_MAX_MODEL_LEN': gate.get('max_model_len', 16384),
-            'FROZEN_GATE_BATCH_SIZE': gate.get('batch_size', 4),
+            'FROZEN_GATE_BATCH_SIZE': gate.get('batch_size', 8),
+            'FROZEN_GATE_REPLICAS': gate.get('replicas', 1),
         })
     probe = cfg.get('local_validation_probe')
     if probe is not None:
@@ -297,7 +303,8 @@ def run_environment(run, *, check_allocation=True):
             'VALIDATION_PROBE_SAMPLES_PER_DATASET': probe.get('samples_per_dataset', 32),
             'VALIDATION_PROBE_MAX_NEW_TOKENS': probe.get('max_new_tokens', 256),
             'VALIDATION_PROBE_MAX_MODEL_LEN': probe.get('max_model_len', 16384),
-            'VALIDATION_PROBE_BATCH_SIZE': probe.get('batch_size', 4),
+            'VALIDATION_PROBE_BATCH_SIZE': probe.get('batch_size', 8),
+            'VALIDATION_PROBE_REPLICAS': probe.get('replicas', 1),
         })
     # Shell quoting protects Hydra interpolations and strings from bash expansion.
     env['AGENT12_EXPERIMENT_OVERRIDES'] = ' '.join(shlex.quote(
@@ -325,6 +332,7 @@ def write_runs(cfg, phase, directory):
         'src/verl/verl/rema_separated_trainer/main_ppo.py',
         'src/verl/verl/workers/reward_manager/rema.py',
         'src/verl/verl/workers/fsdp_rema_workers.py',
+        'src/verl/verl/workers/sharding_manager/fsdp_vllm.py',
         'src/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py',
         'src/verl/verl/utils/dataset/rema_dataset.py',
     )]

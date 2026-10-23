@@ -62,6 +62,29 @@ def record(question='q', plan='PLAN:\n- S1: Compute x.\n- S2: Use S1.', score=1.
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_probe_replicas_reserve_enough_nodes_and_export_batch_settings(self):
+        cfg = config()
+        cfg['nodes'] = 3
+        cfg['gate_solver_backend'] = 'frozen_probe'
+        cfg['local_validation_probe'] = {'model': 's3:bucket/frozen', 'replicas': 4, 'batch_size': 8}
+        run = suite.make_runs(cfg, 'workers')[0]
+        env = suite.run_environment(run, check_allocation=False)
+        self.assertEqual(suite.allocated_nodes(cfg), 4)
+        self.assertEqual(env['VALIDATION_PROBE_REPLICAS'], 4)
+        self.assertEqual(env['VALIDATION_PROBE_BATCH_SIZE'], 8)
+        self.assertEqual(env['KEEP_FROZEN_MODELS_RESIDENT'], 'true')
+        self.assertEqual(env['ROLLOUT_N'], cfg['rollout_n'])
+        self.assertEqual(env['C3_CONTINUATIONS_PER_ACTION'], cfg['continuations_per_action'])
+        cfg['frozen_gate_probe'] = {'model': 's3:bucket/other-frozen', 'replicas': 2}
+        run = suite.make_runs(cfg, 'workers')[0]
+        self.assertEqual(suite.allocated_nodes(cfg), 5)
+        self.assertEqual(suite.run_environment(run, check_allocation=False)['FROZEN_GATE_REPLICAS'], 2)
+        for field in ('local_validation_probe', 'frozen_gate_probe'):
+            for count in (0, -1, True, 1.5):
+                broken = dict(cfg, **{field: dict(cfg[field], replicas=count)})
+                with self.subTest(field=field, count=count), self.assertRaisesRegex(ValueError, 'replicas'):
+                    suite.make_runs(broken, 'workers')
+
     def test_metrics_can_use_snapshot_with_shared_fixed_or_live_role_gates(self):
         cfg = suite.read_json(ROOT / 'config/eac3-round2-gated.json')
         snapshot = cfg['planners']['eac3']
@@ -680,7 +703,7 @@ class ExperimentTests(unittest.TestCase):
                         env = suite.run_environment(run, check_allocation=False)
                         self.assertEqual(suite.allocated_nodes(local_cfg), 5)
                         self.assertEqual({k: v for k, v in env.items() if not k.startswith('VALIDATION_PROBE_')},
-                                         original)
+                                         {k: v for k, v in original.items() if not k.startswith('VALIDATION_PROBE_')})
                         with patch.dict(os.environ, {'SLURM_NNODES': '4'}):
                             with self.assertRaisesRegex(ValueError, 'allocation differs'):
                                 suite.run_environment(run)
@@ -737,7 +760,8 @@ class ExperimentTests(unittest.TestCase):
                     cfg, nodes=3, study=cfg['study'] + '-local-probe-test',
                     planners={'eac3': original['planner']},
                     local_validation_probe={'model': 'Qwen/Qwen2.5-7B-Instruct',
-                                            'revision': 'a' * 40, 'extra_nodes': 1},
+                                            'revision': 'a' * 40, 'extra_nodes': 1,
+                                            'batch_size': 8, 'replicas': 4},
                 ))
                 self.assertEqual(suite.allocated_nodes(manifest['study_config']), 4)
                 self.assertIn('sbatch --export=ALL --nodes=4 --gres=gpu:hopper:4,storage:local:200G',

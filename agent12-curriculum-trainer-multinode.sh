@@ -27,7 +27,9 @@ export VALIDATION_PROBE_REVISION=${VALIDATION_PROBE_REVISION:-}
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=${VALIDATION_PROBE_SAMPLES_PER_DATASET:-32}
 export VALIDATION_PROBE_MAX_NEW_TOKENS=${VALIDATION_PROBE_MAX_NEW_TOKENS:-256}
 export VALIDATION_PROBE_MAX_MODEL_LEN=${VALIDATION_PROBE_MAX_MODEL_LEN:-16384}
-export VALIDATION_PROBE_BATCH_SIZE=${VALIDATION_PROBE_BATCH_SIZE:-4}
+export VALIDATION_PROBE_BATCH_SIZE=${VALIDATION_PROBE_BATCH_SIZE:-8}
+export VALIDATION_PROBE_REPLICAS=${VALIDATION_PROBE_REPLICAS:-1}
+export KEEP_FROZEN_MODELS_RESIDENT=${KEEP_FROZEN_MODELS_RESIDENT:-true}
 if [[ -z "$VALIDATION_PROBE_BACKEND" ]]; then
     if [[ -n "$VALIDATION_PROBE_URL" ]]; then
         export VALIDATION_PROBE_BACKEND=http
@@ -103,7 +105,8 @@ export FROZEN_GATE_MODEL_REMOTE=${FROZEN_GATE_MODEL_REMOTE:-}
 export FROZEN_GATE_MODEL_PATH=${FROZEN_GATE_MODEL_PATH:-}
 export FROZEN_GATE_REVISION=${FROZEN_GATE_REVISION:-}
 export FROZEN_GATE_MAX_MODEL_LEN=${FROZEN_GATE_MAX_MODEL_LEN:-16384}
-export FROZEN_GATE_BATCH_SIZE=${FROZEN_GATE_BATCH_SIZE:-4}
+export FROZEN_GATE_BATCH_SIZE=${FROZEN_GATE_BATCH_SIZE:-8}
+export FROZEN_GATE_REPLICAS=${FROZEN_GATE_REPLICAS:-1}
 export FROZEN_GATE_ENABLE=false
 if [[ -n "$FROZEN_GATE_MODEL_REMOTE" || -n "$FROZEN_GATE_MODEL_PATH" ]]; then
     export FROZEN_GATE_ENABLE=true
@@ -183,12 +186,23 @@ if [[ ! "$TRAINING_NNODES" =~ ^[1-9][0-9]*$ ]] || (( TRAINING_NNODES > SLURM_NNO
     exit 1
 fi
 probe_gpus=0
-if [[ "$VALIDATION_PROBE_BACKEND" == local ]]; then probe_gpus=$((probe_gpus + 1)); fi
-if [[ "${PREFIX_PROBE_ENABLE:-false}" == true && "${FROZEN_GATE_ENABLE:-false}" == true ]]; then probe_gpus=$((probe_gpus + 1)); fi
+if [[ "$VALIDATION_PROBE_BACKEND" == local ]]; then
+    if [[ ! "${VALIDATION_PROBE_REPLICAS:-1}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "VALIDATION_PROBE_REPLICAS must be a positive integer" >&2; exit 1
+    fi
+    probe_gpus=$((probe_gpus + ${VALIDATION_PROBE_REPLICAS:-1}))
+fi
+if [[ "${PREFIX_PROBE_ENABLE:-false}" == true && "${FROZEN_GATE_ENABLE:-false}" == true ]]; then
+    if [[ ! "${FROZEN_GATE_REPLICAS:-1}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "FROZEN_GATE_REPLICAS must be a positive integer" >&2; exit 1
+    fi
+    probe_gpus=$((probe_gpus + ${FROZEN_GATE_REPLICAS:-1}))
+fi
 if (( SLURM_NNODES * GPUS_PER_NODE < 2 * TRAINING_NNODES * POOL_GPUS_PER_NODE + probe_gpus )); then
     echo "Local probes need ${probe_gpus} exclusive GPUs outside both training pools. Reserve extra nodes/GPUs and set TRAINING_NNODES explicitly." >&2
     exit 1
 fi
+echo "GPU allocation: $((2 * TRAINING_NNODES * POOL_GPUS_PER_NODE)) training-pool GPUs + ${probe_gpus} frozen-probe GPUs"
 if (( GPUS_PER_NODE % 2 != 0 )); then
     echo "GPUS_PER_NODE must be even because Agent 1 and Agent 2 use separate pools" >&2
     exit 1
@@ -536,6 +550,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES} \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
   trainer.nnodes=${TRAINING_NNODES} \
+  trainer.keep_frozen_models_resident=${KEEP_FROZEN_MODELS_RESIDENT} \
   trainer.n_gpus_per_node=${POOL_GPUS_PER_NODE} \
   trainer.total_epochs=100 \
   trainer.total_training_steps=${TOTAL_STEPS} \
@@ -561,7 +576,8 @@ python3 -m verl.rema_separated_trainer.main_ppo \
             "trainer.validation_probe.samples_per_dataset=${VALIDATION_PROBE_SAMPLES_PER_DATASET}" \
             "trainer.validation_probe.max_new_tokens=${VALIDATION_PROBE_MAX_NEW_TOKENS}" \
             "trainer.validation_probe.max_model_len=${VALIDATION_PROBE_MAX_MODEL_LEN}" \
-            "trainer.validation_probe.batch_size=${VALIDATION_PROBE_BATCH_SIZE}"; do
+            "trainer.validation_probe.batch_size=${VALIDATION_PROBE_BATCH_SIZE}" \
+            "trainer.validation_probe.replicas=${VALIDATION_PROBE_REPLICAS}"; do
             printf -v probe_argument '%q' "$probe_argument"
             train_command+=" ${probe_argument}"
         done
@@ -573,7 +589,8 @@ python3 -m verl.rema_separated_trainer.main_ppo \
         "trainer.frozen_gate_probe.model=${FROZEN_GATE_MODEL_PATH:-null}" \
         "trainer.frozen_gate_probe.revision=${FROZEN_GATE_REVISION:-null}" \
         "trainer.frozen_gate_probe.max_model_len=${FROZEN_GATE_MAX_MODEL_LEN}" \
-        "trainer.frozen_gate_probe.batch_size=${FROZEN_GATE_BATCH_SIZE}"; do
+        "trainer.frozen_gate_probe.batch_size=${FROZEN_GATE_BATCH_SIZE}" \
+        "trainer.frozen_gate_probe.replicas=${FROZEN_GATE_REPLICAS}"; do
         printf -v gate_argument '%q' "$gate_argument"
         train_command+=" ${gate_argument}"
     done

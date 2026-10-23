@@ -130,6 +130,24 @@ class ValidationProbeTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_launcher_counts_shared_and_separate_probe_replicas(self):
+        launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
+        start = launcher.index('if [[ ! "$TRAINING_NNODES"')
+        end = launcher.index('\nif (( GPUS_PER_NODE', start)
+        shell = 'set -euo pipefail\n' + launcher[start:end]
+        env = dict(os.environ, TRAINING_NNODES='3', SLURM_NNODES='4', GPUS_PER_NODE='4',
+                   POOL_GPUS_PER_NODE='2', VALIDATION_PROBE_BACKEND='local',
+                   VALIDATION_PROBE_REPLICAS='4', PREFIX_PROBE_ENABLE='true', FROZEN_GATE_ENABLE='false')
+        result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('12 training-pool GPUs + 4 frozen-probe GPUs', result.stdout)
+        for changes in ({'VALIDATION_PROBE_REPLICAS': '5'}, {'VALIDATION_PROBE_REPLICAS': '0'},
+                        {'FROZEN_GATE_ENABLE': 'true', 'FROZEN_GATE_REPLICAS': '1'}):
+            with self.subTest(changes=changes):
+                result = subprocess.run(['bash', '-c', shell], env=dict(env, **changes),
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_context_conditions_preserve_boundaries(self):
         inputs = example().inputs
         self.assertEqual(inputs['terminal_only'], 'CURRENT TASK:\nS2: Add 20 to S1.')
@@ -318,7 +336,7 @@ class LocalValidationProbeTests(unittest.TestCase):
     def test_factory_keeps_local_independent_of_http(self):
         client = probe.make_validation_probe_client(self.config())
         self.assertIsInstance(client, local_probe.LocalFrozenProbeClient)
-        self.assertIsNone(client.actor)
+        self.assertEqual(client.actors, [])
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             probe.make_validation_probe_client({'backend': 'typo'})
         for config in (self.config(revision=None), self.config(revision='main'),
@@ -359,7 +377,7 @@ class LocalValidationProbeTests(unittest.TestCase):
             client.start()
             ray.remote.assert_called_once_with(num_cpus=1, num_gpus=1, max_restarts=0, max_task_retries=0)
             actor_type.options.assert_called_once_with(scheduling_strategy='DEFAULT')
-            ray.get.assert_called_once_with(actor.ready.remote.return_value, timeout=900)
+            ray.get.assert_called_once_with([actor.ready.remote.return_value], timeout=900)
             client.close()
             client.close()
         ray.kill.assert_called_once_with(actor, no_restart=True)
@@ -372,7 +390,7 @@ class LocalValidationProbeTests(unittest.TestCase):
         with patch.dict(sys.modules, {'ray': ray}):
             with self.assertRaises(TimeoutError):
                 client.start()
-        self.assertIsNone(client.actor)
+        self.assertEqual(client.actors, [])
         ray.kill.assert_called_once()
 
     def test_cleanup_failure_preserves_original_error(self):
@@ -384,22 +402,23 @@ class LocalValidationProbeTests(unittest.TestCase):
         with patch.dict(sys.modules, {'ray': ray}), self.assertLogs(local_probe.__name__, level='WARNING'):
             with self.assertRaisesRegex(TimeoutError, 'startup'):
                 client.start()
-        self.assertIsNone(client.actor)
+        self.assertEqual(client.actors, [])
 
     def test_generation_batches_are_ordered_and_timeout_is_not_zero_accuracy(self):
         ray = Mock()
         client = local_probe.LocalFrozenProbeClient(self.config(batch_size=2))
-        client.actor = Mock()
+        client.actors = [Mock()]
+        ray.wait.side_effect = lambda refs, **kw: (refs[:1], refs[1:])
         outputs = [probe.ProbeResponse(str(i), 'stop') for i in range(5)]
         ray.get.side_effect = [outputs[:2], outputs[2:4], outputs[4:]]
         with patch.dict(sys.modules, {'ray': ray}):
             self.assertEqual(client.generate(list('abcde')), outputs)
-            self.assertEqual([call.args[0] for call in client.actor.generate.remote.call_args_list],
+            self.assertEqual([call.args[0] for call in client.actors[0].generate.remote.call_args_list],
                              [list('ab'), list('cd'), list('e')])
             ray.get.side_effect = TimeoutError('inference')
             with self.assertRaises(TimeoutError):
                 client.generate(['another'])
-            self.assertIsNone(client.actor)
+            self.assertEqual(client.actors, [])
             ray.kill.assert_called_once()
 
     def test_local_engine_is_frozen_pinned_and_uses_its_own_template(self):
@@ -457,9 +476,10 @@ class LocalValidationProbeTests(unittest.TestCase):
 
     def test_local_client_forwards_gate_options_and_keeps_metrics_defaults(self):
         client = local_probe.LocalFrozenProbeClient(self.config(batch_size=1))
-        client.actor = Mock()
-        actor = client.actor
+        client.actors = [Mock()]
+        actor = client.actors[0]
         ray = Mock()
+        ray.wait.side_effect = lambda refs, **kw: (refs[:1], refs[1:])
         ray.get.return_value = [probe.ProbeResponse(r'\boxed{UNKNOWN}', 'stop', 3)]
         with patch.dict(sys.modules, {'ray': ray}):
             client.generate(['a', 'b'], system_prompt='Gate system', max_new_tokens=512)
@@ -468,7 +488,7 @@ class LocalValidationProbeTests(unittest.TestCase):
         self.assertEqual([call.kwargs['max_new_tokens'] for call in calls], [512, 512, 256])
         self.assertEqual([call.kwargs['system_prompt'] for call in calls],
                          ['Gate system', 'Gate system', probe.SYSTEM_PROMPT])
-        self.assertIs(client.actor, actor)
+        self.assertEqual(client.actors, [actor])
 
     def test_training_finally_closes_probe_even_on_failure(self):
         source = ast.parse((PPO.parent / 'main_ppo.py').read_text())
@@ -511,7 +531,7 @@ class GateBackendTests(unittest.TestCase):
             self.assertIsInstance(gate, local_probe.LocalFrozenProbeClient)
             self.assertEqual(gate.model, checkpoint)
             self.assertEqual(metrics.model, 'fixed-base-qwen')
-            self.assertIsNone(gate.actor)
+            self.assertEqual(gate.actors, [])
             gate.generate = Mock(return_value=[probe.ProbeResponse(r'\boxed{7}', 'stop', 2)])
             metrics.generate = Mock(side_effect=AssertionError('Must not use metrics model for gates'))
             trainer.actor_rollout_wg = {'decomposer': Mock(side_effect=AssertionError('Trainable copy used'))}

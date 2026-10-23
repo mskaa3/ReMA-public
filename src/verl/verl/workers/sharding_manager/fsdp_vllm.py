@@ -46,6 +46,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         full_params: bool = False,
         device_mesh: DeviceMesh = None,
         offload_param: bool = False,
+        keep_resident: bool = False,
     ):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer intialized in vLLMAsyncRollout.load_model
@@ -54,6 +55,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.model_config = model_config
         self.device_mesh = device_mesh
         self.offload_param = offload_param
+        self.keep_resident = keep_resident
+        self._weights_loaded = False
+        self._context_active = False
 
         # Full params
         self.full_params = full_params
@@ -81,6 +85,27 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.gen_random_states = None
 
     def __enter__(self):
+        if self._context_active:
+            raise RuntimeError('Rollout generation context is already active')
+        try:
+            if not self._weights_loaded:
+                self._sync_weights()
+                self._weights_loaded = True
+        except Exception:
+            # Wake-up may have partially succeeded on this rank.
+            self._weights_loaded = True
+            try:
+                self.release_resident()
+            except Exception:
+                logger.exception('Could not clean up failed rollout weight synchronization')
+            raise
+        if self.device_mesh is not None:
+            self.torch_random_states = torch.cuda.get_rng_state()
+            torch.cuda.set_rng_state(self.gen_random_states)
+        self._context_active = True
+        return self
+
+    def _sync_weights(self):
         # NOTE: Basically, we only need `torch.cuda.empty_cache()` before vllm wake_up and
         # after vllm sleep, since vllm has its own caching memory allocator CuMemAllocator.
         # Out of vllm scope, we should avoid empty cache to let pytorch using caching memory
@@ -124,12 +149,23 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
 
-        # important: need to manually set the random states of each tp to be identical.
-        if self.device_mesh is not None:
-            self.torch_random_states = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(self.gen_random_states)
-
     def __exit__(self, exc_type, exc_value, traceback):
+        if not self._context_active:
+            return
+        try:
+            if not self.keep_resident or exc_type is not None:
+                self.release_resident()
+            self.module.train()
+        finally:
+            if self.device_mesh is not None:
+                self.gen_random_states = torch.cuda.get_rng_state()
+                torch.cuda.set_rng_state(self.torch_random_states)
+            self._context_active = False
+
+    def release_resident(self):
+        """Invalidate inference weights before checkpoint I/O or a future reload."""
+        if not self._weights_loaded:
+            return
         # TODO(ZSL): check this
         if vllm_version in (
             "0.5.4",
@@ -138,16 +174,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.inference_engine.offload_model_weights()
         else:
             self.inference_engine.sleep(level=1)
-
-        self.module.train()
-
-        # add empty cache after each compute
+        self._weights_loaded = False
         torch.cuda.empty_cache()
-
-        # restore random states
-        if self.device_mesh is not None:
-            self.gen_random_states = torch.cuda.get_rng_state()
-            torch.cuda.set_rng_state(self.torch_random_states)
 
     def preprocess_data(self, data: DataProto) -> DataProto:
         """All gather across tp group to make each rank has identical input."""

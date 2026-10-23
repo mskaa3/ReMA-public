@@ -82,6 +82,64 @@ switch backends or inference versions midway through a comparison: the
 measurement protocol is shared, but bitwise identical generations are not
 guaranteed across inference environments.
 
+## Throughput without changing the measurement
+
+Local inference defaults to 8 requests per replica and one replica. Increase
+replicas explicitly; no GPU is silently taken from either training pool. For
+the four-node allocation with two six-GPU training pools, use:
+
+```bash
+export VALIDATION_PROBE_BATCH_SIZE=8
+export VALIDATION_PROBE_REPLICAS=4
+export KEEP_FROZEN_MODELS_RESIDENT=true
+```
+
+With `PREFIX_PROBE_SOLVER_BACKEND=frozen_probe` and no separate gate checkpoint,
+the same four replicas serve metrics and gates. The allocation is 6 decomposer
+GPUs + 6 worker GPUs + 4 probe GPUs. Replicas hold identical frozen weights;
+each input is evaluated once, not voted on four times. Prompt/output budgets,
+sampling, verifier, eligibility rules, and C3's 8 x 4 grouping do not change.
+
+For generated experiment manifests, set the fields in the study configuration
+before calling `write_runs` (exporting shell variables does not override a
+manifest):
+
+```python
+cfg['local_validation_probe'].update(batch_size=8, replicas=4)
+cfg['keep_frozen_models_resident'] = True
+```
+
+A separate gate model uses `FROZEN_GATE_BATCH_SIZE` and `FROZEN_GATE_REPLICAS`,
+or `frozen_gate_probe.batch_size` / `frozen_gate_probe.replicas` in the study.
+Counts add: four metrics replicas plus one separate gate replica require five
+extra GPUs. The experiment planner rounds up to enough extra nodes, while the
+ordinary launcher rejects insufficient allocations before starting models.
+The local probe still requires one exclusive GPU per replica and a checkpoint
+visible on every potential host.
+
+At most one batch is in flight on each replica. Completed replicas receive new
+work immediately, but responses are reassembled in original input order.
+Timeouts, incomplete outputs, or actor failures terminate all replicas and
+raise an error; partial results never become zeros or selected training data.
+
+Shared worker roles enter/exit their physical generation pool only once per
+rollout batch. With `trainer.keep_frozen_models_resident=True`, a vLLM pool
+excluded from **all** configured training roles stays resident between
+generation calls. Such a pool synchronizes weights on first use, not on every
+batch. Any pool that can train later in the curriculum retains the ordinary
+sleep/sync lifecycle, and updating a resident-frozen pool is explicitly
+rejected. Checkpoint save/load releases cached inference weights; the next
+generation resynchronizes them. Generation/actor RNG scopes remain separate.
+Use `KEEP_FROZEN_MODELS_RESIDENT=false` (or the corresponding trainer/study key)
+to disable residency without changing the deduplication fix.
+
+Regenerate manifests under new run names after these changes. Keep batch size,
+replica count, checkpoint and inference version identical across comparison
+arms: batching can change floating-point behavior even with greedy decoding.
+Benchmark completed updates/hour and phase timings, including backward-pass
+memory peaks; no particular speedup is guaranteed. This does not pipeline
+different rollout groups or introduce policy-stale asynchronous training.
+
 ## Fixed versus adaptive training gates
 
 The choice is independent of `prefix_probe.apply_to_training`, which still
@@ -117,9 +175,9 @@ limits and preserve equivalent prompt/output budgets in a comparison.
 
 The five metrics retain their own system prompt and output budget: a gate
 request cannot change subsequent evaluation settings. The local frozen model
-is loaded once, on the existing dedicated probe GPU, not once per purpose.
+is loaded once per replica, on dedicated probe GPUs, not once per purpose.
 Gate inference runs every applicable training batch, so frozen gating adds
-work to that GPU and may be slower than the decomposer's multi-GPU replicas.
+work to that inference pool and may be slower than the decomposer's replicas.
 
 `[prefix_probe]` and `[leakage/...]` console records identify `solver_backend`.
 Resolved W&B configuration, experiment manifests, evaluation metadata, and saved
@@ -163,9 +221,10 @@ and evaluation metadata, not only in a transient scratch path.
 Set `PREFIX_PROBE_SOLVER_BACKEND=role` instead to keep adaptive decomposer gates
 while still measuring metrics with this frozen snapshot. Alternatively, retain
 a distinct `FROZEN_GATE_MODEL_REMOTE` to use two different frozen checkpoints.
-Only the last option needs two probe GPUs. Sharing the metrics model for gates
-uses one probe GPU with separate per-request prompts/budgets. Explicitly setting
-both probe checkpoint configurations creates two actors, even for equal paths;
+With the default one replica per model, only the last option needs two probe
+GPUs. Sharing the metrics model for gates uses one inference pool with separate
+per-request prompts/budgets. Explicitly setting both checkpoint configurations
+creates two replica pools, even for equal paths;
 omit the separate gate configuration when you intend to share.
 
 In experiment JSON, set `local_validation_probe.model` to the immutable export
@@ -221,7 +280,7 @@ unset FROZEN_GATE_MODEL_PATH FROZEN_GATE_REVISION
 
 The common launcher stages the gate export into a separate
 `$JOB_TMP/frozen_gate_model` on every node, validates the HF files, and loads
-one inference-only GPU actor. It never uploads over the source checkpoint.
+one inference-only GPU actor per configured replica. It never uploads over the source checkpoint.
 Use a step-specific S3 export that will not be overwritten. Alternatively,
 `FROZEN_GATE_MODEL_PATH` accepts an immutable local HF directory visible inside
 the container on every node, or a HF model ID with a fixed 40-character
@@ -236,7 +295,8 @@ Experiment JSON accepts a separate configuration alongside the existing
   "model": "s3v2:YOUR_BUCKET/path/to/global_step_110/decomposer/huggingface",
   "extra_nodes": 1,
   "max_model_len": 16384,
-  "batch_size": 4
+  "batch_size": 8,
+  "replicas": 1
 }
 ```
 
@@ -245,11 +305,12 @@ accepts `--frozen-gate-checkpoint "$DECOMPOSER_MODEL_REMOTE"` (and
 `--frozen-gate-revision` for a HF model ID); this selects `frozen_probe` and does
 not replace `local_validation_probe`. Regenerate under a fresh study/run name.
 
-**Capacity:** a separate local gate plus local evaluation consumes two reserved
-GPUs, not one. `nodes=3` with four GPUs/node and `extra_nodes=1` still fits:
+**Capacity with one replica per model:** a separate local gate plus local
+evaluation consumes two reserved GPUs, not one. `nodes=3` with four GPUs/node
+and `extra_nodes=1` still fits:
 6 decomposer + 6 worker + 1 metric probe + 1 gate probe = 14 of 16 GPUs.
 The two probes share the extra allocation, not a GPU or model. Capacity checks
-include both actors. Gate-only runs can omit evaluation probes, but should not
+include every replica in both pools. Gate-only runs can omit evaluation probes, but should not
 be used for comparisons requiring the five fixed-probe metrics.
 
 This controls gate drift while keeping metrics fixed. It does not eliminate
@@ -259,7 +320,7 @@ errors. Keep that distinction explicit when interpreting the experiment.
 ## Local inference inside the training job
 
 This mode needs no HTTP server, endpoint address, or separate interactive
-session. A Ray actor loads the fixed model once on one exclusive GPU, outside
+session. Each Ray replica loads the fixed model once on one exclusive GPU, outside
 both training placement groups. It stays resident across validations and is
 killed when the trainer finishes or fails. Inference is batched; no training
 optimizer is created for the probe and its weights are never synchronized
@@ -284,11 +345,13 @@ Changing only the output directory does not change the S3 study identity.
 The manifest records `local_validation_probe.revision` and requests one extra
 node by default, without automatically changing `nodes` for the training pools.
 The CLI example above preserves the original pool sizes and allocates five
-nodes. The round-2 rerun recipe explicitly reduces `nodes` to three instead:
+nodes. The round-2 rerun recipe explicitly reduces `nodes` to three and requests
+four probe replicas instead:
 
 | Configuration | Decomposer GPUs | Worker GPUs | Probe GPUs | Unused GPUs |
 | --- | --- | --- | --- | --- |
 | `nodes=3`, `extra_nodes=1`: 4 nodes total | 6 | 6 | 1 | 3 |
+| `nodes=3`, `extra_nodes=1`, `replicas=4`: rerun recipe | 6 | 6 | 4 | 0 |
 | `nodes=4`, `extra_nodes=1`: 5 nodes total | 8 | 8 | 1 | 3 |
 
 These are homogeneous 4-GPU-per-node requests, not a promise that an entire
@@ -308,7 +371,8 @@ Optional manifest settings (defaults shown) are:
   "samples_per_dataset": 32,
   "max_new_tokens": 256,
   "max_model_len": 16384,
-  "batch_size": 4
+  "batch_size": 8,
+  "replicas": 1
 }
 ```
 

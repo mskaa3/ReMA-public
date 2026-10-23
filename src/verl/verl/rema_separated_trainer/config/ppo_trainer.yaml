@@ -213,6 +213,7 @@ algorithm:
       - /fs-computility/mabasic/shared/models/Qwen2.5-3B-Instruct
 
 trainer:
+  keep_frozen_models_resident: True
   frozen_gate_probe:
     enable: False
     backend: local
@@ -222,7 +223,8 @@ trainer:
     timeout_seconds: 180
     startup_timeout_seconds: 900
     max_model_len: 16384
-    batch_size: 4
+    batch_size: 8
+    replicas: 1
     gpu_memory_utilization: 0.8
   validation_probe:
     enable: False
@@ -237,7 +239,8 @@ trainer:
     concurrency: 4
     startup_timeout_seconds: 900
     max_model_len: 16384
-    batch_size: 4
+    batch_size: 8
+    replicas: 1
     gpu_memory_utilization: 0.8
   balance_batch: True
   total_epochs: 30

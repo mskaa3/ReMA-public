@@ -50,6 +50,7 @@ from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.utils import torch_functional as verl_F
 from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
+from verl.rema_separated_trainer.ppo.rollout_context import generation_context, frozen_pool_flags
 from verl.rema_separated_trainer.ppo.actor_batch import (
     pad_scoped_actor_batch,
     without_actor_padding,
@@ -3224,13 +3225,23 @@ class RayReMASeparatedTrainer(object):
         local_probes = [client for name in ('validation_probe_client', 'frozen_gate_probe_client')
                         if (client := getattr(self, name, None)) is not None and hasattr(client, 'check_capacity')]
         for client in local_probes:
-            client.check_capacity(self.resource_pool_manager.get_n_gpus(), probe_gpus=len(local_probes))
+            client.check_capacity(self.resource_pool_manager.get_n_gpus(),
+                                  probe_gpus=sum(probe.required_gpus for probe in local_probes))
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
         if self.hybrid_engine:
+            keep_resident = frozen_pool_flags(
+                self._get_rollout_agent_roles(), self._get_train_agent_roles(),
+                self._get_hierarchy_config().get('decomposer_role', 'decomposer'),
+                enabled=(self._hierarchy_enabled()
+                         and self.config.actor_rollout_ref.rollout.name == 'vllm'
+                         and self.config.trainer.get('keep_frozen_models_resident', True)),
+            )
+            print(f'[rollout] permanently frozen resident pools: decomposer={keep_resident[0]} '
+                  f'workers={keep_resident[1]}; shared roles enter/exit each pool once', flush=True)
             switch_config = self.config.algorithm.get('switch_agent', {})
             default_model_path = self.config.actor_rollout_ref.model.path
             model_paths = list(switch_config.get('model_paths', [default_model_path, default_model_path]))
@@ -3249,6 +3260,8 @@ class RayReMASeparatedTrainer(object):
 
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Agent0_ActorRollout)
             agent0_config = copy.deepcopy(self.config.actor_rollout_ref)
+            with open_dict(agent0_config.rollout):
+                agent0_config.rollout.keep_frozen_resident = keep_resident[0]
             agent0_config.model.path = model_paths[0]
             agent0_config.model.use_remove_padding = use_remove_padding_for(0)
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Agent0_ActorRollout],
@@ -3258,6 +3271,8 @@ class RayReMASeparatedTrainer(object):
 
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Agent1_ActorRollout)
             agent1_config = copy.deepcopy(self.config.actor_rollout_ref)
+            with open_dict(agent1_config.rollout):
+                agent1_config.rollout.keep_frozen_resident = keep_resident[1]
             agent1_config.model.path = model_paths[1] if len(model_paths) > 1 else model_paths[0]
             agent1_config.model.use_remove_padding = use_remove_padding_for(1 if len(model_paths) > 1 else 0)
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Agent1_ActorRollout],
@@ -3569,20 +3584,10 @@ class RayReMASeparatedTrainer(object):
         dummy_batch = DataProto.from_dict(
             {'dummy_tensor': torch.arange(0, len(gen_batch.batch))}
         )
-        for agent_role, wg in self.actor_rollout_wg.items():
+        for agent_role in self.actor_rollout_wg:
             assert agent_role in agent_roles, f'{agent_roles=}, {agent_role=}'
-            wg.enter_generate_context(dummy_batch)            
-        
-        
-        try: 
-            output = self.multi_agent_rollout.generate(gen_batch)
-        except Exception as e:
-            raise e
-        finally:
-            for agent_role, wg in self.actor_rollout_wg.items():
-                wg.exit_generate_context(dummy_batch)      
-    
-        return output
+        with generation_context(self.actor_rollout_wg.values(), dummy_batch):
+            return self.multi_agent_rollout.generate(gen_batch)
 
     def _update_current_train_agent(self, epoch: int = None) -> None:
         """Update the current training agent based on switch config.

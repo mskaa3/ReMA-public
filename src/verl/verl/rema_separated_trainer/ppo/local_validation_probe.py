@@ -4,6 +4,7 @@ import math
 import logging
 from pathlib import Path
 import re
+import time
 
 from .validation_probes import ProbeResponse, SYSTEM_PROMPT, probe_request_options
 
@@ -20,7 +21,8 @@ def local_probe_config(config):
     if not Path(result['model']).is_dir() and not re.fullmatch(r'[0-9a-fA-F]{40}', result['revision'] or ''):
         raise ValueError('Local validation probe requires a fixed 40-character Hugging Face revision, '
                          'or an immutable local model directory visible to the probe worker')
-    for key, default in (('max_new_tokens', 256), ('max_model_len', 16384), ('batch_size', 4)):
+    for key, default in (('max_new_tokens', 256), ('max_model_len', 16384),
+                         ('batch_size', 8), ('replicas', 1)):
         value = config.get(key, default)
         if isinstance(value, bool) or int(value) != value or int(value) <= 0:
             raise ValueError(f'validation_probe.{key} must be a positive integer')
@@ -118,17 +120,19 @@ class LocalProbeWorker:
 
 
 class LocalFrozenProbeClient:
-    """Own a dedicated inference actor for the job, not an HTTP endpoint."""
+    """Bounded parallel inference on identical, dedicated one-GPU replicas."""
 
     def __init__(self, config):
         self.config = local_probe_config(config)
         self.model = self.config['model']
         self.max_new_tokens = self.config['max_new_tokens']
-        self.actor = None
+        self.actors = []
+        self.required_gpus = self.config['replicas']
 
-    def check_capacity(self, training_gpus, *, probe_gpus=1):
+    def check_capacity(self, training_gpus, *, probe_gpus=None):
         import ray
         check_local_probe_dependencies()
+        probe_gpus = self.required_gpus if probe_gpus is None else probe_gpus
         available = ray.available_resources().get('GPU', 0)
         if available < training_gpus + probe_gpus:
             raise RuntimeError(f'Local frozen probes need {training_gpus} training GPUs plus {probe_gpus} '
@@ -137,17 +141,20 @@ class LocalFrozenProbeClient:
 
     def start(self):
         import ray
-        if self.actor is not None:
+        if self.actors:
             return
-        if ray.available_resources().get('GPU', 0) < 1:
-            raise RuntimeError('No free GPU remains outside the training pools for the frozen probe')
+        if ray.available_resources().get('GPU', 0) < self.required_gpus:
+            raise RuntimeError(f'Frozen probe requires {self.required_gpus} free GPUs outside training pools')
         actor_type = ray.remote(num_cpus=1, num_gpus=1, max_restarts=0,
                                 max_task_retries=0)(LocalProbeWorker)
         # Explicitly avoid inheriting a training placement group.
-        self.actor = actor_type.options(scheduling_strategy='DEFAULT').remote(self.config)
         try:
-            info = ray.get(self.actor.ready.remote(), timeout=self.config['startup_timeout_seconds'])
-            print(f'[validation/probe] local frozen model ready: {info}', flush=True)
+            for _ in range(self.required_gpus):
+                self.actors.append(actor_type.options(scheduling_strategy='DEFAULT').remote(self.config))
+            info = ray.get([actor.ready.remote() for actor in self.actors],
+                           timeout=self.config['startup_timeout_seconds'])
+            print(f'[validation/probe] local frozen replicas={len(self.actors)} '
+                  f'batch_size_per_replica={self.config["batch_size"]} ready: {info}', flush=True)
         except Exception:
             self.close()
             raise
@@ -157,18 +164,40 @@ class LocalFrozenProbeClient:
         system_prompt, budget = probe_request_options(system_prompt, max_new_tokens, self.max_new_tokens)
         if not messages:
             return []
-        if self.actor is None:
+        if not self.actors:
             raise RuntimeError('Local frozen probe has not been started')
-        responses = []
+        responses = [None] * len(messages)
+        pending = {}
+        next_start = 0
+
+        def submit(actor):
+            nonlocal next_start
+            start = next_start
+            chunk = messages[start:start + self.config['batch_size']]
+            next_start += len(chunk)
+            deadline = time.monotonic() + self.config['timeout_seconds']
+            ref = actor.generate.remote(chunk, system_prompt=system_prompt, max_new_tokens=budget)
+            pending[ref] = (actor, start, len(chunk), deadline)
+
         try:
-            for start in range(0, len(messages), self.config['batch_size']):
-                chunk = messages[start:start + self.config['batch_size']]
-                result = ray.get(self.actor.generate.remote(
-                    chunk, system_prompt=system_prompt, max_new_tokens=budget),
-                    timeout=self.config['timeout_seconds'])
-                if len(result) != len(chunk):
+            for actor in self.actors:
+                if next_start < len(messages):
+                    submit(actor)
+            while pending:
+                remaining = min(item[3] for item in pending.values()) - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Local frozen probe generation timed out')
+                ready, _ = ray.wait(list(pending), num_returns=1, timeout=remaining)
+                if not ready:
+                    raise TimeoutError('Local frozen probe generation timed out')
+                ref = ready[0]
+                actor, start, size, deadline = pending.pop(ref)
+                result = ray.get(ref, timeout=max(0, deadline - time.monotonic()))
+                if len(result) != size:
                     raise RuntimeError('Incomplete local probe generation batch')
-                responses.extend(result)
+                responses[start:start + size] = result
+                if next_start < len(messages):
+                    submit(actor)
         except Exception:
             # A timed-out inference must not continue running after evaluation fails.
             self.close()
@@ -176,11 +205,12 @@ class LocalFrozenProbeClient:
         return responses
 
     def close(self):
-        if self.actor is not None:
+        if self.actors:
             import ray
-            actor, self.actor = self.actor, None
-            try:
-                ray.kill(actor, no_restart=True)
-            except Exception:
-                # Preserve the original failure if the Ray cluster is already down.
-                logging.getLogger(__name__).warning('Could not stop local validation probe', exc_info=True)
+            actors, self.actors = self.actors, []
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    # Preserve the original failure if the Ray cluster is already down.
+                    logging.getLogger(__name__).warning('Could not stop local validation probe', exc_info=True)

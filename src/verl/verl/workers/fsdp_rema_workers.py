@@ -394,6 +394,7 @@ class ActorRolloutRefWorker(Worker):
                 full_params="hf" in self.config.rollout.load_format,
                 device_mesh=rollout_device_mesh,
                 offload_param=self._is_offload_param,
+                keep_resident=self.config.rollout.get('keep_frozen_resident', False),
             )
             log_gpu_memory_usage('After building sharding manager',
                                  logger=None)
@@ -510,6 +511,8 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        if self.config.rollout.get('keep_frozen_resident', False):
+            raise RuntimeError('Cannot update a permanently frozen resident model pool')
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
 
@@ -626,9 +629,9 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def enter_generate_context(self, prompts: DataProto):
         assert self._is_rollout
-        if self._is_offload_param:
+        # The sharding manager loads FSDP weights only when a sync is needed.
+        if self._is_offload_param and self.config.rollout.name != 'vllm':
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        
         self.rollout_sharding_manager.__enter__()
         # after parameters sync with rollout, offload actor model to CPU
         if self._is_offload_param:
@@ -782,6 +785,8 @@ class ActorRolloutRefWorker(Worker):
         # only support save and load ckpt for actor
         assert self._is_actor
         import torch
+        if self._is_rollout and hasattr(self.rollout_sharding_manager, 'release_resident'):
+            self.rollout_sharding_manager.release_resident()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
@@ -800,6 +805,8 @@ class ActorRolloutRefWorker(Worker):
                         local_path,
                         hdfs_path=None,
                         del_local_after_load=False):
+        if self._is_rollout and hasattr(self.rollout_sharding_manager, 'release_resident'):
+            self.rollout_sharding_manager.release_resident()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
