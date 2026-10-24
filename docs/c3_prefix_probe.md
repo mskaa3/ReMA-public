@@ -57,7 +57,7 @@ Both probes share one generation call and are deduplicated by input/scoring
 context within a generated batch. A normally completed boxed UNKNOWN is a valid negative recovery result;
 an empty, malformed, or unparseable mathematical answer is an invalid
 measurement. Length-stopped probes, even with a complete box, and surfaced verifier timeouts are also invalid, rather than evidence
-that the terminal instruction is safe. The generation limit remains configurable and defaults to 256
+that the terminal instruction is safe. The generation limit remains configurable and defaults to 1024
 tokens.
 
 The solver is configurable via `prefix_probe.solver_backend`: `role` (default)

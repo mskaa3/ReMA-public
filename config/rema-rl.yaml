@@ -353,7 +353,7 @@ algorithm:
         # frozen_probe uses frozen_gate_probe if enabled, otherwise validation_probe.
         solver_backend: role
         solver_role: decomposer
-        max_new_tokens: 256
+        max_new_tokens: 1024
         diagnostic_samples: 2
         # Zero disables validation probes while retaining the training gate.
         validation_max_samples: 128
@@ -402,7 +402,7 @@ trainer:
     backend: local
     model: null
     revision: null
-    max_new_tokens: 256
+    max_new_tokens: 1024
     timeout_seconds: 180
     startup_timeout_seconds: 900
     max_model_len: 16384
@@ -419,7 +419,7 @@ trainer:
     checkpoint_source: null  # original immutable export/ID, retained after local staging
     revision: null  # local HF models require an immutable 40-character commit hash
     samples_per_dataset: 32
-    max_new_tokens: 256
+    max_new_tokens: 1024
     timeout_seconds: 180
     concurrency: 4
     startup_timeout_seconds: 900

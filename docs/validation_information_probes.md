@@ -301,7 +301,7 @@ and omit `revision` (HF model IDs still require an immutable HF revision):
   "model": "s3v2:YOUR_BUCKET/path/to/global_step_110/decomposer/huggingface",
   "extra_nodes": 1,
   "samples_per_dataset": 32,
-  "max_new_tokens": 256
+  "max_new_tokens": 1024
 }
 ```
 
@@ -435,7 +435,7 @@ Optional manifest settings (defaults shown) are:
   "revision": "REPLACE_WITH_IMMUTABLE_HF_COMMIT_HASH",
   "extra_nodes": 1,
   "samples_per_dataset": 32,
-  "max_new_tokens": 256,
+  "max_new_tokens": 1024,
   "max_model_len": 16384,
   "batch_size": 8,
   "replicas": 1
@@ -524,7 +524,7 @@ export VALIDATION_PROBE_BACKEND=http
 # Optional: already the default when VALIDATION_PROBE_URL is supplied.
 export VALIDATION_PROBE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=32
-export VALIDATION_PROBE_MAX_NEW_TOKENS=256
+export VALIDATION_PROBE_MAX_NEW_TOKENS=1024
 # Optional if the server requires authentication:
 # export VALIDATION_PROBE_API_KEY="..."
 
@@ -543,7 +543,7 @@ trainer.validation_probe.backend=http
 trainer.validation_probe.base_url=http://PROBE_NODE:8000/v1
 trainer.validation_probe.model=Qwen/Qwen2.5-7B-Instruct
 trainer.validation_probe.samples_per_dataset=32
-trainer.validation_probe.max_new_tokens=256
+trainer.validation_probe.max_new_tokens=1024
 ```
 
 `timeout_seconds` (default 180) bounds each HTTP request; `concurrency` (default

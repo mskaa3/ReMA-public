@@ -19,6 +19,7 @@ from rollout_pipeline import pipeline_config  # noqa: E402
 
 PHASES = ('planners', 'workers', 'transfer', 'cross', 'adapt-planners', 'adapt-workers')
 WORKER_ROLES = '[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4]'
+DEFAULT_PROBE_MAX_NEW_TOKENS = 1024
 
 
 def read_json(path):
@@ -98,7 +99,7 @@ def validate_study(cfg):
         for key, default in (('extra_nodes', 1), ('max_model_len', 16384), ('batch_size', 8), ('replicas', 1)):
             if type(gate.get(key, default)) is not int or gate.get(key, default) < 1:
                 raise ValueError(f'frozen_gate_probe.{key} must be a positive integer')
-        if gate.get('max_model_len', 16384) <= 256:
+        if gate.get('max_model_len', 16384) <= DEFAULT_PROBE_MAX_NEW_TOKENS:
             raise ValueError('Frozen gate context must exceed its output budget')
     test_steps = cfg.get('test_update_steps', [])
     if (not isinstance(test_steps, list)
@@ -118,12 +119,15 @@ def validate_study(cfg):
         if ':' not in model and not model.startswith('/') and not re.fullmatch(r'[0-9a-fA-F]{40}', str(probe.get('revision', ''))):
             raise ValueError('local_validation_probe.revision must be a fixed 40-character HF commit hash')
         for key, default in (('extra_nodes', 1), ('samples_per_dataset', 32),
-                             ('max_new_tokens', 256), ('max_model_len', 16384), ('batch_size', 8), ('replicas', 1)):
+                             ('max_new_tokens', DEFAULT_PROBE_MAX_NEW_TOKENS), ('max_model_len', 16384), ('batch_size', 8), ('replicas', 1)):
             value = probe.get(key, default)
             if type(value) is not int or value < 1:
                 raise ValueError(f'local_validation_probe.{key} must be a positive integer')
-        if probe.get('max_model_len', 16384) <= probe.get('max_new_tokens', 256):
+        if probe.get('max_model_len', 16384) <= probe.get('max_new_tokens', DEFAULT_PROBE_MAX_NEW_TOKENS):
             raise ValueError('Local probe context must exceed its output budget')
+        if (cfg.get('gate_solver_backend') == 'frozen_probe' and gate is None
+                and probe.get('max_model_len', 16384) <= DEFAULT_PROBE_MAX_NEW_TOKENS):
+            raise ValueError('Shared probe context must exceed the prefix-probe output budget')
 
 
 def allocated_nodes(cfg):
@@ -270,7 +274,7 @@ def run_environment(run, *, check_allocation=True):
         'ROLLOUT_PIPELINE_GROUPS_PER_CHUNK': pipeline_config(cfg.get('rollout_probe_pipeline'))['groups_per_chunk'],
         # Preserve the existing successful-group requirement in every arm.
         'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
-        'PREFIX_PROBE_MAX_NEW_TOKENS': 256,
+        'PREFIX_PROBE_MAX_NEW_TOKENS': DEFAULT_PROBE_MAX_NEW_TOKENS,
         'PREFIX_PROBE_VALIDATION_MAX_SAMPLES': 128,
         'AGENT2_PILOT': 'false', 'GENERATE_TEACHER_DATA': 0, 'ONLINE_TEACHER_GENERATION': 'false',
         'TEACHER_TRAIN_REMOTE': '' if repository_data else train_source, 'TEACHER_TRAIN_SHARDS_REMOTE': '',
@@ -305,7 +309,7 @@ def run_environment(run, *, check_allocation=True):
             'VALIDATION_PROBE_MODEL_REMOTE': probe_model if ':' in probe_model else '',
             'VALIDATION_PROBE_REVISION': probe.get('revision') or '',
             'VALIDATION_PROBE_SAMPLES_PER_DATASET': probe.get('samples_per_dataset', 32),
-            'VALIDATION_PROBE_MAX_NEW_TOKENS': probe.get('max_new_tokens', 256),
+            'VALIDATION_PROBE_MAX_NEW_TOKENS': probe.get('max_new_tokens', DEFAULT_PROBE_MAX_NEW_TOKENS),
             'VALIDATION_PROBE_MAX_MODEL_LEN': probe.get('max_model_len', 16384),
             'VALIDATION_PROBE_BATCH_SIZE': probe.get('batch_size', 8),
             'VALIDATION_PROBE_REPLICAS': probe.get('replicas', 1),

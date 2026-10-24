@@ -920,7 +920,7 @@ class RayReMASeparatedTrainer(object):
         if uses_frozen_gate and separate_gate:
             if gate_config.get('backend', 'local') != 'local':
                 raise ValueError('frozen_gate_probe uses a dedicated local inference actor')
-            if int(self.prefix_probe_config.get('max_new_tokens', 256)) >= int(gate_config.get('max_model_len', 16384)):
+            if int(self.prefix_probe_config.get('max_new_tokens', 1024)) >= int(gate_config.get('max_model_len', 16384)):
                 raise ValueError('Frozen gate context must exceed the prefix-probe output budget')
             self.frozen_gate_probe_client = make_validation_probe_client(dict(gate_config, backend='local'))
             print(f'[prefix_probe] frozen_checkpoint={self.frozen_gate_probe_client.model} '
@@ -936,7 +936,7 @@ class RayReMASeparatedTrainer(object):
         if int(config.get('samples_per_dataset', 32)) < 1:
             raise ValueError('validation_probe.samples_per_dataset must be positive')
         if (uses_frozen_gate and not separate_gate and config.get('backend', 'http') == 'local'
-                and int(self.prefix_probe_config.get('max_new_tokens', 256)) >= int(config.get('max_model_len', 16384))):
+                and int(self.prefix_probe_config.get('max_new_tokens', 1024)) >= int(config.get('max_model_len', 16384))):
             raise ValueError('Frozen probe context must exceed the prefix-probe output budget')
         self.validation_probe_client = make_validation_probe_client(config)
         print(
@@ -1086,7 +1086,7 @@ class RayReMASeparatedTrainer(object):
                 f"Prefix-probe solver_role={solver_role!r} is absent from "
                 "algorithm.hierarchy.agent_roles"
             )
-        if int(self.prefix_probe_config.get('max_new_tokens', 256)) <= 0:
+        if int(self.prefix_probe_config.get('max_new_tokens', 1024)) <= 0:
             raise ValueError("Prefix-probe max_new_tokens must be positive")
         if int(self.prefix_probe_config.get('diagnostic_samples', 2)) < 0:
             raise ValueError(
@@ -1100,7 +1100,7 @@ class RayReMASeparatedTrainer(object):
             )
         print(f'[prefix_probe] solver_backend={solver_backend} '
               f'solver_role={solver_role if solver_backend == "role" else "none"} '
-              f'max_new_tokens={self.prefix_probe_config.get("max_new_tokens", 256)}', flush=True)
+              f'max_new_tokens={self.prefix_probe_config.get("max_new_tokens", 1024)}', flush=True)
 
     def _prefix_probe_gates_training(self):
         return self.prefix_probe_enabled and bool(
@@ -1175,7 +1175,7 @@ class RayReMASeparatedTrainer(object):
                 raise RuntimeError('Frozen gate probe is not configured; refusing to fall back to a training role')
             responses = client.generate(
                 messages, system_prompt=system_prompt,
-                max_new_tokens=int(self.prefix_probe_config.get('max_new_tokens', 256)),
+                max_new_tokens=int(self.prefix_probe_config.get('max_new_tokens', 1024)),
             )
             if len(responses) != len(messages):
                 raise RuntimeError('Prefix probe returned an incomplete generation batch')
@@ -1229,7 +1229,7 @@ class RayReMASeparatedTrainer(object):
                         self.config.actor_rollout_ref.rollout.response_length
                     ),
                     max_new_tokens=int(
-                        self.prefix_probe_config.get('max_new_tokens', 256)
+                        self.prefix_probe_config.get('max_new_tokens', 1024)
                     ),
                 )
             )

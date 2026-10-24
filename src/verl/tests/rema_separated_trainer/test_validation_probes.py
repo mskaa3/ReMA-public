@@ -267,7 +267,7 @@ class ValidationProbeTests(unittest.TestCase):
         self.assertEqual(responses[0].text, r'\boxed{26}')
         payload = requests[0]
         self.assertEqual(payload['temperature'], 0)
-        self.assertEqual(payload['max_tokens'], 256)
+        self.assertEqual(payload['max_tokens'], 1024)
         self.assertEqual(payload['n'], 1)
         self.assertEqual(payload['messages'][1]['content'], 'CURRENT TASK: use S1')
         self.assertNotIn('ground_truth', payload)
@@ -294,9 +294,9 @@ class ValidationProbeTests(unittest.TestCase):
             gate = client.generate(['gate input'], system_prompt='Gate system', max_new_tokens=512)
             client.generate(['eval input'])
         self.assertEqual(gate[0].num_gen_tokens, 12)
-        self.assertEqual([p['max_tokens'] for p in payloads], [512, 256])
+        self.assertEqual([p['max_tokens'] for p in payloads], [512, 1024])
         self.assertEqual([p['messages'][0]['content'] for p in payloads], ['Gate system', probe.SYSTEM_PROMPT])
-        self.assertEqual(client.max_new_tokens, 256)
+        self.assertEqual(client.max_new_tokens, 1024)
         for budget in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
                 client.generate(['task'], max_new_tokens=budget)
@@ -462,7 +462,7 @@ class LocalValidationProbeTests(unittest.TestCase):
         self.assertEqual(kwargs['tensor_parallel_size'], 1)
         self.assertEqual(kwargs['generation_config'], 'vllm')
         self.assertEqual(vllm.SamplingParams.call_args.kwargs['temperature'], 0)
-        self.assertEqual(vllm.SamplingParams.call_args.kwargs['max_tokens'], 256)
+        self.assertEqual(vllm.SamplingParams.call_args.kwargs['max_tokens'], 1024)
         messages = tokenizer.apply_chat_template.call_args.args[0]
         self.assertEqual(messages, [{'role': 'system', 'content': probe.SYSTEM_PROMPT},
                                     {'role': 'user', 'content': 'CURRENT TASK: use S1'}])
@@ -491,10 +491,10 @@ class LocalValidationProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'rather than truncate'):
                 worker.generate(['gate too long'], max_new_tokens=512)
         vllm.LLM.assert_called_once()
-        self.assertEqual([call.kwargs['max_tokens'] for call in vllm.SamplingParams.call_args_list], [512, 256])
+        self.assertEqual([call.kwargs['max_tokens'] for call in vllm.SamplingParams.call_args_list], [512, 1024])
         self.assertEqual([call.args[0][0]['content'] for call in tokenizer.apply_chat_template.call_args_list[:2]],
                          ['Gate system', probe.SYSTEM_PROMPT])
-        self.assertEqual(worker.config['max_new_tokens'], 256)
+        self.assertEqual(worker.config['max_new_tokens'], 1024)
 
     def test_local_client_forwards_gate_options_and_keeps_metrics_defaults(self):
         client = local_probe.LocalFrozenProbeClient(self.config(batch_size=1))
@@ -507,7 +507,7 @@ class LocalValidationProbeTests(unittest.TestCase):
             client.generate(['a', 'b'], system_prompt='Gate system', max_new_tokens=512)
             client.generate(['eval'])
         calls = actor.generate.remote.call_args_list
-        self.assertEqual([call.kwargs['max_new_tokens'] for call in calls], [512, 512, 256])
+        self.assertEqual([call.kwargs['max_new_tokens'] for call in calls], [512, 512, 1024])
         self.assertEqual([call.kwargs['system_prompt'] for call in calls],
                          ['Gate system', 'Gate system', probe.SYSTEM_PROMPT])
         self.assertEqual(client.actors, [actor])
@@ -590,7 +590,7 @@ class GateBackendTests(unittest.TestCase):
             self.assertEqual(extract_method('_generate_prefix_probe_responses')(trainer, ['task']),
                              ([r'\boxed{7}'], [2], ['stop']))
             client.generate.assert_called_once_with(['task'], system_prompt='Gate system', max_new_tokens=512)
-            self.assertEqual(client.max_new_tokens, 256)
+            self.assertEqual(client.max_new_tokens, 1024)
             client.close = Mock()
             extract_method('close_validation_probes')(trainer)
             client.close.assert_called_once()

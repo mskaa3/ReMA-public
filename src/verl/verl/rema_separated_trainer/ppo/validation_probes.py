@@ -95,7 +95,7 @@ class FrozenProbeClient:
             raise ValueError('validation_probe.base_url must be an HTTP(S) API base URL (ending in /v1)')
         if not self.model:
             raise ValueError('validation_probe.model must identify the frozen served checkpoint')
-        self.max_new_tokens = int(config.get('max_new_tokens', 256))
+        self.max_new_tokens = int(config.get('max_new_tokens', 1024))
         self.timeout = float(config.get('timeout_seconds', 180))
         self.concurrency = int(config.get('concurrency', 4))
         if min(self.max_new_tokens, self.timeout, self.concurrency) <= 0:

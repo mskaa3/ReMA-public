@@ -21,7 +21,7 @@ def local_probe_config(config):
     if not Path(result['model']).is_dir() and not re.fullmatch(r'[0-9a-fA-F]{40}', result['revision'] or ''):
         raise ValueError('Local validation probe requires a fixed 40-character Hugging Face revision, '
                          'or an immutable local model directory visible to the probe worker')
-    for key, default in (('max_new_tokens', 256), ('max_model_len', 16384),
+    for key, default in (('max_new_tokens', 1024), ('max_model_len', 16384),
                          ('batch_size', 8), ('replicas', 1)):
         value = config.get(key, default)
         if isinstance(value, bool) or int(value) != value or int(value) <= 0:
