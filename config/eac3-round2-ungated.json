@@ -13,7 +13,7 @@
   "seeds": [11],
   "eval_seed": 42,
   "planner_updates": 40,
-  "worker_updates": 40,
+  "worker_updates": 200,
   "rollout_step_limit": 1200,
   "test_freq": 10,
   "test_update_steps": [1, 2, 5],

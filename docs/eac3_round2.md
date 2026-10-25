@@ -81,9 +81,14 @@ is question-only: curriculum disabled, no teacher traces or teacher generation.
 Existing non-terminal full-question context, terminal task/results context,
 one-round sequential protocol, and C3 8 actions x 4 continuations stay unchanged.
 
-Both configurations use 40 completed actor updates per phase, with a safety cap
-of 1200 rollout steps. Evaluation is at initialization, updates 1, 2, 5, then
-every 10 updates; local checkpoints save every 10 updates before evaluation.
+Both configurations use 40 completed actor updates for planner training and
+200 for worker training, with a safety cap of 1200 rollout steps per phase.
+These are total updates across the shared worker model, not updates per worker
+position. Evaluation is at initialization, updates 1, 2, 5, then every 10 updates;
+local checkpoints save every 10 updates before evaluation.
+Regenerate launch manifests after changing these budgets: existing manifests
+retain their original settings, and a larger Slurm time limit alone does not
+increase the update target.
 Each job uses 4 nodes x 4 GPUs on `lem-gpu-short`; both together request 32 GPUs.
 These are weight-initialized new stages, not optimizer/dataloader resumes.
 
