@@ -30,6 +30,14 @@ class AnswerVerificationError(ValueError):
 _SYMBOLIC_ERRORS = (AttributeError, ValueError, TypeError, SyntaxError, NotImplementedError, RecursionError)
 
 
+@lru_cache(maxsize=1)
+def _symbolic_error_types():
+    # GeneratorsNeeded and PolynomialError are siblings, neither is a ValueError.
+    # Import lazily so loading the adapter does not initialize SymPy in the driver.
+    from sympy.polys.polyerrors import BasePolynomialError
+    return (*_SYMBOLIC_ERRORS, BasePolynomialError)
+
+
 def _native_boolean(expression):
     from sympy import And, Or, Not
     for operation in (And, Or, Not):
@@ -45,7 +53,7 @@ def _real_solution_set(expression):
         # it to a single relation. Native booleans preserve meaning without that
         # metadata bug. Inequality solution sets are over the real numbers.
         return _native_boolean(expression).as_set().intersect(S.Reals)
-    except _SYMBOLIC_ERRORS as exc:
+    except _symbolic_error_types() as exc:
         raise AnswerVerificationError(
             f"Cannot convert mathematical answer to a real solution set: {type(exc).__name__}: {exc}",
             "set_conversion_failed",
@@ -57,7 +65,7 @@ def _parse_for_verification(text, parse, latex_config, role):
         return _parse_expression(text, parse, latex_config)
     except AnswerVerificationError:
         raise
-    except _SYMBOLIC_ERRORS as exc:
+    except _symbolic_error_types() as exc:
         raise AnswerVerificationError(
             f"Cannot parse {role} mathematical answer: {type(exc).__name__}: {exc}",
             f"{role}_parse_failed",
@@ -279,7 +287,7 @@ def _compute_answer_score(model_output: str, ground_truth: str) -> float:
         # The parent enforces a hard deadline. Disable math-verify's SIGALRM
         # timeout, which can be swallowed or converted into a false verdict.
         return float(bool(answer) and verify(list(gold), list(answer), timeout_seconds=0))
-    except _SYMBOLIC_ERRORS as exc:
+    except _symbolic_error_types() as exc:
         raise AnswerVerificationError(
             f"Cannot compare mathematical answers: {type(exc).__name__}: {exc}",
             "comparison_failed",
