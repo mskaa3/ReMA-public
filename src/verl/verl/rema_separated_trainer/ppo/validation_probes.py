@@ -1,7 +1,7 @@
 """Evaluation-only information metrics and a shared frozen inference client."""
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -52,6 +52,35 @@ class ProbeResponse:
     text: str
     stop_reason: str
     num_gen_tokens: Optional[int] = None
+    retried: bool = False
+
+
+def generate_with_length_retry(generate, messages, *, system_prompt, max_new_tokens,
+                               retry_max_new_tokens):
+    """Retry only truncated completions, once; never use correctness to select outputs."""
+    responses = list(generate(messages, system_prompt=system_prompt, max_new_tokens=max_new_tokens))
+    if len(responses) != len(messages):
+        raise RuntimeError('Incomplete frozen probe generation batch')
+    indices = [i for i, response in enumerate(responses) if response.stop_reason == 'length']
+    if not indices or retry_max_new_tokens <= max_new_tokens:
+        return responses
+    retried = list(generate([messages[i] for i in indices], system_prompt=system_prompt,
+                            max_new_tokens=retry_max_new_tokens))
+    if len(retried) != len(indices):
+        raise RuntimeError('Incomplete frozen probe retry batch')
+    for index, response in zip(indices, retried):
+        responses[index] = replace(response, retried=True)
+    print(f'[probe/retry] requests={len(indices)} initial_budget={max_new_tokens} '
+          f'retry_budget={retry_max_new_tokens} '
+          f'completed={sum(r.stop_reason == "stop" for r in retried)}', flush=True)
+    return responses
+
+
+def probe_retry_budget(value, default=4096):
+    value = default if value is None else value
+    if type(value) is not int or value < 0:
+        raise ValueError('Probe retry_max_new_tokens must be a non-negative integer (0 disables retry)')
+    return value
 
 
 def probe_request_options(system_prompt, max_new_tokens, default_budget):
@@ -95,8 +124,9 @@ class FrozenProbeClient:
             raise ValueError('validation_probe.base_url must be an HTTP(S) API base URL (ending in /v1)')
         if not self.model:
             raise ValueError('validation_probe.model must identify the frozen served checkpoint')
-        self.max_new_tokens = int(config.get('max_new_tokens', 1024))
-        self.timeout = float(config.get('timeout_seconds', 180))
+        self.max_new_tokens = int(config.get('max_new_tokens', 2048))
+        self.retry_max_new_tokens = probe_retry_budget(config.get('retry_max_new_tokens'))
+        self.timeout = float(config.get('timeout_seconds', 600))
         self.concurrency = int(config.get('concurrency', 4))
         if min(self.max_new_tokens, self.timeout, self.concurrency) <= 0:
             raise ValueError('Validation probe budgets, concurrency and timeout must be positive')
@@ -134,11 +164,19 @@ class FrozenProbeClient:
             raise RuntimeError('Malformed frozen probe token count')
         return ProbeResponse(text, stop, tokens)
 
-    def generate(self, messages, *, system_prompt=SYSTEM_PROMPT, max_new_tokens=None):
+    def generate(self, messages, *, system_prompt=SYSTEM_PROMPT, max_new_tokens=None,
+                 retry_max_new_tokens=None):
         system_prompt, budget = probe_request_options(system_prompt, max_new_tokens, self.max_new_tokens)
+        return generate_with_length_retry(
+            self._generate_batch, messages, system_prompt=system_prompt,
+            max_new_tokens=budget,
+            retry_max_new_tokens=probe_retry_budget(retry_max_new_tokens, self.retry_max_new_tokens),
+        )
+
+    def _generate_batch(self, messages, *, system_prompt, max_new_tokens):
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
             return list(executor.map(partial(self._generate_one, system_prompt=system_prompt,
-                                             max_new_tokens=budget), messages))
+                                             max_new_tokens=max_new_tokens), messages))
 
 
 def make_validation_probe_client(config):
@@ -205,6 +243,7 @@ def evaluate_probes(examples, generate, parse_answers, score_responses):
                 'valid': valid[source] if source is not None else False,
                 'missing_context': source is None,
                 'truncated': response.stop_reason == 'length' if response else False,
+                'retried': response.retried if response else False,
                 'unknown': unknown[source] if source is not None else False,
                 'score': 0.0,
             }
@@ -237,7 +276,7 @@ def evaluate_probes(examples, generate, parse_answers, score_responses):
         for condition in CONDITIONS:
             items = [record['conditions'][condition] for record in group]
             metrics[f'{prefix}/{condition}_acc'] = sum(item['score'] for item in items) / count
-            for field in ('valid', 'missing_context', 'truncated', 'unknown'):
+            for field in ('valid', 'missing_context', 'truncated', 'unknown', 'retried'):
                 metrics[f'{diagnostics}/{condition}/{field}_rate'] = sum(item[field] for item in items) / count
         metrics[f'{prefix}/information_gain'] = (
             metrics[f'{prefix}/with_results_acc'] - metrics[f'{prefix}/terminal_only_acc']

@@ -19,7 +19,8 @@ from rollout_pipeline import pipeline_config  # noqa: E402
 
 PHASES = ('planners', 'workers', 'transfer', 'cross', 'adapt-planners', 'adapt-workers')
 WORKER_ROLES = '[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4]'
-DEFAULT_PROBE_MAX_NEW_TOKENS = 1024
+DEFAULT_PROBE_MAX_NEW_TOKENS = 2048
+DEFAULT_PROBE_RETRY_MAX_NEW_TOKENS = 4096
 
 
 def read_json(path):
@@ -99,7 +100,7 @@ def validate_study(cfg):
         for key, default in (('extra_nodes', 1), ('max_model_len', 16384), ('batch_size', 8), ('replicas', 1)):
             if type(gate.get(key, default)) is not int or gate.get(key, default) < 1:
                 raise ValueError(f'frozen_gate_probe.{key} must be a positive integer')
-        if gate.get('max_model_len', 16384) <= DEFAULT_PROBE_MAX_NEW_TOKENS:
+        if gate.get('max_model_len', 16384) <= DEFAULT_PROBE_RETRY_MAX_NEW_TOKENS:
             raise ValueError('Frozen gate context must exceed its output budget')
     test_steps = cfg.get('test_update_steps', [])
     if (not isinstance(test_steps, list)
@@ -123,10 +124,11 @@ def validate_study(cfg):
             value = probe.get(key, default)
             if type(value) is not int or value < 1:
                 raise ValueError(f'local_validation_probe.{key} must be a positive integer')
-        if probe.get('max_model_len', 16384) <= probe.get('max_new_tokens', DEFAULT_PROBE_MAX_NEW_TOKENS):
+        if probe.get('max_model_len', 16384) <= max(
+                probe.get('max_new_tokens', DEFAULT_PROBE_MAX_NEW_TOKENS), DEFAULT_PROBE_RETRY_MAX_NEW_TOKENS):
             raise ValueError('Local probe context must exceed its output budget')
         if (cfg.get('gate_solver_backend') == 'frozen_probe' and gate is None
-                and probe.get('max_model_len', 16384) <= DEFAULT_PROBE_MAX_NEW_TOKENS):
+                and probe.get('max_model_len', 16384) <= DEFAULT_PROBE_RETRY_MAX_NEW_TOKENS):
             raise ValueError('Shared probe context must exceed the prefix-probe output budget')
 
 
@@ -275,6 +277,8 @@ def run_environment(run, *, check_allocation=True):
         # Preserve the existing successful-group requirement in every arm.
         'C3_REQUIRE_ELIGIBLE_SUCCESS': 'true',
         'PREFIX_PROBE_MAX_NEW_TOKENS': DEFAULT_PROBE_MAX_NEW_TOKENS,
+        'PROBE_RETRY_MAX_NEW_TOKENS': DEFAULT_PROBE_RETRY_MAX_NEW_TOKENS,
+        'C3_SELECT_AVAILABLE_WORKER': 'true',
         'PREFIX_PROBE_VALIDATION_MAX_SAMPLES': 128,
         'AGENT2_PILOT': 'false', 'GENERATE_TEACHER_DATA': 0, 'ONLINE_TEACHER_GENERATION': 'false',
         'TEACHER_TRAIN_REMOTE': '' if repository_data else train_source, 'TEACHER_TRAIN_SHARDS_REMOTE': '',

@@ -6,7 +6,8 @@ from pathlib import Path
 import re
 import time
 
-from .validation_probes import ProbeResponse, SYSTEM_PROMPT, probe_request_options
+from .validation_probes import (ProbeResponse, SYSTEM_PROMPT, probe_request_options,
+                                generate_with_length_retry, probe_retry_budget)
 
 
 def local_probe_config(config):
@@ -21,13 +22,15 @@ def local_probe_config(config):
     if not Path(result['model']).is_dir() and not re.fullmatch(r'[0-9a-fA-F]{40}', result['revision'] or ''):
         raise ValueError('Local validation probe requires a fixed 40-character Hugging Face revision, '
                          'or an immutable local model directory visible to the probe worker')
-    for key, default in (('max_new_tokens', 1024), ('max_model_len', 16384),
+    for key, default in (('max_new_tokens', 2048), ('max_model_len', 16384),
                          ('batch_size', 8), ('replicas', 1)):
         value = config.get(key, default)
         if isinstance(value, bool) or int(value) != value or int(value) <= 0:
             raise ValueError(f'validation_probe.{key} must be a positive integer')
         result[key] = int(value)
-    for key, default in (('timeout_seconds', 180), ('startup_timeout_seconds', 900),
+    retry = probe_retry_budget(config.get('retry_max_new_tokens'))
+    result['retry_max_new_tokens'] = retry
+    for key, default in (('timeout_seconds', 600), ('startup_timeout_seconds', 900),
                          ('gpu_memory_utilization', 0.8)):
         value = float(config.get(key, default))
         if not math.isfinite(value) or value <= 0:
@@ -35,7 +38,7 @@ def local_probe_config(config):
         result[key] = value
     if result['gpu_memory_utilization'] > 1:
         raise ValueError('validation_probe.gpu_memory_utilization cannot exceed 1')
-    if result['max_model_len'] <= result['max_new_tokens']:
+    if result['max_model_len'] <= max(result['max_new_tokens'], retry):
         raise ValueError('Probe context must leave room for both input and output tokens')
     return result
 
@@ -159,9 +162,20 @@ class LocalFrozenProbeClient:
             self.close()
             raise
 
-    def generate(self, messages, *, system_prompt=SYSTEM_PROMPT, max_new_tokens=None):
-        import ray
+    def generate(self, messages, *, system_prompt=SYSTEM_PROMPT, max_new_tokens=None,
+                 retry_max_new_tokens=None):
         system_prompt, budget = probe_request_options(system_prompt, max_new_tokens, self.max_new_tokens)
+        retry = probe_retry_budget(retry_max_new_tokens, self.config['retry_max_new_tokens'])
+        if max(budget, retry) >= self.config['max_model_len']:
+            raise ValueError('Probe context must leave room for both input and output tokens')
+        return generate_with_length_retry(
+            self._generate_batch, messages, system_prompt=system_prompt,
+            max_new_tokens=budget, retry_max_new_tokens=retry,
+        )
+
+    def _generate_batch(self, messages, *, system_prompt, max_new_tokens):
+        import ray
+        budget = max_new_tokens
         if not messages:
             return []
         if not self.actors:

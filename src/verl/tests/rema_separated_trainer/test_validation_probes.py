@@ -48,6 +48,52 @@ def extract_method(name, **bindings):
 
 
 class ValidationProbeTests(unittest.TestCase):
+    def test_retry_is_bounded_and_only_replaces_truncated_responses(self):
+        first = [probe.ProbeResponse(r'\boxed{7}', 'stop', 3),
+                 probe.ProbeResponse('unfinished', 'length', 2048)]
+        generate = Mock(side_effect=[first, [probe.ProbeResponse(r'\boxed{UNKNOWN}', 'stop', 2200)]])
+        result = probe.generate_with_length_retry(generate, ['a', 'b'], system_prompt='fixed',
+            max_new_tokens=2048, retry_max_new_tokens=4096)
+        self.assertIs(result[0], first[0])
+        self.assertTrue(result[1].retried)
+        generate.assert_called_with(['b'], system_prompt='fixed', max_new_tokens=4096)
+        self.assertEqual(generate.call_count, 2)
+
+    def test_exhausted_retry_stays_truncated_and_no_retry_on_unknown_or_wrong(self):
+        generate = Mock(return_value=[probe.ProbeResponse(r'\boxed{7}', 'length', 4096)])
+        result = probe.generate_with_length_retry(generate, ['a'], system_prompt='fixed',
+            max_new_tokens=2048, retry_max_new_tokens=4096)
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(result[0].stop_reason, 'length')
+        self.assertTrue(result[0].retried)
+        for stop, retry_budget in [('stop', 4096), ('length', 0)]:
+            generate = Mock(return_value=[probe.ProbeResponse(r'\boxed{UNKNOWN}', stop, 20)])
+            probe.generate_with_length_retry(generate, ['a'], system_prompt='fixed',
+                max_new_tokens=2048, retry_max_new_tokens=retry_budget)
+            generate.assert_called_once()
+
+    def test_retry_failures_are_not_converted_into_nonleaking_results(self):
+        for failure in (RuntimeError('endpoint failed'), []):
+            generate = Mock(side_effect=[[probe.ProbeResponse('unfinished', 'length')], failure])
+            with self.assertRaises(RuntimeError):
+                probe.generate_with_length_retry(generate, ['a'], system_prompt='fixed',
+                    max_new_tokens=2048, retry_max_new_tokens=4096)
+
+    def test_retry_budget_validation(self):
+        self.assertEqual(probe.probe_retry_budget(None), 4096)
+        self.assertEqual(probe.probe_retry_budget(0), 0)
+        for invalid in (-1, True, 1.5, '4096'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                probe.probe_retry_budget(invalid)
+
+    def test_retry_is_logged_in_evaluation_without_changing_denominators(self):
+        responses = [probe.ProbeResponse(r'\boxed{26}', 'stop', 2500, retried=True)] * 3
+        metrics, records = probe.evaluate_probes([example()], lambda _: responses,
+            lambda xs: [True] * len(xs), lambda *args, **kwargs: [1.] * 3)
+        self.assertEqual(metrics['val_diagnostics/probe/gsm8k/terminal_only/retried_rate'], 1.)
+        self.assertEqual(metrics['val_diagnostics/probe/gsm8k/sample_count'], 1)
+        self.assertTrue(records[0]['conditions']['terminal_only']['retried'])
+
     def test_pipeline_shell_settings_are_explicit_and_validated(self):
         launcher = (ROOT / 'agent12-curriculum-trainer-multinode.sh').read_text()
         start = launcher.index('export ROLLOUT_PROBE_PIPELINE=')
@@ -257,7 +303,7 @@ class ValidationProbeTests(unittest.TestCase):
 
         def open_request(request, timeout):
             requests.append(json.loads(request.data))
-            self.assertEqual(timeout, 180)
+            self.assertEqual(timeout, 600)
             self.assertEqual(request.full_url, 'http://probe:8000/v1/chat/completions')
             return io.BytesIO(json.dumps({'model': 'frozen-v1', 'choices': [
                 {'message': {'content': r'\boxed{26}'}, 'finish_reason': 'stop'}]}).encode())
@@ -267,7 +313,7 @@ class ValidationProbeTests(unittest.TestCase):
         self.assertEqual(responses[0].text, r'\boxed{26}')
         payload = requests[0]
         self.assertEqual(payload['temperature'], 0)
-        self.assertEqual(payload['max_tokens'], 1024)
+        self.assertEqual(payload['max_tokens'], 2048)
         self.assertEqual(payload['n'], 1)
         self.assertEqual(payload['messages'][1]['content'], 'CURRENT TASK: use S1')
         self.assertNotIn('ground_truth', payload)
@@ -294,9 +340,9 @@ class ValidationProbeTests(unittest.TestCase):
             gate = client.generate(['gate input'], system_prompt='Gate system', max_new_tokens=512)
             client.generate(['eval input'])
         self.assertEqual(gate[0].num_gen_tokens, 12)
-        self.assertEqual([p['max_tokens'] for p in payloads], [512, 1024])
+        self.assertEqual([p['max_tokens'] for p in payloads], [512, 2048])
         self.assertEqual([p['messages'][0]['content'] for p in payloads], ['Gate system', probe.SYSTEM_PROMPT])
-        self.assertEqual(client.max_new_tokens, 1024)
+        self.assertEqual(client.max_new_tokens, 2048)
         for budget in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
                 client.generate(['task'], max_new_tokens=budget)
@@ -351,6 +397,17 @@ class ValidationProbeTests(unittest.TestCase):
 
 
 class LocalValidationProbeTests(unittest.TestCase):
+    def test_client_retries_only_length_stopped_subset_with_same_prompt(self):
+        client = local_probe.LocalFrozenProbeClient(self.config())
+        client._generate_batch = Mock(side_effect=[
+            [probe.ProbeResponse('ok', 'stop'), probe.ProbeResponse('partial', 'length')],
+            [probe.ProbeResponse('complete', 'stop')],
+        ])
+        result = client.generate(['a', 'b'], system_prompt='gate')
+        client._generate_batch.assert_called_with(['b'], system_prompt='gate', max_new_tokens=4096)
+        self.assertEqual([r.text for r in result], ['ok', 'complete'])
+        self.assertTrue(result[1].retried)
+
     def config(self, **kwargs):
         return {'backend': 'local', 'model': 'Qwen/Qwen2.5-7B-Instruct',
                 'revision': 'a' * 40, **kwargs}
@@ -462,7 +519,7 @@ class LocalValidationProbeTests(unittest.TestCase):
         self.assertEqual(kwargs['tensor_parallel_size'], 1)
         self.assertEqual(kwargs['generation_config'], 'vllm')
         self.assertEqual(vllm.SamplingParams.call_args.kwargs['temperature'], 0)
-        self.assertEqual(vllm.SamplingParams.call_args.kwargs['max_tokens'], 1024)
+        self.assertEqual(vllm.SamplingParams.call_args.kwargs['max_tokens'], 2048)
         messages = tokenizer.apply_chat_template.call_args.args[0]
         self.assertEqual(messages, [{'role': 'system', 'content': probe.SYSTEM_PROMPT},
                                     {'role': 'user', 'content': 'CURRENT TASK: use S1'}])
@@ -491,10 +548,10 @@ class LocalValidationProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'rather than truncate'):
                 worker.generate(['gate too long'], max_new_tokens=512)
         vllm.LLM.assert_called_once()
-        self.assertEqual([call.kwargs['max_tokens'] for call in vllm.SamplingParams.call_args_list], [512, 1024])
+        self.assertEqual([call.kwargs['max_tokens'] for call in vllm.SamplingParams.call_args_list], [512, 2048])
         self.assertEqual([call.args[0][0]['content'] for call in tokenizer.apply_chat_template.call_args_list[:2]],
                          ['Gate system', probe.SYSTEM_PROMPT])
-        self.assertEqual(worker.config['max_new_tokens'], 1024)
+        self.assertEqual(worker.config['max_new_tokens'], 2048)
 
     def test_local_client_forwards_gate_options_and_keeps_metrics_defaults(self):
         client = local_probe.LocalFrozenProbeClient(self.config(batch_size=1))
@@ -507,7 +564,7 @@ class LocalValidationProbeTests(unittest.TestCase):
             client.generate(['a', 'b'], system_prompt='Gate system', max_new_tokens=512)
             client.generate(['eval'])
         calls = actor.generate.remote.call_args_list
-        self.assertEqual([call.kwargs['max_new_tokens'] for call in calls], [512, 512, 1024])
+        self.assertEqual([call.kwargs['max_new_tokens'] for call in calls], [512, 512, 2048])
         self.assertEqual([call.kwargs['system_prompt'] for call in calls],
                          ['Gate system', 'Gate system', probe.SYSTEM_PROMPT])
         self.assertEqual(client.actors, [actor])
@@ -589,8 +646,9 @@ class GateBackendTests(unittest.TestCase):
             client.generate = Mock(return_value=[probe.ProbeResponse(r'\boxed{7}', 'stop', 2)])
             self.assertEqual(extract_method('_generate_prefix_probe_responses')(trainer, ['task']),
                              ([r'\boxed{7}'], [2], ['stop']))
-            client.generate.assert_called_once_with(['task'], system_prompt='Gate system', max_new_tokens=512)
-            self.assertEqual(client.max_new_tokens, 1024)
+            client.generate.assert_called_once_with(['task'], system_prompt='Gate system', max_new_tokens=512,
+                                                   retry_max_new_tokens=4096)
+            self.assertEqual(client.max_new_tokens, 2048)
             client.close = Mock()
             extract_method('close_validation_probes')(trainer)
             client.close.assert_called_once()
@@ -657,7 +715,7 @@ class GateBackendTests(unittest.TestCase):
         generate = extract_method('_generate_prefix_probe_responses')
         self.assertEqual(generate(trainer, ['input']), ([r'\boxed{7}'], [10], ['stop']))
         trainer.validation_probe_client.generate.assert_called_once_with(
-            ['input'], system_prompt='Gate system', max_new_tokens=512)
+            ['input'], system_prompt='Gate system', max_new_tokens=512, retry_max_new_tokens=4096)
         self.assertEqual(generate(trainer, []), ([], [], []))
         trainer.validation_probe_client.generate.return_value = []
         with self.assertRaisesRegex(RuntimeError, 'incomplete'):
@@ -682,7 +740,7 @@ class GateBackendTests(unittest.TestCase):
         trainer.actor_rollout_wg = {'decomposer': rollout}
         trainer.role_tokenizers = {'decomposer': tokenizer}
         trainer.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(
-            rollout=SimpleNamespace(response_length=1024, prompt_length=8192)))
+            rollout=SimpleNamespace(response_length=2048, prompt_length=8192)))
         trainer.multi_agent_rollout = Mock()
         trainer.multi_agent_rollout._generate_from_chat_list.return_value = ([''], [10], ['stop'], None, [[7]])
         self.assertEqual(generate(trainer, ['input']), ([r'\boxed{7}'], [10], ['stop']))
@@ -691,6 +749,8 @@ class GateBackendTests(unittest.TestCase):
         self.assertEqual(call.args[1][0][0]['content'], 'Gate system')
         self.assertFalse(call.args[3]['do_sample'])
         self.assertEqual(call.kwargs['max_new_tokens'], 512)
+        self.assertEqual(call.kwargs['response_length'], 512)
+        self.assertEqual(call.args[3]['probe_response_length'], 512)
         rollout.enter_generate_context.assert_called_once()
         rollout.exit_generate_context.assert_called_once()
         trainer.validation_probe_client.generate.assert_not_called()
@@ -702,6 +762,62 @@ class GateBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'rather than truncate'):
             generate(trainer, ['long input'])
         self.assertEqual(rollout.enter_generate_context.call_count, 2)
+
+    def test_role_gate_retries_only_length_and_keeps_the_larger_response(self):
+        generate = extract_method('_generate_prefix_probe_responses',
+            torch=SimpleNamespace(arange=lambda n: list(range(n))),
+            DataProto=SimpleNamespace(from_dict=lambda x: x),
+            pad_dataproto_to_divisor=lambda batch, divisor: (batch, 0))
+        trainer = self.trainer('role')
+        trainer.prefix_probe_config.update(max_new_tokens=2048, retry_max_new_tokens=4096)
+        tokenizer, rollout = Mock(), Mock(world_size=1)
+        tokenizer.batch_decode.return_value = [r'\boxed{7}', r'\boxed{UNKNOWN}']
+        tokenizer.apply_chat_template.return_value = [[1], [2]]
+        trainer._tokenizer_for_role = lambda role: tokenizer
+        trainer.actor_rollout_wg = {'decomposer': rollout}
+        trainer.role_tokenizers = {'decomposer': tokenizer}
+        trainer.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(response_length=1024, prompt_length=6144)))
+        trainer.multi_agent_rollout = Mock()
+        call = trainer.multi_agent_rollout._generate_from_chat_list
+        call.side_effect = [([r'\boxed{7}', 'unfinished'], [10, 2048], ['stop', 'length'], None, [[7], [1]]),
+                            ([''], [2300], ['stop'], None, [[8]])]
+        self.assertEqual(generate(trainer, ['a', 'b']),
+                         ([r'\boxed{7}', r'\boxed{UNKNOWN}'], [10, 2300], ['stop', 'stop']))
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_args.args[1], [[{'role': 'system', 'content': 'Gate system'},
+                                                 {'role': 'user', 'content': 'b'}]])
+        self.assertEqual(call.call_args.args[3]['probe_response_length'], 4096)
+        self.assertEqual(call.call_args.kwargs['response_length'], 4096)
+        self.assertEqual(call.call_args.kwargs['max_new_tokens'], 4096)
+        rollout.exit_generate_context.assert_called_once()
+
+    def test_vllm_probe_budget_override_does_not_change_training_limits(self):
+        tree = ast.parse((ROOT / 'src/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py').read_text())
+        method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'generate_sequences')
+        start = next(i for i, n in enumerate(method.body) if isinstance(n, ast.Assign)
+                     and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'max_new_tokens')
+        end = next(i for i in range(start, len(method.body)) if isinstance(method.body[i], ast.With))
+        block = compile(ast.Module(body=method.body[start:end], type_ignores=[]), '<vllm-budget>', 'exec')
+        config = SimpleNamespace(response_length=1024, prompt_length=6144)
+
+        def check(meta, **options):
+            namespace = dict(self=SimpleNamespace(config=config), prompts=SimpleNamespace(meta_info=meta),
+                             vllm_inputs=[{'prompt_token_ids': [1] * 200}], kwargs={},
+                             do_sample=False, is_validate=True, is_multi_turn=False)
+            namespace.update(options)
+            exec(block, namespace)
+            return namespace['response_length'], namespace['kwargs']['max_tokens']
+
+        self.assertEqual(check({'max_new_tokens': 4096}), (1024, 1024))
+        self.assertEqual(check({'max_new_tokens': 4096, 'probe_response_length': 4096}), (4096, 4096))
+        self.assertEqual(config.response_length, 1024)
+        for options in ({'do_sample': True}, {'is_validate': False}, {'is_multi_turn': True}):
+            with self.assertRaisesRegex(ValueError, 'reserved'):
+                check({'max_new_tokens': 4096, 'probe_response_length': 4096}, **options)
+        with self.assertRaisesRegex(ValueError, 'context'):
+            check({'max_new_tokens': 4096, 'probe_response_length': 4096},
+                  vllm_inputs=[{'prompt_token_ids': [1] * 4000}])
 
     def test_frozen_gate_requires_enabled_metrics_and_sufficient_context(self):
         trainer = self.trainer()

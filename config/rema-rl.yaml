@@ -328,6 +328,8 @@ algorithm:
     # trained role and independently generate the complete remaining suffix.
     scoped_c3_grpo:
       enable: True
+      # Select a shared-worker role from generated plans, then pin it for the update.
+      select_available_worker: True
       # rollout.n is total trajectory slots: actions * continuations. The
       # Agent-2 launcher uses 32 slots = 8 actions * 4 independent suffixes.
       continuations_per_action: 1
@@ -353,7 +355,8 @@ algorithm:
         # frozen_probe uses frozen_gate_probe if enabled, otherwise validation_probe.
         solver_backend: role
         solver_role: decomposer
-        max_new_tokens: 1024
+        max_new_tokens: 2048
+        retry_max_new_tokens: 4096
         diagnostic_samples: 2
         # Zero disables validation probes while retaining the training gate.
         validation_max_samples: 128
@@ -402,8 +405,9 @@ trainer:
     backend: local
     model: null
     revision: null
-    max_new_tokens: 1024
-    timeout_seconds: 180
+    max_new_tokens: 2048
+    retry_max_new_tokens: 4096
+    timeout_seconds: 600
     startup_timeout_seconds: 900
     max_model_len: 16384
     batch_size: 8
@@ -419,8 +423,9 @@ trainer:
     checkpoint_source: null  # original immutable export/ID, retained after local staging
     revision: null  # local HF models require an immutable 40-character commit hash
     samples_per_dataset: 32
-    max_new_tokens: 1024
-    timeout_seconds: 180
+    max_new_tokens: 2048
+    retry_max_new_tokens: 4096
+    timeout_seconds: 600
     concurrency: 4
     startup_timeout_seconds: 900
     max_model_len: 16384

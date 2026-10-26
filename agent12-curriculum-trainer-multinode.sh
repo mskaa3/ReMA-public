@@ -25,7 +25,8 @@ export VALIDATION_PROBE_MODEL_REMOTE=${VALIDATION_PROBE_MODEL_REMOTE:-}
 export VALIDATION_PROBE_BACKEND=${VALIDATION_PROBE_BACKEND:-}
 export VALIDATION_PROBE_REVISION=${VALIDATION_PROBE_REVISION:-}
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=${VALIDATION_PROBE_SAMPLES_PER_DATASET:-32}
-export VALIDATION_PROBE_MAX_NEW_TOKENS=${VALIDATION_PROBE_MAX_NEW_TOKENS:-1024}
+export VALIDATION_PROBE_MAX_NEW_TOKENS=${VALIDATION_PROBE_MAX_NEW_TOKENS:-2048}
+export PROBE_RETRY_MAX_NEW_TOKENS=${PROBE_RETRY_MAX_NEW_TOKENS:-4096}
 export VALIDATION_PROBE_MAX_MODEL_LEN=${VALIDATION_PROBE_MAX_MODEL_LEN:-16384}
 export VALIDATION_PROBE_BATCH_SIZE=${VALIDATION_PROBE_BATCH_SIZE:-8}
 export VALIDATION_PROBE_REPLICAS=${VALIDATION_PROBE_REPLICAS:-1}
@@ -130,7 +131,16 @@ if [[ -n "$FROZEN_GATE_MODEL_REMOTE" || -n "$FROZEN_GATE_MODEL_PATH" ]]; then
     fi
 fi
 export C3_REQUIRE_ELIGIBLE_SUCCESS=${C3_REQUIRE_ELIGIBLE_SUCCESS:-true}
-export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-1024}
+export C3_SELECT_AVAILABLE_WORKER=${C3_SELECT_AVAILABLE_WORKER:-true}
+case "$C3_SELECT_AVAILABLE_WORKER" in
+    true|false) ;;
+    *) echo "C3_SELECT_AVAILABLE_WORKER must be true or false" >&2; exit 1 ;;
+esac
+if [[ ! "$PROBE_RETRY_MAX_NEW_TOKENS" =~ ^[0-9]+$ ]]; then
+    echo "PROBE_RETRY_MAX_NEW_TOKENS must be non-negative (0 disables retry)" >&2
+    exit 1
+fi
+export PREFIX_PROBE_MAX_NEW_TOKENS=${PREFIX_PROBE_MAX_NEW_TOKENS:-2048}
 export PREFIX_PROBE_VALIDATION_MAX_SAMPLES=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES:-128}
 case "$PREFIX_PROBE_SOLVER_BACKEND" in
     role|frozen_probe) ;;
@@ -555,8 +565,10 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training=${PREFIX_PROBE_APPLY_TO_TRAINING} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_backend=${PREFIX_PROBE_SOLVER_BACKEND} \
   algorithm.hierarchy.scoped_c3_grpo.require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS} \
+  algorithm.hierarchy.scoped_c3_grpo.select_available_worker=${C3_SELECT_AVAILABLE_WORKER} \
   algorithm.hierarchy.scoped_c3_grpo.continuations_per_action=${C3_CONTINUATIONS_PER_ACTION} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
+  algorithm.hierarchy.scoped_c3_grpo.prefix_probe.retry_max_new_tokens=${PROBE_RETRY_MAX_NEW_TOKENS} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES} \
   actor_rollout_ref.rollout.n=${ROLLOUT_N} \
   trainer.nnodes=${TRAINING_NNODES} \
@@ -587,6 +599,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
             "trainer.validation_probe.revision=${VALIDATION_PROBE_REVISION:-null}" \
             "trainer.validation_probe.samples_per_dataset=${VALIDATION_PROBE_SAMPLES_PER_DATASET}" \
             "trainer.validation_probe.max_new_tokens=${VALIDATION_PROBE_MAX_NEW_TOKENS}" \
+            "trainer.validation_probe.retry_max_new_tokens=${PROBE_RETRY_MAX_NEW_TOKENS}" \
             "trainer.validation_probe.max_model_len=${VALIDATION_PROBE_MAX_MODEL_LEN}" \
             "trainer.validation_probe.batch_size=${VALIDATION_PROBE_BATCH_SIZE}" \
             "trainer.validation_probe.replicas=${VALIDATION_PROBE_REPLICAS}"; do
@@ -598,6 +611,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
     local gate_argument
     for gate_argument in \
         "trainer.frozen_gate_probe.enable=${FROZEN_GATE_ENABLE}" \
+        "trainer.frozen_gate_probe.retry_max_new_tokens=${PROBE_RETRY_MAX_NEW_TOKENS}" \
         "trainer.frozen_gate_probe.model=${FROZEN_GATE_MODEL_PATH:-null}" \
         "trainer.frozen_gate_probe.revision=${FROZEN_GATE_REVISION:-null}" \
         "trainer.frozen_gate_probe.max_model_len=${FROZEN_GATE_MAX_MODEL_LEN}" \
@@ -1008,7 +1022,9 @@ validation_probe_model_remote=${VALIDATION_PROBE_MODEL_REMOTE}
 validation_probe_model=${VALIDATION_PROBE_MODEL}
 validation_probe_revision=${VALIDATION_PROBE_REVISION}
 c3_require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS}
+c3_select_available_worker=${C3_SELECT_AVAILABLE_WORKER}
 prefix_probe_max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS}
+probe_retry_max_new_tokens=${PROBE_RETRY_MAX_NEW_TOKENS}
 prefix_probe_validation_max_samples=${PREFIX_PROBE_VALIDATION_MAX_SAMPLES}
 prefix_probe_gate=terminal_instruction
 agent2_pilot=${AGENT2_PILOT}

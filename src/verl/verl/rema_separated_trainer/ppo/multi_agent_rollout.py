@@ -12,6 +12,7 @@ import re
 import hashlib
 from verl.rema_separated_trainer.ppo.local_results import extract_local_result
 from verl.rema_separated_trainer.ppo.validation_probes import make_probe_inputs
+from verl.rema_separated_trainer.ppo.c3_role_selection import select_present_worker_role
 
 
 def curriculum_context_is_visible(
@@ -1903,6 +1904,22 @@ class MultiAgentRollout:
                 ordered_stages = ordered_stages_by_idx.get(idx, [])
                 if ordered_stages:
                     terminal_stage_roles[idx] = ordered_stages[-1][0]
+
+            if (c3_active and i_turn == c3_branch_turn
+                    and c3_focal_role in stage_roles
+                    and prompts.meta_info.get("c3_select_available_worker", False)):
+                selected, coverage = select_present_worker_role(
+                    ordered_stages_by_idx, c3_group_ids,
+                    prompts.meta_info["c3_candidate_worker_roles"],
+                    np.random.default_rng(prompts.meta_info.get('c3_role_selection_seed', 0)),
+                )
+                # The prefix has not branched yet. Pin one role for all chunks
+                # and resampling batches belonging to this optimizer update.
+                if selected is not None:
+                    c3_focal_role = selected
+                    prompts.meta_info["c3_focal_role"] = selected
+                    prompts.meta_info["c3_select_available_worker"] = False
+                print(f"[c3/role_selection] selected={selected} plan_group_coverage={coverage}", flush=True)
 
             # 3. Execute selected worker stages sequentially. Stage roles encode
             # the order; each later worker sees previous results.

@@ -920,7 +920,8 @@ class RayReMASeparatedTrainer(object):
         if uses_frozen_gate and separate_gate:
             if gate_config.get('backend', 'local') != 'local':
                 raise ValueError('frozen_gate_probe uses a dedicated local inference actor')
-            if int(self.prefix_probe_config.get('max_new_tokens', 1024)) >= int(gate_config.get('max_model_len', 16384)):
+            if max(int(self.prefix_probe_config.get('max_new_tokens', 2048)),
+                   int(self.prefix_probe_config.get('retry_max_new_tokens', 4096))) >= int(gate_config.get('max_model_len', 16384)):
                 raise ValueError('Frozen gate context must exceed the prefix-probe output budget')
             self.frozen_gate_probe_client = make_validation_probe_client(dict(gate_config, backend='local'))
             print(f'[prefix_probe] frozen_checkpoint={self.frozen_gate_probe_client.model} '
@@ -936,7 +937,8 @@ class RayReMASeparatedTrainer(object):
         if int(config.get('samples_per_dataset', 32)) < 1:
             raise ValueError('validation_probe.samples_per_dataset must be positive')
         if (uses_frozen_gate and not separate_gate and config.get('backend', 'http') == 'local'
-                and int(self.prefix_probe_config.get('max_new_tokens', 1024)) >= int(config.get('max_model_len', 16384))):
+                and max(int(self.prefix_probe_config.get('max_new_tokens', 2048)),
+                        int(self.prefix_probe_config.get('retry_max_new_tokens', 4096))) >= int(config.get('max_model_len', 16384))):
             raise ValueError('Frozen probe context must exceed the prefix-probe output budget')
         self.validation_probe_client = make_validation_probe_client(config)
         print(
@@ -1086,8 +1088,11 @@ class RayReMASeparatedTrainer(object):
                 f"Prefix-probe solver_role={solver_role!r} is absent from "
                 "algorithm.hierarchy.agent_roles"
             )
-        if int(self.prefix_probe_config.get('max_new_tokens', 1024)) <= 0:
+        if int(self.prefix_probe_config.get('max_new_tokens', 2048)) <= 0:
             raise ValueError("Prefix-probe max_new_tokens must be positive")
+        retry_budget = self.prefix_probe_config.get('retry_max_new_tokens', 4096)
+        if type(retry_budget) is not int or retry_budget < 0:
+            raise ValueError('Prefix-probe retry_max_new_tokens must be a non-negative integer')
         if int(self.prefix_probe_config.get('diagnostic_samples', 2)) < 0:
             raise ValueError(
                 "Prefix-probe diagnostic_samples must be non-negative"
@@ -1100,7 +1105,8 @@ class RayReMASeparatedTrainer(object):
             )
         print(f'[prefix_probe] solver_backend={solver_backend} '
               f'solver_role={solver_role if solver_backend == "role" else "none"} '
-              f'max_new_tokens={self.prefix_probe_config.get("max_new_tokens", 1024)}', flush=True)
+              f'max_new_tokens={self.prefix_probe_config.get("max_new_tokens", 2048)} '
+              f'retry_max_new_tokens={retry_budget}', flush=True)
 
     def _prefix_probe_gates_training(self):
         return self.prefix_probe_enabled and bool(
@@ -1175,7 +1181,8 @@ class RayReMASeparatedTrainer(object):
                 raise RuntimeError('Frozen gate probe is not configured; refusing to fall back to a training role')
             responses = client.generate(
                 messages, system_prompt=system_prompt,
-                max_new_tokens=int(self.prefix_probe_config.get('max_new_tokens', 1024)),
+                max_new_tokens=int(self.prefix_probe_config.get('max_new_tokens', 2048)),
+                retry_max_new_tokens=int(self.prefix_probe_config.get('retry_max_new_tokens', 4096)),
             )
             if len(responses) != len(messages):
                 raise RuntimeError('Prefix probe returned an incomplete generation batch')
@@ -1202,6 +1209,7 @@ class RayReMASeparatedTrainer(object):
             'do_sample': False,
             'validate': True,
             'is_multi_turn': False,
+            'probe_response_length': int(self.prefix_probe_config.get('max_new_tokens', 2048)),
         }
         rollout = self.actor_rollout_wg[solver_role]
         dummy_batch = DataProto.from_dict({
@@ -1225,14 +1233,32 @@ class RayReMASeparatedTrainer(object):
                     chats,
                     self.role_tokenizers,
                     probe_meta_info,
-                    response_length=(
-                        self.config.actor_rollout_ref.rollout.response_length
-                    ),
+                    response_length=probe_meta_info['probe_response_length'],
                     max_new_tokens=int(
-                        self.prefix_probe_config.get('max_new_tokens', 1024)
+                        self.prefix_probe_config.get('max_new_tokens', 2048)
                     ),
                 )
             )
+            retry_budget = int(self.prefix_probe_config.get('retry_max_new_tokens', 4096))
+            retry_indices = [i for i, stop in enumerate(stop_reasons) if stop == 'length']
+            if retry_indices and retry_budget > int(self.prefix_probe_config.get('max_new_tokens', 2048)):
+                retried_outputs, retried_tokens, retried_stops, _, retried_ids = (
+                    self.multi_agent_rollout._generate_from_chat_list(
+                        solver_role, [chats[i] for i in retry_indices], self.role_tokenizers,
+                        dict(probe_meta_info, probe_response_length=retry_budget),
+                        response_length=retry_budget,
+                        max_new_tokens=retry_budget,
+                    )
+                )
+                if len(retried_outputs) != len(retry_indices):
+                    raise RuntimeError('Incomplete role probe retry batch')
+                for j, index in enumerate(retry_indices):
+                    outputs[index] = retried_outputs[j]
+                    num_gen_tokens[index] = retried_tokens[j]
+                    stop_reasons[index] = retried_stops[j]
+                    output_token_ids[index] = retried_ids[j]
+                print(f'[probe/retry] backend=role requests={len(retry_indices)} '
+                      f'retry_budget={retry_budget} completed={retried_stops.count("stop")}', flush=True)
         finally:
             rollout.exit_generate_context(padded_dummy_batch)
 
@@ -3630,7 +3656,11 @@ class RayReMASeparatedTrainer(object):
             self._rollout_pipeline_status = reason
         metrics['rollout/pipeline/enabled'] = float(reason == 'enabled')
         if reason != 'enabled':
-            return self.multi_turn_generate_sequences(gen_batch), None
+            selecting = gen_batch.meta_info.get('c3_select_available_worker', False)
+            output = self.multi_turn_generate_sequences(gen_batch)
+            if 'c3_candidate_worker_roles' in gen_batch.meta_info:
+                self._adopt_c3_focal_role(gen_batch, output, selecting=selecting)
+            return output, None
 
         slices = complete_group_slices(
             gen_batch.non_tensor_batch['uid'], int(self.config.actor_rollout_ref.rollout.n),
@@ -3641,9 +3671,12 @@ class RayReMASeparatedTrainer(object):
             chunk = gen_batch[selection]
             chunk.meta_info = deepcopy(gen_batch.meta_info)
             expected_uids = list(chunk.non_tensor_batch['uid'])
+            selecting = gen_batch.meta_info.get('c3_select_available_worker', False)
             output = self.multi_agent_rollout.generate(chunk)
             if len(output) != len(expected_uids) or list(output.non_tensor_batch['uid']) != expected_uids:
                 raise RuntimeError('Pipeline generation changed C3 group order or returned an incomplete chunk')
+            if 'c3_candidate_worker_roles' in gen_batch.meta_info:
+                self._adopt_c3_focal_role(gen_batch, output, selecting=selecting)
             return output
 
         def prepare(selection, output):
@@ -3665,6 +3698,23 @@ class RayReMASeparatedTrainer(object):
         timing_raw['pipeline_generation'] = stats['generation_seconds']
         timing_raw['pipeline_probe_wait'] = stats['probe_wait_seconds']
         return DataProto.concat(outputs), cache
+
+    def _adopt_c3_focal_role(self, gen_batch, output, *, selecting=False):
+        """Use the actual branch role for probes, advantages and actor updates."""
+        if not selecting:
+            if output.meta_info.get('c3_focal_role') != self._current_train_agent:
+                raise RuntimeError('C3 focal role changed within a pinned optimizer batch')
+            return
+        role = output.meta_info.get('c3_focal_role')
+        if role not in gen_batch.meta_info['c3_candidate_worker_roles']:
+            raise RuntimeError('C3 selected an untrainable worker role')
+        if self.actor_rollout_wg[role] is not self.actor_rollout_wg[self._current_train_agent]:
+            raise RuntimeError('Plan-aware C3 selection requires a shared worker model')
+        self._current_train_agent = role
+        self._current_train_agent_idx = self._get_train_agent_roles().index(role)
+        gen_batch.meta_info['c3_focal_role'] = role
+        gen_batch.meta_info['c3_select_available_worker'] = False
+        output.meta_info['c3_select_available_worker'] = False
 
     def _update_current_train_agent(self, epoch: int = None) -> None:
         """Update the current training agent based on switch config.
@@ -3877,7 +3927,8 @@ class RayReMASeparatedTrainer(object):
         experiment_effort = {'trajectory_slots': 0, 'generation_seconds': 0.0}
 
         for epoch in range(self.config.trainer.total_epochs):
-            self._update_current_train_agent(epoch)
+            if num_gen_batches == 0:
+                self._update_current_train_agent(epoch)
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -3955,6 +4006,19 @@ class RayReMASeparatedTrainer(object):
                     )
                 gen_batch.meta_info['c3_focal_role'] = self._current_train_agent
                 gen_batch.meta_info['validate'] = False
+                if (self.scoped_c3_grpo_enabled
+                        and self.scoped_c3_grpo_config.get('select_available_worker', False)
+                        and int(self.config.actor_rollout_ref.rollout.max_num_turns) == 1):
+                    worker_roles = self._get_hierarchy_config().get('stage_roles', [])
+                    if self._current_train_agent in worker_roles:
+                        gen_batch.meta_info['c3_candidate_worker_roles'] = [
+                            role for role in self._get_train_agent_roles() if role in worker_roles
+                            and self.actor_rollout_wg[role] is self.actor_rollout_wg[self._current_train_agent]
+                        ]
+                        gen_batch.meta_info['c3_select_available_worker'] = num_gen_batches == 1
+                        gen_batch.meta_info['c3_role_selection_seed'] = (
+                            int(self.config.actor_rollout_ref.rollout.get('seed', 0)) + int(self.global_steps)
+                        )
                 if agent12_curriculum_enabled:
                     gen_batch.meta_info['curriculum_step'] = self._get_schedule_step()
                     gen_batch.meta_info['curriculum_phase'] = curriculum_state.phase

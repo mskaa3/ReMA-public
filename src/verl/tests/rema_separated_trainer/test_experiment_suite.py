@@ -62,18 +62,20 @@ def record(question='q', plan='PLAN:\n- S1: Compute x.\n- S2: Use S1.', score=1.
 
 
 class ExperimentTests(unittest.TestCase):
-    def test_probe_budgets_default_to_1024_and_validate_context_capacity(self):
+    def test_probe_budgets_default_to_2048_and_validate_context_capacity(self):
         cfg = repository_config()
         cfg.update(gate_solver_backend='frozen_probe',
                    local_validation_probe={'model': 's3:bucket/frozen'})
         env = suite.run_environment(suite.make_runs(cfg, 'workers')[0], check_allocation=False)
-        self.assertEqual(env['PREFIX_PROBE_MAX_NEW_TOKENS'], 1024)
-        self.assertEqual(env['VALIDATION_PROBE_MAX_NEW_TOKENS'], 1024)
-        cfg['local_validation_probe']['max_new_tokens'] = 2048
-        env = suite.run_environment(suite.make_runs(cfg, 'workers')[0], check_allocation=False)
+        self.assertEqual(env['PREFIX_PROBE_MAX_NEW_TOKENS'], 2048)
         self.assertEqual(env['VALIDATION_PROBE_MAX_NEW_TOKENS'], 2048)
+        self.assertEqual(env['PROBE_RETRY_MAX_NEW_TOKENS'], 4096)
+        self.assertEqual(env['C3_SELECT_AVAILABLE_WORKER'], 'true')
+        cfg['local_validation_probe']['max_new_tokens'] = 3072
+        env = suite.run_environment(suite.make_runs(cfg, 'workers')[0], check_allocation=False)
+        self.assertEqual(env['VALIDATION_PROBE_MAX_NEW_TOKENS'], 3072)
         cfg['local_validation_probe'].update(max_new_tokens=256, max_model_len=512)
-        with self.assertRaisesRegex(ValueError, 'prefix-probe output budget'):
+        with self.assertRaisesRegex(ValueError, 'Local probe context'):
             suite.make_runs(cfg, 'workers')
         cfg['local_validation_probe']['max_model_len'] = 16384
         cfg['frozen_gate_probe'] = {'model': 's3:bucket/gate', 'max_model_len': 1024}
@@ -182,8 +184,8 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(opts['trainer.validation_probe.model'], tmp + '/validation_probe_model')
             self.assertEqual(opts['trainer.validation_probe.checkpoint_source'], source)
             self.assertEqual(opts['trainer.validation_probe.revision'], 'null')
-            self.assertEqual(opts['trainer.validation_probe.max_new_tokens'], '1024')
-            self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens'], '1024')
+            self.assertEqual(opts['trainer.validation_probe.max_new_tokens'], '2048')
+            self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens'], '2048')
             self.assertEqual(opts['trainer.frozen_gate_probe.enable'], 'false')
             result = subprocess.run(['bash', '-c', defaults], env=dict(env, SLURM_NNODES='4'),
                                     capture_output=True, text=True)
@@ -359,7 +361,7 @@ class ExperimentTests(unittest.TestCase):
                     self.assertEqual(env['PREFIX_PROBE_APPLY_TO_TRAINING'],
                                      str(mode == 'gated' and phase == 'workers').lower())
                     self.assertEqual(env['C3_REQUIRE_ELIGIBLE_SUCCESS'], 'true')
-                    self.assertEqual(env['PREFIX_PROBE_MAX_NEW_TOKENS'], 1024)
+                    self.assertEqual(env['PREFIX_PROBE_MAX_NEW_TOKENS'], 2048)
                     self.assertEqual(env['PREFIX_PROBE_VALIDATION_MAX_SAMPLES'], 128)
                     self.assertEqual(env['TRAIN_DECOMPOSER'], 'false')
                     self.assertIn('prefix_probe.solver_role=decomposer', env['AGENT12_EXPERIMENT_OVERRIDES'])
@@ -760,7 +762,7 @@ class ExperimentTests(unittest.TestCase):
                         self.assertEqual(opts['trainer.validation_probe.backend'], 'local')
                         self.assertEqual(opts['trainer.validation_probe.base_url'], 'null')
                         self.assertEqual(opts['trainer.validation_probe.revision'], 'a' * 40)
-                        self.assertEqual(opts['trainer.validation_probe.max_new_tokens'], '1024')
+                        self.assertEqual(opts['trainer.validation_probe.max_new_tokens'], '2048')
                         self.assertEqual(opts['algorithm.hierarchy.scoped_c3_grpo.prefix_probe.apply_to_training'],
                                          str(phase == 'adapt-planners' or arm == 'gated').lower())
 

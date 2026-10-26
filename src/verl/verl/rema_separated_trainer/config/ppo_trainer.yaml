@@ -222,8 +222,9 @@ trainer:
     backend: local
     model: null
     revision: null
-    max_new_tokens: 1024
-    timeout_seconds: 180
+    max_new_tokens: 2048
+    retry_max_new_tokens: 4096
+    timeout_seconds: 600
     startup_timeout_seconds: 900
     max_model_len: 16384
     batch_size: 8
@@ -237,8 +238,9 @@ trainer:
     checkpoint_source: null
     revision: null
     samples_per_dataset: 32
-    max_new_tokens: 1024
-    timeout_seconds: 180
+    max_new_tokens: 2048
+    retry_max_new_tokens: 4096
+    timeout_seconds: 600
     concurrency: 4
     startup_timeout_seconds: 900
     max_model_len: 16384

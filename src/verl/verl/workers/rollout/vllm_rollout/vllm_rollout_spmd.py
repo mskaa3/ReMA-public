@@ -255,10 +255,19 @@ class vLLMRollout(BaseRollout):
                 kwargs['stop'] = [prompts.meta_info['finish_flag']]
 
         max_new_tokens = prompts.meta_info.get("max_new_tokens")
+        response_length = int(self.config.response_length)
+        probe_length = prompts.meta_info.get("probe_response_length")
+        if probe_length is not None:
+            if do_sample or not is_validate or is_multi_turn or type(probe_length) is not int or probe_length <= 0:
+                raise ValueError('probe_response_length is reserved for greedy, validation-only probes')
+            response_length = probe_length
+            if any(len(item['prompt_token_ids']) + response_length >
+                   int(self.config.prompt_length) + int(self.config.response_length) for item in vllm_inputs):
+                raise ValueError('Role probe exceeds model context; use a frozen probe with a longer context')
         if max_new_tokens is not None:
             kwargs["max_tokens"] = max(
                 1,
-                min(int(max_new_tokens), int(self.config.response_length)),
+                min(int(max_new_tokens), response_length),
             )
 
         # users can customize different sampling_params at different run
@@ -290,7 +299,7 @@ class vLLMRollout(BaseRollout):
             response = pad_2d_list_to_length(
                 response,
                 self.pad_token_id,
-                max_length=self.config.response_length).to(idx.device)
+                max_length=response_length).to(idx.device)
 
             if self.sampling_params.n > 1 and do_sample:
                 idx = _repeat_interleave(idx, self.sampling_params.n)

@@ -21,6 +21,29 @@ Each focal action appears once in the baseline and actor loss. Generic M=1
 retains the previous estimator. See [Scoped C3-GRPO](scoped_c3_grpo.md) for
 sampling, costs, and limitations. Raw accuracy still uses individual Y_jm.
 
+### Plan-aware worker selection
+
+`scoped_c3_grpo.select_available_worker=True` (launcher:
+`C3_SELECT_AVAILABLE_WORKER=true`) selects the focal worker after generating
+and routing plans, before generating any worker actions. It applies to
+single-round training with a shared worker model, not to decomposer training
+or evaluation. Worker roles are sampled in proportion to the number of distinct
+question/attempt groups containing them; the 32 copies of a group count once.
+An absent W3/W4 therefore does not consume an entire scheduled update when the
+observed plans only contain W1/W2. Selection uses the rollout seed and rollout
+step, never outcomes, leakage results, or advantages.
+
+One focal role is pinned for the whole optimizer attempt, including subsequent
+generation chunks and resampling batches. With the rollout/probe pipeline,
+the first chunk's plans determine the choice; without it, the first generated
+batch does. Subsequent chunks do not choose a different role. This preserves
+8 alternatives x 4 continuations with an identical pre-action prefix per UID.
+Some other groups may still lack the selected role and remain masked. Empty
+plans, uniformly successful/failed alternatives, or all-rejected actions can
+still produce no update. This reduces absent-role starvation; it does not
+guarantee informative eligible successes or equal training frequency per stage.
+Set the option to `false` to retain the fixed role-switch schedule.
+
 Only groups with differing action means, at least two factual alternatives, and at least one
 eligible successful focal action are used for optimization. For worker training, masked actions remain
 baseline donors. Their outcomes are not replaced by zero before computing
@@ -57,8 +80,30 @@ Both probes share one generation call and are deduplicated by input/scoring
 context within a generated batch. A normally completed boxed UNKNOWN is a valid negative recovery result;
 an empty, malformed, or unparseable mathematical answer is an invalid
 measurement. Length-stopped probes, even with a complete box, and surfaced verifier timeouts are also invalid, rather than evidence
-that the terminal instruction is safe. The generation limit remains configurable and defaults to 1024
-tokens.
+that the terminal instruction is safe. The generation limit defaults to 2048
+output tokens. Only a length-stopped probe is regenerated once with a 4096-token
+budget, using the same input, system prompt, and greedy decoding. The second
+response replaces the truncated one; correctness never controls retry or output
+selection. Another length stop remains invalid. This is regeneration from the
+same input, not continuation of the truncated text, so it incurs extra inference.
+
+The launchers expose `PREFIX_PROBE_MAX_NEW_TOKENS=2048`,
+`VALIDATION_PROBE_MAX_NEW_TOKENS=2048`, and `PROBE_RETRY_MAX_NEW_TOKENS=4096`.
+Set the retry budget to 0 to disable retry. Direct Hydra runs configure
+`prefix_probe.retry_max_new_tokens` for gates and
+`trainer.validation_probe.retry_max_new_tokens` for evaluation. Frozen gate
+calls receive the prefix-probe budget even when sharing the metrics client.
+Console `[probe/retry]` reports retries; evaluation also records `retried_rate`
+under `val_diagnostics/probe/<dataset>/<condition>/`.
+
+Role-backed probes can exceed the worker response budget without changing
+worker generation limits, but input plus requested output must still fit the
+role engine's context. Otherwise the call fails explicitly; use a frozen probe
+with a longer context rather than silently truncating its input. Frozen local
+probes default to a 16384-token context and a 600-second inference timeout.
+Regenerate experiment manifests to pick up new defaults; existing manifests
+and explicit environment overrides retain their configured budgets. Compare
+experimental arms using the same budgets and retry policy.
 
 The solver is configurable via `prefix_probe.solver_backend`: `role` (default)
 uses the current `solver_role`, normally the decomposer; `frozen_probe` uses the

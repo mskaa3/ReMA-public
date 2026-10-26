@@ -301,7 +301,7 @@ and omit `revision` (HF model IDs still require an immutable HF revision):
   "model": "s3v2:YOUR_BUCKET/path/to/global_step_110/decomposer/huggingface",
   "extra_nodes": 1,
   "samples_per_dataset": 32,
-  "max_new_tokens": 1024
+  "max_new_tokens": 2048
 }
 ```
 
@@ -435,7 +435,7 @@ Optional manifest settings (defaults shown) are:
   "revision": "REPLACE_WITH_IMMUTABLE_HF_COMMIT_HASH",
   "extra_nodes": 1,
   "samples_per_dataset": 32,
-  "max_new_tokens": 1024,
+  "max_new_tokens": 2048,
   "max_model_len": 16384,
   "batch_size": 8,
   "replicas": 1
@@ -463,7 +463,7 @@ Missing capacity is an error, not a request to share a training GPU. The shell
 checks requested capacity, the trainer checks Ray capacity before initializing
 training models, and the client checks for a free GPU after training placement
 groups are created. Actor startup has a 900-second limit; each inference batch
-uses `timeout_seconds` (180 by default). Failed startup/inference kills the
+uses `timeout_seconds` (600 by default). Failed startup/inference kills the
 probe actor and fails the run rather than manufacturing zero probe accuracy.
 Long prompts are rejected, never silently truncated.
 
@@ -524,7 +524,7 @@ export VALIDATION_PROBE_BACKEND=http
 # Optional: already the default when VALIDATION_PROBE_URL is supplied.
 export VALIDATION_PROBE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 export VALIDATION_PROBE_SAMPLES_PER_DATASET=32
-export VALIDATION_PROBE_MAX_NEW_TOKENS=1024
+export VALIDATION_PROBE_MAX_NEW_TOKENS=2048
 # Optional if the server requires authentication:
 # export VALIDATION_PROBE_API_KEY="..."
 
@@ -543,19 +543,23 @@ trainer.validation_probe.backend=http
 trainer.validation_probe.base_url=http://PROBE_NODE:8000/v1
 trainer.validation_probe.model=Qwen/Qwen2.5-7B-Instruct
 trainer.validation_probe.samples_per_dataset=32
-trainer.validation_probe.max_new_tokens=1024
+trainer.validation_probe.max_new_tokens=2048
 ```
 
-`timeout_seconds` (default 180) bounds each HTTP request; `concurrency` (default
+`timeout_seconds` (default 600) bounds each HTTP request; `concurrency` (default
 4) bounds outstanding requests. Each evaluation uses at most three probe
 generations per selected trajectory, before input deduplication. For seven
 datasets with 32 questions each, that is at most 672 generations, independent
 of the existing gate probes. Avoid silently truncating prompts at the server.
 
-The output budget remains 256 tokens. Calibrate truncation and recovery rates
-on a small sample before adopting this budget for the study; changing models
-does not establish that 256 tokens is sufficient. Freeze the chosen budget
-and rerun both experimental conditions if it changes.
+The default output budget is 2048 tokens. Length-stopped probes are regenerated
+once from the same input with a 4096-token budget. Other responses are not
+retried; a second length stop remains invalid. Thus each distinct input can
+require up to two generations. Set `PROBE_RETRY_MAX_NEW_TOKENS=0` in the launcher,
+or `trainer.validation_probe.retry_max_new_tokens=0`, to disable retry. Calibration
+still matters: longer reasoning can increase both completion and recovery rates.
+Freeze the budget and retry policy and rerun both experimental conditions if
+they change. Existing manifests keep their explicit values until regenerated.
 
 ## Logging layout
 

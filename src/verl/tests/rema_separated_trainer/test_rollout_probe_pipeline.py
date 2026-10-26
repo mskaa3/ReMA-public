@@ -242,7 +242,7 @@ def trainer_methods(names, **bindings):
 
 class TrainerPipelineTests(unittest.TestCase):
     def trainer(self, enabled=True):
-        cls = trainer_methods(['_generate_training_rollouts'])
+        cls = trainer_methods(['_generate_training_rollouts', '_adopt_c3_focal_role'])
         trainer = cls()
         trainer.config = SimpleNamespace(
             trainer={'rollout_probe_pipeline': {'enable': enabled, 'groups_per_chunk': 1}},
@@ -263,6 +263,46 @@ class TrainerPipelineTests(unittest.TestCase):
         batch = FakeBatch(['a'] * 32 + ['b'] * 32,
                           {'agent_roles': ['decomposer', 'w1', 'w2'], 'c3_focal_role': 'w1'})
         return trainer, batch
+
+    def test_selected_role_is_used_for_probes_and_pinned_across_chunks(self):
+        trainer, batch = self.trainer()
+        trainer._current_train_agent = 'w1'
+        trainer._get_train_agent_roles = lambda: ['w1', 'w2']
+        batch.meta_info.update(c3_select_available_worker=True, c3_candidate_worker_roles=['w1', 'w2'])
+        flags = []
+
+        def generate(chunk):
+            flags.append(chunk.meta_info['c3_select_available_worker'])
+            chunk.meta_info.update(c3_focal_role='w2', c3_select_available_worker=False)
+            return chunk
+
+        def prepare(metadata):
+            self.assertEqual(trainer._current_train_agent, 'w2')
+            return [], [(metadata['uid'][0], 'dataset', 'target', None)], []
+
+        trainer.multi_agent_rollout.generate.side_effect = generate
+        trainer._collect_prefix_probe_items = prepare
+        output, _ = trainer._generate_training_rollouts(batch, batch, {}, {})
+        self.assertEqual(flags, [True, False])
+        self.assertEqual(trainer._current_train_agent_idx, 1)
+        self.assertEqual(output.meta_info['c3_focal_role'], 'w2')
+
+    def test_sync_selection_handles_output_aliasing_input_metadata(self):
+        trainer, batch = self.trainer(enabled=False)
+        trainer._current_train_agent = 'w1'
+        trainer._get_train_agent_roles = lambda: ['w1', 'w2']
+        batch.meta_info.update(c3_select_available_worker=True, c3_candidate_worker_roles=['w1', 'w2'])
+
+        def generate(chunk):
+            chunk.meta_info.update(c3_focal_role='w2', c3_select_available_worker=False)
+            return chunk
+
+        trainer.multi_turn_generate_sequences.side_effect = generate
+        trainer._generate_training_rollouts(batch, batch, {}, {})
+        self.assertEqual(trainer._current_train_agent, 'w2')
+        batch.meta_info['c3_focal_role'] = 'w1'
+        with self.assertRaisesRegex(RuntimeError, 'pinned optimizer'):
+            trainer._adopt_c3_focal_role(batch, batch)
 
     def test_one_pool_lifecycle_full_batch_order_and_cache(self):
         trainer, batch = self.trainer()
