@@ -906,7 +906,7 @@ fi
 
 if [[ -n "${EAC3_RUN_FILE:-}" ]]; then
     # Only fixed-plan replay needs an external bank in repository-data mode.
-    if [[ "${EXPERIMENT_DATA_SOURCE:-remote}" != "repository" || "$EXPERIMENT_MODE" == "replay_eval" ]]; then
+    if [[ "${EXPERIMENT_DATA_SOURCE:-remote}" != "repository" || "$EXPERIMENT_MODE" == "replay_eval" || "$EXPERIMENT_MODE" == "cached_replay_eval" ]]; then
         export AGENT12_VAL_FILE=${JOB_TMP}/experiment-val.parquet
         download_remote_file_on_head "$EXPERIMENT_VAL_REMOTE" "$AGENT12_VAL_FILE" "experiment evaluation data"
     fi
@@ -914,6 +914,7 @@ if [[ -n "${EAC3_RUN_FILE:-}" ]]; then
         apptainer exec --writable-tmpfs "${COMMON_MOUNTS[@]}" "$JOB_TMP/${SIF_NAME}" \
         python3 /root/ReMA-public/scripts/eac3_experiments.py validate-data \
             --train "$TEACHER_TRAIN_FILE" --eval "$AGENT12_VAL_FILE" --mode "$EXPERIMENT_MODE" \
+            --expected-eval-sha256 "${EXPERIMENT_EVAL_SHA256:-}" \
             --output-manifest "$CHECKPOINT_ROOT/evaluations/input-data.json"
     srun --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" bash -lc '
         mkdir -p "$CHECKPOINT_ROOT/evaluations"

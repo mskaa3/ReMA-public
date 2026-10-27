@@ -1400,6 +1400,7 @@ class MultiAgentRollout:
             enabled=bool(prompts.meta_info.get("replay_plans", False)),
             validation=is_validation,
             max_turns=max_num_turns,
+            allow_empty=bool(prompts.meta_info.get("replay_allow_empty_plans", False)),
         )
         sampled_teacher_attempts = prompts.non_tensor_batch.get(
             teacher_attempt_key,
@@ -1815,7 +1816,7 @@ class MultiAgentRollout:
                 for plan_record in reversed(history[idx]):
                     if (
                         plan_record.get("role") == decomposer_role
-                        and plan_record.get("executed", True) is not False
+                        and (plan_record.get("executed", True) is not False or plan_record.get("provided_plan", False))
                     ):
                         plan_record["planned_subtask_count"] = len(subtasks)
                         break

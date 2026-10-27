@@ -22,7 +22,7 @@ def plan_id(plan):
     return hashlib.sha256(str(plan).encode()).hexdigest()
 
 
-def validation_plans(non_tensors, *, enabled, validation, max_turns):
+def validation_plans(non_tensors, *, enabled, validation, max_turns, allow_empty=False):
     if not enabled:
         return None
     if not validation or max_turns != 1:
@@ -30,7 +30,7 @@ def validation_plans(non_tensors, *, enabled, validation, max_turns):
     values = non_tensors.get("fixed_decomposer_output")
     if values is None or len(values) != len(non_tensors["question"]):
         raise ValueError("Replay requires fixed_decomposer_output for every evaluation row")
-    if any(not isinstance(value, str) or not value.strip() for value in values):
+    if any(not isinstance(value, str) or (not allow_empty and not value.strip()) for value in values):
         raise ValueError("Empty fixed plans cannot silently fall back to a generated plan")
     return list(values)
 
@@ -74,7 +74,7 @@ class ValidationRecorder:
                     "history": history,
                     "completion_tokens": sum(int(item.get('num_gen_tokens', 0)) for item in history),
                 }
-                for key in ('eval_item_id', 'plan_source', 'answer_free_reviewed'):
+                for key in ('eval_item_id', 'plan_source', 'answer_free_reviewed', 'plan_cache_unfiltered'):
                     if key in batch:
                         value = batch[key][index]
                         record[key] = value.item() if hasattr(value, 'item') else value

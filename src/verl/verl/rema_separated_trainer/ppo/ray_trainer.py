@@ -2787,6 +2787,7 @@ class RayReMASeparatedTrainer(object):
                 'validate': True,
                 'teacher_attempt_key': teacher_key,
                 'replay_plans': bool(self.config.data.get('replay_plans', False)),
+                'replay_allow_empty_plans': bool(self.config.data.get('replay_allow_empty_plans', False)),
             })
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 

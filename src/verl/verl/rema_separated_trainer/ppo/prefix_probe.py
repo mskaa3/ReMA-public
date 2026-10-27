@@ -99,7 +99,7 @@ def answer_round_records(history: Iterable[Dict], terminal_role: str, decomposer
     starts = [
         index for index, record in enumerate(records[:end])
         if record.get("role") == decomposer_role
-        and record.get("executed", True) is not False
+        and (record.get("executed", True) is not False or record.get("provided_plan", False))
     ]
     return records[starts[-1]:end] if starts else []
 

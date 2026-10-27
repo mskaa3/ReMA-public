@@ -17,7 +17,8 @@ sys.path.insert(0, str(ROOT / 'src/verl/verl/rema_separated_trainer/ppo'))
 from experiment_io import question_id, plan_id  # noqa: E402
 from rollout_pipeline import pipeline_config  # noqa: E402
 
-PHASES = ('planners', 'workers', 'transfer', 'cross', 'adapt-planners', 'adapt-workers')
+FIXED_PLAN_PHASES = ('cache-plans', 'replay-workers')
+PHASES = ('planners', 'workers', 'transfer', 'cross', 'adapt-planners', 'adapt-workers', *FIXED_PLAN_PHASES)
 WORKER_ROLES = '[worker_stage_1,worker_stage_2,worker_stage_3,worker_stage_4]'
 DEFAULT_PROBE_MAX_NEW_TOKENS = 2048
 DEFAULT_PROBE_RETRY_MAX_NEW_TOKENS = 4096
@@ -51,9 +52,19 @@ def validate_study(cfg):
     if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', cfg['study']):
         raise ValueError('study must be a filesystem-safe, unique study name')
     planners = cfg['planners']
-    if not planners or not set(planners).issubset({'baseline', 'eac3'}):
+    fixed_comparison = cfg.get('comparison_kind') == 'fixed_plan_workers'
+    if fixed_comparison:
+        if set(planners) != {'du', 'dg'} or set(cfg.get('workers', {})) != {'u_before', 'u_after', 'g_before', 'g_after'}:
+            raise ValueError('Fixed-plan comparison requires du/dg and four explicit before/after workers')
+        if cfg.get('data_source') != 'repository' or cfg.get('worker_gate_mode') != 'diagnostic':
+            raise ValueError('Fixed-plan comparison uses repository data and diagnostic-only gates')
+        if cfg.get('local_validation_probe') or cfg.get('frozen_gate_probe'):
+            raise ValueError('Use a separate audit for external probes; this comparison uses the same loaded diagnostic model')
+        if cfg.get('gate_solver_backend', 'role') != 'role':
+            raise ValueError('Fixed-plan comparison uses the loaded, frozen diagnostic role')
+    elif not planners or not set(planners).issubset({'baseline', 'eac3'}):
         raise ValueError('Specify baseline and/or eac3 planner exports')
-    if len(planners) == 2 and planners['baseline'] == planners['eac3']:
+    if len(set(planners.values())) != len(planners):
         raise ValueError('Baseline and EAC3 must identify different planner artifacts')
     for key in ('worker_updates', 'rollout_step_limit', 'test_freq', 'save_freq',
                 'train_question_batch_size', 'rollout_n', 'continuations_per_action',
@@ -155,6 +166,8 @@ def adapted_planner_export(cfg, arm, seed):
 
 def make_runs(cfg, phase):
     validate_study(cfg)
+    if (phase in FIXED_PLAN_PHASES) != (cfg.get('comparison_kind') == 'fixed_plan_workers'):
+        raise ValueError('Fixed-plan comparison config must use cache-plans or replay-workers, not legacy phases')
     if phase in ('adapt-planners', 'adapt-workers'):
         if set(cfg['planners']) != {'eac3'} or 'planner_updates' not in cfg:
             raise ValueError('Alternating phases require one eac3 planner and explicit planner_updates')
@@ -199,6 +212,20 @@ def make_runs(cfg, phase):
                 for planner_arm, planner in cfg['planners'].items():
                     add(f'{worker_arm}-under-{planner_arm}', seed, planner,
                         worker_export(cfg, worker_arm, seed), 'planner_eval')
+    elif phase == 'cache-plans':
+        for source, planner in cfg['planners'].items():
+            add(source, cfg['eval_seed'], planner, cfg['workers']['u_before'], 'planner_eval')
+            jobs[-1]['plan_source'] = source
+    elif phase == 'replay-workers':
+        for source in cfg['planners']:
+            cache = cfg.get('plan_caches', {}).get(source, {})
+            if not re.fullmatch(r'[0-9a-f]{64}', cache.get('sha256', '')) or not cache.get('remote'):
+                raise ValueError('Build the complete plan caches first; replay requires pinned parquet checksums')
+            for label, worker in cfg['workers'].items():
+                # A common diagnostic model avoids changing the auditor across plan sources.
+                add(f'{label}-under-{source}', cfg['eval_seed'], cfg['planners']['du'], worker, 'cached_replay_eval')
+                jobs[-1].update(plan_source=source, worker_label=label,
+                                evaluation_remote=cache['remote'], evaluation_sha256=cache['sha256'])
     else:
         raise ValueError(f'Unknown phase: {phase}')
     return jobs
@@ -228,6 +255,7 @@ def run_environment(run, *, check_allocation=True):
         raise ValueError('Slurm node allocation differs from the experiment manifest')
     train_planner = run['mode'] == 'planner_train'
     train = train_planner or run['mode'] == 'worker_train'
+    cached_replay = run['mode'] == 'cached_replay_eval'
     gate_mode = cfg.get('worker_gate_mode', 'off')
     overrides = {
         'algorithm.hierarchy.agent12_curriculum.enable': False,
@@ -244,7 +272,8 @@ def run_environment(run, *, check_allocation=True):
         'data.seed': run['seed'],
         'actor_rollout_ref.rollout.val_kwargs.n': 1,
         'actor_rollout_ref.rollout.val_kwargs.do_sample': False,
-        'data.replay_plans': run['mode'] == 'replay_eval',
+        'data.replay_plans': run['mode'] in ('replay_eval', 'cached_replay_eval'),
+        'data.replay_allow_empty_plans': cached_replay,
         'trainer.val_only': not train,
         'trainer.val_before_train': True,
         'trainer.resume_mode': 'disable',
@@ -288,11 +317,19 @@ def run_environment(run, *, check_allocation=True):
         'ROLLOUT_N': cfg['rollout_n'], 'C3_CONTINUATIONS_PER_ACTION': cfg['continuations_per_action'],
         'TOTAL_STEPS': cfg['rollout_step_limit'], 'TEST_FREQ': cfg['test_freq'], 'SAVE_FREQ': cfg['save_freq'],
         'EXPERIMENT_MODE': run['mode'], 'EXPERIMENT_VAL_REMOTE': run['evaluation_remote'],
+        'EXPERIMENT_EVAL_SHA256': run.get('evaluation_sha256', ''),
         'EXPERIMENT_DATA_SOURCE': 'repository' if repository_data else 'remote',
         # The common launcher copies data/MATH and data/overall_math into JOB_TMP.
         'EXPERIMENT_TRAIN_RELATIVE': data_files['train'][len('data/'):] if repository_data else '',
         'EXPERIMENT_EVAL_RELATIVE': data_files['eval'][len('data/'):] if repository_data else '',
     }
+    if run['phase'] in FIXED_PLAN_PHASES:
+        overrides.update({
+            'algorithm.hierarchy.routing_mode': 'sequential_plan',
+            'trainer.validation_probe.enable': False,
+        })
+        env.update(VALIDATION_PROBE_BACKEND='off', VALIDATION_PROBE_MODEL_REMOTE='',
+                   VALIDATION_PROBE_URL='', ROLLOUT_PROBE_PIPELINE='false')
     env.update(model_env('DECOMPOSER', run['planner']))
     env.update(model_env('WORKER', run['worker']))
     gate = cfg.get('frozen_gate_probe')
@@ -348,8 +385,14 @@ def write_runs(cfg, phase, directory):
         'src/verl/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py',
         'src/verl/verl/utils/dataset/rema_dataset.py',
     )]
+    if phase in FIXED_PLAN_PHASES:
+        code_files += [ROOT / 'scripts/eac3_fixed_plan_evaluation.py', ROOT / 'scripts/analyze_eac3_experiments.py']
     fingerprint = {str(path.relative_to(ROOT)): sha_file(path) for path in code_files}
+    if phase == 'replay-workers':
+        if any(cache.get('code_sha256') != fingerprint for cache in cfg['plan_caches'].values()):
+            raise ValueError('Code/prompts changed since plan caching; use the same revision for replay')
     commands = []
+    fetch = ['#!/bin/bash', 'set -euo pipefail', 'HERE=$(cd -- "$(dirname -- "$0")" && pwd)']
     for run in runs:
         run.update(git_sha=git_sha, code_sha256=fingerprint)
         if data_fingerprint:
@@ -360,12 +403,16 @@ def write_runs(cfg, phase, directory):
                    f"--gres=gpu:hopper:{cfg['gpus_per_node']},storage:local:200G",
                    'eac3-experiment-multinode.sh', str(path)]
         commands.append(shlex.join(command))
+        fetch.append('rclone copy ' + shlex.quote(f"{cfg['remote_root'].rstrip('/')}/{run['run_name']}/evaluations")
+                     + ' "$HERE/results/' + run['run_name'] + '" --stats=30s --stats-one-line')
     (directory / 'commands.txt').write_text('\n'.join(commands) + '\n')
+    if phase in FIXED_PLAN_PHASES:
+        (directory / 'fetch-results.sh').write_text('\n'.join(fetch) + '\n')
     print('\n'.join(commands))
     print(f'Wrote {len(runs)} run manifests. Nothing has been submitted.', file=sys.stderr)
 
 
-def data_frames(train_path, eval_path, *, replay=False, deduplicate_train=False):
+def data_frames(train_path, eval_path, *, replay=False, deduplicate_train=False, unreviewed_cache=False):
     import pandas as pd
     train, evaluation = pd.read_parquet(train_path), pd.read_parquet(eval_path)
     if deduplicate_train:
@@ -391,9 +438,17 @@ def data_frames(train_path, eval_path, *, replay=False, deduplicate_train=False)
             raise ValueError(f'Replay bank requires {sorted(required)}')
         if evaluation.eval_item_id.duplicated().any():
             raise ValueError('Replay bank has duplicate evaluation items')
-        if not all(isinstance(p, str) and p.strip() for p in evaluation.fixed_decomposer_output):
+        if not all(isinstance(p, str) and (unreviewed_cache or p.strip()) for p in evaluation.fixed_decomposer_output):
             raise ValueError('Replay bank contains missing plans')
-        if not evaluation.answer_free_reviewed.eq(True).all():
+        if unreviewed_cache:
+            if not {'plan_source', 'plan_cache_unfiltered'}.issubset(evaluation.columns) or not evaluation.plan_cache_unfiltered.eq(True).all():
+                raise ValueError('Unreviewed replay requires an explicit, unfiltered plan cache')
+            if evaluation.question.map(question_id).duplicated().any():
+                raise ValueError('Each source cache must contain exactly one plan per question')
+            for row in evaluation.itertuples():
+                if row.eval_item_id != question_id(row.question) + ':' + plan_id(row.fixed_decomposer_output):
+                    raise ValueError('Cached question/plan identity mismatch')
+        elif not evaluation.answer_free_reviewed.eq(True).all():
             raise ValueError('Transfer test requires independently reviewed answer-free plans')
     return train, evaluation
 
@@ -438,8 +493,9 @@ def main():
         command.add_argument('--eval', required=True)
     prepare.add_argument('--output-dir', required=True)
     prepare.add_argument('--deduplicate-train', action='store_true')
-    check.add_argument('--mode', choices=['worker_train', 'planner_train', 'planner_eval', 'replay_eval'], required=True)
+    check.add_argument('--mode', choices=['worker_train', 'planner_train', 'planner_eval', 'replay_eval', 'cached_replay_eval'], required=True)
     check.add_argument('--output-manifest')
+    check.add_argument('--expected-eval-sha256', default='')
     args = parser.parse_args()
     if args.command == 'plan':
         cfg = read_json(args.config)
@@ -481,7 +537,13 @@ def main():
     elif args.command == 'prepare-data':
         prepare_data(args.train, args.eval, args.output_dir, args.deduplicate_train)
     else:
-        train, evaluation = data_frames(args.train, args.eval, replay=args.mode == 'replay_eval')
+        if args.expected_eval_sha256 and sha_file(args.eval) != args.expected_eval_sha256:
+            raise ValueError('Evaluation parquet changed after cache creation; refusing unmatched replay')
+        if args.mode == 'cached_replay_eval' and not args.expected_eval_sha256:
+            raise ValueError('Unreviewed cache replay requires --expected-eval-sha256')
+        train, evaluation = data_frames(args.train, args.eval,
+                                       replay=args.mode in ('replay_eval', 'cached_replay_eval'),
+                                       unreviewed_cache=args.mode == 'cached_replay_eval')
         print(f'Validated disjoint train={len(train)}, eval={len(evaluation)}; mode={args.mode}')
         if args.output_manifest:
             path = Path(args.output_manifest)

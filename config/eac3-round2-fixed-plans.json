@@ -1,0 +1,36 @@
+{
+  "study": "eac3-round2-fixed-plans-v1",
+  "comparison_kind": "fixed_plan_workers",
+  "remote_root": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/eac3-experiments",
+  "planners": {
+    "du": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/eac3-experiments/eac3-round2-ungated-v1--adapt-planners-eac3-s11/decomposer/huggingface",
+    "dg": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/eac3-experiments/eac3-round2-gated-v1--adapt-planners-eac3-s11/decomposer/huggingface"
+  },
+  "workers": {
+    "u_before": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/recovered-6106013/snapshots/global_step_63/workers/huggingface",
+    "u_after": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/recovered-6154441/snapshots/global_step_45/workers/huggingface",
+    "g_before": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/recovered-6106014/snapshots/global_step_65/workers/huggingface",
+    "g_after": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/recovered-6154442/snapshots/global_step_45/workers/huggingface"
+  },
+  "checkpoint_notes": {
+    "u_after": "6154441/global_step_45: 30 completed updates in this round",
+    "g_after": "6154442/global_step_45: 30 completed updates in this round",
+    "planners": "Both trained with eligibility; du/dg identify worker histories, not planner gate ablations"
+  },
+  "data_source": "repository",
+  "train_file": "data/MATH/train_lv3to5_8k.parquet",
+  "eval_file": "data/overall_math/test.parquet",
+  "worker_gate_mode": "diagnostic",
+  "gate_solver_backend": "role",
+  "seeds": [42],
+  "eval_seed": 42,
+  "worker_updates": 1,
+  "rollout_step_limit": 1,
+  "test_freq": 10,
+  "save_freq": 10,
+  "train_question_batch_size": 48,
+  "rollout_n": 32,
+  "continuations_per_action": 4,
+  "nodes": 4,
+  "gpus_per_node": 4
+}

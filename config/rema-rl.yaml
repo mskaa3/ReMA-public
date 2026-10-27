@@ -8,6 +8,8 @@ data:
   teacher_assisted_validation: False
   # Opt-in experiment evaluation: replay the exact saved planner text.
   replay_plans: False
+  # Full-benchmark caches retain empty outputs as failures, never regenerate them.
+  replay_allow_empty_plans: False
   prompt_key: question
   reward_fn_key: data_source
   max_prompt_length: 6144

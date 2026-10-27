@@ -626,7 +626,7 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(worker_env['PREFIX_PROBE_ENABLE'], 'true')
             self.assertEqual(worker_env['PREFIX_PROBE_APPLY_TO_TRAINING'],
                              str(cfg['worker_gate_mode'] == 'gated').lower())
-            self.assertIn('trainer.max_actor_updates=40', worker_env['AGENT12_EXPERIMENT_OVERRIDES'])
+            self.assertIn(f"trainer.max_actor_updates={cfg['worker_updates']}", worker_env['AGENT12_EXPERIMENT_OVERRIDES'])
             exports.append(suite.worker_export(cfg, 'eac3', 11, phase='adapt-workers'))
         self.assertEqual({key for key in planner_envs[0] if planner_envs[0][key] != planner_envs[1][key]},
                          {'AGENT12_RUN_NAME', 'AGENT12_WANDB_RUN_ID', 'WORKER_MODEL_REMOTE'})
@@ -680,7 +680,8 @@ class ExperimentTests(unittest.TestCase):
                         self.assertEqual(opts['algorithm.hierarchy.start_agent'],
                                          'decomposer' if planner else 'worker_stage_1')
                         self.assertEqual(opts['algorithm.hierarchy.agent12_curriculum.enable'], 'false')
-                        self.assertEqual(opts['trainer.max_actor_updates'], '40')
+                        self.assertEqual(opts['trainer.max_actor_updates'],
+                                         str(cfg['planner_updates'] if planner else cfg['worker_updates']))
                         self.assertEqual(opts['trainer.val_only'], 'false')
                         self.assertEqual(opts['trainer.save_freq'], '10')
                         self.assertEqual(opts['trainer.validation_probe.enable'], 'True')
@@ -1104,6 +1105,7 @@ rclone() { echo 'unexpected S3 transfer' >&2; return 99; }
         self.assertEqual(histories[0][0]['content'], plan)
         self.assertFalse(histories[0][0]['executed'])
         self.assertTrue(histories[0][0]['provided_plan'])
+        self.assertEqual(histories[0][0]['planned_subtask_count'], 2)
         self.assertIn('QUESTION_SENTINEL', str(chats_seen['worker_stage_1']))
         self.assertNotIn('QUESTION_SENTINEL', str(chats_seen['worker_stage_2']))
         self.assertIn('\\boxed{7}', str(chats_seen['worker_stage_2']))
@@ -1116,6 +1118,17 @@ rclone() { echo 'unexpected S3 transfer' >&2; return 99; }
         self.assertIn('S1 LOCAL_RESULT: \\boxed{7}', inputs['with_results'])
         self.assertNotIn('QUESTION_SENTINEL', str(inputs))
         self.assertNotIn('REASONING:', str(inputs))
+
+        # Full unfiltered caches retain an empty plan and use normal routing;
+        # they must never trigger fresh decomposer generation or disappear.
+        prompts.non_tensor_batch['fixed_decomposer_output'] = ['']
+        prompts.meta_info['replay_allow_empty_plans'] = True
+        histories, flags, reasons = rollout._initialize_conversation_state(1)
+        _, _, _, state = rollout._run_hierarchical_conversation(prompts, {}, 1, roles, system, hierarchy,
+                                                               histories, flags, reasons, 1024, None)
+        self.assertEqual(histories[0][0]['content'], '')
+        self.assertEqual(histories[0][0]['planned_subtask_count'], 1)
+        self.assertEqual(state['terminal_stage_roles'], ['worker_stage_1'])
 
 
 if __name__ == '__main__':
