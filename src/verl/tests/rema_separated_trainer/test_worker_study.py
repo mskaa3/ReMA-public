@@ -272,6 +272,68 @@ class StudyTests(unittest.TestCase):
             self.assertIn('NOT independently reviewed', report['caution'])
             self.assertIn('pipeline development', report['caution'])
 
+    def test_reserved_self_review_requires_exploratory_opt_in_and_remains_labelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            selection, _ = self.sample(tmp)
+            review = self.reviewed(evaluation.read_json(tmp / 'sample/PRIVATE-reserved-review.json'))
+            review.update(review_mode='model_self_review', purpose='exploratory_model_review')
+            for row in review['examples']:
+                row.update(checker=row['author'], checker_type='model')
+            with self.assertRaisesRegex(ValueError, 'independent human'):
+                study.validate_review(selection, review)
+            self.assertEqual(len(study.validate_review(selection, review,
+                             exploratory_self_review=True)), 6)
+            bad = copy.deepcopy(review)
+            bad.pop('purpose')
+            with self.assertRaisesRegex(ValueError, 'explicitly labelled'):
+                study.validate_review(selection, bad, exploratory_self_review=True)
+            bad = copy.deepcopy(review)
+            bad['examples'][0]['checks']['plan_is_coherent'] = False
+            with self.assertRaises(ValueError):
+                study.validate_review(selection, bad, exploratory_self_review=True)
+            path = tmp / 'review.json'
+            evaluation.write_json(path, review)
+            with patch.object(study, 'ROOT', tmp), redirect_stdout(io.StringIO()):
+                study.freeze(tmp / 'sample/selection.json', path, tmp / 'exploratory',
+                             exploratory_self_review=True)
+            data = evaluation.load_dataset(tmp / 'exploratory/dataset.json')
+            self.assertEqual(data['study']['split'], 'exploratory')
+            self.assertEqual(data['study']['source_split'], 'reserved')
+            self.assertFalse(data['study']['independently_reviewed'])
+            models = {name: [dict(id=r['id'], status='unknown') for r in data['examples']]
+                      for name in data['study']['model_ids']}
+            report = stats.analyze(data, models)
+            self.assertIn('Exploratory model self-review', report['caution'])
+            self.assertNotIn('Development-only', report['caution'])
+
+    def test_reviewed_final_notation_keeps_source_label_and_requires_note(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            selection, review = self.sample(tmp)
+            review = self.reviewed(review)
+            original = review['examples'][0]['final_answer']
+            row = review['examples'][0]
+            row['tasks'][-1]['reference_answers'] = [original + '.0']
+            row['tasks'][-1]['checked_result'] = r'LOCAL_RESULT: \boxed{' + original + '.0}'
+            row['canonical_final_answer'] = original + '.0'
+            with self.assertRaisesRegex(ValueError, 'explicit review note'):
+                study.validate_review(selection, review)
+            row['final_answer_notation_note'] = 'Same integer written in decimal notation.'
+            study.validate_review(selection, review)
+            path = tmp / 'review.json'
+            evaluation.write_json(path, review)
+            with patch.object(study, 'ROOT', tmp), redirect_stdout(io.StringIO()):
+                study.freeze(tmp / 'sample/selection.json', path, tmp / 'frozen')
+            data = evaluation.load_dataset(tmp / 'frozen/dataset.json')
+            self.assertEqual(data['examples'][0]['source_final_answer'], original)
+            self.assertEqual(data['examples'][0]['final_answer'], original + '.0')
+            self.assertEqual(len(data['study']['final_answer_notation_changes']), 1)
+            bad = copy.deepcopy(review)
+            bad['examples'][0]['final_answer'] = 'modified original'
+            with self.assertRaisesRegex(ValueError, 'was changed'):
+                study.validate_review(selection, bad)
+
     def test_context_pairing_rejects_missing_or_changed_counterpart(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = self.freeze(Path(directory))['examples']

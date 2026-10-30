@@ -187,7 +187,8 @@ def sample(config_path, output):
     print('No references or plans were authored or certified. Review templates must be completed before freeze.')
 
 
-def validate_review(selection, review, *, allow_development_self_review=False):
+def validate_review(selection, review, *, allow_development_self_review=False,
+                    exploratory_self_review=False):
     original = {k: v for k, v in selection.items() if k != 'selection_sha256'}
     if (selection.get('selection_sha256') != evaluation.digest(original)
             or selection['config_sha256'] != evaluation.digest(selection['config'])):
@@ -201,9 +202,12 @@ def validate_review(selection, review, *, allow_development_self_review=False):
     if review_mode not in {'independent', 'model_self_review'}:
         raise ValueError('Unknown review_mode')
     self_review = review_mode == 'model_self_review'
-    if split == 'reserved' and (self_review or allow_development_self_review):
+    if exploratory_self_review and (split != 'reserved' or not self_review
+            or review.get('purpose') != 'exploratory_model_review'):
+        raise ValueError('Exploratory override requires an explicitly labelled reserved model self-review')
+    if split == 'reserved' and (self_review or allow_development_self_review) and not exploratory_self_review:
         raise ValueError('Reserved questions require independent human review; self-review is development-only')
-    if self_review and not allow_development_self_review:
+    if self_review and not (allow_development_self_review or exploratory_self_review):
         raise ValueError('Model self-review needs explicit --allow-development-self-review for development only')
     expected = {r['question_id']: r for r in selection['splits'][split]}
     rows = review['examples']
@@ -224,7 +228,7 @@ def validate_review(selection, review, *, allow_development_self_review=False):
                 raise ValueError('Model self-review must record the same model author/checker ID and model types')
         elif same_checker:
             raise ValueError('Independent review requires distinct author/checker IDs')
-        if split == 'reserved' and row['checker_type'] != 'human':
+        if split == 'reserved' and row['checker_type'] != 'human' and not exploratory_self_review:
             raise ValueError('Reserved questions require an independent human check, including exclusions')
         if row['decision'] == 'exclude':
             if not row.get('exclusion_reason', '').strip():
@@ -234,6 +238,12 @@ def validate_review(selection, review, *, allow_development_self_review=False):
             raise ValueError('Pending questions/checks cannot be evaluated')
         if not 1 <= len(row['tasks']) <= 4:
             raise ValueError('Use 1-4 coherent tasks; single-task plans are allowed and reported as terminal-only')
+        canonical = row.get('canonical_final_answer')
+        notation_note = row.get('final_answer_notation_note')
+        if 'canonical_final_answer' in row and (not isinstance(canonical, str) or not canonical.strip()
+                or not isinstance(notation_note, str) or not notation_note.strip()
+                or canonical not in row['tasks'][-1]['reference_answers']):
+            raise ValueError('Canonical final notation needs an explicit review note and terminal reference')
         for task in row['tasks']:
             accepted = extract_local_result(task['checked_result'])
             if not accepted or extract_complete_boxed_answer(accepted) not in task['reference_answers']:
@@ -241,9 +251,11 @@ def validate_review(selection, review, *, allow_development_self_review=False):
     return rows
 
 
-def freeze(selection_path, review_path, output, *, allow_development_self_review=False):
+def freeze(selection_path, review_path, output, *, allow_development_self_review=False,
+           exploratory_self_review=False):
     selection, review = evaluation.read_json(selection_path), evaluation.read_json(review_path)
-    rows = validate_review(selection, review, allow_development_self_review=allow_development_self_review)
+    rows = validate_review(selection, review, allow_development_self_review=allow_development_self_review,
+                           exploratory_self_review=exploratory_self_review)
     config = selection['config']
     examples = []
     for row in rows:
@@ -258,13 +270,17 @@ def freeze(selection_path, review_path, output, *, allow_development_self_review
                     question=row['question'], family=stratum(row), kind=task['kind'],
                     subtasks=[t['instruction'] for t in tasks], target=index + 1,
                     previous_results=[t['checked_result'] for t in tasks[:index]],
-                    reference_answers=task['reference_answers'], final_answer=row['final_answer'],
+                    reference_answers=task['reference_answers'],
+                    final_answer=row.get('canonical_final_answer', row['final_answer']),
+                    source_final_answer=row['final_answer'],
                     reference_check=task['reference_check'], question_mode=mode))
     if not examples:
         raise ValueError('All questions excluded; no study can run')
     included = [row for row in rows if row['decision'] == 'include']
     self_review = review.get('review_mode') == 'model_self_review'
-    study = dict(study_id=config['study_id'], evidence_status=config['evidence_status'], split=review['split'],
+    study = dict(study_id=config['study_id'], evidence_status=config['evidence_status'],
+        split='exploratory' if exploratory_self_review else review['split'],
+        source_split=review['split'], exploratory_override=exploratory_self_review,
         review_mode='model_self_review' if self_review else 'independent',
         independently_reviewed=not self_review,
         selection_sha256=selection['selection_sha256'], review_sha256=evaluation.digest(review),
@@ -278,11 +294,18 @@ def freeze(selection_path, review_path, output, *, allow_development_self_review
         input_exclusions=selection.get('input_exclusions', []),
         exclusions=[dict(question_id=r['question_id'], reason=r['exclusion_reason']) for r in rows
                     if r['decision'] == 'exclude'],
+        final_answer_notation_changes=[dict(question_id=r['question_id'],
+            original=r['final_answer'], canonical=r['canonical_final_answer'],
+            note=r['final_answer_notation_note']) for r in included if 'canonical_final_answer' in r],
         bootstrap_samples=config['bootstrap_samples'], bootstrap_seed=config['bootstrap_seed'],
         answer_diagnostic_version=evaluation.ANSWER_DIAGNOSTIC_VERSION,
         primary_endpoint=config['primary_endpoint'], primary_comparison=config['primary_comparison'],
         model_ids=[m['id'] for m in selection['models']], models=selection['models'])
-    provenance = ('Development-only model-authored and self-reviewed tasks; NOT independently reviewed. '
+    provenance = ('Exploratory model-authored and self-reviewed tasks from the previously reserved selection; '
+                  'NOT independently reviewed. Exclusions include unresolved mathematics. '
+                  'Results do not certify worker reasoning or provide untouched confirmatory evidence.'
+                  if exploratory_self_review else
+                  'Development-only model-authored and self-reviewed tasks; NOT independently reviewed. '
                   'Random historical-validation questions with fixed reference prefixes. '
                   'For pipeline development, not confirmatory evidence. See frozen selection and review.'
                   if self_review else
@@ -305,7 +328,7 @@ def freeze(selection_path, review_path, output, *, allow_development_self_review
     evaluation.write_json(out / 'dataset.json', data)
     evaluation.write_json(out / 'eval-config.json', dict(dataset=str(dataset_path), models=selection['models']))
     if self_review:
-        print('WARNING: development-only model self-review; not independently reviewed or confirmatory evidence.')
+        print('WARNING: model self-review; not independently reviewed or confirmatory evidence.')
     print(f'Frozen {len(included)} questions, {len(examples)} prompts (terminals occur once, without Q).')
     print(f'sbatch scripts/eac3_fixed_prefix_eval.sh {out.relative_to(ROOT.resolve())}/eval-config.json')
 
@@ -361,6 +384,8 @@ def main():
     freezing.add_argument('--output', required=True)
     freezing.add_argument('--allow-development-self-review', action='store_true',
                          help='Explicitly allow labelled model self-review for development, never reserved questions')
+    freezing.add_argument('--exploratory-self-review', action='store_true',
+                         help='Explicitly repurpose reserved questions as exploratory, NOT independent evidence')
     auditing = sub.add_parser('audit')
     auditing.add_argument('--review', required=True)
     auditing.add_argument('--output', required=True)
@@ -372,7 +397,8 @@ def main():
             sample(args.config, args.output)
         elif args.command == 'freeze':
             freeze(args.selection, args.review, args.output,
-                   allow_development_self_review=args.allow_development_self_review)
+                   allow_development_self_review=args.allow_development_self_review,
+                   exploratory_self_review=args.exploratory_self_review)
         else:
             audit(args.review, args.output, args.questions, args.seed)
     except (ValueError, OSError) as exc:

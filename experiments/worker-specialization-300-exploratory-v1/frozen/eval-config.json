@@ -1,0 +1,17 @@
+{
+  "dataset": "experiments/worker-specialization-300-exploratory-v1/frozen/dataset.json",
+  "models": [
+    {
+      "id": "w0",
+      "source": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/agent2-only-6055460/snapshots/global_step_50/workers/huggingface"
+    },
+    {
+      "id": "ungated",
+      "source": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/recovered-6106013/snapshots/global_step_63/workers/huggingface"
+    },
+    {
+      "id": "gated",
+      "source": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/recovered-6106014/snapshots/global_step_65/workers/huggingface"
+    }
+  ]
+}

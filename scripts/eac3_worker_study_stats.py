@@ -129,8 +129,9 @@ def analyze(data, models):
         difference = lambda i: int(success(right, i)) - int(success(left, i))
         values.append(difference(full) - difference(task))
         indices.append(full)
-    self_review_warning = ('Development-only model self-review: tasks/references were NOT independently reviewed. '
-                           'Use these results for pipeline development, not confirmatory evidence. '
+    self_review_warning = (('Exploratory' if protocol.get('exploratory_override') else 'Development-only')
+                           + ' model self-review: tasks/references were NOT independently reviewed. '
+                           'Use these results for exploration and pipeline development, not confirmatory evidence. '
                            if protocol.get('review_mode') == 'model_self_review' else '')
     return dict(protocol=protocol, endpoints=endpoints,
         reported_answer_diagnostic=answer_endpoints or None,
