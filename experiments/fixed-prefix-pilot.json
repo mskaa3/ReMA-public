@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "provenance": "Assistant-curated diagnostic pilot based on failure patterns discussed in the logs, with rewritten tasks and analytically checked references/prefixes. Not a random sample, not verbatim historical prompts, not human-validated annotations. Multiple rows share a question. Never use this pilot to estimate population frequencies or choose training hyperparameters for a claimed held-out test.",
+  "examples": [
+    {
+      "id": "stickers-s1", "family": "arithmetic", "kind": "compute",
+      "question": "Maya had 15 stickers, gave away 7, and then received 5. How many stickers does she have now?",
+      "subtasks": ["Maya initially has 15 stickers and gives away 7. Calculate the number remaining before she receives any more. Return a.", "Use a from S1 and add the 5 stickers Maya then receives. Return her final number of stickers."],
+      "target": 1, "previous_results": [], "reference_answers": ["8", "a=8"], "final_answer": "13",
+      "reference_check": "S1: 15-7=8. The later +5 belongs to S2, giving 13."
+    },
+    {
+      "id": "stickers-s2", "family": "arithmetic", "kind": "compute",
+      "question": "Maya had 15 stickers, gave away 7, and then received 5. How many stickers does she have now?",
+      "subtasks": ["Maya initially has 15 stickers and gives away 7. Calculate the number remaining before she receives any more. Return a.", "Use a from S1 and add the 5 stickers Maya then receives. Return her final number of stickers."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{a=8}"], "reference_answers": ["13"], "final_answer": "13",
+      "reference_check": "Checked prefix a=15-7=8; assigned calculation 8+5=13."
+    },
+    {
+      "id": "height-s1", "family": "word_problem", "kind": "compute",
+      "question": "Jackie grew 3 inches over the summer. She is now 2 inches shorter than Anne, who is twice as tall as Albert. Albert is 36 inches tall. How tall was Jackie before the summer?",
+      "subtasks": ["Albert is 36 inches tall. Anne is twice as tall as Albert. Calculate Anne's height A in inches.", "Use Anne's height A from S1. Jackie is now 2 inches shorter than Anne. Calculate Jackie's current height J in inches.", "Use Jackie's current height J from S2. She grew 3 inches over the summer. Calculate her height before the summer in inches."],
+      "target": 1, "previous_results": [], "reference_answers": ["72", "A=72"], "final_answer": "67",
+      "reference_check": "A=2*36=72. J=72-2=70, so earlier height is 70-3=67."
+    },
+    {
+      "id": "height-s2", "family": "word_problem", "kind": "compute",
+      "question": "Jackie grew 3 inches over the summer. She is now 2 inches shorter than Anne, who is twice as tall as Albert. Albert is 36 inches tall. How tall was Jackie before the summer?",
+      "subtasks": ["Albert is 36 inches tall. Anne is twice as tall as Albert. Calculate Anne's height A in inches.", "Use Anne's height A from S1. Jackie is now 2 inches shorter than Anne. Calculate Jackie's current height J in inches.", "Use Jackie's current height J from S2. She grew 3 inches over the summer. Calculate her height before the summer in inches."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{A=72}"], "reference_answers": ["70", "J=70"], "final_answer": "67",
+      "reference_check": "Checked prefix A=72. S2 is 72-2=70, not the original question's answer 67."
+    },
+    {
+      "id": "height-s3", "family": "word_problem", "kind": "compute",
+      "question": "Jackie grew 3 inches over the summer. She is now 2 inches shorter than Anne, who is twice as tall as Albert. Albert is 36 inches tall. How tall was Jackie before the summer?",
+      "subtasks": ["Albert is 36 inches tall. Anne is twice as tall as Albert. Calculate Anne's height A in inches.", "Use Anne's height A from S1. Jackie is now 2 inches shorter than Anne. Calculate Jackie's current height J in inches.", "Use Jackie's current height J from S2. She grew 3 inches over the summer. Calculate her height before the summer in inches."],
+      "target": 3, "previous_results": ["LOCAL_RESULT: \\boxed{A=72}", "LOCAL_RESULT: \\boxed{J=70}"], "reference_answers": ["67"], "final_answer": "67",
+      "reference_check": "Checked A=72 and J=70. Earlier height is 70-3=67."
+    },
+    {
+      "id": "polar-s1", "family": "geometry", "kind": "compute",
+      "question": "Convert (0,3) from rectangular to polar coordinates (r,theta), with r>0 and 0<=theta<2*pi.",
+      "subtasks": ["For x=0 and y=3, calculate r=sqrt(x^2+y^2). Return r.", "For the point (0,3), determine its polar angle theta in radians with 0<=theta<2*pi. Return theta.", "Combine r from S1 and theta from S2 into the ordered polar coordinate pair (r,theta)."],
+      "target": 1, "previous_results": [], "reference_answers": ["3", "r=3"], "final_answer": "(3,\\frac{\\pi}{2})",
+      "reference_check": "r=sqrt(0+9)=3; point lies on the positive y-axis, so theta=pi/2."
+    },
+    {
+      "id": "polar-s2", "family": "geometry", "kind": "compute",
+      "question": "Convert (0,3) from rectangular to polar coordinates (r,theta), with r>0 and 0<=theta<2*pi.",
+      "subtasks": ["For x=0 and y=3, calculate r=sqrt(x^2+y^2). Return r.", "For the point (0,3), determine its polar angle theta in radians with 0<=theta<2*pi. Return theta.", "Combine r from S1 and theta from S2 into the ordered polar coordinate pair (r,theta)."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{r=3}"], "reference_answers": ["\\frac{\\pi}{2}", "\\theta=\\frac{\\pi}{2}"], "final_answer": "(3,\\frac{\\pi}{2})",
+      "reference_check": "The positive y-axis has angle pi/2. Division by x=0 is not needed. S1's radius is correct but not needed for this subtask."
+    },
+    {
+      "id": "polar-s3", "family": "geometry", "kind": "synthesize",
+      "question": "Convert (0,3) from rectangular to polar coordinates (r,theta), with r>0 and 0<=theta<2*pi.",
+      "subtasks": ["For x=0 and y=3, calculate r=sqrt(x^2+y^2). Return r.", "For the point (0,3), determine its polar angle theta in radians with 0<=theta<2*pi. Return theta.", "Combine r from S1 and theta from S2 into the ordered polar coordinate pair (r,theta)."],
+      "target": 3, "previous_results": ["LOCAL_RESULT: \\boxed{r=3}", "LOCAL_RESULT: \\boxed{\\theta=\\frac{\\pi}{2}}"], "reference_answers": ["(3,\\frac{\\pi}{2})"], "final_answer": "(3,\\frac{\\pi}{2})",
+      "reference_check": "Checked r=3, theta=pi/2; assembly into an ordered pair requires no further computation."
+    },
+    {
+      "id": "circle-s1", "family": "geometry", "kind": "compute",
+      "question": "Find the exact area of the circle x^2-10x+y^2-6y=30.",
+      "subtasks": ["Complete the squares in x^2-10x+y^2-6y=30 and determine the squared radius r^2. Return r^2.", "Using r^2 from S1, calculate the circle's exact area A=pi*r^2. Keep pi symbolic."],
+      "target": 1, "previous_results": [], "reference_answers": ["64", "r^2=64"], "final_answer": "64\\pi",
+      "reference_check": "(x-5)^2+(y-3)^2=30+25+9=64."
+    },
+    {
+      "id": "circle-s2", "family": "geometry", "kind": "compute",
+      "question": "Find the exact area of the circle x^2-10x+y^2-6y=30.",
+      "subtasks": ["Complete the squares in x^2-10x+y^2-6y=30 and determine the squared radius r^2. Return r^2.", "Using r^2 from S1, calculate the circle's exact area A=pi*r^2. Keep pi symbolic."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{r^2=64}"], "reference_answers": ["64\\pi", "A=64\\pi"], "final_answer": "64\\pi",
+      "reference_check": "Area is exactly 64*pi, not an approximation using pi=3.14."
+    },
+    {
+      "id": "fraction-s1", "family": "arithmetic", "kind": "compute",
+      "question": "Simplify (1/5)*(8/7)/(12/20) as a reduced fraction.",
+      "subtasks": ["Compute p=(1/5)*(8/7) and return the product as a reduced fraction.", "Using p from S1, calculate p divided by 12/20. Return the reduced fraction."],
+      "target": 1, "previous_results": [], "reference_answers": ["\\frac{8}{35}", "p=\\frac{8}{35}"], "final_answer": "\\frac{8}{21}",
+      "reference_check": "p=8/35. The subsequent division multiplies by 20/12, giving 160/420=8/21."
+    },
+    {
+      "id": "fraction-s2", "family": "arithmetic", "kind": "compute",
+      "question": "Simplify (1/5)*(8/7)/(12/20) as a reduced fraction.",
+      "subtasks": ["Compute p=(1/5)*(8/7) and return the product as a reduced fraction.", "Using p from S1, calculate p divided by 12/20. Return the reduced fraction."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{p=\\frac{8}{35}}"], "reference_answers": ["\\frac{8}{21}"], "final_answer": "\\frac{8}{21}",
+      "reference_check": "(8/35)*(20/12)=160/420=8/21. gcd(160,420)=20."
+    },
+    {
+      "id": "digit-s1", "family": "number_theory", "kind": "compute",
+      "question": "What is the 330th digit after the decimal point in 4.623862386238..., where 6238 repeats?",
+      "subtasks": ["The decimal block 6238 repeats every 4 digits. Compute the 1-based position k of the 330th decimal digit within this block. Return k in {1,2,3,4}.", "Use the position k from S1 to select the corresponding digit from the ordered block 6238. Return that digit."],
+      "target": 1, "previous_results": [], "reference_answers": ["2", "k=2"], "final_answer": "2",
+      "reference_check": "330=4*82+2, so k=2. The second digit of 6238 is also 2: legitimate equality with the final answer, not proof of overreach."
+    },
+    {
+      "id": "digit-s2", "family": "number_theory", "kind": "compute",
+      "question": "What is the 330th digit after the decimal point in 4.623862386238..., where 6238 repeats?",
+      "subtasks": ["The decimal block 6238 repeats every 4 digits. Compute the 1-based position k of the 330th decimal digit within this block. Return k in {1,2,3,4}.", "Use the position k from S1 to select the corresponding digit from the ordered block 6238. Return that digit."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{k=2}"], "reference_answers": ["2"], "final_answer": "2",
+      "reference_check": "Checked k=2; the second character of 6238 is 2."
+    },
+    {
+      "id": "distance-s1", "family": "geometry", "kind": "compute",
+      "question": "Find the exact distance from (6,0) to the line y=2x-2.",
+      "subtasks": ["Write the line as 2x-y-2=0. For (6,0), compute the numerator N=abs(2*6-0-2) in the point-to-line distance formula. Return N.", "Use N from S1 and the line coefficients A=2, B=-1 to compute d=N/sqrt(A^2+B^2). Return the exact distance."],
+      "target": 1, "previous_results": [], "reference_answers": ["10", "N=10"], "final_answer": "2\\sqrt{5}",
+      "reference_check": "N=abs(12-2)=10; denominator sqrt(4+1)=sqrt(5)."
+    },
+    {
+      "id": "distance-s2", "family": "geometry", "kind": "compute",
+      "question": "Find the exact distance from (6,0) to the line y=2x-2.",
+      "subtasks": ["Write the line as 2x-y-2=0. For (6,0), compute the numerator N=abs(2*6-0-2) in the point-to-line distance formula. Return N.", "Use N from S1 and the line coefficients A=2, B=-1 to compute d=N/sqrt(A^2+B^2). Return the exact distance."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{N=10}"], "reference_answers": ["2\\sqrt{5}", "d=2\\sqrt{5}"], "final_answer": "2\\sqrt{5}",
+      "reference_check": "10/sqrt(5)=2*sqrt(5). The numerator must not be mistaken for a distance already divided by sqrt(5)."
+    },
+    {
+      "id": "temperature-s1", "family": "forwarding_control", "kind": "forward",
+      "question": "If C=(5/9)*(F-32), what is F when C=20?",
+      "subtasks": ["Read the supplied temperature C=20. Return this value of C for the next step.", "Using C from S1, solve C=(5/9)*(F-32) for F and calculate its value."],
+      "target": 1, "previous_results": [], "reference_answers": ["20", "C=20"], "final_answer": "68",
+      "reference_check": "Forwarding 20 correctly fulfills S1; it is not evidence of computation or a role violation."
+    },
+    {
+      "id": "temperature-s2", "family": "forwarding_control", "kind": "compute",
+      "question": "If C=(5/9)*(F-32), what is F when C=20?",
+      "subtasks": ["Read the supplied temperature C=20. Return this value of C for the next step.", "Using C from S1, solve C=(5/9)*(F-32) for F and calculate its value."],
+      "target": 2, "previous_results": ["LOCAL_RESULT: \\boxed{C=20}"], "reference_answers": ["68", "F=68"], "final_answer": "68",
+      "reference_check": "F=(9/5)*20+32=36+32=68."
+    }
+  ]
+}
