@@ -55,6 +55,7 @@ def main():
     assert s.limit(x/(x*x/3+1)**2/s.sqrt(2), x, 1) == 9*s.sqrt(2)/32
     report = dict(dataset_sha256=evaluation.digest(data), review_sha256=evaluation.digest(review),
         verifier_version=importlib.metadata.version('math-verify'), sympy_version=s.__version__,
+        verifier_versions=evaluation.verifier_versions(),
         unique_reference_self_checks=len(refs), terminal_reference_checks=len(included),
         negative_controls=len(controls), exact_arithmetic_and_enumeration_checks=len(exact),
         questions_with_exact_checks=len({c['question_number'] for c in exact}),

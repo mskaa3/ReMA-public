@@ -12841,10 +12841,10 @@
         {
           "instruction": "For a closed cylinder, volume V=pi*r^2*h and total area A=2 pi*r*h+2 pi*r^2. Simplify A/(2 V).",
           "reference_answers": [
-            "\\frac1r+\\frac1h"
+            "\\frac{1}{r}+\\frac{1}{h}"
           ],
           "kind": "compute",
-          "checked_result": "LOCAL_RESULT: \\boxed{\\frac1r+\\frac1h}",
+          "checked_result": "LOCAL_RESULT: \\boxed{\\frac{1}{r}+\\frac{1}{h}}",
           "reference_check": "Dividebothterms."
         },
         {

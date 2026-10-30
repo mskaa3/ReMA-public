@@ -3272,7 +3272,7 @@ QUESTION 265 [olympiadbench] INCLUDE
 A cylinder with radius $r$ and height $h$ has volume 1 and total surface area 12. Compute $\frac{1}{r}+\frac{1}{h}$.
 Original final reference: 6
 S1 (compute): For a closed cylinder, volume V=pi*r^2*h and total area A=2 pi*r*h+2 pi*r^2. Simplify A/(2 V).
-Local reference: \frac1r+\frac1h
+Local reference: \frac{1}{r}+\frac{1}{h}
 Math check: Dividebothterms.
 S2 (compute): S1 expresses A/(2 V). Given V=1 and A=12, find 1/r+1/h.
 Local reference: 6

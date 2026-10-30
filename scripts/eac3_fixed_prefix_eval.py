@@ -132,6 +132,41 @@ def capture_prompt(row, rollout_class):
     raise ValueError(f"Target {target} was not reached for {row['id']}")
 
 
+def verifier_versions():
+    versions = {'python': sys.version.split()[0]}
+    for package in ('math-verify', 'latex2sympy2-extended', 'antlr4-python3-runtime', 'sympy'):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = 'not installed'
+    return versions
+
+
+def verify_reference_notation(data, verification_map):
+    # Catch missing scorer dependencies or unsupported gold notation BEFORE GPU loading.
+    versions = verifier_versions()
+    print('Reference verifier versions: ' + json.dumps(versions, sort_keys=True), flush=True)
+    if versions['math-verify'] == 'not installed':
+        raise ValueError('Reference verification requires math-verify; versions: ' + json.dumps(versions))
+    references = []
+    for row in data['examples']:
+        references.extend((row['id'], f'reference_answers[{i}]', ref)
+                          for i, ref in enumerate(row['reference_answers']))
+        references.append((row['id'], 'final_answer', row['final_answer']))
+    checked, stats = verification_map(check_equivalence,
+        [('LOCAL_RESULT: \\boxed{' + ref + '}', [ref]) for _, _, ref in references],
+        timeout_seconds=10, max_workers=2)
+    if len(checked) != len(references):
+        raise ValueError('Reference verifier returned an incomplete batch')
+    invalid = [dict(id=ident, field=field, reference=ref,
+                    result='unknown' if result is None else 'false')
+               for (ident, field, ref), result in zip(references, checked) if result is not True]
+    if invalid:
+        raise ValueError('Reference notation failed verifier self-check:\n' + json.dumps(
+            dict(invalid=invalid, stats=stats, versions=versions), indent=2, sort_keys=True))
+    return dict(stats=stats, versions=versions)
+
+
 def prepare(dataset, output):
     from verl.rema_separated_trainer.ppo.multi_agent_rollout import MultiAgentRollout
     from verl.rema_separated_trainer.ppo.math_verification import bounded_verification_map
@@ -140,22 +175,14 @@ def prepare(dataset, output):
     if data.get('study'):
         from eac3_worker_study_stats import validate_pairs
         validate_pairs(data['examples'])
-    # Catch missing scorer dependencies or unsupported gold notation BEFORE GPU loading.
-    importlib.metadata.version('math-verify')
-    references = [(row['id'], ref) for row in data['examples']
-                  for ref in [*row['reference_answers'], row['final_answer']]]
-    checked, stats = bounded_verification_map(check_equivalence,
-        [('LOCAL_RESULT: \\boxed{' + ref + '}', [ref]) for _, ref in references],
-        timeout_seconds=10, max_workers=2)
-    invalid = [ident for (ident, _), result in zip(references, checked) if result is not True]
-    if invalid:
-        raise ValueError(f'Reference notation failed verifier self-check: {sorted(set(invalid))}; {stats}')
+    verification = verify_reference_notation(data, bounded_verification_map)
     rows = []
     for row in data['examples']:
         messages = capture_prompt(row, MultiAgentRollout)
         rows.append({**row, 'messages': messages, 'prompt_sha256': digest(messages)})
     write_json(output, {**data, 'dataset_sha256': digest(data),
-                        'source_hashes': source_hashes(), 'examples': rows})
+                        'source_hashes': source_hashes(), 'reference_verification': verification,
+                        'examples': rows})
     print(f'Prepared {len(rows)} fixed target prompts; no models were loaded.')
 
 

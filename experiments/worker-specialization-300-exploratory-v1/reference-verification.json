@@ -1,8 +1,15 @@
 {
-  "dataset_sha256": "1e8c581f95b07138ff842384c212f1f3127a1b4f901fbe5a0456c590b3fddad3",
-  "review_sha256": "cd698070eae593b1436b84e4943b583a8665ecb8f0216b499e165ac4f466ed34",
+  "dataset_sha256": "a6cc889a5f04e4a2374a4482c0237c6c7806322ac5347022e924083337f7799b",
+  "review_sha256": "6df4cb9d1d226e20fa991984c55ced61f2f6e1655a368bbe8f2d053c1f147a35",
   "verifier_version": "0.7.0",
   "sympy_version": "1.14.0",
+  "verifier_versions": {
+    "python": "3.11.5",
+    "math-verify": "0.7.0",
+    "latex2sympy2-extended": "1.10.1",
+    "antlr4-python3-runtime": "4.13.2",
+    "sympy": "1.14.0"
+  },
   "unique_reference_self_checks": 336,
   "terminal_reference_checks": 276,
   "negative_controls": 4,
@@ -15,7 +22,7 @@
     "src/verl/verl/rema_separated_trainer/ppo/prefix_probe.py": "a4fae224920ce6dc41f54e976a8ebdfd365dc5a453a72285ceeafba40db70349",
     "src/verl/verl/rema_separated_trainer/ppo/math_verification.py": "65737209a1c0d6952695f592c4b307ed3f6ae49596937d1935815cb1dcf888f7",
     "prompt/math/hierarchical_mamrp.py": "cf8722ddf214d18089017d07ee4bf6d3179fc1a7e5110fe4e2a20a825455db7a",
-    "scripts/eac3_fixed_prefix_eval.py": "28f9102088cc79f4b5282a15e94430b967795f9add6b1b263ae599fe8c774f64",
+    "scripts/eac3_fixed_prefix_eval.py": "cdfc195f1db7be4736f7cb281b8cfb6d641ac7a830e268d84e62663309d4e69a",
     "scripts/eac3_answer_diagnostic.py": "f979717395c757eecf5c1b40f9ca3ccd77a690da39145832f21971f82db25ddc",
     "scripts/eac3_worker_study_stats.py": "15ddaa645a4c106509619ee5bb2b870c369f05cb4fd9fa6a4ed37acb5a869da4"
   },

@@ -9,6 +9,28 @@ No reserved worker outputs were inspected in preparing this package. Historical
 logs/development examples were previously discussed; this is not unseen data.
 No inference or training was run as part of preparing this package.
 
+Preflight notation correction
+-----------------------------
+The first cluster launch stopped before inference: the cylinder task's S1
+reference, written as \frac1r+\frac1h, returned unknown in both context modes.
+It is now written as \frac{1}{r}+\frac{1}{h}, including the fixed result sent to
+S2. The mathematical value, instructions, final answer (6), all 764 example IDs,
+and checkpoint paths are unchanged. No example was skipped or substituted.
+Both notations pass locally; the precise cluster parser difference is not yet
+confirmed. The new preflight logs Python, Math-Verify, latex2sympy, ANTLR and
+SymPy versions, and reports the expression, field and outcome for each failure.
+Successful preflight details are retained in prepared.json.
+
+Dataset digest before correction:
+1e8c581f95b07138ff842384c212f1f3127a1b4f901fbe5a0456c590b3fddad3
+Dataset digest after correction:
+a6cc889a5f04e4a2374a4482c0237c6c7806322ac5347022e924083337f7799b
+
+Review fingerprints and the CPU reference-verification report were refreshed.
+The correction and diagnostic paths have regression coverage (33 study/eval
+tests). Relaunch into a fresh job/output directory with the updated files;
+do not mix artifacts from different dataset or source fingerprints.
+
 All 300 selected questions are accounted for:
   276 provisionally included with plans, local answers, and mathematical checks.
    24 explicitly deferred for missing/ambiguous data, reference issues, or an

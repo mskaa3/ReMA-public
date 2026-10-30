@@ -10,7 +10,7 @@
     "review_mode": "model_self_review",
     "independently_reviewed": false,
     "selection_sha256": "c5baddf888a22c799519b83aae2cbafd2cbf7f7d86ccb1e172af7cbb19fa853e",
-    "review_sha256": "cd698070eae593b1436b84e4943b583a8665ecb8f0216b499e165ac4f466ed34",
+    "review_sha256": "6df4cb9d1d226e20fa991984c55ced61f2f6e1655a368bbe8f2d053c1f147a35",
     "sampled_questions": 300,
     "included_questions": 276,
     "single_task_questions": 40,
@@ -14951,7 +14951,7 @@
       "target": 1,
       "previous_results": [],
       "reference_answers": [
-        "\\frac1r+\\frac1h"
+        "\\frac{1}{r}+\\frac{1}{h}"
       ],
       "final_answer": "6",
       "source_final_answer": "6",
@@ -14972,7 +14972,7 @@
       "target": 1,
       "previous_results": [],
       "reference_answers": [
-        "\\frac1r+\\frac1h"
+        "\\frac{1}{r}+\\frac{1}{h}"
       ],
       "final_answer": "6",
       "source_final_answer": "6",
@@ -14992,7 +14992,7 @@
       ],
       "target": 2,
       "previous_results": [
-        "LOCAL_RESULT: \\boxed{\\frac1r+\\frac1h}"
+        "LOCAL_RESULT: \\boxed{\\frac{1}{r}+\\frac{1}{h}}"
       ],
       "reference_answers": [
         "6"

@@ -52,6 +52,20 @@ class ExploratoryArtifactTests(unittest.TestCase):
                 for i, result in enumerate(row['previous_results'], 1):
                     self.assertIn(f'S{i} LOCAL_RESULT: {evaluation.extract_local_result(result)}', user)
 
+    def test_cylinder_reference_and_fixed_prefix_use_explicit_fraction_braces(self):
+        question_id = '76a1ec3d5b39fbdbcbc86230988e092afb0931eab017dbd0dd77226003a9784f'
+        rows = [r for r in self.data['examples'] if r['question_id'] == question_id]
+        self.assertEqual(len(rows), 3)
+        answer = r'\frac{1}{r}+\frac{1}{h}'
+        for row in rows:
+            if row['target'] == 1:
+                self.assertEqual(row['reference_answers'], [answer])
+            else:
+                self.assertEqual(row['previous_results'], [r'LOCAL_RESULT: \boxed{' + answer + '}'])
+            self.assertEqual(row['final_answer'], '6')
+        reviewed = next(r for r in self.review['examples'] if r['question_id'] == question_id)
+        self.assertEqual(reviewed['tasks'][0]['reference_answers'], [answer])
+
 
 if __name__ == '__main__':
     unittest.main()

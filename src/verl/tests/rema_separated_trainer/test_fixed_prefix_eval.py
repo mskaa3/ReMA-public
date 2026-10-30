@@ -137,6 +137,64 @@ class FixedPrefixTests(unittest.TestCase):
             with patch.dict(sys.modules, {module: SimpleNamespace(compare_worker_final_answers=lambda *a: next(values))}):
                 self.assertIs(evaluation.check_equivalence(('response', ['8', 'a=8'])), expected)
 
+    def test_reference_failure_reports_expression_field_result_and_versions(self):
+        row = copy.deepcopy(self.data['examples'][0])
+        row.update(reference_answers=[r'\frac{1}{r}+\frac{1}{h}'], final_answer='6')
+
+        def bounded(function, jobs, **kwargs):
+            self.assertEqual(len(jobs), 2)
+            return [None, False], dict(checks=2, unknown_count=1)
+
+        with patch.object(evaluation.importlib.metadata, 'version', side_effect=lambda p: p + '-test'), \
+                redirect_stdout(io.StringIO()), self.assertRaises(ValueError) as caught:
+            evaluation.verify_reference_notation({'examples': [row]}, bounded)
+        diagnostic = json.loads(str(caught.exception).split('\n', 1)[1])
+        self.assertEqual(diagnostic['invalid'], [
+            dict(id=row['id'], field='reference_answers[0]', reference=row['reference_answers'][0], result='unknown'),
+            dict(id=row['id'], field='final_answer', reference='6', result='false')])
+        self.assertEqual(diagnostic['versions']['latex2sympy2-extended'], 'latex2sympy2-extended-test')
+        self.assertEqual(diagnostic['stats']['unknown_count'], 1)
+
+    def test_prepare_retains_verifier_versions_and_stops_before_prompt_capture_on_failure(self):
+        for passes in (True, False):
+            with self.subTest(passes=passes), tempfile.TemporaryDirectory() as directory:
+                tmp = Path(directory)
+                path, output = tmp / 'data.json', tmp / 'prepared.json'
+                evaluation.write_json(path, self.data)
+
+                def bounded(function, jobs, **kwargs):
+                    return [True if passes else None for _ in jobs], dict(checks=len(jobs))
+
+                modules = {'verl.rema_separated_trainer.ppo.math_verification':
+                    SimpleNamespace(bounded_verification_map=bounded),
+                    'verl.rema_separated_trainer.ppo.multi_agent_rollout':
+                    SimpleNamespace(MultiAgentRollout=self.rollout)}
+                with patch.dict(sys.modules, modules), patch.object(evaluation.importlib.metadata,
+                        'version', return_value='test'), redirect_stdout(io.StringIO()), patch.object(
+                        evaluation, 'capture_prompt', return_value=[dict(role='user', content='fixture')]) as capture:
+                    if passes:
+                        evaluation.prepare(path, output)
+                        prepared = evaluation.read_json(output)
+                        self.assertEqual(prepared['reference_verification']['versions']['sympy'], 'test')
+                        self.assertEqual(prepared['reference_verification']['stats']['checks'],
+                                         sum(len(r['reference_answers'])+1 for r in self.data['examples']))
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'Reference notation failed'):
+                            evaluation.prepare(path, output)
+                        capture.assert_not_called()
+                        self.assertFalse(output.exists())
+
+    def test_missing_verifier_is_diagnosed_before_any_checks(self):
+        def absent(package):
+            raise evaluation.importlib.metadata.PackageNotFoundError(package)
+
+        def bounded(*args, **kwargs):
+            self.fail('Verification must not run without the required package')
+
+        with patch.object(evaluation.importlib.metadata, 'version', side_effect=absent), \
+                redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'requires math-verify'):
+            evaluation.verify_reference_notation(self.data, bounded)
+
     def test_mock_inference_and_paired_report(self):
         data = self.prepared()
         class Tokenizer:
