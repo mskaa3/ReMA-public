@@ -35,12 +35,16 @@ def write_json(path, value):
 def source_hashes():
     paths = [PPO / 'multi_agent_rollout.py', PPO / 'local_results.py',
              PPO / 'prefix_probe.py', PPO / 'math_verification.py',
-             ROOT / 'prompt/math/hierarchical_mamrp.py', Path(__file__)]
+             ROOT / 'prompt/math/hierarchical_mamrp.py', Path(__file__),
+             ROOT / 'scripts/eac3_worker_study_stats.py']
     return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
 
 def load_dataset(path):
-    data = read_json(path)
+    return validate_dataset(read_json(path))
+
+
+def validate_dataset(data):
     if data.get('schema_version') != 1 or not data.get('provenance') or not data.get('examples'):
         raise ValueError('Expected schema_version=1, provenance and a nonempty examples list')
     ids = set()
@@ -131,6 +135,9 @@ def prepare(dataset, output):
     from verl.rema_separated_trainer.ppo.math_verification import bounded_verification_map
 
     data = load_dataset(dataset)
+    if data.get('study'):
+        from eac3_worker_study_stats import validate_pairs
+        validate_pairs(data['examples'])
     # Catch missing scorer dependencies or unsupported gold notation BEFORE GPU loading.
     importlib.metadata.version('math-verify')
     references = [(row['id'], ref) for row in data['examples']
@@ -164,6 +171,10 @@ def run_model(args):
     from validate_hf_model_dir import validate_model_dir
 
     data = load_prepared(args.prepared)
+    if data.get('study'):
+        expected = {m['id']: m['source'] for m in data['study']['models']}
+        if expected.get(args.model_id) != args.model_source:
+            raise ValueError('Checkpoint source does not match the frozen study configuration')
     if data['source_hashes'] != source_hashes():
         raise ValueError('Code changed since prepare; use a fresh evaluation directory')
     validate_model_dir(args.model_dir)
@@ -299,6 +310,10 @@ def report(prepared, directories, output):
             raise ValueError('Runs do not share identical inputs, inference settings and code/verifier versions')
         settings = common
         model = manifest['model_id']
+        if data.get('study'):
+            expected_sources = {m['id']: m['source'] for m in data['study']['models']}
+            if expected_sources.get(model) != manifest['model_source']:
+                raise ValueError('Checkpoint source does not match the frozen study configuration')
         rows = scored['records']
         indexed = {r['id']: r for r in rows}
         if model in models or len(indexed) != len(rows) or set(indexed) != set(ids):
@@ -321,14 +336,22 @@ def report(prepared, directories, output):
                 [r for r in rows if r['terminal'] == terminal])
     comparisons = {f'{a} -> {b}': compare_records(models[a], models[b])
                    for i, a in enumerate(names) for b in names[i + 1:]}
+    study_results = None
+    caution = 'Curated pilot, not a population estimate. Answer correctness is not proof of role compliance.'
+    if data.get('study'):
+        from eac3_worker_study_stats import analyze
+        study_results = analyze(data, models)
+        caution = study_results['caution']
     out = Path(output)
     out.mkdir(parents=True, exist_ok=False)
     write_json(out / 'report.json', dict(provenance=data['provenance'], summary=summaries, pairs=comparisons,
-        caution='Curated pilot, not a population estimate. Answer correctness is not proof of role compliance.'))
+        study=study_results, caution=caution))
     with (out / 'review.jsonl').open('x') as stream:
         for i, row in enumerate(data['examples']):
             stream.write(json.dumps({**row, 'outputs': {name: models[name][i] for name in names}}) + '\n')
-    lines = ['# Fixed-Prefix Worker Pilot', '',
+    lines = ['# Fixed-Prefix Worker Study' if study_results else '# Fixed-Prefix Worker Pilot', '',
+             caution, '',
+             'The pooled table below mixes task kinds/contexts; use the stratified study endpoints for conclusions.', '',
              '| Model | N | Correct accepted | Wrong | Unknown | No accepted result | Length stop |',
              '|---|---:|---:|---:|---:|---:|---:|']
     for name, summary in summaries.items():
@@ -339,8 +362,11 @@ def report(prepared, directories, output):
     lines += ['', 'Greedy, one response per fixed input. No gates or training applied.',
               'Unknown and missing results are not evidence of mathematically incorrect reasoning.',
               'Inspect review.jsonl for reasoning and role compliance; those labels remain unset.',
-              'This curated pilot is not a random test set. Several examples share a question.', '',
+              'Several examples share a question; responses are not independent observations.', '',
               '## Paired Counts', '', '```json', json.dumps(comparisons, indent=2), '```']
+    if study_results:
+        from eac3_worker_study_stats import markdown
+        lines += markdown(study_results)
     with (out / 'report.md').open('x') as stream:
         stream.write('\n'.join(lines) + '\n')
     print('\n'.join(lines))

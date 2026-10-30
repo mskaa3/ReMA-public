@@ -1,5 +1,9 @@
 # Fixed-prefix worker evaluation
 
+For the larger random-question, paired Q/no-Q comparison, see
+[the worker specialization study protocol](eac3_worker_specialization_study.md).
+The 18-example pilot below remains a diagnostic, not that study's test set.
+
 This inference-only pilot asks: **given the same assigned task and correct prior
 results, do the trained workers produce better local answers than their common
 initialization?** It neither trains nor changes the gates, rewards or prompts.

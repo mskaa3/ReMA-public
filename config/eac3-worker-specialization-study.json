@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "study_id": "worker-specialization-v1",
+  "evidence_status": "historical_validation_exploratory",
+  "candidate_files": ["data/overall_math/test.parquet"],
+  "known_training_files": ["data/MATH/train_lv3to5_8k.parquet"],
+  "exclude_datasets": ["experiments/fixed-prefix-pilot.json"],
+  "seed": 20261030,
+  "development_questions": 30,
+  "reserved_questions": 300,
+  "bootstrap_samples": 5000,
+  "bootstrap_seed": 20261031,
+  "model_config": "config/eac3-fixed-prefix-pilot.json",
+  "primary_endpoint": "accepted_local_correct_compute_nonterminal_full_question",
+  "primary_comparison": ["ungated", "gated"]
+}
