@@ -22,7 +22,8 @@ import experiment_io
 class StudyTests(unittest.TestCase):
     def fixture(self, tmp):
         config = evaluation.read_json(ROOT / 'config/eac3-worker-specialization-study.json')
-        rows = [dict(question=f'Question {i}: compute {i} plus 2.', data_source='a' if i < 8 else 'b',
+        rows = [dict(question=f'Question {i}: compute {i} plus 2.', data_source='ReMA-math',
+                     subset='a' if i < 8 else 'b',
                      reward_model={'ground_truth': str(i + 2)}) for i in range(16)]
         candidates = tmp / 'candidates.jsonl'
         candidates.write_text(''.join(json.dumps(r) + '\n' for r in [*rows, rows[3]]))
@@ -89,6 +90,82 @@ class StudyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             study.proportional_quotas(groups, 12)
 
+    def test_missing_references_are_logged_before_sampling_and_zero_is_kept(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            path = self.fixture(tmp)
+            with (tmp / 'candidates.jsonl').open('a') as stream:
+                for i, answer in enumerate(('', '  ', None, float('nan'), float('inf'), 0)):
+                    stream.write(json.dumps(dict(question=f'Extra {i}', data_source='ReMA-math', subset='a',
+                                                 reward_model={'ground_truth': answer})) + '\n')
+            config = evaluation.read_json(path)
+            config.update(development_questions=8, reserved_questions=8)
+            path.write_text(json.dumps(config))
+            with redirect_stdout(io.StringIO()):
+                study.sample(path, tmp / 'sample')
+            selection = evaluation.read_json(tmp / 'sample/selection.json')
+            exclusions = evaluation.read_json(tmp / 'sample/input-exclusions.json')
+            self.assertEqual(selection['counts']['missing_reference_rows'], 5)
+            self.assertEqual(exclusions, selection['input_exclusions'])
+            self.assertEqual({r['reason'] for r in exclusions}, {'missing_reference'})
+            chosen = selection['splits']['development'] + selection['splits']['reserved']
+            self.assertFalse({r['question_id'] for r in exclusions} & {r['question_id'] for r in chosen})
+            self.assertEqual(next(r for r in chosen if r['question'] == 'Extra 5')['final_answer'], '0')
+            self.assertEqual(set(selection['eligible_question_counts']), {'a', 'b'})
+            self.assertEqual({r['data_source'] for r in chosen}, {'ReMA-math'})
+            config['missing_reference_policy'] = 'error'
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, 'row 17 .*missing/empty/nonfinite'):
+                study.sample(path, tmp / 'strict')
+            self.assertFalse((tmp / 'strict').exists())
+
+    def test_structured_labels_and_bad_schema_still_fail_with_row_details(self):
+        import numpy as np
+
+        for bad in ([1, 2], {'answer': 5}, np.array([1, 2]), False):
+            with self.subTest(answer=repr(bad)), tempfile.TemporaryDirectory() as directory:
+                tmp = Path(directory)
+                config = self.fixture(tmp)
+                original_reader = study.read_rows
+
+                def read(path):
+                    rows = original_reader(path)
+                    if path.name == 'candidates.jsonl':
+                        rows[0]['reward_model']['ground_truth'] = bad
+                    return rows
+
+                with patch.object(study, 'read_rows', side_effect=read), self.assertRaisesRegex(
+                        ValueError, 'row 0 .*unsupported ground truth type'):
+                    study.sample(config, tmp / 'out')
+                self.assertFalse((tmp / 'out').exists())
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            config = self.fixture(tmp)
+            rows = study.read_rows(tmp / 'candidates.jsonl')
+            rows[0]['subset'] = None
+            (tmp / 'candidates.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            with self.assertRaisesRegex(ValueError, 'row 0 .*subset must be a nonempty string'):
+                study.sample(config, tmp / 'out')
+
+    def test_actual_validation_json_source_empty_answers_and_subsets(self):
+        # Mirror preprocess.py without requiring the local Parquet engine.
+        # This checks the repository's real source, not a claim to read its Parquet.
+        source = study.read_rows(ROOT / 'data/overall_math/all_test_data.jsonl')
+        converted = [dict(question=r['question'], data_source='ReMA-math', subset=r['dataset'],
+                          reward_model={'ground_truth': r['answer']}) for r in source]
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            config_path = self.fixture(tmp)
+            (tmp / 'candidates.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in converted))
+            with redirect_stdout(io.StringIO()):
+                study.sample(config_path, tmp / 'sample')
+            selection = evaluation.read_json(tmp / 'sample/selection.json')
+            self.assertEqual(selection['counts']['candidate_rows'], 3221)
+            self.assertEqual(selection['counts']['missing_reference_rows'], 4)
+            self.assertEqual({e['row_index'] for e in selection['input_exclusions']}, {97, 1972, 2056, 2081})
+            self.assertEqual(set(selection['eligible_question_counts']),
+                {'gsm8k', 'olympiadbench', 'MATH500', 'gaokao2023en', 'minerva_math', 'amc23', 'aime24'})
+
     def test_conflicting_duplicate_is_not_arbitrarily_picked(self):
         with tempfile.TemporaryDirectory() as directory:
             tmp = Path(directory)
@@ -110,6 +187,7 @@ class StudyTests(unittest.TestCase):
             self.assertEqual(len(study.validate_review(selection, checked)), 4)
             for change in (lambda r: r['examples'].pop(),
                            lambda r: r['examples'][0].update(question='tampered'),
+                           lambda r: r['examples'][0].update(stratum='tampered'),
                            lambda r: r['examples'][0].update(checker='fixture-author'),
                            lambda r: r['examples'][0]['checks'].update(each_task_sufficient_without_question=False),
                            lambda r: r['examples'][0]['tasks'][0].update(checked_result='The answer is five.')):
@@ -128,6 +206,10 @@ class StudyTests(unittest.TestCase):
             data = self.freeze(Path(directory))
             self.assertEqual(len(data['examples']), 12)
             self.assertEqual(data['study']['included_questions'], 4)
+            self.assertEqual(data['study']['stratify_by'], 'subset')
+            self.assertEqual(set(data['study']['included_by_source']), {'ReMA-math'})
+            self.assertEqual(set(data['study']['included_by_stratum']), {'a', 'b'})
+            self.assertEqual({row['family'] for row in data['examples']}, {'a', 'b'})
             stats.validate_pairs(data['examples'])
             rollout = production_rollout_class()
             for row in data['examples']:

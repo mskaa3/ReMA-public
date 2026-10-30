@@ -26,7 +26,7 @@ Their comparison cannot isolate the causal effect of EAC3 training.
 ## Design fixed before looking at outputs
 
 1. Sample 30 development questions and reserve 300 more, proportionally stratified
-   by `data_source`, using a recorded seed. Use development questions to settle
+   by `subset` (GSM8K, MATH500, etc.), using a recorded seed. Use development questions to settle
    the annotation protocol and check the runner. Do not tune on reserved results.
 2. For every selected question, author one coherent plan of 1-4 tasks. Review the
    local references, each prefix and the sufficiency of each individual task.
@@ -53,6 +53,15 @@ current script deliberately does not relabel this pool as confirmatory.
 
 Sampling removes exact whitespace-normalized overlap with the configured known
 training files, duplicate questions, and the diagnostic pilot questions.
+The default `missing_reference_policy: "exclude"` records and excludes rows with
+missing, empty or nonfinite reference answers BEFORE sampling; it never invents
+an answer from a solution trace. These rows remain visible in
+`input-exclusions.json` and the selection manifest. Use `"error"` for strict
+failure instead. Unsupported structured answers and malformed question/source
+fields still fail with the file path and zero-based row index.
+The default `stratify_by: "subset"` uses actual benchmark names because
+`data_source` is the shared reward-routing label `ReMA-math` in this dataset.
+Other datasets may explicitly select `stratify_by: "data_source"`.
 Conflicting duplicate references/strata fail instead of selecting arbitrarily.
 This is NOT semantic deduplication or proof of no pretraining contamination.
 Check that `known_training_files` lists every relevant training dataset before
@@ -81,7 +90,7 @@ apptainer exec --writable-tmpfs --bind "$PWD:/repo" --pwd /repo \
   --output experiments/worker-specialization-v1/selection
 ```
 
-Outputs: `selection.json`, `development-review.json`,
+Outputs: `selection.json`, `input-exclusions.json`, `development-review.json`,
 `PRIVATE-reserved-review.json`. All output directories must be new. File hashes,
 sampled IDs, strata, exclusions and checkpoint sources are recorded. No model
 outputs or correctness scores are used to select questions.

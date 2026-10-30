@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 import hashlib
 import json
 import math
+from numbers import Real
 from pathlib import Path
 import random
 
@@ -26,6 +27,11 @@ IDENTITY_FIELDS = ('question_id', 'question', 'final_answer', 'data_source')
 
 def question_id(question):
     return hashlib.sha256(' '.join(question.split()).encode()).hexdigest()
+
+
+def stratum(row):
+    # Existing frozen samples used data_source; preserve their interpretation.
+    return row.get('stratum', row['data_source'])
 
 
 def file_hash(path):
@@ -82,6 +88,10 @@ def validate_config(config):
     for field in ('candidate_files', 'known_training_files', 'exclude_datasets'):
         if not isinstance(config.get(field), list) or not config[field]:
             raise ValueError(f'Explicitly configure nonempty {field}')
+    if config.get('missing_reference_policy', 'error') not in {'error', 'exclude'}:
+        raise ValueError('missing_reference_policy must be error or exclude')
+    if config.get('stratify_by', 'data_source') not in {'data_source', 'subset'}:
+        raise ValueError('stratify_by must be data_source or subset')
     models = evaluation.read_json(resolve(config['model_config']))['models']
     if [model['id'] for model in models] != ['w0', 'ungated', 'gated']:
         raise ValueError('Study expects w0, ungated, gated in that order')
@@ -100,24 +110,39 @@ def sample(config_path, output):
                 for row in read_rows(resolve(p))}
     pilot = {question_id(row['question']) for p in config['exclude_datasets']
              for row in evaluation.load_dataset(resolve(p))['examples']}
-    candidates, counts = {}, Counter()
+    candidates, counts, input_exclusions = {}, Counter(), []
+    stratify_by = config.get('stratify_by', 'data_source')
+    missing_policy = config.get('missing_reference_policy', 'error')
     for path in config['candidate_files']:
-        for row in read_rows(resolve(path)):
+        for row_index, row in enumerate(read_rows(resolve(path))):
             counts['candidate_rows'] += 1
             question = row.get('question')
             reward = row.get('reward_model')
             answer = reward.get('ground_truth') if isinstance(reward, dict) else row.get('ground_truth')
             source = row.get('data_source')
-            if (not isinstance(question, str) or not question.strip()
-                    or not isinstance(source, str) or not source.strip()
-                    or answer is None or isinstance(answer, (dict, list))
-                    or isinstance(answer, float) and not math.isfinite(answer)
-                    or not str(answer).strip()):
-                raise ValueError(f'{path}: question, data_source and scalar ground truth are required')
+            group = row.get(stratify_by)
+            location = f'{path}: row {row_index} (zero-based)'
+            for field, value in [('question', question), ('data_source', source), (stratify_by, group)]:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f'{location}: {field} must be a nonempty string; got {value!r}')
             qid = question_id(question)
-            record = dict(question_id=qid, question=question, final_answer=str(answer), data_source=source)
+            missing = (answer is None or isinstance(answer, str) and not answer.strip()
+                       or isinstance(answer, Real) and not math.isfinite(answer))
+            if missing:
+                if missing_policy == 'error':
+                    raise ValueError(f'{location}: missing/empty/nonfinite ground truth for {qid}; '
+                                     'set missing_reference_policy=exclude to record its exclusion before sampling')
+                input_exclusions.append(dict(path=path, row_index=row_index, question_id=qid,
+                    question=question, data_source=source, stratum=group, reason='missing_reference'))
+                counts['missing_reference_rows'] += 1
+                continue
+            if isinstance(answer, bool) or not isinstance(answer, (str, Real)):
+                raise ValueError(f'{location}: unsupported ground truth type {type(answer).__name__}; '
+                                 'expected text or a finite number; refusing to stringify a structured answer')
+            record = dict(question_id=qid, question=question, final_answer=str(answer),
+                          data_source=source, stratum=group)
             if qid in candidates:
-                if any(candidates[qid][key] != record[key] for key in ('final_answer', 'data_source')):
+                if any(candidates[qid][key] != record[key] for key in ('final_answer', 'data_source', 'stratum')):
                     raise ValueError('Duplicate question has conflicting reference or stratum')
                 counts['duplicate_rows'] += 1
             else:
@@ -129,7 +154,7 @@ def sample(config_path, output):
         elif qid in pilot:
             counts['pilot_overlap_questions'] += 1
         else:
-            groups[row['data_source']].append(row)
+            groups[stratum(row)].append(row)
     rng = random.Random(config['seed'])
     for source in sorted(groups):
         rng.shuffle(groups[source])
@@ -141,12 +166,14 @@ def sample(config_path, output):
         groups = {source: rows[quotas[source]:] for source, rows in groups.items()}
     selection = dict(schema_version=1, config=config, config_sha256=evaluation.digest(config),
                      source_file_sha256=sources, models=models, counts=dict(counts),
+                     input_exclusions=input_exclusions,
                      sampler_source_sha256=file_hash(__file__),
                      eligible_question_counts=pool_counts, splits=splits)
     selection['selection_sha256'] = evaluation.digest(selection)
     out = Path(output)
     out.mkdir(parents=True, exist_ok=False)
     evaluation.write_json(out / 'selection.json', selection)
+    evaluation.write_json(out / 'input-exclusions.json', input_exclusions)
     for split, rows in splits.items():
         template = dict(selection_sha256=selection['selection_sha256'], split=split, examples=[
             {**row, 'decision': 'pending', 'exclusion_reason': '', 'author': '', 'checker': '',
@@ -155,6 +182,8 @@ def sample(config_path, output):
         name = 'development-review.json' if split == 'development' else 'PRIVATE-reserved-review.json'
         evaluation.write_json(out / name, template)
     print(f'Sampled {len(splits["development"])} development and {len(splits["reserved"])} reserved questions.')
+    print(f'Excluded {len(input_exclusions)} rows with missing references before sampling; see input-exclusions.json.')
+    print(f'Eligible questions stratified by {stratify_by}: {json.dumps(pool_counts, sort_keys=True)}')
     print('No references or plans were authored or certified. Review templates must be completed before freeze.')
 
 
@@ -175,6 +204,8 @@ def validate_review(selection, review):
     for row in rows:
         if any(row[field] != expected[row['question_id']][field] for field in IDENTITY_FIELDS):
             raise ValueError('Sampled question, reference or stratum was changed')
+        if stratum(row) != stratum(expected[row['question_id']]):
+            raise ValueError('Sampled question stratum was changed')
         if (not row['author'].strip() or not row['checker'].strip()
                 or row['author'].strip() == row['checker'].strip()
                 or row['author_type'] not in {'human', 'model'}
@@ -211,7 +242,7 @@ def freeze(selection_path, review_path, output):
             for mode in (['subtask_context'] if terminal else ['full_question', 'subtask_context']):
                 case = f"{row['question_id']}:s{index + 1}"
                 examples.append(dict(id=f'{case}:{mode}', case_id=case, question_id=row['question_id'],
-                    question=row['question'], family=row['data_source'], kind=task['kind'],
+                    question=row['question'], family=stratum(row), kind=task['kind'],
                     subtasks=[t['instruction'] for t in tasks], target=index + 1,
                     previous_results=[t['checked_result'] for t in tasks[:index]],
                     reference_answers=task['reference_answers'], final_answer=row['final_answer'],
@@ -225,6 +256,10 @@ def freeze(selection_path, review_path, output):
         single_task_questions=sum(len(r['tasks']) == 1 for r in included),
         sampled_by_source=dict(Counter(r['data_source'] for r in rows)),
         included_by_source=dict(Counter(r['data_source'] for r in included)),
+        stratify_by=config.get('stratify_by', 'data_source'),
+        sampled_by_stratum=dict(Counter(stratum(r) for r in rows)),
+        included_by_stratum=dict(Counter(stratum(r) for r in included)),
+        input_exclusions=selection.get('input_exclusions', []),
         exclusions=[dict(question_id=r['question_id'], reason=r['exclusion_reason']) for r in rows
                     if r['decision'] == 'exclude'],
         bootstrap_samples=config['bootstrap_samples'], bootstrap_seed=config['bootstrap_seed'],

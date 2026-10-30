@@ -5,6 +5,8 @@
   "candidate_files": ["data/overall_math/test.parquet"],
   "known_training_files": ["data/MATH/train_lv3to5_8k.parquet"],
   "exclude_datasets": ["experiments/fixed-prefix-pilot.json"],
+  "missing_reference_policy": "exclude",
+  "stratify_by": "subset",
   "seed": 20261030,
   "development_questions": 30,
   "reserved_questions": 300,
