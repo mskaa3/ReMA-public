@@ -131,11 +131,10 @@ class FixedPrefixTests(unittest.TestCase):
         self.assertEqual(evaluation.extract_local_result(r'\boxed{8} or \boxed{13}'), '')
 
     def test_comparator_alternatives_preserve_unknown(self):
-        module = 'verl.rema_separated_trainer.ppo.prefix_probe'
         for outputs, expected in (([False, None], None), ([False, True], True), ([False, False], False)):
-            values = iter(outputs)
-            with patch.dict(sys.modules, {module: SimpleNamespace(compare_worker_final_answers=lambda *a: next(values))}):
-                self.assertIs(evaluation.check_equivalence(('response', ['8', 'a=8'])), expected)
+            values = [ValueError('Unsupported') if x is None else x for x in outputs]
+            with patch.object(evaluation.math_answers, 'compare_answer', side_effect=values):
+                self.assertIs(evaluation.check_equivalence((r'LOCAL_RESULT: \boxed{8}', ['8', 'a=8'])), expected)
 
     def test_reference_failure_reports_expression_field_result_and_versions(self):
         row = copy.deepcopy(self.data['examples'][0])

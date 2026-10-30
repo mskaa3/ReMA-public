@@ -2,9 +2,9 @@
 
 import re
 
-from local_results import extract_complete_boxed_answer
+from local_results import extract_complete_boxed_answer, result_declarations
 
-VERSION = 'standalone-local-result-v1'
+VERSION = 'standalone-local-result-v2'
 
 
 def reported_answer(response):
@@ -16,6 +16,9 @@ def reported_answer(response):
     """
     if not isinstance(response, str) or not response.strip():
         return dict(answer='', reason='empty')
+    own, quoted = result_declarations(response)
+    if quoted and not own:
+        return dict(answer='', reason='predecessor_quote_only')
     declarations = list(re.finditer(
         r'^[ \t]*(?:\*\*)?LOCAL_RESULT[ \t]*:(?:\*\*)?[ \t]*',
         response, re.MULTILINE))

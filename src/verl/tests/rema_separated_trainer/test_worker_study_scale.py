@@ -21,7 +21,7 @@ import test_worker_study as fixtures
 class ScaleTests(unittest.TestCase):
     def test_inline_quote_is_not_a_second_standalone_answer(self):
         response = 'REASONING:\nGiven S2 LOCAL_RESULT: \\boxed{29}, multiply by seven.\n\nLOCAL_RESULT: \\boxed{203}'
-        self.assertEqual(evaluation.extract_local_result(response), '')
+        self.assertEqual(evaluation.extract_local_result(response), r'\boxed{203}')
         self.assertEqual(diagnostic.reported_answer(response)['answer'], '203')
 
     def test_ambiguous_or_truncated_outputs_do_not_fall_back(self):
@@ -35,6 +35,7 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual(diagnostic.reported_answer(r'Therefore \boxed{3\sqrt{13}}.')['answer'], r'3\sqrt{13}')
         self.assertEqual(diagnostic.reported_answer('**LOCAL_RESULT:** \\boxed{5}')['answer'], '5')
         self.assertEqual(diagnostic.reported_answer('')['answer'], '')
+        self.assertEqual(diagnostic.reported_answer(r'Given S1 LOCAL_RESULT: \boxed{8}')['answer'], '')
 
     def test_package_reuses_reserved_sample_without_certifying(self):
         helper = fixtures.StudyTests()

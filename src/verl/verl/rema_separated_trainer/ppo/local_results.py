@@ -3,6 +3,20 @@
 import re
 from typing import Optional
 
+RESULT_BOUNDARY_VERSION = 'source-labelled-quotes-v2'
+
+
+def result_declarations(output: str):
+    """Separate the worker's declarations from explicitly attributed S<n> quotes."""
+    own, quoted = [], []
+    for match in re.finditer(r"local[_ ]result\s*:", output, re.IGNORECASE):
+        line_prefix = output[output.rfind('\n', 0, match.start()) + 1:match.start()]
+        if re.search(r'\bS\d+\s+$', line_prefix, re.IGNORECASE):
+            quoted.append(match)
+        else:
+            own.append(match)
+    return own, quoted
+
 
 def extract_complete_boxed_answer(response: str) -> Optional[str]:
     """Return the last box; a malformed last box never falls back to an earlier one."""
@@ -31,8 +45,11 @@ def extract_local_result(output: str, max_chars: int = 600) -> str:
     """
     if not isinstance(output, str) or not output.strip():
         return ""
-    declarations = list(re.finditer(r"local[_ ]result\s*:", output, re.IGNORECASE))
+    declarations, quoted = result_declarations(output)
     if len(declarations) > 1:
+        return ""
+    # A quoted predecessor result alone is not a new answer.
+    if quoted and not declarations:
         return ""
     if declarations:
         candidate = re.split(

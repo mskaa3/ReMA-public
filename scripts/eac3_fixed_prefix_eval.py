@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / 'src/verl'))
 sys.path.insert(0, str(PPO))
 from local_results import extract_local_result
 from eac3_answer_diagnostic import VERSION as ANSWER_DIAGNOSTIC_VERSION, reported_answer
+import eac3_math_answers as math_answers
 
 
 def digest(value):
@@ -38,6 +39,7 @@ def source_hashes():
              PPO / 'prefix_probe.py', PPO / 'math_verification.py',
              ROOT / 'prompt/math/hierarchical_mamrp.py', Path(__file__),
              ROOT / 'scripts/eac3_answer_diagnostic.py',
+             ROOT / 'scripts/eac3_math_answers.py',
              ROOT / 'scripts/eac3_worker_study_stats.py']
     return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
@@ -263,13 +265,12 @@ def indexed_records(path, expected_ids):
 
 
 def check_equivalence(item):
-    from verl.rema_separated_trainer.ppo.prefix_probe import compare_worker_final_answers
+    from local_results import extract_complete_boxed_answer
 
-    response, references = item
-    values = [compare_worker_final_answers(response, '\\boxed{' + ref + '}') for ref in references]
-    if True in values:
-        return True
-    return None if None in values else False
+    response, references, *context = item
+    accepted = extract_local_result(response)
+    answer = extract_complete_boxed_answer(accepted) if accepted else ''
+    return math_answers.equivalent((answer, references, context[0] if context else ''))
 
 
 def score(prepared, directory):
@@ -281,17 +282,35 @@ def score(prepared, directory):
     if manifest['prepared_sha256'] != digest(data) or manifest['source_hashes'] != source_hashes():
         raise ValueError('Cannot score a different prepared dataset or source version')
     responses = indexed_records(out / 'responses.jsonl', [r['id'] for r in data['examples']])
+    scored = score_records(data, responses, bounded_verification_map)
+    write_json(out / 'scored.json', scored)
+    print(json.dumps(summarize(scored['records']), indent=2))
+
+
+def score_records(data, responses, verification_map):
+    """Shared live/offline scorer; offline callers must validate provenance first."""
     jobs = []
     diagnostics = []
+    form_jobs, form_indices = [], []
     for row in data['examples']:
         response = responses[row['id']]['response']
         diagnostic = reported_answer(response)
         diagnostics.append(diagnostic)
+        task = row['subtasks'][row['target'] - 1]
         candidate = ('LOCAL_RESULT: \\boxed{' + diagnostic['answer'] + '}'
                      if diagnostic['answer'] else '')
-        jobs.extend([(response, row['reference_answers']), (response, [row['final_answer']]),
-                     (candidate, row['reference_answers'])])
-    values, stats = bounded_verification_map(check_equivalence, jobs, timeout_seconds=10, max_workers=2)
+        jobs.extend([(response, row['reference_answers'], task),
+                     (response, [row['final_answer']], row['question']),
+                     (candidate, row['reference_answers'], task)])
+        if math_answers.form_rule(task):
+            form_indices.append(len(diagnostics) - 1)
+            form_jobs.append((diagnostic['answer'], task))
+    values, stats = verification_map(check_equivalence, jobs, timeout_seconds=10, max_workers=2)
+    forms, form_stats = verification_map(math_answers.requested_form, form_jobs,
+                                        timeout_seconds=10, max_workers=2)
+    if len(values) != len(jobs) or len(forms) != len(form_jobs):
+        raise ValueError('Incomplete answer verification batch')
+    form_values = dict(zip(form_indices, forms))
     records = []
     for i, row in enumerate(data['examples']):
         record = responses[row['id']]
@@ -299,21 +318,28 @@ def score(prepared, directory):
         correct, final_match, answer_correct = values[3 * i:3 * i + 3]
         status = ('no_accepted_result' if not accepted else 'unknown' if correct is None
                   else 'correct' if correct else 'wrong')
+        value_status = status
+        form_status = ('not_checked' if i not in form_values else 'unknown' if form_values[i] is None
+                       else 'satisfied' if form_values[i] else 'failed')
+        if status == 'correct' and form_status in {'failed', 'unknown'}:
+            status = 'wrong' if form_status == 'failed' else 'unknown'
         diagnostic = diagnostics[i]
         answer_status = ('no_unambiguous_answer' if not diagnostic['answer'] else
                          'unknown' if answer_correct is None else 'correct' if answer_correct else 'wrong')
         records.append({**record, 'accepted_result': accepted, 'local_correct': correct,
-                        'status': status, 'full_question_answer_match': final_match,
+                        'status': status, 'value_status': value_status,
+                        'task_form_status': form_status, 'full_question_answer_match': final_match,
                         'reported_answer': diagnostic['answer'],
                         'reported_answer_extraction': diagnostic['reason'],
                         'reported_answer_status': answer_status,
                         'terminal': row['target'] == len(row['subtasks']),
                         'family': row['family'], 'kind': row['kind'],
                         'manual_role_compliance': None, 'manual_reasoning_correct': None})
-    write_json(out / 'scored.json', dict(records=records, verification=stats,
-                                       answer_diagnostic_version=ANSWER_DIAGNOSTIC_VERSION,
-                                       math_verify_version=importlib.metadata.version('math-verify')))
-    print(json.dumps(summarize(records), indent=2))
+    return dict(records=records, verification=stats, form_verification=form_stats,
+                scorer_version=math_answers.VERSION, scoring_source_hashes=source_hashes(),
+                verifier_versions=verifier_versions(),
+                answer_diagnostic_version=ANSWER_DIAGNOSTIC_VERSION,
+                math_verify_version=importlib.metadata.version('math-verify'))
 
 
 def summarize(records):
@@ -330,6 +356,8 @@ def summarize(records):
             status_counts=dict(Counter(r['reported_answer_status'] for r in records)),
             correct_but_not_routable=sum(r['reported_answer_status'] == 'correct'
                                          and not r['accepted_result'] for r in records))
+    if records and all('task_form_status' in r for r in records):
+        result['task_form_counts'] = dict(Counter(r['task_form_status'] for r in records))
     return result
 
 
@@ -355,6 +383,9 @@ def report(prepared, directories, output):
                                                 'source_hashes', 'max_model_len', 'batch_size')}
         common['math_verify_version'] = scored['math_verify_version']
         common['answer_diagnostic_version'] = scored.get('answer_diagnostic_version')
+        common['scorer_version'] = scored.get('scorer_version', 'legacy')
+        common['scoring_source_hashes'] = scored.get('scoring_source_hashes')
+        common['verifier_versions'] = scored.get('verifier_versions')
         if manifest['prepared_sha256'] != digest(data) or (settings is not None and common != settings):
             raise ValueError('Runs do not share identical inputs, inference settings and code/verifier versions')
         settings = common
@@ -393,7 +424,8 @@ def report(prepared, directories, output):
         caution = study_results['caution']
     out = Path(output)
     out.mkdir(parents=True, exist_ok=False)
-    write_json(out / 'report.json', dict(provenance=data['provenance'], summary=summaries, pairs=comparisons,
+    write_json(out / 'report.json', dict(provenance=data['provenance'],
+        scorer_version=settings['scorer_version'], summary=summaries, pairs=comparisons,
         study=study_results, caution=caution))
     with (out / 'review.jsonl').open('x') as stream:
         for i, row in enumerate(data['examples']):
@@ -410,8 +442,9 @@ def report(prepared, directories, output):
                      f"{c.get('unknown', 0)} | {c.get('no_accepted_result', 0)} | {s['length_stop_count']} |")
     lines += ['', 'Greedy, one response per fixed input. No gates or training applied.',
               'Unknown and missing results are not evidence of mathematically incorrect reasoning.',
-              'The stated-answer diagnostic ignores inline result-label quotations, not competing answer sections.',
-              'It is secondary: it changes neither production routing nor the primary endpoint, and does not verify reasoning.',
+              'Source-labelled S<n> LOCAL_RESULT quotations are not new answer declarations.',
+              'Scorer: ' + settings['scorer_version'] + '. Explicit supported factorization forms are checked separately.',
+              'The stated-answer diagnostic is secondary and does not verify reasoning or role compliance.',
               'Inspect review.jsonl for reasoning and role compliance; those labels remain unset.',
               'Several examples share a question; responses are not independent observations.', '',
               '## Paired Counts', '', '```json', json.dumps(comparisons, indent=2), '```']

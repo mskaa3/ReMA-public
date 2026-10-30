@@ -138,6 +138,55 @@ of earlier workers, reduced leakage, or gains on harder tasks.
 
 ## CPU checks
 
+### Versioned CPU Rescoring
+
+Scorer `typed-local-math-v2` corrects failures discovered in job 6200552.
+This is a post-hoc measurement revision, not a newly preregistered experiment.
+It applies the same rules to every checkpoint, without changing the frozen
+tasks, references, prompts, generated text, or checkpoint selection.
+
+- Source-labelled `S<n> LOCAL_RESULT:` quotations do not count as the worker's
+  own result declaration. Two competing own declarations, truncated boxes,
+  multiple candidate boxes and quote-only responses remain rejected. This
+  narrow communication-boundary correction also applies to production routing.
+- Evaluation uses full-expression parsing, ordered tuple comparisons, limited
+  task-consistent quantity labels, vector/interval notation, and comparison of
+  numeric equality VALUES rather than merely their truth values. Unsupported
+  notation/units/relations and timed-out checks remain `unknown`.
+- Explicit requests for linear factorization or two monic quadratic factors
+  have a separate structural check. `value_status` retains equivalence alone;
+  `task_form_status` is `satisfied`, `failed`, `unknown`, or `not_checked`.
+  Primary `status` additionally requires a passing form check when applicable.
+  All other task-completion and reasoning labels still require manual audit.
+- These evaluation-only symbolic rules do not replace the training reward or
+  leakage comparator. Reduced answer matches alone still do not prove role
+  specialization. Labels and correct values do not certify valid reasoning.
+
+Rescore a complete downloaded ZIP in a CPU environment with Math-Verify,
+latex2sympy2-extended, SymPy, Pebble and NumPy installed:
+
+```bash
+python3 -B scripts/eac3_rescore_fixed_prefix.py \
+  --archive /path/to/fixed-prefix-6200552.zip \
+  --output results/fixed-prefix-6200552-rescored-v2
+```
+
+The output directory must not exist. No archive content is executed or extracted
+to arbitrary paths. Generation manifests and raw responses are copied verbatim;
+old scores remain as `scored.original.json`, with `report.original.json` at the
+root. `score-changes.jsonl` lists every changed record; `rescore-provenance.json`
+records the archive digest, scorer version, source hashes and dependency versions.
+New reports are in `comparison/`. Mixed scorer versions are rejected. An
+interrupted rescore lacks completion provenance; rerun into a fresh directory.
+
+Keep unknown/missing counts with the accuracy table. A more conservative scorer
+can increase unknowns; do not call those mathematical errors or silently remove
+them. Review both improvements and regressions, plus the planned random audit.
+The original sampling, unequal training-budget, self-review and CI limitations
+still apply.
+
+### Regression Tests
+
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
   -s src/verl/tests/rema_separated_trainer -p 'test_fixed_prefix_eval.py' -v
