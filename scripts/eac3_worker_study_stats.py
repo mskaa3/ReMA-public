@@ -90,7 +90,10 @@ def analyze(data, models):
         for mode in ('full_question', 'subtask_context'):
             partitions[f'{kind}_nonterminal_{mode}'] = [i for i, r in enumerate(examples)
                 if r['kind'] == kind and r['target'] < len(r['subtasks']) and r['question_mode'] == mode]
-    endpoints = {}
+    endpoints, answer_endpoints = {}, {}
+    diagnostic_fields = ['reported_answer_status' in row for rows in models.values() for row in rows]
+    if any(diagnostic_fields) and not all(diagnostic_fields):
+        raise ValueError('Stated-answer diagnostics must be present for every model/response, or none')
     for endpoint, indices in partitions.items():
         results, pairs = {}, {}
         for name in names:
@@ -102,6 +105,19 @@ def analyze(data, models):
                 pairs[f'{right} - {left}'] = estimate([int(success(right, i)) - int(success(left, i))
                     for i in indices], examples, indices, samples, seed)
         endpoints[endpoint] = dict(models=results, paired_differences=pairs)
+        if diagnostic_fields and all(diagnostic_fields):
+            def answer_success(model, index):
+                return models[model][index]['reported_answer_status'] == 'correct'
+            answer_results = {name: dict(
+                confirmed_reported_answer_correct=estimate(
+                    [answer_success(name, i) for i in indices], examples, indices, samples, seed),
+                status_counts=dict(Counter(models[name][i]['reported_answer_status'] for i in indices)))
+                for name in names}
+            answer_pairs = {f'{right} - {left}': estimate(
+                [int(answer_success(right, i)) - int(answer_success(left, i)) for i in indices],
+                examples, indices, samples, seed)
+                for j, left in enumerate(names) for right in names[j + 1:]}
+            answer_endpoints[endpoint] = dict(models=answer_results, paired_differences=answer_pairs)
     left, right = protocol['primary_comparison']
     index_by_id = {r['id']: i for i, r in enumerate(examples)}
     values, indices = [], []
@@ -117,6 +133,7 @@ def analyze(data, models):
                            'Use these results for pipeline development, not confirmatory evidence. '
                            if protocol.get('review_mode') == 'model_self_review' else '')
     return dict(protocol=protocol, endpoints=endpoints,
+        reported_answer_diagnostic=answer_endpoints or None,
         context_interaction=estimate(values, examples, indices, samples, seed),
         interaction_definition='(gated_fullQ - ungated_fullQ) - (gated_taskOnly - ungated_taskOnly)',
         caution=self_review_warning + 'Historical-validation, fixed-prefix checkpoint comparison, not a causal training experiment. '
@@ -143,4 +160,15 @@ def markdown(result):
               result['interaction_definition'], '', '```json']
     import json
     lines += [json.dumps(result['context_interaction'], indent=2), '```']
+    if result.get('reported_answer_diagnostic'):
+        lines += ['', '## Secondary Stated-Answer Diagnostic', '',
+                  'Correctness of an unambiguously stated answer, NOT proof of valid reasoning or role compliance.',
+                  'The production-delivery primary endpoint above is unchanged.', '',
+                  '| Endpoint | Comparison | Questions | Difference (pp) | 95% CI (pp) |',
+                  '|---|---|---:|---:|---|']
+        for name, endpoint in result['reported_answer_diagnostic'].items():
+            for pair, stat in endpoint['paired_differences'].items():
+                ci = stat['ci95']
+                interval = 'N/A' if ci is None else f'[{value(ci[0])}, {value(ci[1])}]'
+                lines.append(f"| {name} | {pair} | {stat['n_questions']} | {value(stat['mean'])} | {interval} |")
     return lines

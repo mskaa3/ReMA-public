@@ -279,6 +279,7 @@ def freeze(selection_path, review_path, output, *, allow_development_self_review
         exclusions=[dict(question_id=r['question_id'], reason=r['exclusion_reason']) for r in rows
                     if r['decision'] == 'exclude'],
         bootstrap_samples=config['bootstrap_samples'], bootstrap_seed=config['bootstrap_seed'],
+        answer_diagnostic_version=evaluation.ANSWER_DIAGNOSTIC_VERSION,
         primary_endpoint=config['primary_endpoint'], primary_comparison=config['primary_comparison'],
         model_ids=[m['id'] for m in selection['models']], models=selection['models'])
     provenance = ('Development-only model-authored and self-reviewed tasks; NOT independently reviewed. '

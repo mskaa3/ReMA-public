@@ -16,6 +16,7 @@ PPO = ROOT / 'src/verl/verl/rema_separated_trainer/ppo'
 sys.path.insert(0, str(ROOT / 'src/verl'))
 sys.path.insert(0, str(PPO))
 from local_results import extract_local_result
+from eac3_answer_diagnostic import VERSION as ANSWER_DIAGNOSTIC_VERSION, reported_answer
 
 
 def digest(value):
@@ -36,6 +37,7 @@ def source_hashes():
     paths = [PPO / 'multi_agent_rollout.py', PPO / 'local_results.py',
              PPO / 'prefix_probe.py', PPO / 'math_verification.py',
              ROOT / 'prompt/math/hierarchical_mamrp.py', Path(__file__),
+             ROOT / 'scripts/eac3_answer_diagnostic.py',
              ROOT / 'scripts/eac3_worker_study_stats.py']
     return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
@@ -253,23 +255,36 @@ def score(prepared, directory):
         raise ValueError('Cannot score a different prepared dataset or source version')
     responses = indexed_records(out / 'responses.jsonl', [r['id'] for r in data['examples']])
     jobs = []
+    diagnostics = []
     for row in data['examples']:
         response = responses[row['id']]['response']
-        jobs.extend([(response, row['reference_answers']), (response, [row['final_answer']])])
+        diagnostic = reported_answer(response)
+        diagnostics.append(diagnostic)
+        candidate = ('LOCAL_RESULT: \\boxed{' + diagnostic['answer'] + '}'
+                     if diagnostic['answer'] else '')
+        jobs.extend([(response, row['reference_answers']), (response, [row['final_answer']]),
+                     (candidate, row['reference_answers'])])
     values, stats = bounded_verification_map(check_equivalence, jobs, timeout_seconds=10, max_workers=2)
     records = []
     for i, row in enumerate(data['examples']):
         record = responses[row['id']]
         accepted = extract_local_result(record['response'])
-        correct, final_match = values[2 * i:2 * i + 2]
+        correct, final_match, answer_correct = values[3 * i:3 * i + 3]
         status = ('no_accepted_result' if not accepted else 'unknown' if correct is None
                   else 'correct' if correct else 'wrong')
+        diagnostic = diagnostics[i]
+        answer_status = ('no_unambiguous_answer' if not diagnostic['answer'] else
+                         'unknown' if answer_correct is None else 'correct' if answer_correct else 'wrong')
         records.append({**record, 'accepted_result': accepted, 'local_correct': correct,
                         'status': status, 'full_question_answer_match': final_match,
+                        'reported_answer': diagnostic['answer'],
+                        'reported_answer_extraction': diagnostic['reason'],
+                        'reported_answer_status': answer_status,
                         'terminal': row['target'] == len(row['subtasks']),
                         'family': row['family'], 'kind': row['kind'],
                         'manual_role_compliance': None, 'manual_reasoning_correct': None})
     write_json(out / 'scored.json', dict(records=records, verification=stats,
+                                       answer_diagnostic_version=ANSWER_DIAGNOSTIC_VERSION,
                                        math_verify_version=importlib.metadata.version('math-verify')))
     print(json.dumps(summarize(records), indent=2))
 
@@ -278,11 +293,17 @@ def summarize(records):
     n = len(records)
     counts = Counter(row['status'] for row in records)
     valid = counts['correct'] + counts['wrong']
-    return dict(n=n, status_counts=dict(counts), accepted_correct_fraction=counts['correct'] / n if n else None,
+    result = dict(n=n, status_counts=dict(counts), accepted_correct_fraction=counts['correct'] / n if n else None,
                 correctness_among_decidable=counts['correct'] / valid if valid else None,
                 accepted_result_fraction=sum(bool(r['accepted_result']) for r in records) / n if n else None,
                 length_stop_count=sum(r['finish_reason'] == 'length' for r in records),
                 mean_generated_tokens=sum(r['generated_tokens'] for r in records) / n if n else None)
+    if records and all('reported_answer_status' in r for r in records):
+        result['answer_diagnostic'] = dict(
+            status_counts=dict(Counter(r['reported_answer_status'] for r in records)),
+            correct_but_not_routable=sum(r['reported_answer_status'] == 'correct'
+                                         and not r['accepted_result'] for r in records))
+    return result
 
 
 def compare_records(left, right):
@@ -306,6 +327,7 @@ def report(prepared, directories, output):
         common = {key: manifest[key] for key in ('prepared_sha256', 'settings', 'versions',
                                                 'source_hashes', 'max_model_len', 'batch_size')}
         common['math_verify_version'] = scored['math_verify_version']
+        common['answer_diagnostic_version'] = scored.get('answer_diagnostic_version')
         if manifest['prepared_sha256'] != digest(data) or (settings is not None and common != settings):
             raise ValueError('Runs do not share identical inputs, inference settings and code/verifier versions')
         settings = common
@@ -361,6 +383,8 @@ def report(prepared, directories, output):
                      f"{c.get('unknown', 0)} | {c.get('no_accepted_result', 0)} | {s['length_stop_count']} |")
     lines += ['', 'Greedy, one response per fixed input. No gates or training applied.',
               'Unknown and missing results are not evidence of mathematically incorrect reasoning.',
+              'The stated-answer diagnostic ignores inline result-label quotations, not competing answer sections.',
+              'It is secondary: it changes neither production routing nor the primary endpoint, and does not verify reasoning.',
               'Inspect review.jsonl for reasoning and role compliance; those labels remain unset.',
               'Several examples share a question; responses are not independent observations.', '',
               '## Paired Counts', '', '```json', json.dumps(comparisons, indent=2), '```']

@@ -1,5 +1,12 @@
 # Worker specialization: from pilot to credible evidence
 
+The existing 300-question sample is packaged in
+`experiments/worker-specialization-300-v1/review/`. It is not a second sample.
+See `experiments/worker-specialization-300-v1/README.md` for its current pending
+review status, fixed analysis rules, and launch commands. Evaluation now also
+reports a secondary stated-answer diagnostic; production routing and the primary
+accepted-local-result endpoint remain unchanged.
+
 ## The claim we test
 
 **Given the same assigned mathematical task and correct previous results, does
