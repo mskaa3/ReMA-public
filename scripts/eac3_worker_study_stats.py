@@ -113,10 +113,13 @@ def analyze(data, models):
         difference = lambda i: int(success(right, i)) - int(success(left, i))
         values.append(difference(full) - difference(task))
         indices.append(full)
+    self_review_warning = ('Development-only model self-review: tasks/references were NOT independently reviewed. '
+                           'Use these results for pipeline development, not confirmatory evidence. '
+                           if protocol.get('review_mode') == 'model_self_review' else '')
     return dict(protocol=protocol, endpoints=endpoints,
         context_interaction=estimate(values, examples, indices, samples, seed),
         interaction_definition='(gated_fullQ - ungated_fullQ) - (gated_taskOnly - ungated_taskOnly)',
-        caution='Historical-validation, fixed-prefix checkpoint comparison, not a causal training experiment. '
+        caution=self_review_warning + 'Historical-validation, fixed-prefix checkpoint comparison, not a causal training experiment. '
                 'Means weight questions equally within each endpoint. Bootstrap resamples questions within '
                 'data sources; it does not measure training-seed uncertainty. Unknown/missing answers count '
                 'as unconfirmed delivery, not incorrect mathematics. Role fidelity and reasoning require '

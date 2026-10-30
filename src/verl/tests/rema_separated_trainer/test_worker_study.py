@@ -221,6 +221,57 @@ class StudyTests(unittest.TestCase):
                 self.assertNotIn(row['reference_check'], messages[1]['content'])
                 self.assertNotIn('fixture-checker', json.dumps(messages))
 
+    def test_model_self_review_is_explicit_and_development_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            selection, review = self.sample(tmp)
+            checked = self.reviewed(review)
+            checked['review_mode'] = 'model_self_review'
+            for row in checked['examples']:
+                row.update(checker=row['author'], checker_type='model')
+            with self.assertRaisesRegex(ValueError, 'explicit'):
+                study.validate_review(selection, checked)
+            self.assertEqual(len(study.validate_review(selection, checked,
+                allow_development_self_review=True)), 4)
+            for change in (lambda r: r.pop('review_mode'),
+                           lambda r: r.update(review_mode='unknown'),
+                           lambda r: r['examples'][0].update(checker='invented-second-reviewer'),
+                           lambda r: r['examples'][0].update(checker_type='human'),
+                           lambda r: r['examples'][0].update(decision='pending'),
+                           lambda r: r['examples'][0]['checks'].update(plan_is_coherent=False),
+                           lambda r: r['examples'][0]['tasks'][0].update(checked_result='unroutable')):
+                bad = copy.deepcopy(checked)
+                change(bad)
+                with self.assertRaises(ValueError):
+                    study.validate_review(selection, bad, allow_development_self_review=True)
+            reserved = self.reviewed(evaluation.read_json(tmp / 'sample/PRIVATE-reserved-review.json'))
+            study.validate_review(selection, reserved)
+            with self.assertRaisesRegex(ValueError, 'independent human'):
+                study.validate_review(selection, reserved, allow_development_self_review=True)
+            reserved['review_mode'] = 'model_self_review'
+            with self.assertRaisesRegex(ValueError, 'independent human'):
+                study.validate_review(selection, reserved)
+
+            path = tmp / 'self-review.json'
+            evaluation.write_json(path, checked)
+            with patch.object(study, 'ROOT', tmp), redirect_stdout(io.StringIO()) as output:
+                study.freeze(tmp / 'sample/selection.json', path, tmp / 'self-reviewed',
+                             allow_development_self_review=True)
+            self.assertIn('WARNING', output.getvalue())
+            data = evaluation.load_dataset(tmp / 'self-reviewed/dataset.json')
+            self.assertEqual(data['study']['review_mode'], 'model_self_review')
+            self.assertFalse(data['study']['independently_reviewed'])
+            self.assertIn('NOT independently reviewed', data['provenance'])
+            with patch.object(study, 'ROOT', tmp), self.assertRaises(ValueError):
+                study.freeze(tmp / 'sample/selection.json', path, tmp / 'blocked')
+            self.assertFalse((tmp / 'blocked').exists())
+
+            models = {name: [dict(id=r['id'], status='unknown') for r in data['examples']]
+                      for name in data['study']['model_ids']}
+            report = stats.analyze(data, models)
+            self.assertIn('NOT independently reviewed', report['caution'])
+            self.assertIn('pipeline development', report['caution'])
+
     def test_context_pairing_rejects_missing_or_changed_counterpart(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = self.freeze(Path(directory))['examples']

@@ -107,6 +107,16 @@ without doing them. A model can draft tasks; record its actual identity and
 requires `checker_type: "human"`, including exclusions. Different IDs alone do
 not ensure independent judgement; use a genuinely independent reviewer.
 
+For development only, an explicit opt-in permits a model author to self-review:
+set top-level `review_mode: "model_self_review"`, record the SAME actual
+author/checker ID with both types `model`, and pass
+`--allow-development-self-review` to `freeze`. Do not invent a second reviewer.
+Every inclusion decision/check must still be substantively completed. The frozen
+dataset and reports prominently label this as development-only and NOT
+independently reviewed. Without the flag the normal independent-review rule
+applies. Reserved questions reject both this mode and this flag; their human
+review requirement is unchanged.
+
 For each question choose `decision: "include"` or `"exclude"`. Every exclusion
 needs a reason. Do not drop rows, silently replace questions, or exclude based on
 checkpoint outputs. Publish exclusion counts/reasons and scope the claim to the

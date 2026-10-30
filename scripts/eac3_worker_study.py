@@ -187,7 +187,7 @@ def sample(config_path, output):
     print('No references or plans were authored or certified. Review templates must be completed before freeze.')
 
 
-def validate_review(selection, review):
+def validate_review(selection, review, *, allow_development_self_review=False):
     original = {k: v for k, v in selection.items() if k != 'selection_sha256'}
     if (selection.get('selection_sha256') != evaluation.digest(original)
             or selection['config_sha256'] != evaluation.digest(selection['config'])):
@@ -197,6 +197,14 @@ def validate_review(selection, review):
     split = review['split']
     if split not in {'development', 'reserved'}:
         raise ValueError('Unknown split')
+    review_mode = review.get('review_mode', 'independent')
+    if review_mode not in {'independent', 'model_self_review'}:
+        raise ValueError('Unknown review_mode')
+    self_review = review_mode == 'model_self_review'
+    if split == 'reserved' and (self_review or allow_development_self_review):
+        raise ValueError('Reserved questions require independent human review; self-review is development-only')
+    if self_review and not allow_development_self_review:
+        raise ValueError('Model self-review needs explicit --allow-development-self-review for development only')
     expected = {r['question_id']: r for r in selection['splits'][split]}
     rows = review['examples']
     if len(rows) != len(expected) or {r['question_id'] for r in rows} != set(expected):
@@ -207,10 +215,15 @@ def validate_review(selection, review):
         if stratum(row) != stratum(expected[row['question_id']]):
             raise ValueError('Sampled question stratum was changed')
         if (not row['author'].strip() or not row['checker'].strip()
-                or row['author'].strip() == row['checker'].strip()
                 or row['author_type'] not in {'human', 'model'}
                 or row['checker_type'] not in {'human', 'model'}):
-            raise ValueError('Record distinct author/checker IDs and honest human/model provenance')
+            raise ValueError('Record author/checker IDs and honest human/model provenance')
+        same_checker = row['author'].strip() == row['checker'].strip()
+        if self_review:
+            if not same_checker or row['author_type'] != 'model' or row['checker_type'] != 'model':
+                raise ValueError('Model self-review must record the same model author/checker ID and model types')
+        elif same_checker:
+            raise ValueError('Independent review requires distinct author/checker IDs')
         if split == 'reserved' and row['checker_type'] != 'human':
             raise ValueError('Reserved questions require an independent human check, including exclusions')
         if row['decision'] == 'exclude':
@@ -228,9 +241,9 @@ def validate_review(selection, review):
     return rows
 
 
-def freeze(selection_path, review_path, output):
+def freeze(selection_path, review_path, output, *, allow_development_self_review=False):
     selection, review = evaluation.read_json(selection_path), evaluation.read_json(review_path)
-    rows = validate_review(selection, review)
+    rows = validate_review(selection, review, allow_development_self_review=allow_development_self_review)
     config = selection['config']
     examples = []
     for row in rows:
@@ -250,7 +263,10 @@ def freeze(selection_path, review_path, output):
     if not examples:
         raise ValueError('All questions excluded; no study can run')
     included = [row for row in rows if row['decision'] == 'include']
+    self_review = review.get('review_mode') == 'model_self_review'
     study = dict(study_id=config['study_id'], evidence_status=config['evidence_status'], split=review['split'],
+        review_mode='model_self_review' if self_review else 'independent',
+        independently_reviewed=not self_review,
         selection_sha256=selection['selection_sha256'], review_sha256=evaluation.digest(review),
         sampled_questions=len(rows), included_questions=len(included),
         single_task_questions=sum(len(r['tasks']) == 1 for r in included),
@@ -265,8 +281,13 @@ def freeze(selection_path, review_path, output):
         bootstrap_samples=config['bootstrap_samples'], bootstrap_seed=config['bootstrap_seed'],
         primary_endpoint=config['primary_endpoint'], primary_comparison=config['primary_comparison'],
         model_ids=[m['id'] for m in selection['models']], models=selection['models'])
-    data = dict(schema_version=1, provenance='Random questions from historical validation, with independently '
-                'reviewed task instructions and correct fixed prefixes. See frozen selection and review.',
+    provenance = ('Development-only model-authored and self-reviewed tasks; NOT independently reviewed. '
+                  'Random historical-validation questions with fixed reference prefixes. '
+                  'For pipeline development, not confirmatory evidence. See frozen selection and review.'
+                  if self_review else
+                  'Random questions from historical validation, with independently reviewed task instructions '
+                  'and correct fixed prefixes. See frozen selection and review.')
+    data = dict(schema_version=1, provenance=provenance,
                 study=study, examples=examples)
     out = Path(output).resolve()
     try:
@@ -282,6 +303,8 @@ def freeze(selection_path, review_path, output):
     evaluation.write_json(out / 'review.json', review)
     evaluation.write_json(out / 'dataset.json', data)
     evaluation.write_json(out / 'eval-config.json', dict(dataset=str(dataset_path), models=selection['models']))
+    if self_review:
+        print('WARNING: development-only model self-review; not independently reviewed or confirmatory evidence.')
     print(f'Frozen {len(included)} questions, {len(examples)} prompts (terminals occur once, without Q).')
     print(f'sbatch scripts/eac3_fixed_prefix_eval.sh {out.relative_to(ROOT.resolve())}/eval-config.json')
 
@@ -335,6 +358,8 @@ def main():
     freezing.add_argument('--selection', required=True)
     freezing.add_argument('--review', required=True)
     freezing.add_argument('--output', required=True)
+    freezing.add_argument('--allow-development-self-review', action='store_true',
+                         help='Explicitly allow labelled model self-review for development, never reserved questions')
     auditing = sub.add_parser('audit')
     auditing.add_argument('--review', required=True)
     auditing.add_argument('--output', required=True)
@@ -345,7 +370,8 @@ def main():
         if args.command == 'sample':
             sample(args.config, args.output)
         elif args.command == 'freeze':
-            freeze(args.selection, args.review, args.output)
+            freeze(args.selection, args.review, args.output,
+                   allow_development_self_review=args.allow_development_self_review)
         else:
             audit(args.review, args.output, args.questions, args.seed)
     except (ValueError, OSError) as exc:

@@ -1,0 +1,110 @@
+DEVELOPMENT MODEL SELF-REVIEW
+
+Status: completed by the same model author; NOT independently reviewed.
+29 included questions; 1 exclusion for missing material constants.
+The original draft and original user files are unchanged.
+Reserved-set human review rules remain unchanged.
+
+Cases 13, 14 and 22 are conditional on explicitly documented benchmark assumptions.
+Case 23 is a forwarding control; case 4 is terminal-only.
+Case 26 has corrected polynomial terminology and a self-contained terminal instruction.
+Case 30 now has the induction proof in evaluator-only reference_check.
+No checkpoint outputs were used for selection, review or exclusion.
+
+Math-Verify notation compatibility and GPU inference are still untested locally.
+The cluster prepare command will check notation before loading models.
+
+Each included checklist item reflects this author self-review, not a human signoff.
+The excluded question retains false/inapplicable checklist fields and an explicit reason.
+
+Review details:
+
+1. include | 4639686b328fdf3073dec61a9a86aee58ce6224c2882566d961fde9a5166577c
+The residue, minimum b, and original total are distinct valid calculations. Each later instruction defines its prefix result; integrality and the strict inequality are explicit. Redistribution checks: 203+53=256.
+
+2. include | 2bb95410df5e904e453d267d1a97f01d14cc19e2d401c789862b09d3c9188d75
+Two calculations, B*h and division by 3, preserve cubic units. Neither instruction supplies its assigned result. The volume 65 agrees with the original reference.
+
+3. include | 7402b093e77ab835f3b04b716db0c7f7278821bfe49c39a3fd138d563e45f328
+Algebra reduces to 2ab. Distinct primes greater than 2 make all three factors distinct; the divisor count is 8. The second task restates the prime assumptions needed without Q.
+
+4. include | 1ebb7bb0cc81425aae3093e8ba0ecf0cc8c96cb8a64e1aea3e0ad42f770465c8
+One natural limit calculation gives 4/3. Retain as terminal-only; do not treat it as evidence of distributed or nonterminal reasoning.
+
+5. include | c0364fc64487e4ecdb562a1fd4efb3265dd75c6c2ced96273c9d5df0312b1595
+Displacement (-6,9), squared norm 117, and nonnegative distance 3sqrt(13) are consistent. Coordinate order and the meaning/units of each routed result are explicit.
+
+6. include | 9d3df2d1c5f6f5b8a88eee1e05cba53b28a56b13383b57d28b0b85916015b930
+Equal internal-tangency distances put centers on the perpendicular bisector. The largest circle is centered at the origin with R=3/4. Solving 1/16+(R+r)^2=(1-r)^2 gives r=3/28, a feasible positive radius. Instructions include the geometry required without Q.
+
+7. include | 453b8941096f31a8ed1438c0b91c0e731c9b92194d923d19210f487e376a690c
+Prime exponents and the minimal digit multiset were checked by exact factorization and exhaustive ordered-multiset enumeration. Concatenation is synthesis, not new arithmetic. S2 encodes the eventual integer as a tuple legitimately because that is its assigned task; do not label this overreach solely from recoverability.
+
+8. include | 88556a024cdf9ce7e137c114cb4272b4d6bf4710fce181c3310f1ba2a96e38af
+Completing squares gives r^2=64, then area 64pi. This is semantically familiar from earlier diagnostics; retained for development with the flag, never described as unseen confirmatory data.
+
+9. include | 5558d5bba74210f251a1c91a09919c067e7b5d0605c342be60f1496146f45878
+Probability gives 105 total, known colors give 75 nonyellow, and subtraction gives 30 yellow. Interpret the original typo "if 2/15" as "is 2/15". Instructions restate the intended probability.
+
+10. include | a390bffd7dd7262b85fbf53e9f413db2ca2f2bf9cf7a706547ebbe49aaef8651
+Bacon unit price gives chicken total 24; independent fruit cost is 26; remaining budget is 65-10-24-26=5. Dollar units and all needed prices are in each instruction.
+
+11. include | 26951bd58640bd492d0ba638fc90b8fc5d62c4860aca1524bed4a3119f5887a8
+Existing regular chairs are 40; shortages are 2 regular and 7 high chairs. The explicit one-chair-per-person and noninterchangeable-type convention matches the reference. A worker is not required to infer these conventions from hidden earlier text.
+
+12. include | c3a98d978c2bb7d406c7abffb21c12dd9eb7711638c7f6ddce23024c0fb632f6
+Total students are 180 and teachers are 36. The second task specifies the meaning of S1 and the five-students-per-teacher ratio.
+
+13. include | 75188122e96b5843116515a2b8168fd7c2b947640a96b3df377194f2527ec528
+Include under the benchmark convention of three complete story heights, stated in S1. Drop height is 72 feet, second bounce is 72*(2/3)^2=32 feet. This is conditional on that floor-numbering convention, not a claim that the original wording uniquely fixes it.
+
+14. include | 060edd899f95d83128cf6cce2fa88efef880218af000684c6ba710fff535034e
+Include under the benchmark interpretation of a constant attained growth rate of 30 inches/day, explicitly stated in S2. Extra growth is 360 inches, time is 12 days. The original "up to" alone implies only a minimum-time bound; retain the ambiguity flag and do not claim an unconditional exact time.
+
+15. include | 1a4e2bf2683ab853b585c01fd362ea01d8133a9eded17d945412a02eb67a6e2d
+Successive equal cuts give 25 cm then 5 cm. Both stages are calculations with fully specified units and counts.
+
+16. include | 47484d317509112369ed291782c060232e596e6ec2e58c86468e66345446b925
+Saving 10 per week for 12 weeks gives 120; 80 still needed at 10/week takes 8 weeks. Whole-week indexing and target are explicit.
+
+17. include | 36f5568a75d7669af941f49875fc256148458676483aec3cca97710ec8542b89
+The two volume ratios yield 12 then 3 cubic inches. The later worker receives the correct named intermediate and its own required ratio.
+
+18. include | f2cd1186949207c89eeab2662cd4342e75944cfbb1c637039ef88895c61d679d
+The two disjoint phone-call portions each cost 4 dollars; their sum is 8. Equal partial values are valid independent calculations, not automatic duplication violations.
+
+19. include | 53afc302e4f6969b4cf8fd05ac74046c35a1a170a25bd8d44051ad4d8af1060e
+Passenger conservation gives 138 after the first stop and 100 after the second. S2 states that no passenger boards at the second stop, matching the intended question.
+
+20. include | 7f6654ee59efcdb1a09aa7081bed275bf430905d68f117ce548110925994dcb3
+Six weeks times two sessions times two hours gives 24 hours; multiplying by 125 dollars/hour gives 3000 dollars.
+
+21. include | 90afcc9e43d5b91738e11d9c95ac7fee09248453d4b642fa384ff9f86a8a5751
+12 players, 3 coaches and 24 guests give 39 people, then 13 pizzas and 195 dollars. Whole-pizza rounding is explicit, though the division is exact here.
+
+22. include | 5387ef7e1ffe894bec007443c63235270f43861bfbda5b87343169911e4992ed
+Include as a domain-conditioned task: explicitly use the conventional Arrhenius model, as in the source solution. No new instance-specific constants are imported. Exact kelvin conversion and reciprocal-temperature algebra yield u=387260/2386503 and D=1.453017698741008e-5, rounded to 1.45e-5. Two measurements alone would not determine an arbitrary function D(T).
+
+23. include | 573473135f9302401b0dac8c0d2b5404743f265626741117a4535929d7185956
+The original Q already states p=64 and y=sqrt(p). S1 deliberately extracts supplied information and is labelled forward; it is outside the primary compute/nonterminal endpoint. S2 computes 8. The no-assigned-answer check applies to calculations, not to this legitimate extraction control.
+
+24. exclude | 9875bbd13bfd7e897cb90d13c9b981764ad7f8583c8212f8da495ec28b82b012
+Exclude for under-specified instance-specific inputs: numerical diffraction needs material constants/lattice data and wavelength information absent from Q. The source solution imports those values. Do not manufacture a self-contained task by silently turning computed/source-only values into givens. Exclusion was decided without model outputs.
+
+25. include | 06442f2dc9629f2f5366d3ddbcdd69cc84c9bd61a9e138acdecc3b6b76674251
+The resident-pair bijection gives d(d-1)/2 for d>=2; evaluation at 17 gives 136. The irrelevant narrative is removed but all needed conditions remain.
+
+26. include | b97e7aea18bbc07c388a2a9d02bfba7a8dca20333c708e6526f890732ef47fe9
+Reviewed the obstruction and complementary-pair construction. Corrected "bilinear" to "degree at most one in each variable": f(0,v)=v would contradict strict bilinearity. Also restated the obstruction and construction in S3, since only earlier boxes, not earlier instructions, are routed. Proof reasoning still needs auditing in model outputs.
+
+27. include | 9e4f58c2be24c0203bcdddc2fca3a99b75fad6c25bdf577a2bfa25e784d54b8c
+Direct digit enumeration and modular multiplication agree with exponent-based computation: counts (1612,622,602,602,602,602,602,602), exponents (4234,2408,602), residue 976. Inclusive bounds, digit order, no leading zeros and residue convention are explicit.
+
+28. include | 7929eb31c474ff9a6ee94e053a9c9bf3cecde5ffc957589bfd69d46aab38485c
+cos(15 degrees)/3=(sqrt(6)+sqrt(2))/12. The acute-domain inverse sine gives 18.782423... degrees, rounded to 18.8. Degrees and precision are stated in both relevant tasks.
+
+29. include | 8ff45c5909a247e59b8ee40833f11eed0d321114f3ad05693b885a37f2321835
+The pair (50,231) yields K=50^2/20=125 and K=(19+231)/2=125; both sequences increase. S2 specifies both original constraints without needing Q.
+
+30. include | c05f58414c36387b7c823649796ce01dc5577a449c25b3713c80f2db368f902c
+Completed the general suffix-mean lemma by induction using monotone prefix means, not just finite checks. It gives a_N>=S/N and a_(N+1)<=(S+a_N)/N, hence jump<=S/N^2<=(N-1)/N^2. The prescribed suffix choices attain it. N=2017 gives the original reference. Box scoring alone cannot certify generated proofs.
