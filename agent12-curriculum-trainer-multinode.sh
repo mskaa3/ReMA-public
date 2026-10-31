@@ -13,6 +13,11 @@ set -euo pipefail
 
 source ./env.sh
 
+# Paired experiments reapply their generated settings after site credentials.
+if [[ -n "${AGENT12_PINNED_ENV_FILE:-}" ]]; then
+    source "$AGENT12_PINNED_ENV_FILE"
+fi
+
 export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 export POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
 export RAY_PORT=${RAY_PORT:-6379}

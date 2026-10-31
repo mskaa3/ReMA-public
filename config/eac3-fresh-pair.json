@@ -1,0 +1,23 @@
+{
+  "study": "eac3-fresh-pair-v1",
+  "remote_root": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/eac3-experiments",
+  "teacher_shards_remote": "s3v2:s3min-tomasznaskret-1712063354/user/ajanz/agent12/teacher_data/math-phi4-mini-reasoning-n16-all-attempt-groups.shards/q512/train",
+  "decomposer_model": "Qwen/Qwen2.5-7B-Instruct",
+  "worker_model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "seed": 11,
+  "worker_updates": 100,
+  "decomposer_updates": 100,
+  "decomposer_transfer_updates": 50,
+  "rollout_step_limit": 1200,
+  "test_freq": 10,
+  "save_freq": 10,
+  "balance_worker_functions": true,
+  "base_question_batch_size": 3,
+  "teacher_attempts": 16,
+  "rollout_n": 32,
+  "continuations_per_action": 4,
+  "nodes": 4,
+  "gpus_per_node": 4,
+  "partition": "lem-gpu-short",
+  "time": "72:00:00"
+}
