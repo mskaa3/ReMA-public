@@ -64,6 +64,7 @@ from verl.rema_separated_trainer.ppo.scoped_c3_grpo import (
     estimate_scoped_c3_grpo,
 )
 from verl.rema_separated_trainer.ppo.credit_audit import CreditAudit
+from verl.rema_separated_trainer.ppo.c3_role_selection import WORKER_FUNCTIONS, worker_function_ids
 from verl.rema_separated_trainer.ppo.math_verification import (
     bounded_verification_map,
     boxed_answer_is_parseable,
@@ -974,6 +975,21 @@ class RayReMASeparatedTrainer(object):
         self.scoped_c3_grpo_enabled = bool(
             self.scoped_c3_grpo_config.get('enable', False)
         )
+        if self.scoped_c3_grpo_config.get('balance_worker_functions', False):
+            filter_config = self.config.algorithm.get('filter_groups', {})
+            if not (
+                self.scoped_c3_grpo_enabled
+                and self.scoped_c3_grpo_config.get('select_available_worker', False)
+                and hierarchy_config.get('terminal_worker_as_answer', False)
+                and hierarchy_config.get('routing_mode') == 'sequential_plan'
+                and int(self.config.actor_rollout_ref.rollout.get('max_num_turns', 1)) == 1
+            ):
+                raise ValueError('balance_worker_functions requires C3, select_available_worker, '
+                                 'sequential_plan, terminal_worker_as_answer and one round')
+            if filter_config.get('enable', False) and int(filter_config.get('max_num_gen_batches', 0)) <= 0:
+                raise ValueError('balance_worker_functions requires bounded max_num_gen_batches')
+            if filter_config.get('enable', False) and not filter_config.get('skip_update_on_zero_trainable', False):
+                raise ValueError('balance_worker_functions requires skip_update_on_zero_trainable')
         if not self.scoped_c3_grpo_enabled:
             return
 
@@ -1830,7 +1846,8 @@ class RayReMASeparatedTrainer(object):
         )
         # Preserve all factual outcomes through continuation aggregation.
         # Apply decomposer rewards only after aggregating the complete action.
-        baseline_valid = action_present & exact_prefix
+        function_selected = self._attach_c3_worker_functions(data_batch, role, action_present)
+        baseline_valid = action_present & exact_prefix & function_selected
         update_valid = baseline_valid & prefix_gate_valid & collaboration_eligible
         action_gate_eligible = prefix_gate_valid & collaboration_eligible
         positive_only = self._c3_positive_only_mask(data_batch, role, action_present)
@@ -1934,6 +1951,7 @@ class RayReMASeparatedTrainer(object):
             baseline_valid, apply_probe_gate, dtype=torch.bool,
         )
         data_batch.batch['scoped_c3_causal_valid'] = baseline_valid
+        data_batch.batch['scoped_c3_baseline_candidate'] = pre_mixed_valid
         data_batch.batch['scoped_c3_gate_update_mask'] = update_valid.clone()
         data_batch.batch['scoped_c3_positive_only_mask'] = positive_only
         data_batch.batch['scoped_c3_update_mask'] = update_valid
@@ -3420,6 +3438,55 @@ class RayReMASeparatedTrainer(object):
             return self.actor_update_steps + 1
         return self.global_steps
 
+    def _begin_c3_worker_attempt(self):
+        """Choose before rollouts; retries/chunks keep this function and focal stage."""
+        self._c3_worker_function = None
+        if not self.scoped_c3_grpo_config.get('balance_worker_functions', False):
+            return
+        if self._current_train_agent not in self._get_hierarchy_config().get('stage_roles', []):
+            return
+        attempts = getattr(self, 'worker_function_attempts', 0)
+        self._c3_worker_function = WORKER_FUNCTIONS[attempts % len(WORKER_FUNCTIONS)]
+        self.worker_function_attempts = attempts + 1
+        print(f'[c3/worker_function] attempt={self.worker_function_attempts} '
+              f'target={self._c3_worker_function}', flush=True)
+
+    def _attach_c3_worker_functions(self, batch, role, action_present):
+        hierarchy = self._get_hierarchy_config()
+        target = batch.meta_info.get('c3_worker_function')
+        function_ids = [-1] * len(batch)
+        if ('terminal_stage_role' in batch.non_tensor_batch
+                and hierarchy.get('terminal_worker_as_answer', False)
+                and int(self.config.actor_rollout_ref.rollout.max_num_turns) == 1):
+            function_ids = worker_function_ids(
+                role, batch.non_tensor_batch.get('terminal_stage_role', [''] * len(batch)),
+                action_present.tolist(), batch.non_tensor_batch['uid'],
+                hierarchy.get('stage_roles', []),
+            )
+        ids = torch.tensor(function_ids, dtype=torch.long)
+        selected = torch.ones_like(action_present)
+        if target is not None:
+            if target not in WORKER_FUNCTIONS:
+                raise ValueError(f'Unknown C3 worker function: {target!r}')
+            selected = ids == WORKER_FUNCTIONS.index(target)
+        if (self.scoped_c3_grpo_config.get('balance_worker_functions', False)
+                and role in hierarchy.get('stage_roles', [])
+                and target != getattr(self, '_c3_worker_function', None)):
+            raise ValueError('C3 worker function changed within an optimizer attempt')
+        if (self.scoped_c3_grpo_config.get('balance_worker_functions', False)
+                and role in hierarchy.get('stage_roles', []) and target is None):
+            raise ValueError('Balanced worker training requires a preselected function')
+        batch.batch['scoped_c3_worker_function_id'] = ids
+        batch.batch['scoped_c3_function_selected'] = selected
+        return selected
+
+    def _record_worker_function_metrics(self, metrics):
+        totals = getattr(self, 'worker_function_totals', {})
+        for key, value in metrics.items():
+            if key.startswith('train/credit/functions/'):
+                totals[key] = totals.get(key, 0.0) + value
+        self.worker_function_totals = totals
+
     def _record_actor_update(self):
         self.actor_update_steps += 1
         role = self._current_train_agent
@@ -3436,6 +3503,9 @@ class RayReMASeparatedTrainer(object):
             f'train/roles/{role}/actor_update_count': count
             for role, count in self.actor_updates_by_role.items()
         })
+        metrics['train/worker_function/balanced_attempt_count'] = getattr(self, 'worker_function_attempts', 0)
+        metrics.update({key.replace('train/credit/functions/', 'train/worker_function/totals/'): value
+                        for key, value in getattr(self, 'worker_function_totals', {}).items()})
         return metrics
 
     def _save_training_progress(self, folder):
@@ -3446,10 +3516,14 @@ class RayReMASeparatedTrainer(object):
             'actor_update_steps': self.actor_update_steps,
             'actor_updates_by_role': self.actor_updates_by_role,
             'actor_update_count_origin_step': self.actor_update_count_origin_step,
+            'worker_function_attempts': getattr(self, 'worker_function_attempts', 0),
+            'worker_function_totals': getattr(self, 'worker_function_totals', {}),
         }))
         temporary.replace(path)
 
     def _load_training_progress(self, folder):
+        self.worker_function_attempts = 0
+        self.worker_function_totals = {}
         path = Path(folder) / 'training_progress.json'
         if not path.exists():
             self.actor_update_steps = 0
@@ -3467,6 +3541,8 @@ class RayReMASeparatedTrainer(object):
         self.actor_update_steps = int(progress['actor_update_steps'])
         self.actor_updates_by_role = progress['actor_updates_by_role']
         self.actor_update_count_origin_step = int(progress['actor_update_count_origin_step'])
+        self.worker_function_attempts = int(progress.get('worker_function_attempts', 0))
+        self.worker_function_totals = progress.get('worker_function_totals', {})
 
     def _update_frequency_due(self, frequency, actor_updated, extra_steps=()):
         return (
@@ -3702,6 +3778,8 @@ class RayReMASeparatedTrainer(object):
 
     def _adopt_c3_focal_role(self, gen_batch, output, *, selecting=False):
         """Use the actual branch role for probes, advantages and actor updates."""
+        if output.meta_info.get('c3_worker_function') != gen_batch.meta_info.get('c3_worker_function'):
+            raise RuntimeError('C3 worker function changed within a pinned optimizer batch')
         if not selecting:
             if output.meta_info.get('c3_focal_role') != self._current_train_agent:
                 raise RuntimeError('C3 focal role changed within a pinned optimizer batch')
@@ -3820,6 +3898,8 @@ class RayReMASeparatedTrainer(object):
         self.actor_update_steps = 0
         self.actor_updates_by_role = {}
         self.actor_update_count_origin_step = 0
+        self.worker_function_attempts = 0
+        self.worker_function_totals = {}
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -4007,6 +4087,10 @@ class RayReMASeparatedTrainer(object):
                     )
                 gen_batch.meta_info['c3_focal_role'] = self._current_train_agent
                 gen_batch.meta_info['validate'] = False
+                if num_gen_batches == 1:
+                    self._begin_c3_worker_attempt()
+                if getattr(self, '_c3_worker_function', None) is not None:
+                    gen_batch.meta_info['c3_worker_function'] = self._c3_worker_function
                 if (self.scoped_c3_grpo_enabled
                         and self.scoped_c3_grpo_config.get('select_available_worker', False)
                         and int(self.config.actor_rollout_ref.rollout.max_num_turns) == 1):
@@ -4586,7 +4670,7 @@ class RayReMASeparatedTrainer(object):
                         actor_updated = True
 
                     if self._credit_audit is not None:
-                        metrics.update(self._credit_audit.finish(
+                        credit_metrics = self._credit_audit.finish(
                             batch, actor_updated=actor_updated,
                             actor_update_step=self.actor_update_steps,
                             skip_reason=(
@@ -4594,7 +4678,9 @@ class RayReMASeparatedTrainer(object):
                                 'sparse_batch' if not collective_safe_update else
                                 'critic_warmup' if not actor_updated else None
                             ),
-                        ))
+                        )
+                        metrics.update(credit_metrics)
+                        self._record_worker_function_metrics(credit_metrics)
 
                     update_target = self.config.trainer.get('max_actor_updates')
                     if update_target is not None and self.actor_update_steps >= int(update_target):

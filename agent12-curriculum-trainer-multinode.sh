@@ -99,6 +99,7 @@ export TEACHER_CHECKPOINT_EVERY_BATCHES=${TEACHER_CHECKPOINT_EVERY_BATCHES:-5}
 export TEACHER_GENERATION_MAX_ATTEMPTS=${TEACHER_GENERATION_MAX_ATTEMPTS:-3}
 export ROLLOUT_N=${ROLLOUT_N:-16}
 export C3_CONTINUATIONS_PER_ACTION=${C3_CONTINUATIONS_PER_ACTION:-1}
+export C3_BALANCE_WORKER_FUNCTIONS=${C3_BALANCE_WORKER_FUNCTIONS:-false}
 export TEACHER_ATTEMPT_MAX_CHARS=${TEACHER_ATTEMPT_MAX_CHARS:-8000}
 export BASE_QUESTION_BATCH_SIZE=${BASE_QUESTION_BATCH_SIZE:-3}
 export OPTIMIZER_PROMPT_BATCH_SIZE=${OPTIMIZER_PROMPT_BATCH_SIZE:-$((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N))}
@@ -132,6 +133,10 @@ if [[ -n "$FROZEN_GATE_MODEL_REMOTE" || -n "$FROZEN_GATE_MODEL_PATH" ]]; then
 fi
 export C3_REQUIRE_ELIGIBLE_SUCCESS=${C3_REQUIRE_ELIGIBLE_SUCCESS:-true}
 export C3_SELECT_AVAILABLE_WORKER=${C3_SELECT_AVAILABLE_WORKER:-true}
+case "$C3_BALANCE_WORKER_FUNCTIONS" in
+    true|false) ;;
+    *) echo "C3_BALANCE_WORKER_FUNCTIONS must be true or false" >&2; exit 1 ;;
+esac
 case "$C3_SELECT_AVAILABLE_WORKER" in
     true|false) ;;
     *) echo "C3_SELECT_AVAILABLE_WORKER must be true or false" >&2; exit 1 ;;
@@ -249,6 +254,7 @@ if (( C3_CONTINUATIONS_PER_ACTION < 1 || ROLLOUT_N % C3_CONTINUATIONS_PER_ACTION
 fi
 echo "Agent 1/2 batch: ${BASE_QUESTION_BATCH_SIZE} questions x ${TEACHER_ROLLOUT_N} attempts x ${ROLLOUT_N} rollouts = $((BASE_QUESTION_BATCH_SIZE * TEACHER_ROLLOUT_N * ROLLOUT_N)) trajectories"
 echo "C3 per group: $((ROLLOUT_N / C3_CONTINUATIONS_PER_ACTION)) focal actions x ${C3_CONTINUATIONS_PER_ACTION} continuations"
+echo "Balance terminal/nonterminal worker attempts: ${C3_BALANCE_WORKER_FUNCTIONS}"
 echo "Train decomposer: ${TRAIN_DECOMPOSER}; train roles: ${TRAIN_AGENT_ROLES}"
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
@@ -566,6 +572,7 @@ python3 -m verl.rema_separated_trainer.main_ppo \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.solver_backend=${PREFIX_PROBE_SOLVER_BACKEND} \
   algorithm.hierarchy.scoped_c3_grpo.require_eligible_success=${C3_REQUIRE_ELIGIBLE_SUCCESS} \
   algorithm.hierarchy.scoped_c3_grpo.select_available_worker=${C3_SELECT_AVAILABLE_WORKER} \
+  algorithm.hierarchy.scoped_c3_grpo.balance_worker_functions=${C3_BALANCE_WORKER_FUNCTIONS} \
   algorithm.hierarchy.scoped_c3_grpo.continuations_per_action=${C3_CONTINUATIONS_PER_ACTION} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.max_new_tokens=${PREFIX_PROBE_MAX_NEW_TOKENS} \
   algorithm.hierarchy.scoped_c3_grpo.prefix_probe.retry_max_new_tokens=${PROBE_RETRY_MAX_NEW_TOKENS} \
@@ -1005,6 +1012,7 @@ base_question_batch_size=${BASE_QUESTION_BATCH_SIZE}
 teacher_attempts_per_question=${TEACHER_ROLLOUT_N}
 rollouts_per_attempt=${ROLLOUT_N}
 c3_continuations_per_action=${C3_CONTINUATIONS_PER_ACTION}
+c3_balance_worker_functions=${C3_BALANCE_WORKER_FUNCTIONS}
 c3_actions_per_attempt=$((ROLLOUT_N / C3_CONTINUATIONS_PER_ACTION))
 optimizer_prompt_batch_size=${OPTIMIZER_PROMPT_BATCH_SIZE}
 train_decomposer=${TRAIN_DECOMPOSER}

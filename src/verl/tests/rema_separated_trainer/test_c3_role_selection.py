@@ -16,7 +16,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[4]
 PPO = ROOT / 'src/verl/verl/rema_separated_trainer/ppo'
 sys.path.insert(0, str(PPO))
-from c3_role_selection import select_present_worker_role
+from c3_role_selection import select_present_worker_role, worker_function_ids
 from local_results import extract_local_result
 import experiment_io
 
@@ -43,6 +43,39 @@ class RoleSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'shared plan'):
             select_present_worker_role({0: [('w1', '', [])], 1: []}, ['a', 'a'], ['w1'], Mock())
 
+    def test_balanced_selection_uses_terminal_position_not_stage_number(self):
+        # w2 is terminal in a, nonterminal in b; w4 need not exist at all.
+        groups = ['a'] * 32 + ['b'] * 32
+        plans = {i: [(role, '', []) for role in (['w1', 'w2'] if i < 32 else ['w1', 'w2', 'w3'])]
+                 for i in range(64)}
+        for function, expected, probabilities in (
+            ('terminal', {'w1': 0, 'w2': 1, 'w3': 1, 'w4': 0}, [0.5, 0.5]),
+            ('nonterminal', {'w1': 2, 'w2': 1, 'w3': 0, 'w4': 0}, [2 / 3, 1 / 3]),
+        ):
+            rng = Mock()
+            _, counts = select_present_worker_role(plans, groups, list(expected), rng, function)
+            self.assertEqual(counts, expected)
+            rng.choice.assert_called_once_with([r for r, n in expected.items() if n], p=probabilities)
+
+    def test_no_nonterminal_never_falls_back_to_terminal(self):
+        rng = Mock()
+        self.assertEqual(select_present_worker_role({0: [('w1', '', [])]}, ['a'], ['w1'], rng,
+                                                   'nonterminal'), (None, {'w1': 0}))
+        rng.choice.assert_not_called()
+
+    def test_function_ids_are_group_constant_and_absent_actions_unknown(self):
+        self.assertEqual(worker_function_ids('w2', ['w2', 'w2', 'w3', 'w3', ''],
+                         [True, True, True, True, False], ['a', 'a', 'b', 'b', 'c'],
+                         ['w1', 'w2', 'w3']), [1, 1, 0, 0, -1])
+        with self.assertRaisesRegex(ValueError, 'shared terminal'):
+            worker_function_ids('w2', ['w2', 'w3'], [True] * 2, ['a'] * 2, ['w2', 'w3'])
+        with self.assertRaisesRegex(ValueError, 'Invalid terminal'):
+            worker_function_ids('w2', [''], [True], ['a'], ['w2'])
+        with self.assertRaisesRegex(ValueError, 'one value per trajectory'):
+            worker_function_ids('w2', [], [True], ['a'], ['w2'])
+        with self.assertRaisesRegex(ValueError, 'Unknown worker function'):
+            select_present_worker_role({}, [], ['w1'], Mock(), 'bad')
+
     def test_real_rollout_selects_before_branching_and_keeps_eight_by_four(self):
         path = PPO / 'multi_agent_rollout.py'
         definitions = [n for n in ast.parse(path.read_text()).body
@@ -51,14 +84,15 @@ class RoleSelectionTests(unittest.TestCase):
             names=[ast.alias(name='annotations')], level=0), *definitions], type_ignores=[])
         ast.fix_missing_locations(tree)
         helpers = runpy.run_path(str(PPO / 'c3_role_selection.py'))
-        for focal in ('worker_stage_1', 'worker_stage_2'):
-            with self.subTest(focal=focal):
+        for focal, function in (('worker_stage_1', None), ('worker_stage_2', None),
+                                ('worker_stage_1', 'nonterminal'), ('worker_stage_2', 'terminal')):
+            with self.subTest(focal=focal, function=function):
                 rng = Mock()
                 rng.choice.return_value = focal
                 ns = dict(np=np, re=re, hashlib=hashlib, unicodedata=unicodedata,
                           extract_local_result=extract_local_result)
-                ns['select_present_worker_role'] = lambda plans, groups, roles, _: helpers[
-                    'select_present_worker_role'](plans, groups, roles, rng)
+                ns['select_present_worker_role'] = lambda plans, groups, roles, _, **kwargs: helpers[
+                    'select_present_worker_role'](plans, groups, roles, rng, **kwargs)
                 probe_tree = ast.parse((PPO / 'validation_probes.py').read_text())
                 make_inputs = next(n for n in probe_tree.body if isinstance(n, ast.FunctionDef)
                                    and n.name == 'make_probe_inputs')
@@ -89,6 +123,8 @@ class RoleSelectionTests(unittest.TestCase):
                 prompts = SimpleNamespace(non_tensor_batch={'question': ['q'] * 32, 'uid': ['a'] * 32},
                     meta_info={'validate': False, 'c3_focal_role': 'worker_stage_4',
                                'c3_select_available_worker': True, 'c3_candidate_worker_roles': stages})
+                if function is not None:
+                    prompts.meta_info['c3_worker_function'] = function
                 system = runpy.run_path(str(ROOT / 'prompt/math/hierarchical_mamrp.py'))[
                     'build_hierarchical_system_prompts'](stages)
                 histories, flags, reasons = rollout._initialize_conversation_state(32)
@@ -97,6 +133,9 @@ class RoleSelectionTests(unittest.TestCase):
                         prompts, {}, 1, roles, system, hierarchy, histories, flags, reasons, 1024, None)
                 self.assertEqual(prompts.meta_info['c3_focal_role'], focal)
                 self.assertFalse(prompts.meta_info['c3_select_available_worker'])
+                if function is not None:
+                    self.assertEqual(prompts.meta_info['c3_worker_function'], function)
+                    rng.choice.assert_called_once_with([focal], p=[1.0])
                 expected = [('decomposer', 1), ('worker_stage_1', 8), ('worker_stage_2', 32)]
                 if focal == 'worker_stage_2':
                     expected = [('decomposer', 1), ('worker_stage_1', 1), ('worker_stage_2', 8)]

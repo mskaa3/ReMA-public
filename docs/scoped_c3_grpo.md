@@ -141,6 +141,97 @@ Runtime is not necessarily doubled. Memory pressure may increase; token limits,
 GPU allocation, and sparse-rank safeguards are unchanged. Eight focal actions
 are not 32 trainable actions, so sparse updates can still be skipped.
 
+## Optional function-balanced worker sampling
+
+Set `C3_BALANCE_WORKER_FUNCTIONS=true` when submitting the existing Agent-2
+launcher. It maps to `algorithm.hierarchy.scoped_c3_grpo.balance_worker_functions`.
+The default is **false**, including in existing experiment scripts, so old
+commands keep their sampling policy. Keep your checkpoint, data, model, gate,
+seed and Slurm resource settings unchanged for the ablation:
+
+```bash
+C3_BALANCE_WORKER_FUNCTIONS=true sbatch --export=ALL agent2-only-rl-trainer-multinode.sh
+```
+
+The new option changes sampling, not correctness rewards, leakage definitions,
+positive-only policy or the C3 estimator:
+
+1. Before generating an optimizer attempt, choose nonterminal, terminal,
+   nonterminal, terminal, and so on. Decomposer attempts do not consume this
+   sequence. These are bounded **optimizer attempts**, not individual resampling
+   batches and not a promise of equal successful update counts.
+2. Generate the shared plans, then select a focal worker stage in proportion to
+   distinct UID coverage *in the requested function*. The last routed stage of
+   each plan is terminal, even when it is `worker_stage_1` or `worker_stage_2`.
+   The stage and function stay pinned across pipeline chunks and resampling
+   batches for this optimizer attempt. In pipelined mode the first chunk supplies
+   the plan coverage, as in the original stage selector.
+3. Keep complete UID groups only when the focal stage has the selected function.
+   Never choose individual successful actions or suffixes to satisfy a quota.
+   For retained groups, all factual alternatives still enter the same C3
+   baseline, and all four suffix outcomes enter each action mean. Rejected
+   groups do not donate cross-function baseline entries or train actor tokens.
+4. Existing gates, mixed-group filtering and collective-safety checks can still
+   reject the attempt. After bounded retries, advance to the other function,
+   even if no update occurred. There is no fallback that trains the opposite
+   function instead. An empty candidate set retains the existing placeholder
+   stage, but the function mask still excludes mismatching groups.
+
+This requires single-round sequential plans, `terminal_worker_as_answer=true`,
+`select_available_worker=true`, C3 enabled, and a bounded group-filter search
+with `skip_update_on_zero_trainable=true` when filtering is enabled.
+Validation/inference are unchanged. A one-subtask
+plan still fails the existing collaboration gate; balancing does not override it.
+The function counter and cumulative exposure metrics are saved in
+`training_progress.json`. A full trainer resume restores them. Older checkpoints
+and fresh runs initialized from Hugging Face weights start the new counters at
+zero; no terminal exposure is inferred from old stage-name counters.
+
+For a minimal change to the rollout implementation, mismatching groups may still
+be generated and probed before being excluded. This can increase filtering cost
+and reduce usable batch size. Equal attempt counts do not guarantee equal token
+exposure, optimizer updates or wall-clock cost. This is an opt-in ablation of
+training coverage, not an established cure for terminal errors or leakage.
+
+### Functional exposure metrics
+
+The existing per-action JSONL audit now includes `worker_function`,
+`requested_worker_function`, `function_selected`, and `generated_action_tokens`.
+Functional labels come from per-trajectory terminal-role metadata, not the
+positive-only setting. Missing actions and nonworker roles have no functional
+label. These diagnostics also run when balancing is off, allowing a comparison
+with the original sampler.
+
+Console lines `[c3/worker_function]` show the requested function, while
+`[credit/functions]` show selected actions, gate rejections, zero advantages,
+actual positive/negative update participation and used tokens. W&B receives
+per-attempt counts under `train/credit/functions/{nonterminal,terminal}/`:
+
+- `attempt_count`, `generated_groups`, `generated_actions`, `generated_tokens`;
+- `sampled_actions`, `gate_rejected_actions`, `probe_unknown_actions`;
+- `zero_advantage_actions`, `effective_actions`;
+- `used_positive_actions`, `used_negative_actions`, `used_tokens`, `actor_update_count`.
+
+`sampled_actions` counts generated focal actions selected by function, before
+eligibility checks. `zero_advantage_actions` counts baseline-valid actions with
+zero C3 advantage, before the mixed-group filter. Gate rejections and
+zero-advantage counts may overlap; they
+are not a disjoint error taxonomy. Unknown probes are included in gate rejections
+only when gates apply to training. `effective_actions` is before final batch
+selection and collective-safety checks, whereas `used_*` requires a completed
+actor call. A transport replica or one of four suffix rows is never counted as
+a separate action. Tokens are unique focal-action training tokens, not multiplied
+by PPO epochs or reused continuation copies; they do not measure total rollout
+compute. `actor_update_count` is one per completed actor call with participating
+actions of that function, not internal minibatch optimizer steps.
+
+Cumulative versions use `train/worker_function/totals/{function}/...`.
+`train/worker_function/balanced_attempt_count` is the resumable alternation
+counter. In unbalanced training an attempt can contain both functions, so their
+per-function update counts can overlap. Audit status
+`outside_selected_worker_function` distinguishes sampling exclusion from a failed
+leakage gate or a genuine lack of outcome contrast.
+
 ## Statistical interpretation and limitations
 
 For a fixed prefix and focal action, q_j is a Monte Carlo estimate of downstream

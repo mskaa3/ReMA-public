@@ -1913,6 +1913,7 @@ class MultiAgentRollout:
                     ordered_stages_by_idx, c3_group_ids,
                     prompts.meta_info["c3_candidate_worker_roles"],
                     np.random.default_rng(prompts.meta_info.get('c3_role_selection_seed', 0)),
+                    target_function=prompts.meta_info.get('c3_worker_function'),
                 )
                 # The prefix has not branched yet. Pin one role for all chunks
                 # and resampling batches belonging to this optimizer update.
@@ -1920,7 +1921,9 @@ class MultiAgentRollout:
                     c3_focal_role = selected
                     prompts.meta_info["c3_focal_role"] = selected
                     prompts.meta_info["c3_select_available_worker"] = False
-                print(f"[c3/role_selection] selected={selected} plan_group_coverage={coverage}", flush=True)
+                print(f"[c3/role_selection] selected={selected} "
+                      f"function={prompts.meta_info.get('c3_worker_function', 'any')} "
+                      f"plan_group_coverage={coverage}", flush=True)
 
             # 3. Execute selected worker stages sequentially. Stage roles encode
             # the order; each later worker sees previous results.

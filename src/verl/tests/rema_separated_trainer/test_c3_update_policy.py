@@ -158,6 +158,37 @@ def test_trainer_uses_dynamic_terminal_role_and_masks_actor_tokens(capsys):
     assert "positive=2 negative=2" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize('function,kept', [('nonterminal', [True] * 3 + [False] * 3),
+                                         ('terminal', [False] * 3 + [True] * 3)])
+@pytest.mark.parametrize('continuations', [1, 4])
+def test_function_balancing_filters_entire_groups_without_changing_selected_credit(function, kept, continuations):
+    original, batch, raw = _trainer_and_batch()
+    if continuations > 1:
+        batch = batch.repeat(repeat_times=continuations, interleave=True)
+        raw = raw.repeat_interleave(continuations)
+        # Every one of three actions per group has four exact token-identical suffixes.
+        batch.non_tensor_batch['c3_action_index'] = _objects([i % 3 for i in range(6)
+                                                            for _ in range(continuations)])
+        batch.non_tensor_batch['c3_suffix_index'] = _objects(list(range(continuations)) * 6)
+    original.scoped_c3_grpo_config['continuations_per_action'] = continuations
+    original._attach_scoped_c3_grpo_signals(batch, {'acc': raw}, {})
+    before = original._estimate_scoped_c3_advantages(batch)
+    original.scoped_c3_grpo_config['balance_worker_functions'] = True
+    original._c3_worker_function = function
+    batch.meta_info['c3_worker_function'] = function
+    original._attach_scoped_c3_grpo_signals(batch, {'acc': raw}, {})
+    after = original._estimate_scoped_c3_advantages(batch)
+    selected = torch.tensor(kept).repeat_interleave(continuations)
+    assert torch.equal(batch.batch['scoped_c3_function_selected'], selected)
+    torch.testing.assert_close(after.advantage[selected], before.advantage[selected])
+    assert torch.equal(after.effective_mask[selected], before.effective_mask[selected])
+    assert not after.effective_mask[~selected].any()
+    assert not batch.batch['scoped_c3_causal_valid'][~selected].any()
+    torch.testing.assert_close(batch.batch['scoped_c3_raw_outcome_score'], raw)
+    original._compute_scoped_c3_grpo_advantage(batch, {})
+    assert (batch.batch['labels'][~selected] == -100).all()
+
+
 @pytest.mark.parametrize("agg_mode,clip_mode", [
     ("token", "token"), ("turn", "token"), ("trajectory", "token"),
     ("turn", "turn"), ("trajectory", "turn"),

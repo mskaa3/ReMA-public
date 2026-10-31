@@ -269,9 +269,11 @@ class TrainerPipelineTests(unittest.TestCase):
         trainer._current_train_agent = 'w1'
         trainer._get_train_agent_roles = lambda: ['w1', 'w2']
         batch.meta_info.update(c3_select_available_worker=True, c3_candidate_worker_roles=['w1', 'w2'])
+        batch.meta_info['c3_worker_function'] = 'terminal'
         flags = []
 
         def generate(chunk):
+            self.assertEqual(chunk.meta_info['c3_worker_function'], 'terminal')
             flags.append(chunk.meta_info['c3_select_available_worker'])
             chunk.meta_info.update(c3_focal_role='w2', c3_select_available_worker=False)
             return chunk
@@ -286,6 +288,7 @@ class TrainerPipelineTests(unittest.TestCase):
         self.assertEqual(flags, [True, False])
         self.assertEqual(trainer._current_train_agent_idx, 1)
         self.assertEqual(output.meta_info['c3_focal_role'], 'w2')
+        self.assertEqual(output.meta_info['c3_worker_function'], 'terminal')
 
     def test_sync_selection_handles_output_aliasing_input_metadata(self):
         trainer, batch = self.trainer(enabled=False)

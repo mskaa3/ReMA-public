@@ -332,6 +332,9 @@ algorithm:
       enable: True
       # Select a shared-worker role from generated plans, then pin it for the update.
       select_available_worker: True
+      # Opt-in ablation: alternate bounded nonterminal/terminal worker attempts.
+      # Uses the last executed stage of each plan, not the configured final slot.
+      balance_worker_functions: False
       # rollout.n is total trajectory slots: actions * continuations. The
       # Agent-2 launcher uses 32 slots = 8 actions * 4 independent suffixes.
       continuations_per_action: 1

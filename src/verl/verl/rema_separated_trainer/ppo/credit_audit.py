@@ -61,8 +61,15 @@ class CreditAudit:
             valid = values('prefix_probe_gate_valid', True)
             gates = values('prefix_probe_collaboration_eligible', True)
             gates = [bool(v and g) for v, g in zip(valid, gates)]
+            function_id = int(values('scoped_c3_worker_function_id', -1)[0])
+            worker_function = {0: 'nonterminal', 1: 'terminal'}.get(function_id)
+            action_tokens = batch.non_tensor_batch.get(f'{role}_action_token_ids')
             record = {
                 'audit_id': audit_id, 'rollout_step': int(step), 'role': role,
+                'worker_function': worker_function,
+                'requested_worker_function': batch.meta_info.get('c3_worker_function'),
+                'function_selected': bool(values('scoped_c3_function_selected', True)[0]),
+                'generated_action_tokens': len(action_tokens[i]) if action_tokens is not None else 0,
                 'uid': str(batch.non_tensor_batch['uid'][i]),
                 'action_index': action_numbers[audit_id],
                 'suffix_outcomes': values('scoped_c3_raw_outcome_score', None),
@@ -78,6 +85,7 @@ class CreditAudit:
                 'gate_zeroed_reward': bool(values('scoped_c3_gate_zeroed_reward', False)[0]),
                 'advantage': float(estimate.advantage[i]),
                 'c3_effective': bool(estimate.effective_mask[i]),
+                'c3_baseline_candidate': bool(values('scoped_c3_baseline_candidate', True)[0]),
                 'c3_positive_only': bool(batch.batch['scoped_c3_positive_only_mask'][i]),
                 'c3_group_has_eligible_success': bool(estimate.eligible_success_group_mask[i]),
             }
@@ -120,7 +128,18 @@ class CreditAudit:
             'zero_trainable_batch', 'sparse_batch', 'critic_warmup',
             'actor_update_not_completed',
             'unknown_collaboration_reward',
+            'outside_selected_worker_function',
         )})
+        function_fields = (
+            'attempt_count', 'generated_groups', 'generated_actions', 'generated_tokens',
+            'sampled_actions', 'gate_rejected_actions', 'probe_unknown_actions',
+            'zero_advantage_actions', 'effective_actions', 'used_positive_actions',
+            'used_negative_actions', 'used_tokens', 'actor_update_count',
+        )
+        for function in ('nonterminal', 'terminal'):
+            counts.update({f'functions/{function}/{field}': 0 for field in function_fields})
+        function_groups = defaultdict(set)
+        attempted_functions = set()
         events = []
         for audit_id, record in self.pending.items():
             selected = audit_id in final_rows
@@ -131,6 +150,8 @@ class CreditAudit:
                 reason = 'included_positive' if advantage > 0 else 'included_negative'
             elif unknown:
                 reason = 'actor_update_failed_or_partial'
+            elif not record['function_selected']:
+                reason = 'outside_selected_worker_function'
             elif not record['reward_known']:
                 reason = 'unknown_collaboration_reward'
             elif (record['eligibility_applied_to_training']
@@ -173,6 +194,36 @@ class CreditAudit:
             counts['excluded_actions'] += int(not included and not unknown)
             counts['unknown_update_actions'] += int(unknown)
             counts[f'status/{reason}'] += 1
+            target = record['requested_worker_function']
+            function = record['worker_function']
+            if target is not None:
+                attempted_functions.add(target)
+            elif function is not None:
+                attempted_functions.add(function)
+            if function is not None:
+                prefix = f'functions/{function}'
+                function_groups[function].add(record['uid'])
+                counts[f'{prefix}/generated_actions'] += 1
+                counts[f'{prefix}/generated_tokens'] += record['generated_action_tokens']
+                sampled = record['function_selected']
+                counts[f'{prefix}/sampled_actions'] += int(sampled)
+                counts[f'{prefix}/gate_rejected_actions'] += int(
+                    sampled and record['eligibility_applied_to_training']
+                    and not record['all_suffix_gates_pass'])
+                counts[f'{prefix}/probe_unknown_actions'] += int(
+                    sampled and record['eligibility_applied_to_training']
+                    and not all(record['suffix_gate_valid']))
+                counts[f'{prefix}/zero_advantage_actions'] += int(
+                    sampled and record['c3_baseline_candidate'] and record['advantage'] == 0)
+                counts[f'{prefix}/effective_actions'] += int(sampled and record['c3_effective'])
+                counts[f'{prefix}/used_positive_actions'] += int(bool(event['positive_training_signal']))
+                counts[f'{prefix}/used_negative_actions'] += int(bool(event['negative_training_signal']))
+                counts[f'{prefix}/used_tokens'] += tokens if included else 0
+                if included:
+                    counts[f'{prefix}/actor_update_count'] = 1
+        for function in ('nonterminal', 'terminal'):
+            counts[f'functions/{function}/attempt_count'] = int(function in attempted_functions)
+            counts[f'functions/{function}/generated_groups'] = len(function_groups[function])
         if events:
             self._write(events[0]['rollout_step'], events)
             # Include a used action when available, not only early rejected actions.
@@ -192,5 +243,14 @@ class CreditAudit:
                   f"used_negative={counts['used_negative_actions']} "
                   f"excluded={counts['excluded_actions']} "
                   f"unknown={counts['unknown_update_actions']}", flush=True)
+            for function in ('nonterminal', 'terminal'):
+                prefix = f'functions/{function}'
+                print(f"[credit/functions] function={function} "
+                      f"sampled={counts[f'{prefix}/sampled_actions']} "
+                      f"gate_rejected={counts[f'{prefix}/gate_rejected_actions']} "
+                      f"zero_advantage={counts[f'{prefix}/zero_advantage_actions']} "
+                      f"used_positive={counts[f'{prefix}/used_positive_actions']} "
+                      f"used_negative={counts[f'{prefix}/used_negative_actions']} "
+                      f"used_tokens={counts[f'{prefix}/used_tokens']}", flush=True)
         self.pending.clear()
         return {f'train/credit/{key}': float(value) for key, value in counts.items()}
