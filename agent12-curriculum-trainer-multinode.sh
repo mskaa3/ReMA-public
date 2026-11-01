@@ -18,6 +18,7 @@ if [[ -n "${AGENT12_PINNED_ENV_FILE:-}" ]]; then
     source "$AGENT12_PINNED_ENV_FILE"
 fi
 
+# BEGIN_AGENT12_LAUNCH_SETTINGS
 export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 export POOL_GPUS_PER_NODE=${POOL_GPUS_PER_NODE:-$((GPUS_PER_NODE / 2))}
 export RAY_PORT=${RAY_PORT:-6379}
@@ -261,6 +262,7 @@ echo "Agent 1/2 batch: ${BASE_QUESTION_BATCH_SIZE} questions x ${TEACHER_ROLLOUT
 echo "C3 per group: $((ROLLOUT_N / C3_CONTINUATIONS_PER_ACTION)) focal actions x ${C3_CONTINUATIONS_PER_ACTION} continuations"
 echo "Balance terminal/nonterminal worker attempts: ${C3_BALANCE_WORKER_FUNCTIONS}"
 echo "Train decomposer: ${TRAIN_DECOMPOSER}; train roles: ${TRAIN_AGENT_ROLES}"
+# END_AGENT12_LAUNCH_SETTINGS
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 HEAD_NODE=${NODES[0]}

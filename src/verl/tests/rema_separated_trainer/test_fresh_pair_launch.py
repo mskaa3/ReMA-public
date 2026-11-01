@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -71,11 +72,42 @@ class FreshPairTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'node count'):
             pair.environment(run(), '123', 6)
 
+    def test_reset_preserves_runtime_variables_and_site_configuration(self):
+        runtime = {
+            'TMPDIR': '/tmp/slurm scratch', 'PYTHONPATH': '/site/python:/other path',
+            'HF_HOME': '/site/huggingface', 'RAY_ADDRESS': 'head:6379',
+            'SIF_REMOTE': 's3:site/images/runtime.sif', 'SIF_NAME': 'runtime.sif',
+            'WANDB_API_KEY': 'dummy-test-credential',
+        }
+        for stage in ('workers', 'decomposers'):
+            for arm in pair.ARMS:
+                with self.subTest(stage=stage, arm=arm):
+                    settings = pair.shell_environment(run(stage, arm), '123', 4)
+                    result = subprocess.run(
+                        ['bash', '-c', 'set -euo pipefail\n' + settings + settings + '\nenv'],
+                        env={'PATH': os.environ['PATH'], **runtime},
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    env = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+                    for key, value in runtime.items():
+                        self.assertEqual(env.get(key), value, key)
+
+    def test_reset_requires_unambiguous_settings_section(self):
+        source = pair.COMMON.read_text()
+        for text in (source.replace('# END_AGENT12_LAUNCH_SETTINGS', '# missing end'), source + source):
+            with self.subTest(duplicate=text == source + source), patch.object(pair, 'COMMON') as common:
+                common.read_text.return_value = text
+                with self.assertRaisesRegex(ValueError, 'exactly one marked'):
+                    pair.shell_environment(run(), '123', 4)
+
     def test_effective_training_command_resists_inherited_and_site_settings(self):
         common = pair.COMMON.read_text()
         defaults = common[:common.index('\nif (( GPUS_PER_NODE')]
         # Mimic env.sh containing an old experiment, after the stage wrapper ran.
         defaults = defaults.replace('source ./env.sh', '\n'.join([
+            'export SITE_TMPDIR_SEEN="$TMPDIR"',
+            'export SITE_PYTHONPATH_SEEN="$PYTHONPATH"',
             'export WORKER_MODEL_REMOTE=s3:bucket/old-workers',
             'export DECOMPOSER_MODEL_REMOTE=s3:bucket/old-planner',
             'export TRAIN_DECOMPOSER=true', 'export C3_BALANCE_WORKER_FUNCTIONS=false',
@@ -109,6 +141,7 @@ class FreshPairTests(unittest.TestCase):
                         'VALIDATION_PROBE_URL': 'http://old-server',
                         'JOB_TMP': '/old-job', 'TRAIN_AGENT_ROLES': '[decomposer]',
                         'AGENT12_EXPERIMENT_OVERRIDES': 'trainer.resume_mode=auto',
+                        'TMPDIR': tmp, 'PYTHONPATH': '/site/python',
                     })
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     env = dict(line.split('=', 1) for line in state.read_text().splitlines() if '=' in line)
@@ -117,6 +150,10 @@ class FreshPairTests(unittest.TestCase):
                     self.assertEqual(env['VALIDATION_PROBE_URL'], '')
                     self.assertEqual(env['DECOMPOSER_MODEL_REMOTE'], '')
                     self.assertEqual(env['WORKER_MODEL_REMOTE'], run(stage, arm)['worker_remote'])
+                    self.assertEqual(env['SITE_TMPDIR_SEEN'], tmp)
+                    self.assertEqual(env['TMPDIR'], tmp)
+                    self.assertEqual(env['SITE_PYTHONPATH_SEEN'], '/site/python')
+                    self.assertEqual(env['PYTHONPATH'], '/site/python')
                     tokens = shlex.split(capture.read_text().rsplit(';', 1)[-1])
                     opts = dict(token.split('=', 1) for token in tokens if '=' in token and not token.startswith('--'))
                     self.assertEqual(opts['trainer.max_actor_updates'], '100')

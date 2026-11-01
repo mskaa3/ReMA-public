@@ -148,7 +148,15 @@ def environment(run, job_id, nodes):
 def shell_environment(run, job_id, nodes):
     # Reset launcher knobs, not credentials. env.sh is sourced before this file
     # again in the common launcher, so stale site/user model settings cannot win.
-    reset = set(re.findall(r'^export ([A-Z][A-Z0-9_]*)=', COMMON.read_text(), re.M))
+    # Later command strings also contain exports (TMPDIR, PYTHONPATH, etc.).
+    # They are runtime variables, not experiment settings to clear on the host.
+    settings = re.findall(
+        r'^# BEGIN_AGENT12_LAUNCH_SETTINGS\n(.*?)^# END_AGENT12_LAUNCH_SETTINGS$',
+        COMMON.read_text(), re.M | re.S,
+    )
+    if len(settings) != 1:
+        raise ValueError('Expected exactly one marked Agent 1/2 launcher settings section')
+    reset = set(re.findall(r'^export ([A-Z][A-Z0-9_]*)=', settings[0], re.M))
     reset -= {'SIF_REMOTE', 'SIF_NAME'}
     reset.update(('EAC3_RUN_FILE', 'AGENT12_EXPERIMENT_OVERRIDES', 'WANDB_RUN_ID', 'WANDB_RESUME'))
     return '\n'.join(['unset ' + ' '.join(sorted(reset))] + [

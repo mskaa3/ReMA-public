@@ -49,7 +49,8 @@ editing training code after preparation requires regenerating both manifests in
 a new directory. Every submitted job gets a distinct W&B/S3 name containing its
 Slurm ID. Previous model, scratch, resume, probe and experiment settings in the
 shell or `env.sh` do not override the generated experiment settings. Credentials
-and a site-specific SIF path can still come from `env.sh`.
+and a site-specific SIF path can still come from `env.sh`. Runtime variables such
+as `TMPDIR`, `PYTHONPATH` and `HF_HOME` are preserved; they are not experiment knobs.
 
 ## 2. Check completion, then prepare decomposers
 
